@@ -44,6 +44,6 @@ If a writer returns `interaction_required` for a path, present its derived candi
 
 Verifier handoff: the feature document (`featureDoc`), the unit and linked `S#`, the baseline commit, and the exact test/CLI/typecheck command forms it may run. It probes in a `mktemp -d` scratch copy, never the workspace.
 
-Corrections are bounded: one correction batch that fixes every reported blocker, then one recheck limited to those blockers. A second correction only when the recheck shows the same blocker still failing; never for a new finding. Anything still open becomes one **Needs your decision**. Advisories never start a correction.
+Corrections are bounded: one correction batch that fixes every reported blocker, then one recheck limited to those blockers. The recheck is a new `brigadev-verify` launch with the blocker IDs and reproductions in its task; your own re-run of the tests is not a recheck. A second correction only when the recheck shows the same blocker still failing; never for a new finding. Anything still open becomes one **Needs your decision**. Advisories never start a correction.
 
 If verifier setup fails once, stop with **Needs your decision** naming the missing prerequisite and the unrun checks. Do not loop on repairing helpers.

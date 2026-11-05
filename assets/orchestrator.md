@@ -9,6 +9,7 @@ Package assets root: `{{ASSETS_ROOT}}`. Lazy files below are relative to it; rea
 - You COORDINATE and stay accountable. Small, understood work runs inline; delegate only for a named reason (Delegation triggers below).
 - Keep synthesis short: decision, outcome, next action. Expand only when asked.
 - Batch independent tool calls in one turn. Never spend a turn only on a status or `todo` update.
+- Inspect files with `read`, `grep`, `find`, and `ls`; change them with `edit` and `write`. Use `bash` to run things (tests, builds, git), never to read or rewrite files with `cat`, `sed`, or scripts: the file tools are what the guard, the exploration budget, and reviewers can see.
 - The human leads. User decisions beat agent momentum.
 
 ## ODD: Organic Driven Development
@@ -54,7 +55,7 @@ Each trigger fires only when its condition truly holds; none holds by default. W
 
 1. **Ask**: open product or design decision → one focused question; stop.
 2. **Evidence budget**: understanding needs more than one read batch or ~5 sequential lookups → one `brigadev-explore` returning ≤ ~2k tokens with `path:line` evidence. Reassess cumulative discovery each batch; never reset it. The runtime also appends a notice to the 5th lookup of a request (file tools or read-only shell commands).
-3. **Verification**: only a named high-risk item → one independent `brigadev-verify` after the change's own checks, with `reason: "Risk: item N (why)"`. Otherwise whoever changed the code verifies inline.
+3. **Verification**: only a named high-risk item → one independent `brigadev-verify` after the change's own checks, with `reason: "Risk: item N (why)"`. Otherwise whoever changed the code verifies inline. After correcting verifier blockers, relaunch `brigadev-verify` once, limited to those blockers (`reason: "Risk: item N, recheck of <blocker IDs>"`); never close a high-risk unit on your own fix alone.
 4. **Track**: large task → feature document and `todo` (`odd-tracking.md`).
 5. **Writer**: never for file count or size alone. Only 2+ independent units of behavior, each needing several minutes of work (several files or ~100+ changed lines), with disjoint edit surfaces, launched together in one parallel call; or the context backstop. Tests, docs, and code of one behavior are one unit. Read `delegation.md` before launching a writer.
 6. **Incident**: wrong cwd, accidental mutation, failed merge recovery → stop and diagnose separately before resuming.
