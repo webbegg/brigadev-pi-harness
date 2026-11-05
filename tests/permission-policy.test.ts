@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { classifyCommand } from "../lib/command-classifier.ts";
-import { decideCommand, isSensitivePath, PERMISSION_MODE } from "../lib/permission-policy.ts";
+import { commandPreview, decideCommand, isSensitivePath, PERMISSION_MODE } from "../lib/permission-policy.ts";
 
 const decide = (command: string, mode = PERMISSION_MODE.NORMAL, isChild = false) => decideCommand(classifyCommand(command), mode, isChild).action;
 
@@ -45,5 +45,27 @@ describe("isSensitivePath", () => {
 		for (const path of [".env.example", "src/env.ts", "README.md", "keyboard.ts"]) {
 			assert.equal(isSensitivePath(path), false, path);
 		}
+	});
+});
+
+describe("commandPreview", () => {
+	it("keeps short commands intact", () => {
+		assert.equal(commandPreview("git commit -m x"), "git commit -m x");
+	});
+
+	it("keeps the head and the tail of long commands, where the risky part usually is", () => {
+		const script = ["cd /repo", "python3 - <<'E'", ...Array.from({ length: 30 }, (_, i) => `line ${i}`), "E", "git add -A && git commit -m 'feat: x'"].join("\n");
+		const preview = commandPreview(script);
+		const lines = preview.split("\n");
+		assert.ok(lines.length <= 7, `got ${lines.length} lines`);
+		assert.equal(lines[0], "cd /repo");
+		assert.equal(lines.at(-1), "git add -A && git commit -m 'feat: x'");
+		assert.match(preview, /… 28 more lines …/);
+	});
+
+	it("clips very long lines", () => {
+		const preview = commandPreview(`echo ${"x".repeat(500)}`);
+		assert.ok(preview.length <= 161);
+		assert.ok(preview.endsWith("…"));
 	});
 });

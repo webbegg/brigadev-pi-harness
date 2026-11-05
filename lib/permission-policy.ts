@@ -52,3 +52,21 @@ export function isSensitivePath(path: string): boolean {
 	if (/(^|\/)\.env\.(example|sample|template)$/.test(normalized)) return false;
 	return SENSITIVE_PATTERNS.some((p) => p.test(normalized));
 }
+
+const PREVIEW_HEAD_LINES = 3;
+const PREVIEW_TAIL_LINES = 3;
+const PREVIEW_LINE_CHARS = 160;
+
+/**
+ * Bounded preview of a command for confirmation dialogs. A dialog taller
+ * than the terminal hides its own Yes/No options, so long scripts keep only
+ * their first and last lines (the risky step, such as `git commit`, usually
+ * comes last).
+ */
+export function commandPreview(command: string): string {
+	const clip = (line: string) => (line.length > PREVIEW_LINE_CHARS ? `${line.slice(0, PREVIEW_LINE_CHARS - 1)}…` : line);
+	const lines = command.trim().split("\n");
+	if (lines.length <= PREVIEW_HEAD_LINES + PREVIEW_TAIL_LINES + 1) return lines.map(clip).join("\n");
+	const hidden = lines.length - PREVIEW_HEAD_LINES - PREVIEW_TAIL_LINES;
+	return [...lines.slice(0, PREVIEW_HEAD_LINES), `… ${hidden} more lines …`, ...lines.slice(-PREVIEW_TAIL_LINES)].map(clip).join("\n");
+}

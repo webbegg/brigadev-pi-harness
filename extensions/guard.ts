@@ -11,7 +11,7 @@ import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { isWithinSurfaces } from "../lib/edit-surfaces.ts";
-import { decideCommand, isPermissionMode, isSensitivePath, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
+import { commandPreview, decideCommand, isPermissionMode, isSensitivePath, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { appendSystemPromptOnce, CHILD_ENV, childAllowedSurfaces, isChildSession, readSettings, writeSettings } from "../lib/runtime.ts";
 
 const MODE_ENTRY = "brigadev-mode";
@@ -82,7 +82,7 @@ export default function (pi: ExtensionAPI) {
 			const decision = decideCommand(classifyCommand(event.input.command), mode, isChild);
 			if (decision.action === "allow") return undefined;
 			if (decision.action === "block") return { block: true, reason: decision.reason };
-			const ok = await confirm(ctx, "brigadev: confirm command", `${decision.reason}\n\n  ${event.input.command}\n\nRun it?`);
+			const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(event.input.command)}\n\nRun it?`);
 			return ok ? undefined : { block: true, reason: `User declined: ${decision.reason}` };
 		}
 
