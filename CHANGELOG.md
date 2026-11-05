@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Runtime signals (parent session only): a context backstop notice when context first reaches min(150k tokens, 50% of the window), re-armed after compaction, and an exploration budget notice on the 5th read/grep/find/ls call of a request.
+
 ## [0.2.0] - 2026-11-05
 
 - Model routing profiles (`/brigadev:profile`): per-agent and orchestrator model + thinking, prefix globs, session binding, default profile that also sets Pi's default model, example profiles (economy, balanced, deep).

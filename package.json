@@ -19,7 +19,9 @@
 			"./extensions/subagents.ts",
 			"./extensions/todo.ts",
 			"./extensions/profiles.ts",
-			"./extensions/cost.ts"
+			"./extensions/cost.ts",
+			"./extensions/context-backstop.ts",
+			"./extensions/exploration-budget.ts"
 		],
 		"skills": [
 			"./skills"

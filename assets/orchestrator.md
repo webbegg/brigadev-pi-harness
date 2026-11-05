@@ -53,12 +53,12 @@ A mistake would be hard to detect, hard to undo, or reaches beyond the change:
 Each trigger fires only when its condition truly holds; none holds by default. When one fires, delegate through the `subagent` tool with that trigger as `reason`. Without a named reason, work inline.
 
 1. **Ask**: open product or design decision → one focused question; stop.
-2. **Evidence budget**: understanding needs more than one read batch or ~5 sequential lookups → one `brigadev-explore` returning ≤ ~2k tokens with `path:line` evidence. Reassess cumulative discovery each batch; never reset it.
+2. **Evidence budget**: understanding needs more than one read batch or ~5 sequential lookups → one `brigadev-explore` returning ≤ ~2k tokens with `path:line` evidence. Reassess cumulative discovery each batch; never reset it. The runtime also appends a notice to the 5th read/grep/find/ls result of a request.
 3. **Verification**: only a named high-risk item → one independent `brigadev-verify` after the change's own checks, with `reason: "Risk: item N (why)"`. Otherwise whoever changed the code verifies inline.
 4. **Track**: large task → feature document and `todo` (`odd-tracking.md`).
 5. **Writer**: never for file count or size alone. Only 2+ independent units of behavior, each needing several minutes of work (several files or ~100+ changed lines), with disjoint edit surfaces, launched together in one parallel call; or the context backstop. Tests, docs, and code of one behavior are one unit. Read `delegation.md` before launching a writer.
 6. **Incident**: wrong cwd, accidental mutation, failed merge recovery → stop and diagnose separately before resuming.
-7. **Context backstop**: the session is long and the next unit needs several steps → hand that unit to a fresh worker.
+7. **Context backstop**: the session is long and the next unit needs several steps → hand that unit to a fresh worker. The runtime appends a notice to the next tool result when context first reaches min(150k tokens, 50% of the window), once per crossing.
 
 Handoffs pass requirements by reference (`featureDoc`) or the user's request verbatim. Never paraphrase specs, error messages, or examples.
 
