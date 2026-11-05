@@ -6,26 +6,17 @@
  * Subagents load this file explicitly (`-e`), so it must work standalone.
  */
 
-import { homedir } from "node:os";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, relative, resolve, sep } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { isWithinSurfaces } from "../lib/edit-surfaces.ts";
 import { commandPreview, decideCommand, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
+import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { appendSystemPromptOnce, CHILD_ENV, childAllowedSurfaces, isChildSession, readSettings, writeSettings } from "../lib/runtime.ts";
 
 const MODE_ENTRY = "brigadev-mode";
 const STATUS_KEY = "brigadev-mode";
 
-
-function expandHome(path: string): string {
-	return path === "~" ? homedir() : path.startsWith("~/") ? resolve(homedir(), path.slice(2)) : path;
-}
-
-function isInside(root: string, target: string): boolean {
-	const rel = relative(root, target);
-	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
 
 export default function (pi: ExtensionAPI) {
 	const isChild = isChildSession();
@@ -33,7 +24,7 @@ export default function (pi: ExtensionAPI) {
 	// Per-session grants for directories outside the project root.
 	const outsideGrants = new Set<string>();
 
-	const projectRoot = (ctx: ExtensionContext) => resolve(process.env[CHILD_ENV.PROJECT_ROOT] ?? ctx.cwd);
+	const projectRoot = (ctx: ExtensionContext) => canonicalPath(process.env[CHILD_ENV.PROJECT_ROOT] ?? ctx.cwd);
 
 	const publishStatus = (ctx: ExtensionContext) => {
 		if (isChild || !ctx.hasUI) return;
@@ -88,7 +79,7 @@ export default function (pi: ExtensionAPI) {
 
 		const rawPath = String((event.input as { path?: unknown }).path ?? "");
 		if (!rawPath) return undefined;
-		const absolute = resolve(ctx.cwd, expandHome(rawPath));
+		const absolute = canonicalPath(resolve(ctx.cwd, expandHome(rawPath)));
 		const root = projectRoot(ctx);
 
 		if (isSensitivePath(absolute)) {
