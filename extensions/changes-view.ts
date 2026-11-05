@@ -6,11 +6,13 @@
  * all show up. Committed work disappears.
  */
 
+import { spawn } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey } from "@earendil-works/pi-tui";
 import { boundDiff, countLines, DIFF_MAX_BYTES, diffLineTone, parseNumstat, parseStatus, statusTone, totals, untrackedAsDiff, withCounts, type ChangeEntry } from "../lib/git-changes.ts";
+import { buildEditorLaunch } from "../lib/editor-launch.ts";
 import { isChildSession } from "../lib/runtime.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { maxScroll, renderTwoPane, type Row } from "../lib/two-pane.ts";
@@ -65,6 +67,14 @@ export default function (pi: ExtensionAPI) {
 		return lines.map((text) => ({ text: text.replace(/\t/g, "    "), tone: diffLineTone(text) }));
 	};
 
+	// Runs the editor on the terminal and resolves with a failure message, or undefined on success.
+	const runEditor = (command: string, args: string[], cwd: string) =>
+		new Promise<string | undefined>((resolve) => {
+			const proc = spawn(command, args, { cwd, shell: false, stdio: "inherit" });
+			proc.on("error", (error) => resolve(`Could not launch ${command}: ${error.message}`));
+			proc.on("close", (code, signal) => resolve(code === 0 ? undefined : `${command} exited with ${signal ?? `code ${code}`}`));
+		});
+
 	const open = async (ctx: ExtensionContext) => {
 		if (ctx.mode !== "tui") return ctx.ui.notify("/brigadev:changes needs the interactive UI", "error");
 		await ctx.ui.custom<void>((tui, theme, _kb, done) => {
@@ -99,6 +109,26 @@ export default function (pi: ExtensionAPI) {
 			};
 			void refresh();
 
+			// tui.stop()/start() release and retake the terminal around the editor.
+			const openInEditor = async () => {
+				const entry = entries[selected];
+				if (!entry || !root || entry.status === "D") return;
+				const launch = buildEditorLaunch(process.env, join(root, entry.path));
+				if (!launch.ok) return ctx.ui.notify(launch.message, "warning");
+				let failure: string | undefined;
+				try {
+					tui.stop();
+					failure = await runEditor(launch.command, launch.args, root);
+				} catch (error) {
+					failure = `Could not launch ${launch.command}: ${(error as Error).message}`;
+				} finally {
+					tui.start();
+					tui.requestRender(true);
+				}
+				if (failure) ctx.ui.notify(failure, "warning");
+				void refresh();
+			};
+
 			const select = (index: number) => {
 				const next = Math.max(0, Math.min(entries.length - 1, index));
 				if (next === selected) return;
@@ -120,6 +150,7 @@ export default function (pi: ExtensionAPI) {
 					else if (data === "G") scroll = maxScroll(detail.length, bodyHeight);
 					else if (data === "F") detailOnly = !detailOnly;
 					else if (data === "r") return void refresh();
+					else if (data === "o") return void openInEditor();
 					tui.requestRender();
 				},
 				render(width: number): string[] {
@@ -142,7 +173,7 @@ export default function (pi: ExtensionAPI) {
 							detailScroll: scroll,
 							detailOnly,
 							empty: loading ? "loading…" : "No uncommitted changes",
-							footer: "j/k file · space/J/K scroll · g/G top/end · F diff only · r refresh · q close",
+							footer: "j/k file · space/J/K scroll · g/G top/end · F diff only · o open in editor · r refresh · q close",
 						},
 						painter,
 					);
