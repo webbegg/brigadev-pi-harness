@@ -106,3 +106,116 @@ describe("classifyCommand", () => {
 		assert.deepEqual(kinds("cat <<'EOF' > notes.md\nrun git reset --hard\nEOF"), []);
 	});
 });
+
+describe("dependency changes", () => {
+	const dependency = [COMMAND_KIND.DEPENDENCY];
+
+	it("flags package-manager installs and removals, bare install included", () => {
+		for (const command of [
+			"npm install",
+			"npm i",
+			"npm install left-pad",
+			"npm ci",
+			"npm add x",
+			"npm remove x",
+			"npm rm x",
+			"npm uninstall x",
+			"npm update",
+			"npm upgrade",
+			"npm up",
+			"npm --prefix web install",
+			"pnpm install",
+			"pnpm add -D vitest",
+			"pnpm up",
+			"yarn",
+			"yarn --frozen-lockfile",
+			"yarn install",
+			"yarn add x",
+			"yarn remove x",
+			"yarn upgrade",
+			"bun install",
+			"bun add x",
+			"bun i",
+			"bun update",
+		]) {
+			assert.deepEqual(kinds(command), dependency, command);
+		}
+	});
+
+	it("flags Python, Rust, Go, Homebrew, and Ruby dependency changes", () => {
+		for (const command of [
+			"pip install requests",
+			"pip3 install -r requirements.txt",
+			"pip uninstall requests",
+			"python3 -m pip install x",
+			"uv pip install x",
+			"uv pip uninstall x",
+			"uv add x",
+			"uv remove x",
+			"uv sync",
+			"poetry add x",
+			"poetry remove x",
+			"poetry install",
+			"poetry update",
+			"cargo add serde",
+			"cargo remove serde",
+			"cargo install ripgrep",
+			"go get example.com/x",
+			"go install example.com/x@latest",
+			"brew install jq",
+			"brew uninstall jq",
+			"brew upgrade",
+			"gem install rails",
+		]) {
+			assert.deepEqual(kinds(command), dependency, command);
+		}
+	});
+
+	it("leaves read-only and unrelated forms alone", () => {
+		for (const command of [
+			"npm ls",
+			"npm view left-pad",
+			"npm test",
+			"npm run build",
+			"npm run install-hooks",
+			"npm --version",
+			"pnpm test",
+			"yarn --version",
+			"yarn test",
+			"bun run dev",
+			"pip list",
+			"pip show requests",
+			"pip3 freeze",
+			"uv run pytest",
+			"poetry show",
+			"cargo build",
+			"cargo test",
+			"go build ./...",
+			"go test ./...",
+			"brew list",
+			"brew info jq",
+			"gem list",
+			`grep -rn "npm install" docs`,
+			`echo "pip install x"`,
+		]) {
+			assert.deepEqual(kinds(command), [], command);
+		}
+	});
+
+	it("sees dependency changes behind wrappers, chains, and nested shells", () => {
+		assert.deepEqual(kinds("sudo npm install -g x"), [COMMAND_KIND.PRIVILEGED, COMMAND_KIND.DEPENDENCY]);
+		assert.deepEqual(kinds("bash -c 'npm i x'"), dependency);
+		assert.deepEqual(kinds("cd web && npm ci && npm test"), dependency);
+		assert.deepEqual(kinds("FOO=1 npm install"), dependency);
+		assert.deepEqual(kinds("/usr/local/bin/npm install"), dependency);
+	});
+
+	it("keeps publishing a publish, not a dependency change", () => {
+		assert.deepEqual(kinds("npm publish"), [COMMAND_KIND.PUBLISH]);
+		assert.deepEqual(kinds("cargo publish"), [COMMAND_KIND.PUBLISH]);
+	});
+
+	it("never hard-denies a dependency change", () => {
+		assert.equal(hardDenied("npm install"), false);
+	});
+});

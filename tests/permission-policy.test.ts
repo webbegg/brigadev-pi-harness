@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { classifyCommand } from "../lib/command-classifier.ts";
-import { commandPreview, decideCommand, isSensitivePath, PERMISSION_MODE } from "../lib/permission-policy.ts";
+import { commandPreview, decideCommand, isSensitivePath, MODE_PROMPT, PERMISSION_MODE } from "../lib/permission-policy.ts";
 
 const decide = (command: string, mode = PERMISSION_MODE.NORMAL, isChild = false) => decideCommand(classifyCommand(command), mode, isChild).action;
 
@@ -31,6 +31,34 @@ describe("decideCommand", () => {
 	it("blocks every risky kind in subagents, including delivery", () => {
 		assert.equal(decide("git commit -m x", PERMISSION_MODE.YOLO, true), "block");
 		assert.equal(decide("rm -rf build", PERMISSION_MODE.NORMAL, true), "block");
+	});
+});
+
+describe("decideCommand for dependency changes", () => {
+	it("asks in normal and in yolo", () => {
+		for (const command of ["npm install", "pip install requests", "uv sync"]) {
+			assert.equal(decide(command, PERMISSION_MODE.NORMAL), "confirm", command);
+			assert.equal(decide(command, PERMISSION_MODE.YOLO), "confirm", command);
+		}
+	});
+
+	it("blocks in subagents", () => {
+		assert.equal(decide("npm install", PERMISSION_MODE.NORMAL, true), "block");
+		assert.equal(decide("pip install x", PERMISSION_MODE.YOLO, true), "block");
+	});
+
+	it("still allows read-only package-manager commands", () => {
+		assert.equal(decide("npm ls", PERMISSION_MODE.YOLO), "allow");
+		assert.equal(decide("npm run build", PERMISSION_MODE.NORMAL, true), "allow");
+	});
+
+	it("asks for a dependency change chained after a waived delivery in yolo", () => {
+		assert.equal(decide("git commit -m x && npm install", PERMISSION_MODE.YOLO), "confirm");
+	});
+
+	it("keeps the mode prompts accurate", () => {
+		assert.match(MODE_PROMPT.yolo, /dependency/i);
+		assert.match(MODE_PROMPT.normal, /dependency/i);
 	});
 });
 

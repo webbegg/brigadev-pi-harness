@@ -9,6 +9,8 @@ export const COMMAND_KIND = {
 	DELIVERY: "delivery",
 	PUBLISH: "publish",
 	PRIVILEGED: "privileged",
+	/** Changes installed dependencies or the environment (npm install, pip install, brew upgrade). */
+	DEPENDENCY: "dependency",
 } as const;
 export type CommandKind = (typeof COMMAND_KIND)[keyof typeof COMMAND_KIND];
 
@@ -146,6 +148,43 @@ function isScratchPath(target: string, root: string = tmpdir().replace(/\/+$/, "
 	if (!target.startsWith(`${root}/`)) return false;
 	const segments = target.slice(root.length + 1).replace(/\/$/, "").split("/");
 	return segments.every((seg) => seg !== "" && seg !== "." && seg !== "..");
+}
+
+// Options that take a separate value, per manager, so the value is not
+// mistaken for the subcommand. The same flag can differ: npm -w takes a
+// workspace name, pnpm -w means --workspace-root and takes none.
+const VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
+	npm: new Set(["--prefix", "-w", "--workspace", "--registry", "-C"]),
+	pnpm: new Set(["--filter", "-F", "-C", "--dir", "--registry"]),
+	yarn: new Set(["--cwd", "--registry"]),
+	bun: new Set(["--cwd", "--registry"]),
+};
+const JS_DEPENDENCY_SUBCOMMANDS = new Set(["install", "i", "add", "ci", "remove", "rm", "uninstall", "update", "upgrade", "up"]);
+
+/** First argument that is not an option (or an option's value). */
+function firstSubcommand(args: string[], valueOptions: ReadonlySet<string>): { sub: string | undefined; index: number } {
+	for (let i = 0; i < args.length; i++) {
+		if (valueOptions.has(args[i])) i++;
+		else if (!args[i].startsWith("-")) return { sub: args[i], index: i };
+	}
+	return { sub: undefined, index: -1 };
+}
+
+function dependencyMatch(command: string): CommandMatch {
+	return { kind: COMMAND_KIND.DEPENDENCY, reason: `${command} changes installed dependencies` };
+}
+
+function classifyJsPackageManager(name: string, args: string[]): CommandMatch | undefined {
+	const { sub } = firstSubcommand(args, VALUE_OPTIONS[name] ?? new Set());
+	if (sub === undefined) {
+		// `yarn` alone installs; `yarn --version` and friends do not.
+		return name === "yarn" && !hasAny(args, "--version", "-v", "--help", "-h") ? dependencyMatch("yarn install") : undefined;
+	}
+	return JS_DEPENDENCY_SUBCOMMANDS.has(sub) ? dependencyMatch(`${name} ${sub}`) : undefined;
+}
+
+function classifyPip(label: string, args: string[]): CommandMatch | undefined {
+	return args[0] === "install" || args[0] === "uninstall" ? dependencyMatch(`${label} ${args[0]}`) : undefined;
 }
 
 function classifyRm(args: string[], viaXargs: boolean): CommandMatch | undefined {
@@ -319,10 +358,37 @@ function classifySegment(rawArgv: string[], before: string): CommandMatch[] {
 		case "bun":
 			if (args[0] === "publish" || args[0] === "unpublish" || (args[0] === "dist-tag" && args[1] !== "ls")) {
 				match = { kind: COMMAND_KIND.PUBLISH, reason: `${name} ${args[0]}` };
+			} else {
+				match = classifyJsPackageManager(name, args);
 			}
+			break;
+		case "pip":
+		case "pip3":
+			match = classifyPip(name, args);
+			break;
+		case "python":
+		case "python3":
+			if (args[0] === "-m" && (args[1] === "pip" || args[1] === "pip3")) match = classifyPip(`${name} -m ${args[1]}`, args.slice(2));
+			break;
+		case "uv":
+			if (args[0] === "pip") match = classifyPip("uv pip", args.slice(1));
+			else if (["add", "remove", "sync"].includes(args[0])) match = dependencyMatch(`uv ${args[0]}`);
+			break;
+		case "poetry":
+			if (["add", "remove", "install", "update"].includes(args[0])) match = dependencyMatch(`poetry ${args[0]}`);
+			break;
+		case "go":
+			if (args[0] === "get" || args[0] === "install") match = dependencyMatch(`go ${args[0]}`);
+			break;
+		case "brew":
+			if (["install", "uninstall", "upgrade"].includes(args[0])) match = dependencyMatch(`brew ${args[0]}`);
+			break;
+		case "gem":
+			if (args[0] === "install") match = dependencyMatch("gem install");
 			break;
 		case "cargo":
 			if (args[0] === "publish" || args[0] === "yank") match = { kind: COMMAND_KIND.PUBLISH, reason: `cargo ${args[0]}` };
+			else if (["add", "remove", "install"].includes(args[0])) match = dependencyMatch(`cargo ${args[0]}`);
 			break;
 		case "twine":
 			if (args[0] === "upload") match = { kind: COMMAND_KIND.PUBLISH, reason: "twine upload" };

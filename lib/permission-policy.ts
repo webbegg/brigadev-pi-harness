@@ -9,8 +9,8 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
 
 /** One line per mode, appended to the parent's system prompt every turn. */
 export const MODE_PROMPT: Record<PermissionMode, string> = {
-	normal: "Permission mode NORMAL: the guard asks the user before commits, pushes, PR/issue writes, and destructive, publish, or privileged commands. Run the command; don't ask in chat first.",
-	yolo: "Permission mode YOLO: commits, non-force pushes, and PR/issue creation run without asking; destructive, publish, and privileged commands still ask.",
+	normal: "Permission mode NORMAL: the guard asks the user before commits, pushes, PR/issue writes, and destructive, publish, privileged, or dependency-changing commands. Run the command; don't ask in chat first.",
+	yolo: "Permission mode YOLO: commits, non-force pushes, and PR/issue creation run without asking; destructive, publish, privileged, and dependency (install) commands still ask.",
 };
 
 export type Decision = { action: "allow" } | { action: "confirm"; reason: string } | { action: "block"; reason: string };
@@ -20,11 +20,11 @@ export type Decision = { action: "allow" } | { action: "confirm"; reason: string
  *
  * - Hard-deny forms are always blocked.
  * - Subagents (no human in the loop) never run destructive, delivery,
- *   publish, or privileged commands: delivery is parent-owned.
+ *   publish, privileged, or dependency commands: delivery is parent-owned.
  * - NORMAL asks before every risky kind.
  * - YOLO gives standing permission for ordinary delivery (commits,
  *   non-force pushes, PR/issue creation) but still asks for destructive,
- *   publish, and privileged commands.
+ *   publish, privileged, and dependency commands.
  */
 export function decideCommand(matches: CommandMatch[], mode: PermissionMode, isChild: boolean): Decision {
 	if (matches.length === 0) return { action: "allow" };
