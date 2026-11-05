@@ -2,7 +2,7 @@
 // priority first, until the line fits. Pure: width measuring and colors are
 // supplied by the caller.
 
-export type Tone = "accent" | "muted" | "dim" | "success" | "warning" | "error" | "text";
+export type Tone = "accent" | "muted" | "dim" | "success" | "warning" | "error" | "text" | "borderMuted";
 
 export interface Segment {
 	id: string;
