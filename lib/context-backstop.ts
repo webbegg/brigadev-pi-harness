@@ -8,7 +8,7 @@ export interface ContextUsageLike {
 }
 
 export const BACKSTOP_NOTICE =
-	"[brigadev runtime] Context backstop: this session's context is long. Hand the next multi-step unit to a fresh brigadev-worker (trigger 7) instead of continuing inline.";
+	"[brigadev runtime] Context backstop: this session's context is long. Hand the next multi-step unit to a fresh brigadev-worker (context backstop trigger) instead of continuing inline.";
 
 export function backstopThreshold(contextWindow: number): number {
 	return Math.min(TOKEN_CEILING, contextWindow * 0.5);

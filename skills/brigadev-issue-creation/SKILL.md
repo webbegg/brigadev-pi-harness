@@ -1,6 +1,6 @@
 ---
 name: brigadev-issue-creation
-description: "Trigger: create issue, bug report, feature request, file a ticket. Create GitHub issues from repository evidence using the target's issue forms, after a duplicate search."
+description: "Trigger: create issue, bug report, feature request. GitHub issues from evidence after a duplicate search."
 metadata:
   author: brigadev
   version: "0.1"

@@ -1,6 +1,6 @@
 ---
 name: brigadev-work-unit-commits
-description: "Trigger: committing, splitting commits, preparing commits for a PR, ODD delivery. Plan commits as reviewable work units with tests and docs kept with their code."
+description: "Trigger: commit, split commits, prepare commits. Commits as work units with their tests and docs."
 metadata:
   author: brigadev
   version: "0.1"

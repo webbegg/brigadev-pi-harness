@@ -11,16 +11,12 @@ import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { isWithinSurfaces } from "../lib/edit-surfaces.ts";
-import { commandPreview, decideCommand, isPermissionMode, isSensitivePath, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
+import { commandPreview, decideCommand, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { appendSystemPromptOnce, CHILD_ENV, childAllowedSurfaces, isChildSession, readSettings, writeSettings } from "../lib/runtime.ts";
 
 const MODE_ENTRY = "brigadev-mode";
 const STATUS_KEY = "brigadev-mode";
 
-const MODE_PROMPT: Record<PermissionMode, string> = {
-	normal: "brigadev permission mode: NORMAL. The runtime asks the user before commits, pushes, PR/issue writes, destructive, publish, and privileged commands. Do not ask in chat first; run the command and let the guard ask.",
-	yolo: "brigadev permission mode: YOLO. Standing permission for ordinary already-scoped work: commits, non-force pushes, and PR/issue creation run without a prompt. Destructive, publish, and privileged commands still require fresh confirmation from the runtime.",
-};
 
 function expandHome(path: string): string {
 	return path === "~" ? homedir() : path.startsWith("~/") ? resolve(homedir(), path.slice(2)) : path;

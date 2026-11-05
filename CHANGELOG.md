@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Prompt trim: brigadev's per-turn prompt went from about 15.1k to 9.7k characters (measured trivial turn: 11,103 → 9,259 prompt tokens). Compact orchestrator prompt with the same rules, tool schemas without duplicated field descriptions, shorter skill descriptions, and Judgment Day and the skill creator hidden from the model's skill list (run them with `/skill:brigadev-judgment-day` and `/skill:brigadev-skill-creator`; the `/judgment-day` prompt is gone). `tests/prompt-budget.test.ts` keeps it from growing back.
+
 - `/brigadev:doctor`: diagnostics (bridge hooks, profiles, settings, model) and `fix-bridge-hooks`, which adds `disableAllHooks: true` to the installed claude-bridge so the user's Claude Code hooks stop running inside Pi turns (measured: about 0.8k prompt and 0.3k output tokens, 7-9 s per turn). Warns once per session while hooks are on. Re-run after bridge updates; an upstream option is drafted in `docs/upstream/`.
 
 ## [0.3.0] - 2026-11-05

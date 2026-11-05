@@ -25,7 +25,7 @@ Check it loaded: `/brigadev:status`.
 | ODD tracking | `assets/odd-tracking.md`, `/track` | Large work gets one feature document at `odd/tasks/<name>.md` (Specs quoted verbatim, Tasks, Log) and a `todo` projection. Small work stays inline with no artifacts. |
 | Subagents | `extensions/subagents.ts`, `assets/agents/` | `subagent` tool runs each agent in its own `pi` process. Every launch needs a `reason`; the verifier needs `Risk: item N`; writers need narrow `allowedEditSurfaces`, and parallel writers must be disjoint. Specs travel by reference (`featureDoc`), skills by exact path. |
 | Review | `skills/brigadev-review`, `/review` | 4R lenses (Risk, Readability, Reliability, Resilience) on one frozen candidate; only the lenses that fit. |
-| Judgment Day | `skills/brigadev-judgment-day`, `/judgment-day` | Two blind judges, frozen ledger, at most two scoped fix and re-judgment rounds. |
+| Judgment Day | `skills/brigadev-judgment-day`, `/skill:brigadev-judgment-day` | Two blind judges, frozen ledger, at most two scoped fix and re-judgment rounds. |
 | Safety guard | `extensions/guard.ts` | Confirms destructive, delivery, publish, and privileged commands; hard-denies catastrophic ones; asks before writes outside the project or touching secret files. In subagents: blocks all of those and enforces allowed edit surfaces. |
 | Todo | `extensions/todo.ts` | Visible task list with `pending / in_progress / done / blocked / dropped`. Kept out of the system prompt so updates never break the prompt cache. |
 | Status bar | `extensions/shell-bar.ts` | One-line footer: repo, branch ±dirty, yolo, model · thinking, context gauge, cost, profile. |
@@ -50,7 +50,7 @@ Check it loaded: `/brigadev:status`.
 | `/brigadev:agents` | Effective agent list (package, user, trusted project) |
 | `/brigadev:harness on\|off` | Toggle the orchestrator prompt for this session (A/B testing) |
 | `/review [base or focus]` | 4R review |
-| `/judgment-day [target]` | Judgment Day |
+| `/skill:brigadev-judgment-day [target]` | Judgment Day (hidden from the model's skill list; run it explicitly) |
 | `/track <request>` | Force ODD tracking for a request |
 
 ## Model routing profiles

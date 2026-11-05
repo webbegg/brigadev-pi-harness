@@ -199,23 +199,29 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 	}
 }
 
-const LaunchSchema = {
-	agent: Type.String({ description: "Agent name (see /brigadev:agents)" }),
-	task: Type.String({ description: "What to do. Pass requirements by reference (featureDoc) or the user's request verbatim; never paraphrase specs." }),
-	reason: Type.String({ description: 'Delegation trigger, e.g. "evidence budget", "independent units", "context backstop", or "Risk: item N (why)" for the verifier.' }),
-	allowedEditSurfaces: Type.Optional(Type.Array(Type.String(), { description: "Writers only: narrow repository-relative paths/globs the agent may edit. Never '.' or absolute." })),
-	featureDoc: Type.Optional(Type.String({ description: "Repository-relative ODD feature document the agent reads until ## Log." })),
-	skills: Type.Optional(Type.Array(Type.String(), { description: "Skill names the agent must read before work; resolved to exact SKILL.md paths." })),
+// Field descriptions live on the top-level fields only; parallel items reuse
+// the same fields without repeating them (every tool byte is sent each turn).
+const launchFields = (described: boolean) => {
+	const d = (description: string) => (described ? { description } : {});
+	return {
+		agent: Type.String(d("Agent name")),
+		task: Type.String(d("Task; requirements by reference or verbatim")),
+		reason: Type.String(d('Delegation trigger, or "Risk: item N (why)" for brigadev-verify')),
+		allowedEditSurfaces: Type.Optional(Type.Array(Type.String(), d("Writers: narrow repo-relative paths/globs"))),
+		featureDoc: Type.Optional(Type.String(d("Feature document path (read until ## Log)"))),
+		skills: Type.Optional(Type.Array(Type.String(), d("Skill names to read first"))),
+	};
 };
 
+const described = launchFields(true);
 const Params = Type.Object({
-	agent: Type.Optional(LaunchSchema.agent),
-	task: Type.Optional(LaunchSchema.task),
-	reason: Type.Optional(LaunchSchema.reason),
-	allowedEditSurfaces: LaunchSchema.allowedEditSurfaces,
-	featureDoc: LaunchSchema.featureDoc,
-	skills: LaunchSchema.skills,
-	tasks: Type.Optional(Type.Array(Type.Object(LaunchSchema), { description: `Parallel launches (max ${MAX_PARALLEL_TASKS}). Use only for independent units.` })),
+	agent: Type.Optional(described.agent),
+	task: Type.Optional(described.task),
+	reason: Type.Optional(described.reason),
+	allowedEditSurfaces: described.allowedEditSurfaces,
+	featureDoc: described.featureDoc,
+	skills: described.skills,
+	tasks: Type.Optional(Type.Array(Type.Object(launchFields(false)), { description: `Parallel independent units (max ${MAX_PARALLEL_TASKS}), same fields` })),
 });
 
 function formatUsage(r: RunResult): string {
@@ -321,11 +327,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: [
-			"Delegate bounded work to a focused brigadev agent with an isolated context. Delegate only for a named reason; otherwise work inline.",
-			"Single: {agent, task, reason, ...}. Parallel: {tasks: [...]} for independent units only.",
-			"Writers need allowedEditSurfaces; the verifier needs 'Risk: item N' in reason. Results return to you; you stay accountable.",
-		].join(" "),
+		description: "Run a focused brigadev agent in its own context, only for a named delegation trigger. Single: agent, task, reason. Parallel: tasks[]. Writers need allowedEditSurfaces.",
 		parameters: Params,
 
 		async execute(_id, params, signal, onUpdate, ctx) {

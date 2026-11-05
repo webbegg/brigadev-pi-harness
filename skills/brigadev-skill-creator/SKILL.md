@@ -1,6 +1,7 @@
 ---
 name: brigadev-skill-creator
-description: "Trigger: create skill, new skill, skill creator, update skill. Create or update concise, LLM-first Agent Skills with valid frontmatter for Pi."
+description: "Create or update concise LLM-first skills with valid frontmatter. Run with /skill:brigadev-skill-creator."
+disable-model-invocation: true
 metadata:
   author: brigadev
   version: "0.1"

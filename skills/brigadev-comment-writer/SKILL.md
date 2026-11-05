@@ -1,6 +1,6 @@
 ---
 name: brigadev-comment-writer
-description: "Trigger: PR feedback, review comment, issue reply, Slack or Discord message. Write warm, direct, short comments other humans will read."
+description: "Trigger: PR feedback, review comment, issue reply, team message. Short, warm, direct comments."
 metadata:
   author: brigadev
   version: "0.1"

@@ -1,6 +1,6 @@
 ---
 name: brigadev-review
-description: "Trigger: review, code review, 4R review, review my changes, review this commit or PR. Risk-scoped review of one frozen candidate with the 4R lenses (Risk, Readability, Reliability, Resilience)."
+description: "Trigger: review, code review, 4R. Risk-scoped review of one frozen change with the 4R lenses."
 metadata:
   author: brigadev
   version: "0.1"

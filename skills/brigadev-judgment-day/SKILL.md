@@ -1,6 +1,7 @@
 ---
 name: brigadev-judgment-day
-description: "Trigger: judgment day, judgement day, dual review, adversarial review, juzgar. Explicit blind dual review by two judges with at most two scoped fix and re-judgment rounds."
+description: "Explicit blind dual review by two judges with at most two scoped fix rounds. Run with /skill:brigadev-judgment-day."
+disable-model-invocation: true
 metadata:
   author: brigadev
   version: "0.1"

@@ -4,7 +4,7 @@ const LOOKUP_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const LOOKUP_LIMIT = 5;
 
 export const EXPLORE_NOTICE =
-	"[brigadev runtime] Exploration budget: 5 lookups (file tools or read-only shell commands) this request. If understanding still needs more, delegate one brigadev-explore (trigger 2) instead of continuing to read.";
+	"[brigadev runtime] Exploration budget: 5 lookups (file tools or read-only shell commands) this request. If understanding still needs more, delegate one brigadev-explore (evidence budget trigger) instead of continuing to read.";
 
 // Read-only shell commands count too: agents often read files with `cat` or
 // `sed -n` instead of the read tool, and those reads cost the same context.

@@ -7,6 +7,12 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
 	return value === PERMISSION_MODE.NORMAL || value === PERMISSION_MODE.YOLO;
 }
 
+/** One line per mode, appended to the parent's system prompt every turn. */
+export const MODE_PROMPT: Record<PermissionMode, string> = {
+	normal: "Permission mode NORMAL: the guard asks the user before commits, pushes, PR/issue writes, and destructive, publish, or privileged commands. Run the command; don't ask in chat first.",
+	yolo: "Permission mode YOLO: commits, non-force pushes, and PR/issue creation run without asking; destructive, publish, and privileged commands still ask.",
+};
+
 export type Decision = { action: "allow" } | { action: "confirm"; reason: string } | { action: "block"; reason: string };
 
 /**

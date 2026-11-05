@@ -18,15 +18,15 @@ interface ChoiceDetails {
 }
 
 const OptionSchema = Type.Object({
-	label: Type.String({ description: "Short option label" }),
-	description: Type.Optional(Type.String({ description: "One line on the consequence or tradeoff of this option" })),
+	label: Type.String(),
+	description: Type.Optional(Type.String({ description: "Consequence or tradeoff" })),
 });
 
 const Params = Type.Object({
-	question: Type.String({ description: "One focused question, in the user's language" }),
-	options: Type.Array(OptionSchema, { description: "2-6 concrete options" }),
-	recommended: Type.Optional(Type.Number({ description: "1-based index of the option you recommend" })),
-	allowOther: Type.Optional(Type.Boolean({ description: "Offer a free-text answer (default true)" })),
+	question: Type.String(),
+	options: Type.Array(OptionSchema, { description: "2-6 options" }),
+	recommended: Type.Optional(Type.Number({ description: "1-based recommended option" })),
+	allowOther: Type.Optional(Type.Boolean({ description: "Allow free text (default true)" })),
 });
 
 type DisplayOption = { label: string; description?: string; isOther?: boolean };
@@ -38,7 +38,7 @@ export default function (pi: ExtensionAPI) {
 		name: "ask_user_choice",
 		label: "Ask",
 		description:
-			"Ask the user one focused question with concrete options, as a dialog. Use for real product or design decisions and delivery choices (e.g. the chained-PR menu); never for things you can find out yourself. The answer comes back as the tool result.",
+			"Ask one focused question with concrete options as a dialog, for real product, design, or delivery decisions only.",
 		parameters: Params,
 		executionMode: "sequential",
 

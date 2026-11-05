@@ -1,6 +1,6 @@
 ---
 name: brigadev-branch-pr
-description: "Trigger: create PR, open pull request, prepare branch for review. Prepare branches and pull requests from verified evidence, following the target repository's policy."
+description: "Trigger: create PR, open pull request. Prepare branches and PRs from evidence, following the repo's policy."
 metadata:
   author: brigadev
   version: "0.1"

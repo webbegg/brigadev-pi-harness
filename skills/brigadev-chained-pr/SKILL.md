@@ -1,6 +1,6 @@
 ---
 name: brigadev-chained-pr
-description: "Trigger: PR over 400 lines, stacked PRs, chained PRs, review slices. Split oversized changes into chained PRs that protect reviewer focus."
+description: "Trigger: PR over 400 lines, stacked or chained PRs. Split oversized changes into reviewable PR slices."
 metadata:
   author: brigadev
   version: "0.1"

@@ -28,18 +28,18 @@ const COLLAPSE_KEY = "ctrl+shift+t";
 const STATE_MESSAGE = "brigadev-todo-state";
 
 const TodoItem = Type.Object({
-	id: Type.String({ description: "Stable task ID, e.g. T1 (match the feature document)" }),
+	id: Type.String({ description: "Task ID, as in the feature document" }),
 	text: Type.String(),
 	status: Type.Optional(StringEnum(STATUSES)),
-	note: Type.Optional(Type.String({ description: "For blocked: what it waits for and what unblocks it. For dropped: why." })),
+	note: Type.Optional(Type.String({ description: "Why blocked or dropped" })),
 });
 
 const Params = Type.Object({
 	action: StringEnum(["set", "update", "list", "clear"] as const, {
-		description: "set: replace the whole list; update: change one item's status/note; list; clear",
+		description: "set replaces the list; update changes one item",
 	}),
-	todos: Type.Optional(Type.Array(TodoItem, { description: "For set" })),
-	id: Type.Optional(Type.String({ description: "For update" })),
+	todos: Type.Optional(Type.Array(TodoItem)),
+	id: Type.Optional(Type.String()),
 	status: Type.Optional(StringEnum(STATUSES)),
 	note: Type.Optional(Type.String()),
 });
@@ -132,7 +132,7 @@ export default function (pi: ExtensionAPI) {
 		name: "todo",
 		label: "Todo",
 		description:
-			"Visible task list for large ODD work only (never for small tasks). Mirror the feature document's ## Tasks with the same IDs. Statuses: pending, in_progress, done, blocked (note what unblocks it), dropped (note why).",
+			"Task list for large ODD work only, mirroring the feature document's ## Tasks IDs. blocked and dropped need a note.",
 		parameters: Params,
 
 		async execute(_id, params, _signal, _onUpdate, ctx) {
