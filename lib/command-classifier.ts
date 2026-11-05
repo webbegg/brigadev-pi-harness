@@ -2,6 +2,8 @@
 // best-effort guard, not a sandbox: it does not expand variables, load
 // scripts, or follow aliases. Unknown shapes are allowed, never guessed.
 
+import { tmpdir } from "node:os";
+
 export const COMMAND_KIND = {
 	DESTRUCTIVE: "destructive",
 	DELIVERY: "delivery",
@@ -133,14 +135,31 @@ function hasAny(args: string[], ...flags: string[]): boolean {
 	return args.some((a) => flags.includes(a) || flags.some((f) => f.startsWith("--") && a.startsWith(`${f}=`)));
 }
 
-function classifyRm(args: string[]): CommandMatch | undefined {
+/**
+ * True for an absolute, literal path strictly inside the system temp dir.
+ * Rejects the temp dir itself, "." / ".." / empty segments, and anything the
+ * shell could expand (globs, variables, substitutions, tilde).
+ */
+function isScratchPath(target: string, root: string = tmpdir().replace(/\/+$/, "")): boolean {
+	if (!root.startsWith("/") || root.split("/").some((seg) => seg === "." || seg === "..")) return false;
+	if (/[*?[\]{}()$`~\\!<>@+^#]/.test(target)) return false;
+	if (!target.startsWith(`${root}/`)) return false;
+	const segments = target.slice(root.length + 1).replace(/\/$/, "").split("/");
+	return segments.every((seg) => seg !== "" && seg !== "." && seg !== "..");
+}
+
+function classifyRm(args: string[], viaXargs: boolean): CommandMatch | undefined {
 	const recursive = hasShortFlag(args, "r") || hasShortFlag(args, "R") || hasAny(args, "--recursive");
 	const force = hasShortFlag(args, "f") || hasAny(args, "--force");
 	if (!recursive && !force) return undefined;
-	const targets = args.filter((a) => !a.startsWith("-"));
+	// Everything after "--" is a target, even when it starts with a dash.
+	const endOfOptions = args.indexOf("--");
+	const targets = args.filter((a, i) => (endOfOptions === -1 || i < endOfOptions ? !a.startsWith("-") : i > endOfOptions));
 	if (recursive && targets.some((t) => CATASTROPHIC_RM_TARGETS.has(t.replace(/\/+$/, "") || "/") || CATASTROPHIC_RM_TARGETS.has(t))) {
 		return { kind: COMMAND_KIND.DESTRUCTIVE, reason: `rm on a root, home, or wildcard target (${targets.join(" ")})`, hardDeny: true };
 	}
+	// xargs appends targets from stdin, so the visible ones are not the full list.
+	if (recursive && !viaXargs && targets.length > 0 && targets.every((t) => isScratchPath(t))) return undefined;
 	return { kind: COMMAND_KIND.DESTRUCTIVE, reason: `rm ${recursive ? "recursive" : "forced"} removal` };
 }
 
@@ -266,7 +285,7 @@ function classifySegment(rawArgv: string[], before: string): CommandMatch[] {
 	let match: CommandMatch | undefined;
 	switch (name) {
 		case "rm":
-			match = classifyRm(args);
+			match = classifyRm(args, rawArgv.some((a) => basename(a) === "xargs"));
 			break;
 		case "git":
 			match = classifyGit(args);

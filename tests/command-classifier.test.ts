@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
 import { classifyCommand, COMMAND_KIND } from "../lib/command-classifier.ts";
 
@@ -17,6 +18,49 @@ describe("classifyCommand", () => {
 		assert.deepEqual(kinds("rm -f a.txt"), [COMMAND_KIND.DESTRUCTIVE]);
 		assert.deepEqual(kinds("find . -name '*.log' -delete"), [COMMAND_KIND.DESTRUCTIVE]);
 		assert.deepEqual(kinds("find dist -exec rm {} \\;"), [COMMAND_KIND.DESTRUCTIVE]);
+	});
+
+	it("allows recursive rm strictly inside the system temp dir", () => {
+		const tmp = tmpdir().replace(/\/+$/, "");
+		for (const command of [`rm -rf ${tmp}/scratch`, `rm -r ${tmp}/a/b`, `rm -rf ${tmp}/a/ ${tmp}/b`, `rm -rf "${tmp}/my dir"`, `rm --recursive --force ${tmp}/x`]) {
+			assert.deepEqual(kinds(command), [], command);
+		}
+	});
+
+	it("still flags rm of the temp dir itself, escapes, globs, and mixed targets", () => {
+		const tmp = tmpdir().replace(/\/+$/, "");
+		for (const command of [
+			`rm -rf ${tmp}`,
+			`rm -rf ${tmp}/`,
+			`rm -rf ${tmp}/../etc`,
+			`rm -rf ${tmp}/a/../..`,
+			`rm -rf ${tmp}/*`,
+			`rm -rf ${tmp}/a?`,
+			`rm -rf ${tmp}/{a,b}`,
+			`rm -rf ${tmp}/$X`,
+			`rm -rf ${tmp}/$(pwd)`,
+			`rm -rf ${tmp}/./a`,
+			`rm -rf ${tmp}//a`,
+			`rm -rf ${tmp}x/a`,
+			`rm -rf ${tmp}/a build`,
+			`rm -rf ${tmp}/a /home/me/project`,
+			`rm -rf tmp/a`,
+			`rm -rf ~/${tmp}/a`,
+			`rm -f ${tmp}/a`,
+			`rm -rf`,
+			`echo x | xargs rm -rf ${tmp}/a`,
+			`rm -rf ${tmp}/a -- -foo`,
+			`rm -rf -- ${tmp}/a -foo`,
+			`rm -rf ${tmp}/@(a)/../../etc`,
+			`rm -rf ${tmp}/+(a)`,
+			`rm -rf ${tmp}/a^b`,
+			`rm -rf ${tmp}/a#b`,
+			`rm -rf ${tmp}/a>/etc/x`,
+			`rm -rf ${tmp}/a</etc/x`,
+		]) {
+			assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+		}
+		assert.ok(kinds(`sudo rm -rf ${tmp}/a`).includes(COMMAND_KIND.PRIVILEGED));
 	});
 
 	it("hard-denies catastrophic targets", () => {
