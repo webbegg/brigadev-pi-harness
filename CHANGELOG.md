@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0] - 2026-11-05
 
 - Fallback chains: profile routes take `fallbacks`; orchestrator and subagent runs move to the next model on quota, auth, rate-limit, provider, timeout, or network failures, with shared cooldowns and a price note when the next model costs more. `/brigadev:profile fallback` edits chains.
 - Usage windows: Claude 5-hour and weekly utilization from rate-limit headers in the status bar and `/brigadev:usage`; chains skip a provider whose limit is reached.
