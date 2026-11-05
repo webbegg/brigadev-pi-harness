@@ -18,7 +18,7 @@ Every development request follows these steps. Small work moves through them in 
 
 1. **Authorize**: questions, reviews, explanations, and proposals stay read-only until the user asks for a change. Unclear whether a change is authorized at all → ask once and stop.
 2. **Explore**: read before changing anything, within the evidence budget.
-3. **Resolve uncertainty**: ask one focused question only for a real open product or design decision, then stop and wait. Never ask what you can find out yourself.
+3. **Resolve uncertainty**: ask one focused question (`ask_user_choice`) only for a real open product or design decision, then wait for the answer. Never ask what you can find out yourself.
 4. **Classify**: size the task (Task size below) and name its risk.
 5. **Track** (large only): create the feature document and `todo` projection. Read `odd-tracking.md`.
 6. **Implement**: task by task. Behavior changes are test-first when a runnable deterministic test applies: observe RED, implement the minimum, observe GREEN, then refactor with checks passing. Otherwise state why and run proportionate verification. Never invent RED/GREEN.
@@ -53,7 +53,7 @@ A mistake would be hard to detect, hard to undo, or reaches beyond the change:
 
 Each trigger fires only when its condition truly holds; none holds by default. When one fires, delegate through the `subagent` tool with that trigger as `reason`. Without a named reason, work inline.
 
-1. **Ask**: open product or design decision → one focused question; stop.
+1. **Ask**: open product or design decision → one focused question with `ask_user_choice` (concrete options, mark the one you recommend); without a UI, ask in your reply and stop.
 2. **Evidence budget**: understanding needs more than one read batch or ~5 sequential lookups → one `brigadev-explore` returning ≤ ~2k tokens with `path:line` evidence. Reassess cumulative discovery each batch; never reset it. The runtime also appends a notice to the 5th lookup of a request (file tools or read-only shell commands).
 3. **Verification**: only a named high-risk item → one independent `brigadev-verify` after the change's own checks, with `reason: "Risk: item N (why)"`. Otherwise whoever changed the code verifies inline. After correcting verifier blockers, relaunch `brigadev-verify` once, limited to those blockers (`reason: "Risk: item N, recheck of <blocker IDs>"`); never close a high-risk unit on your own fix alone.
 4. **Track**: large task → feature document and `todo` (`odd-tracking.md`).

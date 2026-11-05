@@ -23,7 +23,8 @@
 			"./extensions/context-backstop.ts",
 			"./extensions/exploration-budget.ts",
 			"./extensions/shell-bar.ts",
-			"./extensions/odd-phase.ts"
+			"./extensions/odd-phase.ts",
+			"./extensions/ask-user.ts"
 		],
 		"skills": [
 			"./skills"

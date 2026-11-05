@@ -22,7 +22,7 @@ A planned PR may exceed ~400 changed lines (additions + deletions, generated fil
 
 ## Oversized delivery menu
 
-Ask once, in the user's language, with exactly these options in this order:
+Ask once with `ask_user_choice` (in the user's language), with exactly these options in this order:
 
 1. **Feature branch chain**: a draft tracker PR to the default branch; child PRs target the tracker (first) or their parent (later). Nothing lands until the chain completes.
 2. **Stacked to the default branch**: each slice lands on the default branch in order. Partial behavior may land.
