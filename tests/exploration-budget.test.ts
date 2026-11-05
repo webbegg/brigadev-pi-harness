@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { createExplorationBudget, isLookupTool, isShellLookup } from "../lib/exploration-budget.ts";
+import { createExplorationBudget, isLookupTool, isShellLookup, SHELL_READ_NOTICE } from "../lib/exploration-budget.ts";
 
 describe("exploration budget", () => {
 	it("counts only read, grep, find, and ls as lookups", () => {
@@ -46,5 +46,46 @@ describe("exploration budget", () => {
 		for (let i = 0; i < 4; i++) assert.equal(budget.record("bash", { command: "cat x.ts" }), undefined);
 		assert.equal(budget.record("bash", { command: "npm test" }), undefined);
 		assert.match(budget.record("bash", { command: "sed -n 1,9p y.ts" }) ?? "", /brigadev-explore/);
+	});
+});
+
+describe("shell read nudge", () => {
+	const cat = { command: "cat lib/cost.ts" };
+
+	it("fires on the first read-only shell lookup of a request, once", () => {
+		const budget = createExplorationBudget();
+		assert.equal(budget.nudgeShellRead("bash", { command: "npm test" }), undefined);
+		assert.equal(budget.nudgeShellRead("read", cat), undefined);
+		assert.equal(budget.nudgeShellRead("bash", cat), SHELL_READ_NOTICE);
+		assert.equal(budget.nudgeShellRead("bash", { command: "grep -rn x lib" }), undefined);
+		assert.equal(budget.nudgeShellRead("bash", cat), undefined);
+	});
+
+	it("names the file tools and the reason", () => {
+		assert.match(SHELL_READ_NOTICE, /^\[brigadev runtime\] Use read, grep, find, or ls for files instead of bash/);
+		assert.match(SHELL_READ_NOTICE, /invisible to the guard and reviewers/);
+	});
+
+	it("does not fire for writes, runs, or malformed input", () => {
+		const budget = createExplorationBudget();
+		for (const command of ["git status", "sed -i '' s/a/b/ x.ts", "cat a > b"]) assert.equal(budget.nudgeShellRead("bash", { command }), undefined, command);
+		assert.equal(budget.nudgeShellRead("bash", {}), undefined);
+		assert.equal(budget.nudgeShellRead("bash"), undefined);
+		assert.equal(budget.nudgeShellRead("bash", cat), SHELL_READ_NOTICE);
+	});
+
+	it("fires again after a new request resets it", () => {
+		const budget = createExplorationBudget();
+		assert.equal(budget.nudgeShellRead("bash", cat), SHELL_READ_NOTICE);
+		budget.reset();
+		assert.equal(budget.nudgeShellRead("bash", cat), SHELL_READ_NOTICE);
+		assert.equal(budget.nudgeShellRead("bash", cat), undefined);
+	});
+
+	it("is independent of the lookup budget", () => {
+		const budget = createExplorationBudget();
+		for (let i = 0; i < 4; i++) assert.equal(budget.record("read"), undefined);
+		assert.equal(budget.nudgeShellRead("bash", cat), SHELL_READ_NOTICE);
+		assert.match(budget.record("bash", cat) ?? "", /brigadev-explore/);
 	});
 });
