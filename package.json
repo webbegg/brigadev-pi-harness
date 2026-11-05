@@ -1,0 +1,54 @@
+{
+	"name": "brigadev-harness",
+	"version": "0.2.0",
+	"description": "Opinionated Pi harness: ODD workflow orchestrator, focused subagents with per-agent model routing, cost visibility, 4R and Judgment Day review, safety guard, and delivery skills.",
+	"license": "MIT",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"odd",
+		"subagents",
+		"code-review",
+		"agent-harness"
+	],
+	"pi": {
+		"extensions": [
+			"./extensions/orchestrator.ts",
+			"./extensions/guard.ts",
+			"./extensions/subagents.ts",
+			"./extensions/todo.ts",
+			"./extensions/profiles.ts",
+			"./extensions/cost.ts"
+		],
+		"skills": [
+			"./skills"
+		],
+		"prompts": [
+			"./prompts"
+		]
+	},
+	"files": [
+		"assets/",
+		"extensions/",
+		"lib/",
+		"prompts/",
+		"skills/",
+		"README.md",
+		"NOTICE.md",
+		"CHANGELOG.md"
+	],
+	"scripts": {
+		"test": "node --test tests/*.test.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
