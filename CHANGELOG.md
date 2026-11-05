@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Fallback chains: profile routes take `fallbacks`; orchestrator and subagent runs move to the next model on quota, auth, rate-limit, provider, timeout, or network failures, with shared cooldowns and a price note when the next model costs more. `/brigadev:profile fallback` edits chains.
+- Usage windows: Claude 5-hour and weekly utilization from rate-limit headers in the status bar and `/brigadev:usage`; chains skip a provider whose limit is reached.
+
 - Subagents start with `PWD` set to their resolved working directory. Under a symlinked path (macOS `/tmp`) an inherited `PWD` showed the child two directories, and it ran every lookup twice (measured: 4 → 2 tool calls for the same task). Projects outside symlinks were not affected.
 
 ## [0.4.0] - 2026-11-05

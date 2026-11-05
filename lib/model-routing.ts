@@ -7,11 +7,20 @@ export const DEFAULT_KEY = "*";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
+export interface FallbackStep {
+	model: string;
+	thinking?: ThinkingLevel;
+}
+
 export interface RouteEntry {
 	/** Canonical "provider/model". */
 	model?: string;
 	thinking?: ThinkingLevel;
+	/** Tried in order when a run fails on quota, auth, rate limit, or provider trouble. */
+	fallbacks?: FallbackStep[];
 }
+
+export const MAX_FALLBACKS = 8;
 
 /** Keys: agent names, prefix globs ending in "*" (e.g. "review-*"), "*", and "orchestrator". */
 export type Profile = Record<string, RouteEntry>;
@@ -63,7 +72,7 @@ export function parseProfilesFile(raw: unknown): { file: ProfilesFile; problems:
 				problems.push(`profile "${name}": invalid key "${key}"`);
 				continue;
 			}
-			const e = (typeof entry === "string" ? { model: entry } : entry) as { model?: unknown; thinking?: unknown } | null;
+			const e = (typeof entry === "string" ? { model: entry } : entry) as { model?: unknown; thinking?: unknown; fallbacks?: unknown } | null;
 			if (!e || typeof e !== "object") {
 				problems.push(`profile "${name}": "${key}" must be an object`);
 				continue;
@@ -73,7 +82,12 @@ export function parseProfilesFile(raw: unknown): { file: ProfilesFile; problems:
 			else if (e.model !== undefined) problems.push(`profile "${name}": "${key}".model must be a string`);
 			if (isThinkingLevel(e.thinking)) route.thinking = e.thinking;
 			else if (e.thinking !== undefined) problems.push(`profile "${name}": "${key}".thinking must be one of ${THINKING_LEVELS.join(", ")}`);
-			if (route.model || route.thinking) profile[key] = route;
+			if (e.fallbacks !== undefined) {
+				const steps = parseFallbacks(e.fallbacks);
+				problems.push(...steps.problems.map((p) => `profile "${name}": "${key}".fallbacks ${p}`));
+				if (steps.steps.length) route.fallbacks = steps.steps;
+			}
+			if (route.model || route.thinking || route.fallbacks) profile[key] = route;
 		}
 		file.profiles[name] = profile;
 	}
@@ -82,6 +96,26 @@ export function parseProfilesFile(raw: unknown): { file: ProfilesFile; problems:
 		else problems.push(`active profile "${source.active}" does not exist`);
 	}
 	return { file, problems };
+}
+
+function parseFallbacks(value: unknown): { steps: FallbackStep[]; problems: string[] } {
+	if (!Array.isArray(value)) return { steps: [], problems: ["must be an array"] };
+	const steps: FallbackStep[] = [];
+	const problems: string[] = [];
+	for (const item of value) {
+		const step = (typeof item === "string" ? { model: item } : item) as { model?: unknown; thinking?: unknown } | null;
+		if (!step || typeof step.model !== "string" || !step.model.trim()) {
+			problems.push("entries need a model");
+			continue;
+		}
+		if (steps.some((s) => s.model === step.model)) continue;
+		if (steps.length >= MAX_FALLBACKS) {
+			problems.push(`keep at most ${MAX_FALLBACKS} models`);
+			break;
+		}
+		steps.push(isThinkingLevel(step.thinking) ? { model: step.model.trim(), thinking: step.thinking } : { model: step.model.trim() });
+	}
+	return { steps, problems };
 }
 
 /** Exact name, then the longest matching prefix glob, then "*". The orchestrator only matches its own key. */
@@ -168,7 +202,23 @@ export function withRoute(file: ProfilesFile, profileName: string, key: string, 
 	const merged: RouteEntry = { ...profile[key], ...entry };
 	if (entry.model === undefined && "model" in entry) delete merged.model;
 	if (entry.thinking === undefined && "thinking" in entry) delete merged.thinking;
-	if (merged.model || merged.thinking) profile[key] = merged;
+	if (merged.model || merged.thinking || merged.fallbacks?.length) profile[key] = merged;
+	else delete profile[key];
+	return next;
+}
+
+/** Returns a copy with the fallback chain of one route replaced (empty clears it). */
+export function withFallbacks(file: ProfilesFile, profileName: string, key: string, steps: FallbackStep[]): ProfilesFile {
+	const next: ProfilesFile = structuredClone(file);
+	const profile = next.profiles[profileName];
+	if (!profile) throw new Error(`Profile "${profileName}" does not exist`);
+	if (!validKey(key)) throw new Error(`Invalid routing key "${key}"`);
+	const unique = steps.filter((s, i) => steps.findIndex((o) => o.model === s.model) === i);
+	if (unique.length > MAX_FALLBACKS) throw new Error(`Keep at most ${MAX_FALLBACKS} fallback models`);
+	const route: RouteEntry = { ...profile[key] };
+	if (unique.length) route.fallbacks = unique;
+	else delete route.fallbacks;
+	if (route.model || route.thinking || route.fallbacks?.length) profile[key] = route;
 	else delete profile[key];
 	return next;
 }

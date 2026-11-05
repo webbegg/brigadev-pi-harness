@@ -24,8 +24,10 @@ import { listWidth, maxScroll, renderTwoPane, type Row } from "../lib/two-pane.t
 import type { AgentDefinition } from "../lib/agents.ts";
 import { addUsage, emptyTally, formatCost, formatTokens, priceBridgeMessage, type CostCalculator, type Tally } from "../lib/cost.ts";
 import { admitLaunch, buildChildTask, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
-import { resolveAgentRoute, resolveModelRef, type ResolvedRoute } from "../lib/model-routing.ts";
-import { costCalculator, currentModelRef, loadAgents, modelCatalog } from "../lib/pi-adapters.ts";
+import { classifyFailure, cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
+import { blockedReason, fallbackState } from "../lib/fallback-state.ts";
+import { resolveAgentRoute, resolveModelRef, routeFor, type ResolvedRoute } from "../lib/model-routing.ts";
+import { costCalculator, currentModelRef, listPrice, loadAgents, modelCatalog } from "../lib/pi-adapters.ts";
 import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
 import { canonicalPath } from "../lib/paths.ts";
 import { CHILD_ENV, GUARD_EXTENSION_PATH, isChildSession } from "../lib/runtime.ts";
@@ -50,6 +52,8 @@ interface RunResult {
 	thinking?: string;
 	/** Where the model came from: "profile:<name>/<key>", "definition", or "parent". */
 	route?: string;
+	/** Models that failed before this one, with the failure category. */
+	fallbacks?: string[];
 	stopReason?: string;
 	errorMessage?: string;
 }
@@ -409,23 +413,48 @@ export default function (pi: ExtensionAPI) {
 					cardRun.cost = r.usage.cost;
 					if (r.model) cardRun.model = r.model;
 				};
+				// Fallback chain: the primary, then the profile's fallbacks, with cooling
+				// or out-of-quota models moved behind usable ones.
+				const route = routes[index]!;
+				const chain = route.model
+					? launchOrder({ model: route.model, thinking: route.thinking }, routeFor(profile.profile, agent!.name)?.entry.fallbacks ?? [], (m) => blockedReason(m, Date.now()) !== undefined)
+					: [{ model: route.model, thinking: route.thinking }];
+				const failedModels: string[] = [];
 				try {
-					results[index] = await runAgent({
-						cwd: ctx.cwd,
-						agent: agent!,
-						request,
-						taskText: text,
-						route: routes[index]!,
-						routeLabel: routeLabel(routes[index]!, profile.name),
-						price,
-						signal,
-						onUpdate: (partial) => {
-							results[index] = partial;
-							liveResults.set(cardRun.id, partial);
-							syncCard(partial);
-							emit();
-						},
-					});
+					for (let step = 0; step < chain.length; step++) {
+						const attempt = chain[step];
+						const stepRoute: ResolvedRoute = { ...route, model: attempt.model, thinking: attempt.thinking ?? route.thinking };
+						Object.assign(cardRun, { model: stepRoute.model, thinking: stepRoute.thinking });
+						results[index] = await runAgent({
+							cwd: ctx.cwd,
+							agent: agent!,
+							request,
+							taskText: text,
+							route: stepRoute,
+							routeLabel: `${routeLabel(route, profile.name)}${attempt.model !== route.model ? " ↪ fallback" : ""}`,
+							price,
+							signal,
+							onUpdate: (partial) => {
+								results[index] = partial;
+								liveResults.set(cardRun.id, partial);
+								syncCard(partial);
+								emit();
+							},
+						});
+						const r = results[index];
+						if (!failed(r) || !attempt.model) break;
+						const category = classifyFailure(r.stopReason ?? "error", r.errorMessage || r.stderr);
+						if (!category) break;
+						fallbackState().cooldowns.cool(attempt.model, Date.now() + cooldownMs(category));
+						failedModels.push(`${attempt.model} (${category})`);
+						const next = chain[step + 1];
+						if (!next?.model) break;
+						pi.appendEntry("brigadev-fallback", { agent: agent!.name, from: attempt.model, to: next.model, category });
+						if (ctx.hasUI) {
+							ctx.ui.notify(`brigadev: ${agent!.name} hit ${category} on ${attempt.model} → retrying on ${next.model}${priceNote(listPrice(ctx, attempt.model), listPrice(ctx, next.model))}`, "warning");
+						}
+					}
+					if (failedModels.length) results[index].fallbacks = failedModels;
 				} finally {
 					syncCard(results[index]);
 					cardRun.state = failed(results[index]) || results[index].exitCode === -1 ? "failed" : "done";

@@ -44,6 +44,7 @@ Check it loaded: `/brigadev:status`.
 | `/brigadev:doctor [fix-bridge-hooks]` | Diagnostics; turn off your Claude Code hooks inside claude-bridge turns |
 | `/brigadev:profile …` | Model routing profiles (see below) |
 | `/brigadev:cost` | Session cost: orchestrator per model, subagents per agent, cache hit rate |
+| `/brigadev:usage` | Subscription usage windows (5h, weekly) and their resets |
 | `/brigadev:ui footer\|phase on\|off` | Turn the status bar or the phase label off and on |
 | `ctrl+shift+t` / `ctrl+shift+a` | Collapse the todo card / the agents card |
 | `alt+g` or `/brigadev:changes` | Changes viewer: uncommitted files and their diffs |
@@ -87,6 +88,22 @@ Stored at `~/.pi/agent/brigadev-profiles.json`:
   }
 }
 ```
+
+## Fallback chains and usage limits
+
+Each profile route can list fallback models. When a run fails on quota, auth, a rate limit, provider trouble, a timeout, or the network (after Pi's own retries), the run moves to the next model; context-length and invalid-request failures never fall back.
+
+```bash
+/brigadev:profile fallback balanced orchestrator claude-sonnet-5-5 high
+/brigadev:profile fallback balanced brigadev-worker claude-haiku-5-5
+/brigadev:profile fallback balanced brigadev-worker clear
+```
+
+- **Orchestrator:** switches the session's model and continues the same conversation, with a note quoting your latest request.
+- **Subagents:** the run is retried on the next model from the start (`-p` children cannot switch mid-conversation).
+- **Cooldowns:** a model that failed is skipped by every agent of the session for 30 minutes after a limit or auth error, 2 minutes after a transient one; a launch whose primary is cooling starts on the first usable fallback.
+- **Usage windows:** `/brigadev:usage` and the status bar (`◷ week 56%`) show your Claude 5-hour and weekly windows from each response's rate-limit headers. When a provider's limit is reached (and Extra Usage is off), chains skip that provider until its reset.
+- All `claude-bridge` models share one subscription: within the bridge, a chain helps with model-specific failures (overload, a per-model limit); for a spent subscription, add a model from another provider.
 
 ## Cost visibility
 

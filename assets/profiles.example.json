@@ -3,28 +3,112 @@
 	"active": "balanced",
 	"profiles": {
 		"economy": {
-			"orchestrator": { "model": "claude-sonnet-5-5", "thinking": "medium" },
-			"brigadev-explore": { "model": "claude-haiku-5-5", "thinking": "low" },
-			"brigadev-worker": { "model": "claude-sonnet-5-5", "thinking": "medium" },
-			"brigadev-verify": { "model": "claude-sonnet-5-5", "thinking": "high" },
-			"review-*": { "model": "claude-haiku-5-5", "thinking": "medium" },
-			"jd-*": { "model": "claude-sonnet-5-5", "thinking": "high" }
+			"orchestrator": {
+				"model": "claude-sonnet-5-5",
+				"thinking": "medium",
+				"fallbacks": [
+					{
+						"model": "claude-haiku-5-5",
+						"thinking": "medium"
+					}
+				]
+			},
+			"brigadev-explore": {
+				"model": "claude-haiku-5-5",
+				"thinking": "low"
+			},
+			"brigadev-worker": {
+				"model": "claude-sonnet-5-5",
+				"thinking": "medium"
+			},
+			"brigadev-verify": {
+				"model": "claude-sonnet-5-5",
+				"thinking": "high"
+			},
+			"review-*": {
+				"model": "claude-haiku-5-5",
+				"thinking": "medium"
+			},
+			"jd-*": {
+				"model": "claude-sonnet-5-5",
+				"thinking": "high"
+			}
 		},
 		"balanced": {
-			"orchestrator": { "model": "claude-opus-5-5", "thinking": "high" },
-			"brigadev-explore": { "model": "claude-haiku-5-5", "thinking": "low" },
-			"brigadev-worker": { "model": "claude-sonnet-5-5", "thinking": "high" },
-			"brigadev-verify": { "model": "claude-opus-5-5", "thinking": "high" },
-			"review-*": { "model": "claude-sonnet-5-5", "thinking": "medium" },
-			"jd-*": { "model": "claude-opus-5-5", "thinking": "high" }
+			"orchestrator": {
+				"model": "claude-opus-5-5",
+				"thinking": "high",
+				"fallbacks": [
+					{
+						"model": "claude-sonnet-5-5",
+						"thinking": "high"
+					}
+				]
+			},
+			"brigadev-explore": {
+				"model": "claude-haiku-5-5",
+				"thinking": "low"
+			},
+			"brigadev-worker": {
+				"model": "claude-sonnet-5-5",
+				"thinking": "high"
+			},
+			"brigadev-verify": {
+				"model": "claude-opus-5-5",
+				"thinking": "high",
+				"fallbacks": [
+					{
+						"model": "claude-sonnet-5-5",
+						"thinking": "high"
+					}
+				]
+			},
+			"review-*": {
+				"model": "claude-sonnet-5-5",
+				"thinking": "medium"
+			},
+			"jd-*": {
+				"model": "claude-opus-5-5",
+				"thinking": "high"
+			}
 		},
 		"deep": {
-			"orchestrator": { "model": "claude-opus-5-5", "thinking": "xhigh" },
-			"brigadev-explore": { "model": "claude-sonnet-5-5", "thinking": "medium" },
-			"brigadev-worker": { "model": "claude-opus-5-5", "thinking": "high" },
-			"brigadev-verify": { "model": "claude-opus-5-5", "thinking": "xhigh" },
-			"review-*": { "model": "claude-opus-5-5", "thinking": "high" },
-			"jd-*": { "model": "claude-opus-5-5", "thinking": "xhigh" }
+			"orchestrator": {
+				"model": "claude-opus-5-5",
+				"thinking": "xhigh",
+				"fallbacks": [
+					{
+						"model": "claude-sonnet-5-5",
+						"thinking": "high"
+					}
+				]
+			},
+			"brigadev-explore": {
+				"model": "claude-sonnet-5-5",
+				"thinking": "medium"
+			},
+			"brigadev-worker": {
+				"model": "claude-opus-5-5",
+				"thinking": "high",
+				"fallbacks": [
+					{
+						"model": "claude-sonnet-5-5",
+						"thinking": "high"
+					}
+				]
+			},
+			"brigadev-verify": {
+				"model": "claude-opus-5-5",
+				"thinking": "xhigh"
+			},
+			"review-*": {
+				"model": "claude-opus-5-5",
+				"thinking": "high"
+			},
+			"jd-*": {
+				"model": "claude-opus-5-5",
+				"thinking": "xhigh"
+			}
 		}
 	}
 }

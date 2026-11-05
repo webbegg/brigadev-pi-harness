@@ -47,6 +47,12 @@ export function statusSegment(key: string, text: string): Segment | undefined {
 			return { id: key, text: text.replace(/^profile:\s*/, "profile "), tone: "dim", priority: 40 };
 		case "brigadev-agents":
 			return { id: key, text, tone: "accent", priority: 85 };
+		case "brigadev-usage": {
+			// Percentages in the text decide the tone, like the context gauge.
+			const top = Math.max(0, ...[...text.matchAll(/(\d+)%/g)].map((m) => Number(m[1])));
+			const tone: Tone = /limit reached/.test(text) || top >= 95 ? "error" : top >= 80 ? "warning" : "dim";
+			return { id: key, text: `◷ ${text}`, tone, priority: 65 };
+		}
 		case "brigadev-harness":
 			return { id: key, text, tone: "warning", priority: 95 };
 		default:
@@ -55,4 +61,4 @@ export function statusSegment(key: string, text: string): Segment | undefined {
 }
 
 /** Statuses the bar renders as its own segments, in this order, before third-party ones. */
-export const KNOWN_STATUS_ORDER = ["brigadev-harness", "brigadev-mode", "brigadev-agents", "brigadev-cost", "brigadev-profile"];
+export const KNOWN_STATUS_ORDER = ["brigadev-harness", "brigadev-mode", "brigadev-agents", "brigadev-cost", "brigadev-usage", "brigadev-profile"];

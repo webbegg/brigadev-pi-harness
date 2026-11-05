@@ -32,5 +32,8 @@ describe("shell bar", () => {
 		assert.equal(statusSegment("brigadev-mode", "🚀 brigadev: yolo")?.text, "🚀 yolo");
 		assert.equal(statusSegment("brigadev-profile", "profile: economy (session)")?.text, "profile economy (session)");
 		assert.equal(statusSegment("other-ext", "MCP: 2")?.priority, 10);
+		assert.deepEqual([statusSegment("brigadev-usage", "week 55%")?.text, statusSegment("brigadev-usage", "week 55%")?.tone], ["◷ week 55%", "dim"]);
+		assert.equal(statusSegment("brigadev-usage", "5h 91% · week 55%")?.tone, "warning");
+		assert.equal(statusSegment("brigadev-usage", "limit reached (five_hour)")?.tone, "error");
 	});
 });

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { calculateCost } from "@earendil-works/pi-ai";
 import { getAgentDir, parseFrontmatter, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { discoverAgents, type AgentDefinition } from "./agents.ts";
-import type { CostCalculator } from "./cost.ts";
+import { CLAUDE_BRIDGE_PROVIDER, LIST_PRICE_PROVIDER, type CostCalculator } from "./cost.ts";
 import type { ModelId } from "./model-routing.ts";
 import { PACKAGE_AGENTS_DIR } from "./runtime.ts";
 
@@ -33,4 +33,15 @@ export function costCalculator(ctx: ExtensionContext): CostCalculator {
 
 export function currentModelRef(ctx: ExtensionContext): string | undefined {
 	return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+}
+
+/** List price per 1M tokens; claude-bridge models are priced as their Anthropic twins. */
+export function listPrice(ctx: ExtensionContext, modelRef: string | undefined): { input: number; output: number } | undefined {
+	if (!modelRef) return undefined;
+	const slash = modelRef.indexOf("/");
+	if (slash < 0) return undefined;
+	const provider = modelRef.slice(0, slash);
+	const id = modelRef.slice(slash + 1);
+	const model = ctx.modelRegistry.find(provider === CLAUDE_BRIDGE_PROVIDER ? LIST_PRICE_PROVIDER : provider, id);
+	return model ? { input: model.cost.input, output: model.cost.output } : undefined;
 }
