@@ -1,8 +1,17 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] - 2026-11-05
 
-- Runtime signals (parent session only): a context backstop notice when context first reaches min(150k tokens, 50% of the window), re-armed after compaction, and an exploration budget notice on the 5th read/grep/find/ls call of a request.
+- UI: one-line status bar replacing Pi's footer (repo, branch, dirty count, yolo mode, model and thinking, context gauge, API-equivalent cost, profile, other extensions' statuses), dropping segments by priority on narrow terminals.
+- UI: ODD phase in the working message (exploring, implementing, checking, delegating · agent, delivering), inferred from tool activity.
+- UI: todo card with progress, blocked notes, a stale marker after two runs without an update, and a collapse key (ctrl+shift+t).
+- UI: agents card above the editor while subagents run: aligned model · thinking, tokens, cost, and elapsed columns; finished rows stay 60 s; collapse key (ctrl+shift+a).
+- `ask_user_choice` tool: focused questions as a dialog with a recommended option, number keys, and optional free text; used by the Ask trigger and the chained-PR menu.
+- `/brigadev:ui footer|phase on|off`.
+- Runtime signals (parent session only): a context backstop notice when context first reaches min(150k tokens, 50% of the window), re-armed after compaction, and an exploration budget notice on the 5th lookup of a request, counting read-only shell commands.
+- Guard: recursive rm of literal scratch paths inside the temp dir runs without asking; confirmation dialogs show a bounded command preview.
+- Prompts: file tools for file work; a verifier recheck after correcting blockers.
+- `formatCost(0)` prints `$0`.
 
 ## [0.2.0] - 2026-11-05
 

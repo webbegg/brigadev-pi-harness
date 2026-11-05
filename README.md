@@ -28,6 +28,10 @@ Check it loaded: `/brigadev:status`.
 | Judgment Day | `skills/brigadev-judgment-day`, `/judgment-day` | Two blind judges, frozen ledger, at most two scoped fix and re-judgment rounds. |
 | Safety guard | `extensions/guard.ts` | Confirms destructive, delivery, publish, and privileged commands; hard-denies catastrophic ones; asks before writes outside the project or touching secret files. In subagents: blocks all of those and enforces allowed edit surfaces. |
 | Todo | `extensions/todo.ts` | Visible task list with `pending / in_progress / done / blocked / dropped`. Kept out of the system prompt so updates never break the prompt cache. |
+| Status bar | `extensions/shell-bar.ts` | One-line footer: repo, branch ±dirty, yolo, model · thinking, context gauge, cost, profile. |
+| Phase label | `extensions/odd-phase.ts` | The working message shows the ODD phase (exploring, implementing, checking, delegating · agent). |
+| Agents card | `extensions/subagents.ts` | Live rows above the editor while subagents run (model · thinking, tokens, cost, elapsed). |
+| Ask dialog | `extensions/ask-user.ts` | `ask_user_choice`: focused questions as a dialog with a recommended option. |
 | Model routing | `extensions/profiles.ts` | Named profiles route the orchestrator and every agent to a model and thinking level. |
 | Cost | `extensions/cost.ts` | API-equivalent pricing for `claude-bridge` turns, session tally, `/brigadev:cost` breakdown. |
 | Delivery skills | `skills/` | work-unit commits, branch/PR, chained PRs, issue creation, comment writer, skill creator. |
@@ -39,6 +43,8 @@ Check it loaded: `/brigadev:status`.
 | `/brigadev:status` | Version, prompt on/off, paths |
 | `/brigadev:profile …` | Model routing profiles (see below) |
 | `/brigadev:cost` | Session cost: orchestrator per model, subagents per agent, cache hit rate |
+| `/brigadev:ui footer\|phase on\|off` | Turn the status bar or the phase label off and on |
+| `ctrl+shift+t` / `ctrl+shift+a` | Collapse the todo card / the agents card |
 | `/brigadev:mode [normal\|yolo\|default <mode>]` | Permission mode for this session, or the default for new sessions |
 | `/brigadev:agents` | Effective agent list (package, user, trusted project) |
 | `/brigadev:harness on\|off` | Toggle the orchestrator prompt for this session (A/B testing) |
