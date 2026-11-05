@@ -15,9 +15,12 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { agentsCard, FINISHED_TTL_MS, visibleRuns, type AgentRun } from "../lib/agents-card.ts";
+import { agentsCard, FINISHED_TTL_MS, formatElapsed, visibleRuns, type AgentRun } from "../lib/agents-card.ts";
+import { threadRows } from "../lib/agent-thread.ts";
+import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
+import { listWidth, maxScroll, renderTwoPane, type Row } from "../lib/two-pane.ts";
 import type { AgentDefinition } from "../lib/agents.ts";
 import { addUsage, emptyTally, formatCost, formatTokens, priceBridgeMessage, type CostCalculator, type Tally } from "../lib/cost.ts";
 import { admitLaunch, buildChildTask, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
@@ -33,6 +36,7 @@ const COLLAPSED_ITEMS = 6;
 const STATUS_KEY = "brigadev-agents";
 const CARD_KEY = "brigadev-agents-card";
 const CARD_COLLAPSE_KEY = "ctrl+shift+a";
+const VIEWER_KEY = "alt+a";
 
 interface RunResult {
 	agent: string;
@@ -253,6 +257,8 @@ export default function (pi: ExtensionAPI) {
 
 	// Agents card: live rows above the editor while subagents run.
 	let runs: AgentRun[] = [];
+	// Live results by card run id, for the Agents viewer while a run is in flight.
+	const liveResults = new Map<string, RunResult>();
 	let cardCollapsed = false;
 	let renderCard: (() => void) | undefined;
 	let ticker: ReturnType<typeof setInterval> | undefined;
@@ -391,6 +397,7 @@ export default function (pi: ExtensionAPI) {
 				};
 				runs.push(cardRun);
 				showCard(ctx);
+				liveResults.set(cardRun.id, results[index]);
 				const syncCard = (r: RunResult) => {
 					cardRun.tokens = r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output;
 					cardRun.cost = r.usage.cost;
@@ -408,6 +415,7 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						onUpdate: (partial) => {
 							results[index] = partial;
+							liveResults.set(cardRun.id, partial);
 							syncCard(partial);
 							emit();
 						},
@@ -416,6 +424,7 @@ export default function (pi: ExtensionAPI) {
 					syncCard(results[index]);
 					cardRun.state = failed(results[index]) || results[index].exitCode === -1 ? "failed" : "done";
 					cardRun.endedAt = Date.now();
+					liveResults.delete(cardRun.id);
 					showCard(ctx);
 					setRunning(ctx, -1);
 					if (writer) activeWriters.splice(activeWriters.indexOf(writer), 1);
@@ -473,6 +482,109 @@ export default function (pi: ExtensionAPI) {
 			return container;
 		},
 	});
+
+	interface ViewerRun {
+		result: RunResult;
+		state: "running" | "done" | "failed";
+		startedAt?: number;
+		elapsed?: string;
+	}
+
+	/** Runs in flight plus every finished run recorded on this branch, newest first. */
+	const viewerRuns = (ctx: ExtensionContext): ViewerRun[] => {
+		const finished: ViewerRun[] = [];
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type !== "message" || entry.message.role !== "toolResult" || entry.message.toolName !== "subagent") continue;
+			const details = entry.message.details as Details | undefined;
+			const at = Date.parse(entry.timestamp);
+			for (const result of details?.results ?? []) finished.push({ result, state: failed(result) ? "failed" : "done", startedAt: at });
+		}
+		const live: ViewerRun[] = runs
+			.filter((r) => r.state === "running" && liveResults.has(r.id))
+			.map((r) => ({ result: liveResults.get(r.id)!, state: "running", startedAt: r.startedAt, elapsed: formatElapsed(Date.now() - r.startedAt) }));
+		return [...live, ...finished.reverse()];
+	};
+
+	const openViewer = async (ctx: ExtensionContext) => {
+		if (ctx.mode !== "tui") return ctx.ui.notify("The Agents viewer needs the interactive UI", "error");
+		await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+			const painter = themePainter(theme);
+			let selected = 0;
+			let scroll = 0;
+			let detailOnly = false;
+			let follow = true;
+			// Live runs stream new messages; repaint while the viewer is open.
+			const timer = setInterval(() => tui.requestRender(), 1000);
+			const close = () => {
+				clearInterval(timer);
+				done();
+			};
+			const glyph = { running: "◐", done: "✓", failed: "✗" } as const;
+			const tone = { running: "accent", done: "success", failed: "error" } as const;
+
+			const detailFor = (run: ViewerRun | undefined, width: number): Row[] => {
+				if (!run) return [];
+				const r = run.result;
+				const u = r.usage;
+				const header = [
+					`${r.agent} · ${run.state}${run.elapsed ? ` · ${run.elapsed}` : ""}`,
+					`${r.model ?? "?"}${r.thinking ? ` · ${r.thinking}` : ""}${r.route ? ` · ${r.route}` : ""}`,
+					`${u.turns} turns · ↑${formatTokens(u.input + u.cacheRead + u.cacheWrite)} ↓${formatTokens(u.output)} · ${formatCost(u.cost)}`,
+					`task: ${r.task.split("\n")[0]}`,
+				];
+				const rows = threadRows(header, r.messages, width);
+				if (run.state === "failed" && (r.errorMessage || r.stderr)) rows.push({ text: `error: ${(r.errorMessage || r.stderr).split("\n")[0]}`, tone: "error" });
+				return rows;
+			};
+
+			return {
+				invalidate() {},
+				handleInput(data: string) {
+					const list = viewerRuns(ctx);
+					const bodyHeight = Math.max(1, tui.terminal.rows - 3);
+					const width = tui.terminal.columns;
+					const detail = detailFor(list[selected], detailOnly ? width - 2 : width - listWidth(width) - 4);
+					if (matchesKey(data, Key.escape) || data === "q") return close();
+					if (matchesKey(data, Key.down) || data === "j") [selected, scroll, follow] = [Math.min(list.length - 1, selected + 1), 0, true];
+					else if (matchesKey(data, Key.up) || data === "k") [selected, scroll, follow] = [Math.max(0, selected - 1), 0, true];
+					else if (matchesKey(data, Key.pageDown) || data === " " || data === "J") [scroll, follow] = [Math.min(maxScroll(detail.length, bodyHeight), scroll + 10), false];
+					else if (matchesKey(data, Key.pageUp) || data === "K") [scroll, follow] = [Math.max(0, scroll - 10), false];
+					else if (data === "g") [scroll, follow] = [0, false];
+					else if (data === "G") [scroll, follow] = [maxScroll(detail.length, bodyHeight), true];
+					else if (data === "F") detailOnly = !detailOnly;
+					tui.requestRender();
+				},
+				render(width: number): string[] {
+					const list = viewerRuns(ctx);
+					selected = Math.min(selected, Math.max(0, list.length - 1));
+					const run = list[selected];
+					const detail = detailFor(run, detailOnly ? width - 2 : width - listWidth(width) - 4);
+					const bodyHeight = Math.max(1, tui.terminal.rows - 3);
+					// A running thread follows its newest lines until the user scrolls.
+					if (follow && run?.state === "running") scroll = maxScroll(detail.length, bodyHeight);
+					const running = list.filter((r) => r.state === "running").length;
+					return renderTwoPane(
+						{
+							width,
+							height: tui.terminal.rows,
+							title: `Agents · ${running} running · ${list.length - running} finished`,
+							list: list.map((r) => ({ text: `${glyph[r.state]} ${r.result.agent} · ${r.result.task.split("\n")[0]}`, tone: tone[r.state] })),
+							selected,
+							detail,
+							detailScroll: scroll,
+							detailOnly,
+							empty: "No subagent runs in this session yet",
+							footer: "j/k run · space/J/K scroll · g/G top/end · F thread only · q close",
+						},
+						painter,
+					);
+				},
+			};
+		}, FULLSCREEN_OVERLAY);
+	};
+
+	pi.registerCommand("brigadev:runs", { description: "Agents viewer: every subagent run in this session with its thread", handler: async (_args, ctx) => openViewer(ctx) });
+	pi.registerShortcut(VIEWER_KEY, { description: "Open the brigadev Agents viewer", handler: async (ctx) => openViewer(ctx) });
 
 	pi.registerCommand("brigadev:agents", {
 		description: "List brigadev agents (package, user, and trusted project agents)",
