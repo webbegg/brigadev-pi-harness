@@ -21,7 +21,9 @@
 			"./extensions/profiles.ts",
 			"./extensions/cost.ts",
 			"./extensions/context-backstop.ts",
-			"./extensions/exploration-budget.ts"
+			"./extensions/exploration-budget.ts",
+			"./extensions/shell-bar.ts",
+			"./extensions/odd-phase.ts"
 		],
 		"skills": [
 			"./skills"

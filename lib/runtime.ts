@@ -51,6 +51,8 @@ export interface BrigadevSettings {
 	defaultMode?: string;
 	/** Price zero-cost claude-bridge turns at the Anthropic list price (default true). */
 	bridgePricing?: boolean;
+	/** UI features, each on by default. */
+	ui?: { footer?: boolean; phase?: boolean };
 }
 
 export function agentDir(): string {
