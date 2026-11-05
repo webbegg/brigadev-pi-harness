@@ -78,7 +78,7 @@ export default function (pi: ExtensionAPI) {
 					`orchestrator prompt: ${enabled ? "on" : "off"}`,
 					`assets: ${ASSETS_ROOT}`,
 					`settings: ${settingsPath()}`,
-					"commands: /brigadev:profile, /brigadev:cost, /brigadev:mode, /brigadev:agents, /brigadev:ui, /brigadev:harness, /review, /judgment-day, /track",
+					"commands: /brigadev:doctor, /brigadev:profile, /brigadev:cost, /brigadev:mode, /brigadev:agents, /brigadev:ui, /brigadev:harness, /review, /judgment-day, /track",
 				].join("\n"),
 				"info",
 			);

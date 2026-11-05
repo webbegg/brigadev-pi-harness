@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- `/brigadev:doctor`: diagnostics (bridge hooks, profiles, settings, model) and `fix-bridge-hooks`, which adds `disableAllHooks: true` to the installed claude-bridge so the user's Claude Code hooks stop running inside Pi turns (measured: about 0.8k prompt and 0.3k output tokens, 7-9 s per turn). Warns once per session while hooks are on. Re-run after bridge updates; an upstream option is drafted in `docs/upstream/`.
+
 ## [0.3.0] - 2026-11-05
 
 - UI: one-line status bar replacing Pi's footer (repo, branch, dirty count, yolo mode, model and thinking, context gauge, API-equivalent cost, profile, other extensions' statuses), dropping segments by priority on narrow terminals.

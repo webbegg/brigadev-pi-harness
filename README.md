@@ -41,6 +41,7 @@ Check it loaded: `/brigadev:status`.
 | Command | Purpose |
 | --- | --- |
 | `/brigadev:status` | Version, prompt on/off, paths |
+| `/brigadev:doctor [fix-bridge-hooks]` | Diagnostics; turn off your Claude Code hooks inside claude-bridge turns |
 | `/brigadev:profile …` | Model routing profiles (see below) |
 | `/brigadev:cost` | Session cost: orchestrator per model, subagents per agent, cache hit rate |
 | `/brigadev:ui footer\|phase on\|off` | Turn the status bar or the phase label off and on |
@@ -116,6 +117,10 @@ npm test   # node --test, no build step (Node ≥ 22.19 runs TypeScript directly
 ```
 
 Pure logic lives in `lib/` and is covered by `tests/`. Extensions are thin adapters over the Pi API.
+
+## claude-bridge and Claude Code hooks
+
+`pi-claude-bridge` starts Claude Code with your user settings on every turn, so your Claude Code hooks and plugin hooks run inside Pi turns and inject their output. `/brigadev:doctor` detects it; `/brigadev:doctor fix-bridge-hooks` adds one line (`disableAllHooks: true`) to the installed bridge. Normal Claude Code sessions keep their hooks. A bridge update undoes the line: the doctor warns at the next session start; run the fix again.
 
 ## Known limits (MVP)
 

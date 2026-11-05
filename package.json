@@ -24,7 +24,8 @@
 			"./extensions/exploration-budget.ts",
 			"./extensions/shell-bar.ts",
 			"./extensions/odd-phase.ts",
-			"./extensions/ask-user.ts"
+			"./extensions/ask-user.ts",
+			"./extensions/doctor.ts"
 		],
 		"skills": [
 			"./skills"
