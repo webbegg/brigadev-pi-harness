@@ -13,27 +13,18 @@
 
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { isChildSession } from "../lib/runtime.ts";
-
-const STATUSES = ["pending", "in_progress", "done", "blocked", "dropped"] as const;
-type Status = (typeof STATUSES)[number];
-
-interface Todo {
-	id: string;
-	text: string;
-	status: Status;
-	note?: string;
-}
+import { isOpen, TODO_GLYPH as GLYPH, TODO_STATUSES as STATUSES, todoCard, type Todo, type TodoStatus as Status } from "../lib/todo-card.ts";
 
 interface TodoDetails {
 	todos: Todo[];
 	error?: string;
 }
 
-const GLYPH: Record<Status, string> = { pending: "○", in_progress: "◐", done: "✓", blocked: "⧗", dropped: "✗" };
 const WIDGET_KEY = "brigadev-todo";
+const COLLAPSE_KEY = "ctrl+shift+t";
 const STATE_MESSAGE = "brigadev-todo-state";
 
 const TodoItem = Type.Object({
@@ -53,8 +44,6 @@ const Params = Type.Object({
 	note: Type.Optional(Type.String()),
 });
 
-const isOpen = (t: Todo) => t.status === "pending" || t.status === "in_progress" || t.status === "blocked";
-
 function summary(todos: Todo[]): string {
 	return todos.map((t) => `${GLYPH[t.status]} ${t.id} ${t.text}${t.note ? ` — ${t.note}` : ""} [${t.status}]`).join("\n") || "No todos";
 }
@@ -64,22 +53,36 @@ export default function (pi: ExtensionAPI) {
 	let todos: Todo[] = [];
 	// Whether the model's current context already holds the latest list.
 	let listInContext = false;
+	let collapsed = false;
+	// Agent runs since the last todo update while work is open (shown as "stale").
+	let staleRuns = 0;
+	let updatedThisRun = false;
 
 	const refreshWidget = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
-		if (todos.length === 0 || todos.every((t) => !isOpen(t))) {
+		const card = todoCard(todos, { collapsed, staleRuns });
+		if (!card) {
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
 			return;
 		}
-		const done = todos.filter((t) => t.status === "done").length;
-		const active = todos.filter((t) => t.status !== "dropped").length;
-		const lines = [`Todo ${done}/${active}`, ...todos.filter((t) => t.status !== "dropped").map((t) => `${GLYPH[t.status]} ${t.id} ${t.text}`)];
-		ctx.ui.setWidget(WIDGET_KEY, lines);
+		ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => ({
+			invalidate() {},
+			render(width: number): string[] {
+				const hint = theme.fg("dim", ` ${COLLAPSE_KEY}`);
+				const title = theme.fg(card.header.tone, theme.bold(card.header.text));
+				const rule = theme.fg("borderMuted", "─".repeat(Math.max(0, width - card.header.text.length - COLLAPSE_KEY.length - 5)));
+				return [
+					truncateToWidth(`${theme.fg("borderMuted", "─ ")}${title} ${rule}${hint}`, width),
+					...card.rows.map((r) => truncateToWidth(`  ${theme.fg(r.tone, r.text)}`, width)),
+				];
+			},
+		}));
 	};
 
 	const reconstruct = (ctx: ExtensionContext) => {
 		todos = [];
 		listInContext = false;
+		staleRuns = 0;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "compaction") listInContext = false;
 			else if (entry.type === "custom_message" && entry.customType === STATE_MESSAGE) listInContext = true;
@@ -97,6 +100,23 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_compact", async () => {
 		listInContext = false;
+	});
+
+	pi.on("agent_start", async () => {
+		updatedThisRun = false;
+	});
+
+	pi.on("agent_end", async (_event, ctx) => {
+		staleRuns = !updatedThisRun && todos.some(isOpen) ? staleRuns + 1 : 0;
+		refreshWidget(ctx);
+	});
+
+	pi.registerShortcut(COLLAPSE_KEY, {
+		description: "Collapse or expand the brigadev todo card",
+		handler: async (ctx) => {
+			collapsed = !collapsed;
+			refreshWidget(ctx);
+		},
 	});
 
 	pi.on("before_agent_start", async () => {
@@ -118,6 +138,10 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const reply = (text: string, error?: string) => {
 				listInContext = true;
+				if (!error && params.action !== "list") {
+					updatedThisRun = true;
+					staleRuns = 0;
+				}
 				refreshWidget(ctx);
 				return { content: [{ type: "text" as const, text }], details: { todos: todos.map((t) => ({ ...t })), error } as TodoDetails };
 			};

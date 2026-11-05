@@ -15,8 +15,9 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { agentsCard, FINISHED_TTL_MS, visibleRuns, type AgentRun } from "../lib/agents-card.ts";
 import type { AgentDefinition } from "../lib/agents.ts";
 import { addUsage, emptyTally, formatCost, formatTokens, priceBridgeMessage, type CostCalculator, type Tally } from "../lib/cost.ts";
 import { admitLaunch, buildChildTask, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
@@ -30,6 +31,8 @@ const MAX_CONCURRENCY = 4;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 const COLLAPSED_ITEMS = 6;
 const STATUS_KEY = "brigadev-agents";
+const CARD_KEY = "brigadev-agents-card";
+const CARD_COLLAPSE_KEY = "ctrl+shift+a";
 
 interface RunResult {
 	agent: string;
@@ -242,9 +245,73 @@ export default function (pi: ExtensionAPI) {
 	const activeWriters: ActiveWriter[] = [];
 	let running = 0;
 
+	// Agents card: live rows above the editor while subagents run.
+	let runs: AgentRun[] = [];
+	let cardCollapsed = false;
+	let renderCard: (() => void) | undefined;
+	let ticker: ReturnType<typeof setInterval> | undefined;
+	let expiry: ReturnType<typeof setTimeout> | undefined;
+
+	const stopTimers = () => {
+		if (ticker) clearInterval(ticker);
+		if (expiry) clearTimeout(expiry);
+		ticker = expiry = undefined;
+	};
+
+	const showCard = (ctx: ExtensionContext) => {
+		if (!ctx.hasUI) return;
+		if (visibleRuns(runs, Date.now()).length === 0) {
+			stopTimers();
+			renderCard = undefined;
+			ctx.ui.setWidget(CARD_KEY, undefined);
+			return;
+		}
+		if (!renderCard) {
+			ctx.ui.setWidget(CARD_KEY, (tui, theme) => {
+				renderCard = () => tui.requestRender();
+				return {
+					dispose() {
+						renderCard = undefined;
+					},
+					invalidate() {},
+					render(width: number): string[] {
+						// Rows are indented by 2 columns, so lay them out for the remaining width.
+						return agentsCard(runs, { width: Math.max(10, width - 2), now: Date.now(), collapsed: cardCollapsed, measure: visibleWidth }).map((line, i) =>
+							truncateToWidth(i === 0 ? `${theme.fg("borderMuted", "─ ")}${theme.fg(line.tone, theme.bold(line.text))}` : `  ${theme.fg(line.tone, line.text)}`, width),
+						);
+					},
+				};
+			});
+		}
+		renderCard?.();
+		// Tick the elapsed column while work runs; drop finished rows after their TTL.
+		const anyRunning = runs.some((r) => r.state === "running");
+		if (anyRunning && !ticker) ticker = setInterval(() => renderCard?.(), 1000);
+		if (!anyRunning) {
+			if (ticker) clearInterval(ticker);
+			ticker = undefined;
+			if (expiry) clearTimeout(expiry);
+			expiry = setTimeout(() => showCard(ctx), FINISHED_TTL_MS + 100);
+		}
+	};
+
+	pi.on("session_start", async (_event, ctx) => {
+		runs = [];
+		showCard(ctx);
+	});
+	pi.on("session_shutdown", async () => stopTimers());
+
+	pi.registerShortcut(CARD_COLLAPSE_KEY, {
+		description: "Collapse or expand the brigadev agents card",
+		handler: async (ctx) => {
+			cardCollapsed = !cardCollapsed;
+			showCard(ctx);
+		},
+	});
+
 	const setRunning = (ctx: ExtensionContext, delta: number) => {
 		running += delta;
-		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, running > 0 ? `⚙ ${running} agent${running === 1 ? "" : "s"}` : undefined);
+		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, running > 0 ? `◐ ${running} agent${running === 1 ? "" : "s"}` : undefined);
 	};
 
 	pi.on("before_agent_start", async (event) => {
@@ -309,6 +376,24 @@ export default function (pi: ExtensionAPI) {
 				const writer: ActiveWriter | undefined = agent!.writer ? { id: randomUUID().slice(0, 8), agent: agent!.name, surfaces: request.allowedEditSurfaces ?? [] } : undefined;
 				if (writer) activeWriters.push(writer);
 				setRunning(ctx, 1);
+				const cardRun: AgentRun = {
+					id: randomUUID().slice(0, 8),
+					agent: agent!.name,
+					task: request.task.split("\n")[0],
+					state: "running",
+					model: routes[index]!.model,
+					thinking: routes[index]!.thinking,
+					tokens: 0,
+					cost: 0,
+					startedAt: Date.now(),
+				};
+				runs.push(cardRun);
+				showCard(ctx);
+				const syncCard = (r: RunResult) => {
+					cardRun.tokens = r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output;
+					cardRun.cost = r.usage.cost;
+					if (r.model) cardRun.model = r.model;
+				};
 				try {
 					results[index] = await runAgent({
 						cwd: ctx.cwd,
@@ -321,10 +406,15 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						onUpdate: (partial) => {
 							results[index] = partial;
+							syncCard(partial);
 							emit();
 						},
 					});
 				} finally {
+					syncCard(results[index]);
+					cardRun.state = failed(results[index]) || results[index].exitCode === -1 ? "failed" : "done";
+					cardRun.endedAt = Date.now();
+					showCard(ctx);
 					setRunning(ctx, -1);
 					if (writer) activeWriters.splice(activeWriters.indexOf(writer), 1);
 				}
