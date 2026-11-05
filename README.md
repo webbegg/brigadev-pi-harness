@@ -46,6 +46,8 @@ Check it loaded: `/brigadev:status`.
 | `/brigadev:cost` | Session cost: orchestrator per model, subagents per agent, cache hit rate |
 | `/brigadev:ui footer\|phase on\|off` | Turn the status bar or the phase label off and on |
 | `ctrl+shift+t` / `ctrl+shift+a` | Collapse the todo card / the agents card |
+| `alt+g` or `/brigadev:changes` | Changes viewer: uncommitted files and their diffs |
+| `alt+a` or `/brigadev:runs` | Agents viewer: subagent runs with their threads |
 | `/brigadev:mode [normal\|yolo\|default <mode>]` | Permission mode for this session, or the default for new sessions |
 | `/brigadev:agents` | Effective agent list (package, user, trusted project) |
 | `/brigadev:harness on\|off` | Toggle the orchestrator prompt for this session (A/B testing) |

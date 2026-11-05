@@ -1,6 +1,9 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0] - 2026-11-05
+
+- Changes viewer (`alt+g`, `/brigadev:changes`): working tree against HEAD in a full-screen two-pane view with per-file line counts and diffs.
+- Agents viewer (`alt+a`, `/brigadev:runs`): every subagent run of the session with its thread, route, usage, and cost; live runs follow along.
 
 - Guard: the project-root and edit-surface checks resolve symlinks, so a project reached through a symlink (macOS `/tmp` → `/private/tmp`, a symlinked checkout) is no longer treated as outside itself.
 - Stop tracking the generated `.atl/` registry that a Claude Code hook wrote into the repo.
