@@ -33,7 +33,7 @@ When the user asks for a full review, run all four.
 1. **Freeze** the candidate into a patch file outside the repository:
 
 ```bash
-SCRATCH=$(mktemp -d)
+SCRATCH=$(mktemp -d) && echo "$SCRATCH"             # note the printed path for step 5
 git diff <base>...HEAD > "$SCRATCH/candidate.patch"   # committed range
 git diff HEAD > "$SCRATCH/candidate.patch"            # uncommitted work
 git diff --stat <base>...HEAD
@@ -46,7 +46,7 @@ git diff --stat <base>...HEAD
    - **advisory**: WARNING and SUGGESTION.
    Discard claims without evidence, and say so.
 4. **Correct** (only when the user authorized changes): one correction batch for all blockers, then one re-review limited to those blocker IDs by the lens that raised them. Blockers still open after that become one **Needs your decision**.
-5. Remove the scratch directory when done.
+5. Remove the scratch directory when done with the literal path `mktemp -d` printed (`rm -rf /var/folders/.../tmp.XXXX`), never `$(…)` or a variable: the guard runs a literal temp-dir path without a confirmation.
 
 ## Output
 

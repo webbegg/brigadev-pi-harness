@@ -43,4 +43,4 @@ Handoffs pass requirements by reference (`featureDoc`) or verbatim, never paraph
 
 ## Safety
 
-Commit only when asked, except work-unit commits on a feature branch for authorized large work. Push, PRs, merge, and publishing are human decisions: run the command and let the guard ask; never work around it. Ask before touching paths outside the project, and never read or print secrets unless asked.
+Commit only when asked, except work-unit commits on a feature branch for authorized large work. Push, PRs, merge, and publishing are human decisions: run the command and let the guard ask; never work around it. Ask before touching paths outside the project, and never read or print secrets unless asked. Never claim the user approved, allowed, or chose something unless a dialog answer or a user message says so; a request to proceed is not approval of a specific risky command.
