@@ -47,7 +47,8 @@ Check it loaded: `/brigadev:status`.
 | `/brigadev:usage` | Subscription usage windows (5h, weekly) and their resets |
 | `/brigadev:ui footer\|phase on\|off` | Turn the status bar or the phase label off and on |
 | `ctrl+shift+t` / `ctrl+shift+a` | Collapse the todo card / the agents card |
-| `alt+g` or `/brigadev:changes` | Changes viewer: uncommitted files and their diffs |
+| `alt+g` or `/brigadev:changes` | Changes viewer: uncommitted files and their diffs (`o` opens the file in `$VISUAL` / `$EDITOR`) |
+| `alt+k` or `/brigadev:commands` | Command palette: search the brigadev commands, Enter runs one |
 | `alt+a` or `/brigadev:runs` | Agents viewer: subagent runs with their threads |
 | `/brigadev:mode [normal\|yolo\|default <mode>]` | Permission mode for this session, or the default for new sessions |
 | `/brigadev:agents` | Effective agent list (package, user, trusted project) |
@@ -118,6 +119,7 @@ Each profile route can list fallback models. When a run fails on quota, auth, a 
 | destructive (`rm -rf dir`, `git reset --hard`, `git push --force`, `DROP TABLE`) | ask | ask | block |
 | publish (`npm publish`, `gh pr merge`, `gh release`) | ask | ask | block |
 | privileged (`sudo`, `curl … \| sh`) | ask | ask | block |
+| dependency (`npm install`, `pip install`) | ask | ask | block |
 | catastrophic (`rm -rf ~`, `rm -rf /`, `mkfs`, `dd of=/dev/…`) | block | block | block |
 
 Without a UI (print mode), "ask" means block. The guard recognizes executable forms; it is not a sandbox.

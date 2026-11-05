@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.0] - 2026-11-05
+
+- Changes viewer: `o` opens the selected file in `$VISUAL` or `$EDITOR` (path passed as a literal argument, no shell), restores the TUI afterwards, and warns when the editor cannot launch.
+- Command palette (`alt+k`, `/brigadev:commands`): searchable list of the registered brigadev commands with descriptions; Enter runs the selected one.
+- Command palette: Enter now runs the command (`sendUserMessage` returns void and needs `expandPromptTemplates: true`; the old code threw), and the list includes brigadev's `/review` and `/track` prompt templates.
+- Guard: new `dependency` command kind (`npm`/`pnpm`/`yarn`/`bun` install, add, remove, update; `pip`, `uv`, `poetry`, `cargo`, `go`, `brew`, `gem` installs) asks in normal and yolo and is blocked in subagents.
+- Exploration budget: the first read-only `bash` lookup (`cat`, `sed`, `grep`...) of a request gets a notice to use `read`, `grep`, `find`, or `ls`.
+- Orchestrator prompt: never claim the user approved something unless a dialog answer or message says so. `brigadev-review` cleans its scratch directory with the literal `mktemp -d` path so the guard does not ask.
+
 ## [0.5.0] - 2026-11-05
 
 - Fallback chains: profile routes take `fallbacks`; orchestrator and subagent runs move to the next model on quota, auth, rate-limit, provider, timeout, or network failures, with shared cooldowns and a price note when the next model costs more. `/brigadev:profile fallback` edits chains.
