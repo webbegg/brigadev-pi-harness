@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Subagents start with `PWD` set to their resolved working directory. Under a symlinked path (macOS `/tmp`) an inherited `PWD` showed the child two directories, and it ran every lookup twice (measured: 4 → 2 tool calls for the same task). Projects outside symlinks were not affected.
+
 ## [0.4.0] - 2026-11-05
 
 - Changes viewer (`alt+g`, `/brigadev:changes`): working tree against HEAD in a full-screen two-pane view with per-file line counts and diffs.

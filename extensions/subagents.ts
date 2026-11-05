@@ -27,6 +27,7 @@ import { admitLaunch, buildChildTask, writerConflicts, type ActiveWriter, type L
 import { resolveAgentRoute, resolveModelRef, type ResolvedRoute } from "../lib/model-routing.ts";
 import { costCalculator, currentModelRef, loadAgents, modelCatalog } from "../lib/pi-adapters.ts";
 import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
+import { canonicalPath } from "../lib/paths.ts";
 import { CHILD_ENV, GUARD_EXTENSION_PATH, isChildSession } from "../lib/runtime.ts";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -130,11 +131,16 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 		}
 		args.push(options.taskText);
 
+		// One spelling of the working directory: an inherited PWD that differs
+		// from the real cwd (macOS /tmp -> /private/tmp, a symlinked checkout)
+		// shows the child two directories, and it then runs every lookup twice.
+		const cwd = canonicalPath(options.cwd);
 		const env: NodeJS.ProcessEnv = {
 			...process.env,
+			PWD: cwd,
 			[CHILD_ENV.CHILD]: "1",
 			[CHILD_ENV.AGENT]: agent.name,
-			[CHILD_ENV.PROJECT_ROOT]: options.cwd,
+			[CHILD_ENV.PROJECT_ROOT]: cwd,
 			[CHILD_ENV.READ_ONLY]: agent.writer ? "0" : "1",
 		};
 		if (agent.writer && request.allowedEditSurfaces) env[CHILD_ENV.ALLOWED_SURFACES] = JSON.stringify(request.allowedEditSurfaces);
@@ -143,7 +149,7 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 		let aborted = false;
 		result.exitCode = await new Promise<number>((resolveExit) => {
 			const invocation = piInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, { cwd: options.cwd, env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+			const proc = spawn(invocation.command, invocation.args, { cwd, env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
 			let buffer = "";
 
 			const processLine = (line: string) => {
