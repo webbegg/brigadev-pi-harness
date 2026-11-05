@@ -27,6 +27,7 @@
 			"./extensions/ask-user.ts",
 			"./extensions/doctor.ts",
 			"./extensions/changes-view.ts",
+			"./extensions/command-palette.ts",
 			"./extensions/usage.ts",
 			"./extensions/fallback.ts"
 		],
