@@ -31,6 +31,7 @@ import { costCalculator, currentModelRef, listPrice, loadAgents, modelCatalog } 
 import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
 import { canonicalPath } from "../lib/paths.ts";
 import { CHILD_ENV, GUARD_EXTENSION_PATH, isChildSession } from "../lib/runtime.ts";
+import { diffSnapshots, outsideSurfaces, takeSnapshot } from "../lib/worktree-snapshot.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -61,6 +62,8 @@ interface RunResult {
 interface Details {
 	mode: "single" | "parallel";
 	results: RunResult[];
+	/** Files the batch changed outside every writer's surfaces (set when writers ran in a git repo). */
+	outsideSurfaces?: string[];
 }
 
 
@@ -388,6 +391,13 @@ export default function (pi: ExtensionAPI) {
 			const price = costCalculator(ctx);
 			const warnings: string[] = [];
 
+			// Backstop for writers: the parent is idle during the call, so any change
+			// outside the union of the writers' surfaces came from a child.
+			const writerSurfaces = resolved.flatMap(({ request, agent }) => (agent?.writer ? (request.allowedEditSurfaces ?? []) : []));
+			const watchTree = resolved.some(({ agent }) => agent?.writer);
+			const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);
+			const treeBefore = watchTree ? await takeSnapshot(exec, canonicalPath(ctx.cwd)) : undefined;
+
 			await mapLimited(resolved, MAX_CONCURRENCY, async ({ request, agent }, index) => {
 				const { text, missingSkills } = buildChildTask(request, agent!, skills);
 				if (missingSkills.length) warnings.push(`${agent!.name}: unknown skills ${missingSkills.join(", ")}`);
@@ -468,6 +478,11 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			const details: Details = { mode, results };
+			const treeAfter = treeBefore ? await takeSnapshot(exec, canonicalPath(ctx.cwd)) : undefined;
+			if (treeBefore && treeAfter) {
+				details.outsideSurfaces = outsideSurfaces(diffSnapshots(treeBefore, treeAfter), writerSurfaces);
+				if (details.outsideSurfaces.length > 0) warnings.push(`files changed outside the writers' allowed edit surfaces: ${details.outsideSurfaces.join(", ")}`);
+			}
 			const warningText = warnings.length ? `\n\nWarnings: ${warnings.join("; ")}` : "";
 			if (mode === "single") {
 				const r = results[0];

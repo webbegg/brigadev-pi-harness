@@ -23,42 +23,182 @@ export interface CommandMatch {
 
 const SEPARATORS = new Set([";", "&&", "||", "|", "&", "\n", "(", ")"]);
 const WRAPPERS = new Set(["sudo", "doas", "env", "command", "builtin", "nohup", "time", "nice", "exec", "xargs", "timeout", "caffeinate"]);
-const SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "ksh"]);
+export const SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "ksh"]);
 // Commands whose arguments are data (search patterns, text), not actions.
 const TEXT_COMMANDS = new Set(["grep", "rg", "ag", "echo", "printf", "cat", "less", "head", "tail", "sed", "awk", "jq", "wc"]);
 const CATASTROPHIC_RM_TARGETS = new Set(["/", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/", "${HOME}/", ".", "./", "..", "../", "*", "/Users", "/home", "/usr", "/etc", "/var", "/System"]);
 
-interface Segment {
+export interface Redirect {
+	/** Output operator: >, >>, >|, >&, &>, &>>. */
+	op: string;
+	target: string;
+}
+
+export interface Segment {
 	argv: string[];
 	/** Separator that precedes this segment ("" for the first one). */
 	before: string;
+	/** Output redirections; only filled when tokenizing with `redirections`. */
+	redirects: Redirect[];
 }
 
 /** Literal heredoc bodies are data, not commands. */
-function blankHeredocs(command: string): string {
+export function blankHeredocs(command: string): string {
 	return command.replace(/<<-?\s*(['"]?)([A-Za-z_]\w*)\1[^\n]*\n[\s\S]*?\n\2(?=\n|$)/g, (raw) => {
 		const header = raw.slice(0, raw.indexOf("\n") + 1);
 		return header + " ".repeat(raw.length - header.length);
 	});
 }
 
-function tokenize(command: string): Segment[] {
+/** Index just past the `))` closing an arithmetic expression whose `((` ends at `from`, or -1. */
+function arithmeticEnd(text: string, from: number): number {
+	let depth = 2;
+	let loweredToOneAt = -1;
+	for (let j = from; j < text.length; j++) {
+		if (text[j] === "(") depth++;
+		else if (text[j] === ")") {
+			depth--;
+			if (depth === 1) loweredToOneAt = j;
+			else if (depth === 0) return loweredToOneAt === j - 1 ? j + 1 : -1;
+		}
+	}
+	return -1;
+}
+
+/** Index just past the `]]` closing a `[[` whose opening ends at `from`, or -1. */
+function conditionalEnd(text: string, from: number): number {
+	let quote: "'" | '"' | null = null;
+	for (let j = from; j < text.length; j++) {
+		const ch = text[j];
+		if (quote) {
+			if (ch === "\\" && quote === '"') j++;
+			else if (ch === quote) quote = null;
+		} else if (ch === "'" || ch === '"') quote = ch;
+		else if (ch === "\\") j++;
+		else if (ch === "]" && text[j + 1] === "]" && /\s/.test(text[j - 1]) && (j + 2 >= text.length || /[\s;&|)]/.test(text[j + 2]))) return j + 2;
+	}
+	return -1;
+}
+
+/** Index just past the `)` closing a `$(` whose opening ends at `from`, or -1. */
+function substitutionEnd(text: string, from: number): number {
+	let depth = 1;
+	let quote: "'" | '"' | null = null;
+	for (let j = from; j < text.length; j++) {
+		const ch = text[j];
+		if (quote) {
+			if (ch === "\\" && quote === '"') j++;
+			else if (ch === quote) quote = null;
+		} else if (ch === "'" || ch === '"') quote = ch;
+		else if (ch === "\\") j++;
+		else if (ch === "(") depth++;
+		else if (ch === ")" && --depth === 0) return j + 1;
+	}
+	return -1;
+}
+
+/** Blanks a conditional's text (newlines kept), leaving its `$( )` substitutions, which run as commands. */
+function blankAroundSubstitutions(region: string): string {
+	let out = "";
+	let quote: "'" | '"' | null = null;
+	for (let j = 0; j < region.length; j++) {
+		const ch = region[j];
+		if (quote) {
+			if (ch === "\\" && quote === '"') {
+				out += region.slice(j, j + 2).replace(/[^\n]/g, " ");
+				j++;
+				continue;
+			}
+			if (ch === quote) quote = null;
+		} else if (ch === "'" || ch === '"') quote = ch;
+		else if (ch === "\\") {
+			out += region.slice(j, j + 2).replace(/[^\n]/g, " ");
+			j++;
+			continue;
+		}
+		if (quote !== "'" && ch === "$" && region[j + 1] === "(" && region[j + 2] !== "(") {
+			const end = substitutionEnd(region, j + 2);
+			if (end !== -1) {
+				out += blankConditionals(region.slice(j, end));
+				j = end - 1;
+				continue;
+			}
+		}
+		out += ch === "\n" ? ch : " ";
+	}
+	return out;
+}
+
+/**
+ * `(( ))`, `$(( ))` and `[[ ]]` hold comparisons, where `>` is not a
+ * redirection. Blanks them (newlines kept) so offsets and line structure
+ * stay, except for the `$( )` substitutions inside, which still run.
+ */
+export function blankConditionals(command: string): string {
+	let out = command;
+	let quote: "'" | '"' | null = null;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (quote) {
+			if (ch === "\\" && quote === '"') i++;
+			else if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			continue;
+		}
+		if (ch === "\\") {
+			i++;
+			continue;
+		}
+		const atWordStart = i === 0 || /[\s;&|(){]/.test(command[i - 1]);
+		let end = -1;
+		if (ch === "$" && command.startsWith("((", i + 1)) end = arithmeticEnd(command, i + 3);
+		else if (ch === "(" && command[i + 1] === "(" && (i === 0 || !/[\w$]/.test(command[i - 1]))) end = arithmeticEnd(command, i + 2);
+		else if (ch === "[" && command[i + 1] === "[" && atWordStart && /\s/.test(command[i + 2] ?? "")) end = conditionalEnd(command, i + 2);
+		if (end > i) {
+			out = out.slice(0, i) + blankAroundSubstitutions(out.slice(i, end)) + out.slice(end);
+			i = end - 1;
+		}
+	}
+	return out;
+}
+
+/**
+ * Splits a command into segments of words. With `redirections`, unquoted
+ * output operators (`>`, `>>`, `>|`, `>&`, `&>`, with an optional fd prefix)
+ * and their target word are moved out of argv into `redirects`, and every
+ * `(` or `)` is kept as the `before` of a segment, even an empty one, so the
+ * scope of a subshell can be followed.
+ */
+export function tokenize(command: string, options: { redirections?: boolean } = {}): Segment[] {
+	const redirections = options.redirections === true;
 	const segments: Segment[] = [];
 	let argv: string[] = [];
+	let redirects: Redirect[] = [];
+	let pendingOp: string | null = null;
 	let before = "";
 	let current = "";
 	let inToken = false;
 	let quote: "'" | '"' | null = null;
 
 	const pushToken = () => {
-		if (inToken) argv.push(current);
+		if (inToken) {
+			if (pendingOp !== null) redirects.push({ op: pendingOp, target: current });
+			else argv.push(current);
+			pendingOp = null;
+		}
 		current = "";
 		inToken = false;
 	};
 	const pushSegment = (separator: string) => {
 		pushToken();
-		if (argv.length > 0) segments.push({ argv, before });
+		const scopeMarker = redirections && (before === "(" || before === ")");
+		if (argv.length > 0 || redirects.length > 0 || scopeMarker) segments.push({ argv, before, redirects });
 		argv = [];
+		redirects = [];
+		pendingOp = null;
 		before = separator;
 	};
 
@@ -83,6 +223,29 @@ function tokenize(command: string): Segment[] {
 			i++;
 			continue;
 		}
+		if (redirections && (ch === ">" || (ch === "&" && command[i + 1] === ">"))) {
+			// A word of digits right before ">" is the file descriptor, not an argument.
+			if (ch === ">" && inToken && /^\d+$/.test(current)) {
+				current = "";
+				inToken = false;
+			} else pushToken();
+			let op = ch;
+			let next = i + 1;
+			if (ch === "&") {
+				op += ">";
+				next++;
+			}
+			if (command[next] === ">") {
+				op += ">";
+				next++;
+			} else if (ch === ">" && (command[next] === "|" || command[next] === "&")) {
+				op += command[next];
+				next++;
+			}
+			pendingOp = op;
+			i = next - 1;
+			continue;
+		}
 		const two = command.slice(i, i + 2);
 		if (two === "&&" || two === "||") {
 			pushSegment(two);
@@ -104,13 +267,13 @@ function tokenize(command: string): Segment[] {
 	return segments;
 }
 
-function basename(executable: string): string {
+export function basename(executable: string): string {
 	const slash = executable.lastIndexOf("/");
 	return slash === -1 ? executable : executable.slice(slash + 1);
 }
 
 /** Strips env assignments and wrapper commands; reports whether sudo was used. */
-function unwrap(argv: string[]): { argv: string[]; privileged: boolean } {
+export function unwrap(argv: string[]): { argv: string[]; privileged: boolean } {
 	let rest = argv;
 	let privileged = false;
 	while (rest.length > 0) {

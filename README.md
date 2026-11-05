@@ -145,7 +145,7 @@ Pure logic lives in `lib/` and is covered by `tests/`. Extensions are thin adapt
 
 ## Known limits (MVP)
 
-- Edit-surface enforcement covers the `write` and `edit` tools; a writer's `bash` could still write elsewhere (the prompt forbids it, the runtime does not parse redirections).
+- Edit surfaces and `bash`: `write` and `edit` are blocked outside a writer's surfaces. For `bash`, the guard blocks calls that write a literal project path outside the surfaces (`>`, `>>`, `&>`, `tee`, `sed -i`, `cp`/`mv`/`install`/`ln` destinations, `touch`, `mkdir`, `truncate`). This is best effort: variables, globs, substitutions, and scripts run by an interpreter (`python3 - <<EOF`) are not parsed. In a git repository the guard also compares the working tree before and after each writer `bash` call and flags any file changed outside the surfaces, after the fact: it reports the paths and marks the result as an error, and never reverts anything. Ignored files and repositories without git are not covered by that check. After a launch with writers, the `subagent` result also lists files changed outside the writers' surfaces. Writes outside the project root (such as the system temp dir) are not restricted by these checks.
 - Subagents run in the foreground (parallel within one call). No background jobs, agent dashboard, or model fallback chains yet.
 - Profiles have no per-repository pin and are not frozen at session start: a session without its own profile follows the default as it changes.
 - No "auto" permission mode (classifier-based approvals).

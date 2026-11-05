@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Guard: a writer's `bash` can no longer change files outside its allowed edit surfaces unnoticed. Calls that write a literal project path outside the surfaces (redirections, `tee`, `sed -i`, `cp`/`mv`/`install`/`ln`, `touch`, `mkdir`, `truncate`) are blocked; in git repositories a before/after working-tree comparison flags any other change, and the `subagent` result lists files changed outside the writers' surfaces.
+
 ## [0.6.0] - 2026-11-05
 
 - Changes viewer: `o` opens the selected file in `$VISUAL` or `$EDITOR` (path passed as a literal argument, no shell), restores the TUI afterwards, and warns when the editor cannot launch.

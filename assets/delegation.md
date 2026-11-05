@@ -24,7 +24,7 @@ Run `/brigadev:agents` to see the effective list, including user (`~/.pi/agent/a
 
 ## Allowed edit surfaces
 
-Derive them yourself; never ask the human to author paths. List the files the unit must touch plus directories where it may create files, as narrow repository-relative paths or globs. Never `.`, the repository root, absolute paths, or `..`. A surface wider than the task is a defect. The runtime blocks edits outside them and rejects overlapping parallel writers.
+Derive them yourself; never ask the human to author paths. List the files the unit must touch plus directories where it may create files, as narrow repository-relative paths or globs. Never `.`, the repository root, absolute paths, or `..`. A surface wider than the task is a defect. The runtime blocks edits outside them and rejects overlapping parallel writers, and reports files a writer changed outside them through `bash`.
 
 If a writer returns `interaction_required` for a path, present its derived candidate paths to the user as an approve/decline choice.
 
