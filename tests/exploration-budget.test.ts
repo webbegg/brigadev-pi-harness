@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { createExplorationBudget, isLookupTool } from "../lib/exploration-budget.ts";
+import { createExplorationBudget, isLookupTool, isShellLookup } from "../lib/exploration-budget.ts";
 
 describe("exploration budget", () => {
 	it("counts only read, grep, find, and ls as lookups", () => {
@@ -27,5 +27,24 @@ describe("exploration budget", () => {
 		budget.reset();
 		for (let i = 0; i < 4; i++) assert.equal(budget.record("read"), undefined);
 		assert.ok(budget.record("read"));
+	});
+
+	it("counts read-only shell commands, which agents often use instead of the read tool", () => {
+		for (const c of ["cat lib/cost.ts", "cd /repo && sed -n 1,80p lib/agents.ts", "head -40 README.md; tail -5 CHANGELOG.md", "grep -rn foo src | head", "rg -n bar lib", "ls -la extensions", "wc -l lib/*.ts"]) {
+			assert.equal(isShellLookup(c), true, c);
+		}
+	});
+
+	it("does not count shell commands that write, run, or rewrite", () => {
+		for (const c of ["npm test", "git status", "cat <<'EOF' > notes.md\nx\nEOF", "sed -i '' 's/a/b/' x.ts", "python3 - <<'E'\nopen('x','w')\nE", "cat a.txt > b.txt", "echo hi"]) {
+			assert.equal(isShellLookup(c), false, c);
+		}
+	});
+
+	it("records bash calls by their command", () => {
+		const budget = createExplorationBudget();
+		for (let i = 0; i < 4; i++) assert.equal(budget.record("bash", { command: "cat x.ts" }), undefined);
+		assert.equal(budget.record("bash", { command: "npm test" }), undefined);
+		assert.match(budget.record("bash", { command: "sed -n 1,9p y.ts" }) ?? "", /brigadev-explore/);
 	});
 });

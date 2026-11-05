@@ -53,7 +53,7 @@ A mistake would be hard to detect, hard to undo, or reaches beyond the change:
 Each trigger fires only when its condition truly holds; none holds by default. When one fires, delegate through the `subagent` tool with that trigger as `reason`. Without a named reason, work inline.
 
 1. **Ask**: open product or design decision → one focused question; stop.
-2. **Evidence budget**: understanding needs more than one read batch or ~5 sequential lookups → one `brigadev-explore` returning ≤ ~2k tokens with `path:line` evidence. Reassess cumulative discovery each batch; never reset it. The runtime also appends a notice to the 5th read/grep/find/ls result of a request.
+2. **Evidence budget**: understanding needs more than one read batch or ~5 sequential lookups → one `brigadev-explore` returning ≤ ~2k tokens with `path:line` evidence. Reassess cumulative discovery each batch; never reset it. The runtime also appends a notice to the 5th lookup of a request (file tools or read-only shell commands).
 3. **Verification**: only a named high-risk item → one independent `brigadev-verify` after the change's own checks, with `reason: "Risk: item N (why)"`. Otherwise whoever changed the code verifies inline.
 4. **Track**: large task → feature document and `todo` (`odd-tracking.md`).
 5. **Writer**: never for file count or size alone. Only 2+ independent units of behavior, each needing several minutes of work (several files or ~100+ changed lines), with disjoint edit surfaces, launched together in one parallel call; or the context backstop. Tests, docs, and code of one behavior are one unit. Read `delegation.md` before launching a writer.
