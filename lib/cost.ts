@@ -77,5 +77,6 @@ export function formatTokens(n: number): string {
 }
 
 export function formatCost(usd: number): string {
+	if (usd === 0) return "$0";
 	return usd >= 1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(usd >= 0.01 ? 3 : 4)}`;
 }

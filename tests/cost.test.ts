@@ -55,4 +55,8 @@ describe("tally", () => {
 		assert.equal(formatCost(0.0567), "$0.057");
 		assert.equal(formatCost(0.00123), "$0.0012");
 	});
+
+	it("formats zero cost without decimals", () => {
+		assert.equal(formatCost(0), "$0");
+	});
 });
