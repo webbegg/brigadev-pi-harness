@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.10.0] - 2026-11-06
 
 - Guard: a dangling symlink now resolves to its target, so a write through a link that points outside the project (or outside the repo docs folder) asks, or is blocked for subagents, instead of following it silently.
 - Repo docs folder: feature documents and review ledgers now live in `~/.brigadev/<repo>/` (`tasks/`, `reviews/`; `BRIGADEV_HOME` overrides the root), never inside the project. `<repo>` is the main worktree's basename, so worktrees share it. The orchestrator prompt names the resolved folder, the parent writes there without a dialog (subagents still cannot write outside the project), and `/brigadev:status` and `/brigadev:doctor` show it. The old `odd/tasks/` location is gone from prompts, skills, and docs.
