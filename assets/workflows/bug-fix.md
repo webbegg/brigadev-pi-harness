@@ -7,6 +7,9 @@ questions:
     label: "Where does it happen?"
     kind: text
     required: true
+  - id: environment
+    label: "Environment: browser, device, app version, or feature flag"
+    kind: text
   - id: steps
     label: "Steps to reproduce"
     kind: long
@@ -26,6 +29,7 @@ questions:
 Bug fix request, started from the workflow menu. Follow the normal ODD flow: reproduce the problem first, add a failing regression test when a deterministic one applies, fix the root cause, then run the tests.
 
 - Where it happens: {{where}}
+- Environment: {{environment}}
 - Steps to reproduce: {{steps}}
 - Expected: {{expected}}
 - Actual (errors or logs): {{actual}}

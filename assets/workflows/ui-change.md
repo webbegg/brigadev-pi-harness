@@ -18,6 +18,12 @@ questions:
   - id: states
     label: "States and breakpoints to cover"
     kind: text
+  - id: components
+    label: "Design system components or tokens to use"
+    kind: text
+  - id: accessibility
+    label: "Accessibility and i18n requirements"
+    kind: text
   - id: verify
     label: "How should it be verified?"
     kind: choice
@@ -30,6 +36,8 @@ UI change request, started from the workflow menu. Follow the normal ODD flow: e
 - Page or component: {{target}}
 - Acceptance criteria: {{criteria}}
 - States and breakpoints to cover: {{states}}
+- Design system components or tokens to use: {{components}}
+- Accessibility and i18n requirements: {{accessibility}}
 - Verification: {{verify}}
 
 "Manual steps in the summary" means list the exact steps to check the change by hand in the final summary. If the design source cannot be opened, say so and ask rather than guess at it.

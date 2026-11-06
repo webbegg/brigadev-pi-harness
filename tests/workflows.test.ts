@@ -71,6 +71,20 @@ describe("package workflows", () => {
 			}
 		}
 	});
+
+	it("asks the frontend context questions as optional text, after the question they extend", () => {
+		const ids = (name: string) => loaded.workflows.find((w) => w.name === name)!.questions;
+		const bug = ids("Bug fix");
+		const environment = bug.find((q) => q.id === "environment")!;
+		assert.equal(environment.label, "Environment: browser, device, app version, or feature flag");
+		assert.deepEqual([environment.kind, environment.required], ["text", false]);
+		assert.equal(bug.findIndex((q) => q.id === "environment"), bug.findIndex((q) => q.id === "where") + 1);
+		const ui = ids("UI change from a design or ticket");
+		for (const label of ["Design system components or tokens to use", "Accessibility and i18n requirements"]) {
+			const q = ui.find((candidate) => candidate.label === label)!;
+			assert.deepEqual([q.kind, q.required], ["text", false], label);
+		}
+	});
 });
 
 describe("package workflows composed", () => {
@@ -85,8 +99,8 @@ describe("package workflows composed", () => {
 		"Answer PR feedback": ["brigadev-comment-writer"],
 		"Create an issue": ["brigadev-issue-creation", "Target repository: origin"],
 		"UI change from a design or ticket": ["Verification: Both"],
-		"Refactor a component": ["brigadev-work-unit-commits"],
-		"Upgrade dependencies": ["brigadev-work-unit-commits", "npm run check"],
+		"Refactor a component": ["brigadev-work-unit-commits", "contract change", "Risk: item 3"],
+		"Upgrade dependencies": ["brigadev-work-unit-commits", "npm run check", "State your grouping", "Risk: item 5"],
 	};
 
 	for (const name of NINE) {

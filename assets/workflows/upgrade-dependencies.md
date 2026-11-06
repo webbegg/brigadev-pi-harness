@@ -23,4 +23,6 @@ Dependency upgrade request, started from the workflow menu. Follow the normal OD
 - Allowed range: {{range}}
 - Verification: {{verify}}
 
-Stay inside the allowed range: "Patch" means patch releases only, "Minor" means minor and patch, "Major" allows breaking releases, one package group at a time. Run the verification after each group and stop at the first failure, reporting which package caused it. Commit by work unit, following the `brigadev-work-unit-commits` skill.
+Stay inside the allowed range: "Patch" means patch releases only, "Minor" means minor and patch, "Major" allows breaking releases. A group is one package together with its peer and type packages (for example `react`, `react-dom`, and `@types/react`), or one ecosystem family. State your grouping before starting, then upgrade one group at a time, whatever the range. Run the verification after each group and stop at the first failure, reporting which package caused it. Commit by work unit, following the `brigadev-work-unit-commits` skill.
+
+Dependency changes are high-risk item 5: end with `Risk: item 5 (dependency changes)`, so an independent `brigadev-verify` runs after the change's own checks.

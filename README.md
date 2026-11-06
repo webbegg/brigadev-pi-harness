@@ -139,7 +139,7 @@ Harness documents live outside the project, in `~/.brigadev/<repo>/` (`BRIGADEV_
 
 `/brigadev:start` (or `alt+w`, also listed in the `alt+k` palette) opens a list of workflows; Esc at any step cancels and sends nothing. Nine ship with the package: New feature, Bug fix, Review a PR or branch, Open a PR, Answer PR feedback, Create an issue, UI change from a design or ticket, Refactor a component, Upgrade dependencies.
 
-Each workflow asks its own questions (one line, multi-line editor, or a choice; required or optional). Required answers cannot be empty (asked again once, then the workflow is cancelled). Answers the session can find are offered as defaults instead of asked blind: the current and default branch (git) and the repo's `package.json` test script. Only local lookups run; nothing touches the network. Before anything is sent you see the composed request and choose Start, Edit answers, or Cancel. The request quotes every answer verbatim, names the skills and commands the workflow needs, and is sent as a normal message, so the ODD flow and the guard apply. The questions use plain select, input, and editor dialogs, so the menu also works over RPC.
+Each workflow asks its own questions (one line, multi-line editor, or a choice; required or optional). Required answers cannot be empty (asked again once, then the workflow is cancelled). When you choose Edit answers, an optional text answer is cleared by entering `-` (the title says so), and an optional choice offers a final `(no answer)` option. Answers the session can find are offered as defaults instead of asked blind: the current and default branch (git) and the repo's `package.json` test script. Only local lookups run; nothing touches the network. Before anything is sent you see the composed request and choose Start, Edit answers, or Cancel. The request quotes every answer verbatim, names the skills and commands the workflow needs, and is sent as a normal message, so the ODD flow and the guard apply. The questions use plain select, input, and editor dialogs, so the menu also works over RPC.
 
 Workflows are markdown files. Add or override them by name in `~/.brigadev/workflows/` (all repos) or `~/.brigadev/<repo>/workflows/` (one repo; wins over the global folder); `BRIGADEV_HOME` moves the root. Invalid files are skipped with a warning. Format (see `assets/workflows/` for the defaults):
 
@@ -170,7 +170,7 @@ Add an endpoint, following the normal ODD flow.
 - Base branch: {{base}}
 ```
 
-In the body, `{{id}}` is replaced by the answer (a multi-line answer becomes a block quote), and a line whose answer was skipped is left out. A placeholder that names no question makes the file invalid.
+In the body, `{{id}}` is replaced by the answer (a multi-line answer becomes a block quote), and a line is left out only when all of its answers were skipped (a skipped answer on a line with others renders as empty). A multi-line answer sits on its own quoted lines, with any text after the placeholder on the line below. A placeholder that names no question makes the file invalid.
 
 ## Delivery flow
 

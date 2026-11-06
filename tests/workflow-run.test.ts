@@ -39,6 +39,24 @@ describe("composeRequest", () => {
 		assert.equal(composeRequest(w, { what: "x", area: "  " }, {}), "Plan the work.\n- What: x");
 	});
 
+	it("keeps the provided answers of a line when only some of its placeholders are skipped", () => {
+		const two = workflow("Start\nWhere: {{a}} / Ticket: {{b}}\nOther: {{c}}", [question("a"), question("b"), question("c")]);
+		assert.equal(composeRequest(two, { a: "x" }, {}), "Start\nWhere: x / Ticket:");
+		assert.equal(composeRequest(two, { b: "T-1" }, {}), "Start\nWhere: / Ticket: T-1");
+		assert.equal(composeRequest(two, { a: "x", b: "T-1" }, {}), "Start\nWhere: x / Ticket: T-1");
+		// Only a line whose placeholders are all skipped is left out.
+		assert.equal(composeRequest(two, {}, {}), "Start");
+	});
+
+	it("puts a multi-line answer on its own quoted lines and the trailing text after the quote", () => {
+		const t = workflow("- What: {{what}} (required)\n  - Nested: {{what}} done\n- Plain: {{what}}", [question("what")]);
+		assert.equal(
+			composeRequest(t, { what: "a\nb" }, {}),
+			"- What:\n> a\n> b\n(required)\n  - Nested:\n  > a\n  > b\n  done\n- Plain:\n> a\n> b",
+		);
+		assert.equal(composeRequest(t, { what: "one" }, {}), "- What: one (required)\n  - Nested: one done\n- Plain: one");
+	});
+
 	it("falls back to the default built from the facts", () => {
 		const d = workflow("Start\nBase: {{base}}", [question("base", { default: "{{defaultBranch}}" })]);
 		assert.equal(composeRequest(d, {}, { defaultBranch: "main" }), "Start\nBase: main");
@@ -104,6 +122,42 @@ describe("askQuestions", () => {
 		assert.equal(calls[3].arg, "x");
 		// Clearing the editor prefill of an optional long question drops the answer.
 		assert.deepEqual(answers, { a: "first", c: "one", d: "x" });
+	});
+
+	it("lets an optional text answer be cleared with a literal dash when editing", async () => {
+		const { ui, calls } = scripted(["-", "-", "one", "-"]);
+		const answers = await askQuestions(w, {}, ui, { a: "first", b: "was long", c: "one", d: "x" });
+		// Required a: the dash is an ordinary answer. Optional text d: cleared. Long b: no dash rule.
+		assert.equal(answers?.a, "-");
+		assert.equal(answers?.b, "-");
+		assert.equal("d" in (answers ?? {}), false);
+		assert.doesNotMatch(calls[0].title, /clears/);
+		assert.match(calls[3].title, /\(optional, "-" clears\)/);
+
+		// Without a previous answer there is nothing to clear and the title does not mention it.
+		const first = scripted(["a", "", "two", "-"]);
+		const fresh = await askQuestions(w, {}, first.ui);
+		assert.match(first.calls[3].title, /\(optional\)$/);
+		assert.equal(fresh?.d, "-");
+	});
+
+	it("offers (no answer) last on an optional choice that has a previous answer, and only then", async () => {
+		const opt = workflow("{{c}}", [question("c", { kind: "choice", options: ["one", "two"] })]);
+		const clear = scripted(["(no answer)"]);
+		assert.deepEqual(await askQuestions(opt, {}, clear.ui, { c: "two" }), {});
+		assert.deepEqual(clear.calls[0].arg, ["two", "one", "(no answer)"]);
+
+		const keep = scripted(["one"]);
+		assert.deepEqual(await askQuestions(opt, {}, keep.ui, { c: "two" }), { c: "one" });
+
+		const fresh = scripted(["one"]);
+		await askQuestions(opt, {}, fresh.ui);
+		assert.deepEqual(fresh.calls[0].arg, ["one", "two"]);
+
+		const required = workflow("{{c}}", [question("c", { kind: "choice", required: true, options: ["one", "two"] })]);
+		const req = scripted(["two"]);
+		await askQuestions(required, {}, req.ui, { c: "one" });
+		assert.deepEqual(req.calls[0].arg, ["one", "two"]);
 	});
 
 	it("cancels everything when any question is escaped", async () => {

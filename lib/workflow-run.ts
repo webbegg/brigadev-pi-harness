@@ -27,6 +27,8 @@ export interface QuestionUi {
 
 const PLACEHOLDER = /([ \t]*)\{\{([^{}]*)\}\}/g;
 const REQUIRED_HINT = "required, this answer cannot be empty";
+const NO_ANSWER = "(no answer)";
+const CLEAR = "-";
 
 /** The question's default with `{{fact}}` placeholders filled; undefined when it has none or a fact is unknown. */
 export function questionDefault(question: WorkflowQuestion, facts: WorkflowFacts): string | undefined {
@@ -50,27 +52,56 @@ export function missingRequired(workflow: Workflow, answers: Answers, facts: Wor
 	return workflow.questions.filter((question) => question.required && effectiveAnswer(question, answers, facts) === undefined);
 }
 
-const quoted = (answer: string): string => `\n${answer.split("\n").map((line) => `> ${line}`).join("\n")}`;
+/**
+ * One body line with its answers filled in; undefined when every placeholder
+ * on it was skipped. A skipped placeholder renders as empty. A multi-line
+ * answer becomes a block quote on its own lines, indented like the line, with
+ * the text before it kept above and the text after it on the line below.
+ */
+function composeLine(line: string, values: Map<string, string | undefined>): string[] | undefined {
+	const matches = [...line.matchAll(PLACEHOLDER)];
+	if (matches.length && matches.every((match) => values.get(match[2].trim()) === undefined)) return undefined;
+	const indent = /^[ \t]*/.exec(line)?.[0] ?? "";
+	const out: string[] = [];
+	let current = "";
+	let afterQuote = false;
+	// Text right after a quote starts a fresh line, so its leading space goes.
+	const append = (text: string) => {
+		current += afterQuote && current === indent ? text.trimStart() : text;
+	};
+	let last = 0;
+	// One pass over the line, so an answer that contains `{{...}}` is not expanded again.
+	for (const match of matches) {
+		append(line.slice(last, match.index));
+		last = (match.index ?? 0) + match[0].length;
+		const answer = values.get(match[2].trim());
+		if (answer === undefined) continue;
+		if (!answer.includes("\n")) {
+			append(`${match[1]}${answer}`);
+			continue;
+		}
+		if (current.trim()) out.push(current.trimEnd());
+		out.push(...answer.split("\n").map((part) => `${indent}> ${part}`));
+		current = indent;
+		afterQuote = true;
+	}
+	append(line.slice(last));
+	if (current.trim() || !afterQuote) out.push(current);
+	return out;
+}
 
 /**
  * The request text: the workflow body with each `{{id}}` replaced by the
  * answer, verbatim (a multi-line answer becomes a block quote). A body line
- * whose answer was skipped is left out. Throws when a required answer is missing.
+ * is left out only when all of its answers were skipped. Throws when a
+ * required answer is missing.
  */
 export function composeRequest(workflow: Workflow, answers: Answers, facts: WorkflowFacts): string {
 	const missing = missingRequired(workflow, answers, facts);
 	if (missing.length) throw new Error(`required answers missing: ${missing.map((question) => question.id).join(", ")}`);
 	const values = new Map(workflow.questions.map((question) => [question.id, effectiveAnswer(question, answers, facts)]));
 	const lines: string[] = [];
-	for (const line of workflow.body.split("\n")) {
-		const used = [...line.matchAll(PLACEHOLDER)].map((match) => match[2].trim());
-		if (used.some((id) => values.get(id) === undefined)) continue;
-		// One pass over the line, so an answer that contains `{{...}}` is not expanded again.
-		lines.push(line.replace(PLACEHOLDER, (_match, space: string, id: string) => {
-			const answer = values.get(id.trim()) as string;
-			return answer.includes("\n") ? quoted(answer) : `${space}${answer}`;
-		}));
-	}
+	for (const line of workflow.body.split("\n")) lines.push(...(composeLine(line, values) ?? []));
 	return lines.join("\n").trim();
 }
 
@@ -79,19 +110,25 @@ const defaultFirst = (options: string[], preferred: string | undefined): string[
 
 /**
  * Asks every question in order. `current` holds earlier answers (when the user
- * edits them) and takes the place of the question's default. Returns undefined
- * when the user escapes any question or leaves a required one empty twice.
+ * edits them) and takes the place of the question's default; an optional
+ * answer that was given can then be cleared (`-` for text, `(no answer)` for a
+ * choice). Returns undefined when the user escapes any question or leaves a
+ * required one empty twice.
  */
 export async function askQuestions(workflow: Workflow, facts: WorkflowFacts, ui: QuestionUi, current: Answers = {}): Promise<Answers | undefined> {
 	const answers: Answers = {};
 	for (const question of workflow.questions) {
-		const title = `${workflow.name}: ${question.label}${question.required ? "" : " (optional)"}`;
-		const preset = current[question.id] ?? questionDefault(question, facts);
+		const previous = current[question.id];
+		const clearable = !question.required && previous !== undefined;
+		const optional = question.required ? "" : clearable && question.kind === "text" ? ` (optional, "${CLEAR}" clears)` : " (optional)";
+		const title = `${workflow.name}: ${question.label}${optional}`;
+		const preset = previous ?? questionDefault(question, facts);
 
 		if (question.kind === "choice") {
-			const choice = await ui.select(title, defaultFirst(question.options ?? [], preset));
+			const options = defaultFirst(question.options ?? [], preset);
+			const choice = await ui.select(title, clearable ? [...options, NO_ANSWER] : options);
 			if (choice === undefined) return undefined;
-			answers[question.id] = choice;
+			if (choice !== NO_ANSWER) answers[question.id] = choice;
 			continue;
 		}
 
@@ -100,6 +137,10 @@ export async function askQuestions(workflow: Workflow, facts: WorkflowFacts, ui:
 			const heading = attempt === 0 ? title : `${title} — ${REQUIRED_HINT}`;
 			reply = question.kind === "long" ? await ui.editor(heading, preset ?? "") : await ui.input(heading, preset);
 			if (reply === undefined) return undefined;
+			if (clearable && question.kind === "text" && reply.trim() === CLEAR) {
+				reply = "";
+				break;
+			}
 			// A text answer left empty accepts the default shown as the placeholder; an emptied editor means no answer.
 			if (question.kind === "text" && !reply.trim()) reply = preset ?? "";
 			if (reply.trim() || !question.required) break;
