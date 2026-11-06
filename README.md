@@ -33,6 +33,7 @@ Check it loaded: `/brigadev:status`.
 | Agents card | `extensions/subagents.ts` | Live rows above the editor while subagents run (model · thinking, tokens, cost, elapsed). |
 | Ask dialog | `extensions/ask-user.ts` | `ask_user_choice`: focused questions as a dialog with a recommended option. |
 | Model routing | `extensions/profiles.ts` | Named profiles route the orchestrator and every agent to a model and thinking level. |
+| Workflow menu | `extensions/workflow-menu.ts`, `assets/workflows/` | `/brigadev:start` (`alt+w`): pick a day-to-day workflow, answer its questions, review the composed request, and start it. See [Workflows](#workflows). |
 | Cost | `extensions/cost.ts` | API-equivalent pricing for `claude-bridge` turns, session tally, `/brigadev:cost` breakdown. |
 | Delivery skills | `skills/` | work-unit commits, branch/PR, chained PRs, issue creation, comment writer, skill creator. |
 
@@ -41,6 +42,7 @@ Check it loaded: `/brigadev:status`.
 | Command | Purpose |
 | --- | --- |
 | `/brigadev:status` | Version, prompt on/off, paths, repo docs folder |
+| `alt+w` or `/brigadev:start` | Workflow menu: new feature, bug fix, review, PR, PR feedback, issue, UI change, refactor, dependency upgrade. Asks what each needs, then sends one complete request |
 | `/brigadev:doctor [fix-bridge-hooks]` | Diagnostics, including the repo docs folder; turn off your Claude Code hooks inside claude-bridge turns |
 | `/brigadev:profile …` | Model routing profiles (see below) |
 | `/brigadev:cost` | Session cost: orchestrator per model, subagents per agent, cache hit rate |
@@ -132,6 +134,43 @@ Without a UI (print mode), "ask" means block. The guard recognizes executable fo
 ## Repo docs folder
 
 Harness documents live outside the project, in `~/.brigadev/<repo>/` (`BRIGADEV_HOME` overrides `~/.brigadev`): feature documents in `tasks/`, review ledgers in `reviews/`. `<repo>` is the basename of the main worktree root, so every worktree of a repository shares one folder; outside git it is the directory name. The parent session writes there without asking; subagents still cannot write outside the project. `/brigadev:status` and `/brigadev:doctor` print the resolved folder.
+
+## Workflows
+
+`/brigadev:start` (or `alt+w`, also listed in the `alt+k` palette) opens a list of workflows; Esc at any step cancels and sends nothing. Nine ship with the package: New feature, Bug fix, Review a PR or branch, Open a PR, Answer PR feedback, Create an issue, UI change from a design or ticket, Refactor a component, Upgrade dependencies.
+
+Each workflow asks its own questions (one line, multi-line editor, or a choice; required or optional). Required answers cannot be empty (asked again once, then the workflow is cancelled). Answers the session can find are offered as defaults instead of asked blind: the current and default branch (git) and the repo's `package.json` test script. Only local lookups run; nothing touches the network. Before anything is sent you see the composed request and choose Start, Edit answers, or Cancel. The request quotes every answer verbatim, names the skills and commands the workflow needs, and is sent as a normal message, so the ODD flow and the guard apply. The questions use plain select, input, and editor dialogs, so the menu also works over RPC.
+
+Workflows are markdown files. Add or override them by name in `~/.brigadev/workflows/` (all repos) or `~/.brigadev/<repo>/workflows/` (one repo; wins over the global folder); `BRIGADEV_HOME` moves the root. Invalid files are skipped with a warning. Format (see `assets/workflows/` for the defaults):
+
+```markdown
+---
+name: "Add endpoint"
+description: "One line shown in the menu"
+order: 100          # optional; lower comes first
+questions:
+  - id: route
+    label: "Which route?"
+    kind: text      # text | long | choice
+    required: true
+  - id: auth
+    label: "Authentication"
+    kind: choice
+    options: ["Public", "Signed in"]
+    default: "Signed in"
+  - id: base
+    label: "Base branch"
+    kind: text
+    default: "{{defaultBranch}}"   # facts: currentBranch, defaultBranch, testScript
+---
+Add an endpoint, following the normal ODD flow.
+
+- Route: {{route}}
+- Authentication: {{auth}}
+- Base branch: {{base}}
+```
+
+In the body, `{{id}}` is replaced by the answer (a multi-line answer becomes a block quote), and a line whose answer was skipped is left out. A placeholder that names no question makes the file invalid.
 
 ## Delivery flow
 

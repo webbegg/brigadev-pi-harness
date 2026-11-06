@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Workflow menu (`/brigadev:start`, `alt+w`, also in the command palette): pick one of nine day-to-day workflows (New feature, Bug fix, Review a PR or branch, Open a PR, Answer PR feedback, Create an issue, UI change from a design or ticket, Refactor a component, Upgrade dependencies), answer the questions it declares, review the composed request, and start it. Answers the session can find (current and default branch, the repo's test script) are offered as defaults; only local lookups run. The request quotes every answer verbatim and names the skills and commands it needs. Workflows are markdown files: package defaults in `assets/workflows/`, your own in `~/.brigadev/workflows/` and `~/.brigadev/<repo>/workflows/` override by name or add new ones; invalid files are skipped with a warning. Works over RPC; the orchestrator prompt is unchanged.
+
 ## [0.10.0] - 2026-11-06
 
 - Guard: a dangling symlink now resolves to its target, so a write through a link that points outside the project (or outside the repo docs folder) asks, or is blocked for subagents, instead of following it silently.

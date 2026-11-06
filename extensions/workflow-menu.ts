@@ -1,0 +1,65 @@
+/**
+ * brigadev workflow menu (alt+w, /brigadev:start): pick a day-to-day workflow,
+ * answer the questions it declares, review the composed request, and hand it
+ * to the orchestrator. Workflows are files (assets/workflows/, plus the user's
+ * own in ~/.brigadev/workflows/ and ~/.brigadev/<repo>/workflows/). The dialogs
+ * are select/input/editor, so the menu works in the TUI and over RPC.
+ */
+
+import { join } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { ASSETS_ROOT, isChildSession } from "../lib/runtime.ts";
+import { askQuestions, composeRequest, gatherFacts, type Answers } from "../lib/workflow-run.ts";
+import { discoverWorkflows, workflowDirs } from "../lib/workflows.ts";
+import type { ExecFn } from "../lib/worktree-snapshot.ts";
+
+const SHORTCUT = "alt+w";
+const COMMAND = "brigadev:start";
+const START = "Start";
+const EDIT = "Edit answers";
+const CANCEL = "Cancel";
+
+export default function (pi: ExtensionAPI) {
+	if (isChildSession()) return;
+	const exec: ExecFn = (command, args, options) => pi.exec(command, args, options);
+
+	const open = async (ctx: ExtensionContext) => {
+		if (!ctx.hasUI) return;
+		const { workflows, warnings } = discoverWorkflows({ packageDir: join(ASSETS_ROOT, "workflows"), ...workflowDirs(ctx.cwd), parse: (content) => parseFrontmatter<Record<string, unknown>>(content) });
+		if (warnings.length) ctx.ui.notify(`brigadev: skipped invalid workflow files\n${warnings.join("\n")}`, "warning");
+		if (!workflows.length) return ctx.ui.notify("brigadev: no workflows found", "error");
+
+		const labels = workflows.map((workflow) => `${workflow.name} — ${workflow.description}`);
+		const picked = await ctx.ui.select("Start a workflow", labels);
+		const workflow = picked === undefined ? undefined : workflows[labels.indexOf(picked)];
+		if (!workflow) return;
+
+		const facts = await gatherFacts(exec, ctx.cwd);
+		let answers: Answers | undefined = await askQuestions(workflow, facts, ctx.ui);
+		while (answers) {
+			let request: string;
+			try {
+				request = composeRequest(workflow, answers, facts);
+			} catch (error) {
+				return ctx.ui.notify(`brigadev: ${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+			const choice = await ctx.ui.select(`${workflow.name}: send this request?\n\n${request}`, [START, EDIT, CANCEL]);
+			if (choice === START) {
+				// sendUserMessage returns void; only expandPromptTemplates makes pi treat the text like typed input.
+				try {
+					pi.sendUserMessage(request, { expandPromptTemplates: true });
+				} catch (error) {
+					ctx.ui.notify(`Could not start ${workflow.name}: ${error instanceof Error ? error.message : String(error)}`, "error");
+				}
+				return;
+			}
+			if (choice !== EDIT) break;
+			answers = await askQuestions(workflow, facts, ctx.ui, answers);
+		}
+		ctx.ui.notify(`${workflow.name}: cancelled, nothing sent`, "info");
+	};
+
+	pi.registerCommand(COMMAND, { description: "Start a day-to-day workflow: pick one, answer its questions, send the request", handler: async (_args, ctx) => open(ctx) });
+	pi.registerShortcut(SHORTCUT, { description: "Open the brigadev workflow menu", handler: async (ctx) => open(ctx) });
+}

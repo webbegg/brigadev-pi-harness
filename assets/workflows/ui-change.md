@@ -1,0 +1,35 @@
+---
+name: "UI change from a design or ticket"
+description: "Implement a UI change and verify it against the design"
+order: 70
+questions:
+  - id: source
+    label: "Design link, screenshot path, or ticket"
+    kind: text
+    required: true
+  - id: target
+    label: "Page or component"
+    kind: text
+    required: true
+  - id: criteria
+    label: "Acceptance criteria"
+    kind: long
+    required: true
+  - id: states
+    label: "States and breakpoints to cover"
+    kind: text
+  - id: verify
+    label: "How should it be verified?"
+    kind: choice
+    options: ["Tests", "Manual steps in the summary", "Both"]
+    default: "Both"
+---
+UI change request, started from the workflow menu. Follow the normal ODD flow: explore the existing component and its conventions first, implement the change, then verify it the way requested below.
+
+- Design, screenshot, or ticket: {{source}}
+- Page or component: {{target}}
+- Acceptance criteria: {{criteria}}
+- States and breakpoints to cover: {{states}}
+- Verification: {{verify}}
+
+"Manual steps in the summary" means list the exact steps to check the change by hand in the final summary. If the design source cannot be opened, say so and ask rather than guess at it.
