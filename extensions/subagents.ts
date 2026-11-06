@@ -23,6 +23,7 @@ import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { listWidth, maxScroll, renderTwoPane, type Row } from "../lib/two-pane.ts";
 import type { AgentDefinition } from "../lib/agents.ts";
 import { addUsage, emptyTally, formatCost, formatTokens, priceBridgeMessage, type CostCalculator, type Tally } from "../lib/cost.ts";
+import { createStallWatchdog, resolveStallTimeouts, stallMessage } from "../lib/stall-watchdog.ts";
 import { admitLaunch, buildChildTask, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
 import { classifyFailure, cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
 import { blockedReason, fallbackState } from "../lib/fallback-state.ts";
@@ -155,10 +156,47 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 		else delete env[CHILD_ENV.ALLOWED_SURFACES];
 
 		let aborted = false;
+		let stalled = false;
 		result.exitCode = await new Promise<number>((resolveExit) => {
 			const invocation = piInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, { cwd, env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
 			let buffer = "";
+			let exited = false;
+			let stallError = "";
+			let killTimer: NodeJS.Timeout | undefined;
+
+			// SIGTERM now, SIGKILL after 5 s if the child has not exited by then.
+			const terminate = () => {
+				proc.kill("SIGTERM");
+				killTimer ??= setTimeout(() => !exited && proc.kill("SIGKILL"), 5000);
+			};
+
+			const watchdog = createStallWatchdog({
+				...resolveStallTimeouts(process.env),
+				setTimer: (fn, ms) => setTimeout(fn, ms),
+				clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
+				onStall: (info) => {
+					stalled = true;
+					result.stopReason = "error";
+					stallError = stallMessage(info);
+					result.errorMessage = stallError;
+					terminate();
+				},
+			});
+			watchdog.start();
+
+			const trackActivity = (event: any) => {
+				const msg = event.type === "message_end" ? event.message : undefined;
+				if (msg?.role === "assistant" && Array.isArray(msg.content)) {
+					const calls = msg.content.filter((p: any) => p?.type === "toolCall");
+					for (const call of calls) watchdog.toolStarted(String(call.id), `tool ${call.name}`);
+					if (!calls.length) watchdog.activity("assistant message");
+				} else if (msg?.role === "toolResult") {
+					watchdog.toolFinished(String(msg.toolCallId), `result of ${msg.toolName ?? "tool"}`);
+				} else {
+					watchdog.activity(String(event.type ?? "event"));
+				}
+			};
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
@@ -168,6 +206,7 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 				} catch {
 					return;
 				}
+				trackActivity(event);
 				if (event.type === "message_end" && event.message) {
 					// Bridge turns report $0; price them at list price (see lib/cost.ts).
 					const msg = (priceBridgeMessage(event.message, options.price) ?? event.message) as Message;
@@ -192,10 +231,18 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 				result.stderr += data.toString();
 			});
 			proc.on("close", (code) => {
+				exited = true;
+				watchdog.stop();
+				clearTimeout(killTimer);
 				if (buffer.trim()) processLine(buffer);
-				resolveExit(code ?? 0);
+				// The child may report its own "aborted" on SIGTERM; the stall is the real cause.
+				if (stalled) Object.assign(result, { stopReason: "error", errorMessage: stallError });
+				resolveExit(stalled ? 1 : (code ?? 0));
 			});
 			proc.on("error", (error) => {
+				exited = true;
+				watchdog.stop();
+				clearTimeout(killTimer);
 				result.stderr += String(error);
 				resolveExit(1);
 			});
@@ -203,8 +250,7 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 			if (options.signal) {
 				const kill = () => {
 					aborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 5000);
+					terminate();
 				};
 				if (options.signal.aborted) kill();
 				else options.signal.addEventListener("abort", kill, { once: true });

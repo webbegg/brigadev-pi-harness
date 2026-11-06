@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Subagents: stall watchdog. A child with no event for 4 minutes (30 while a tool call is in flight) is stopped and its run fails with "stalled for N min after: <last step>"; override with `BRIGADEV_STALL_TIMEOUT_MS` and `BRIGADEV_TOOL_STALL_TIMEOUT_MS`. Stopping a child now really sends SIGKILL 5 s after SIGTERM (the old check never fired).
+
 ## [0.8.0] - 2026-11-06
 
 - Side panel (`alt+o`, `/brigadev:panel`): an optional right-anchored overlay with Todos, Agents, Changes, and Session sections, shown on terminals at least 140 columns wide. It is a non-capturing overlay that draws over the right 44 columns of the transcript while open (a docked rail would need private Pi internals), and it repaints only on todo, subagent, and cost updates, a throttled git refresh, and a one-second tick while an agent runs.
