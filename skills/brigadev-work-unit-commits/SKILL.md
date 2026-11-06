@@ -22,6 +22,12 @@ Load before deciding what goes into each commit or PR: committing ODD work, spli
 | Story | A reviewer understands why the commit exists from its diff and message. |
 | Budget is not code-golf | Never delete comments, blank lines, docs, or tests, or compress code, to fit ~400 lines. Slice by unit or report the overage. |
 
+## Branch and automation
+
+- An authorized change on the default branch first starts a `type/description` branch (naming in `brigadev-branch-pr`); never commit authorized work to the default branch.
+- Commit each finished work unit automatically, with its tests and docs, without asking. The guard lets a commit on a feature branch run without a dialog; it still asks on the default branch or a detached HEAD.
+- Push, PR, and merge stay the user's decisions.
+
 ## Checklist before each commit
 
 - [ ] One clear purpose.

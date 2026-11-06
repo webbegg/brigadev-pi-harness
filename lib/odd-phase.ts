@@ -18,7 +18,8 @@ export function inferPhase(toolName: string, input: Record<string, unknown> | un
 			return { phase: "exploring" };
 		case "edit":
 		case "write":
-			return /(^|\/)odd\/tasks\//.test(path) ? { phase: "planning" } : { phase: "implementing" };
+			// Feature documents live in the repo docs folder, ~/.brigadev/<repo>/tasks/.
+			return /(^|\/)\.brigadev\/[^/]+\/tasks\//.test(path) ? { phase: "planning" } : { phase: "implementing" };
 		case "todo":
 			return { phase: "planning" };
 		case "ask_user_choice":

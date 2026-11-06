@@ -6,13 +6,14 @@
  * Subagents load this file explicitly (`-e`), so it must work standalone.
  */
 
-import { dirname, relative, resolve, sep } from "node:path";
+import { resolve } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
-import { classifyCommand } from "../lib/command-classifier.ts";
-import { isWithinSurfaces } from "../lib/edit-surfaces.ts";
-import { commandPreview, decideCommand, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
+import { readBranchFacts } from "../lib/commit-branch.ts";
+import { decideBashCommand, decideFileAccess, type PathVerdict } from "../lib/guard-rules.ts";
+import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
+import { repoDocsDir } from "../lib/repo-docs.ts";
 import { appendSystemPromptOnce, CHILD_ENV, childAllowedSurfaces, isChildSession, readSettings, writeSettings } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
 
@@ -85,7 +86,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const decision = decideCommand(classifyCommand(event.input.command), mode, isChild);
+			const decision = await decideBashCommand({ command: event.input.command, mode, isChild, cwd: ctx.cwd, readFacts: (cwd) => readBranchFacts(exec, cwd) });
 			if (decision.action === "block") return { block: true, reason: decision.reason };
 			if (decision.action === "confirm") {
 				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(event.input.command)}\n\nRun it?`);
@@ -109,36 +110,32 @@ export default function (pi: ExtensionAPI) {
 		const absolute = canonicalPath(resolve(ctx.cwd, expandHome(rawPath)));
 		const root = projectRoot(ctx);
 
-		if (isSensitivePath(absolute)) {
-			if (isChild) return { block: true, reason: `Blocked by brigadev guard: ${rawPath} may hold secrets; subagents never read or write it.` };
+		const decision = decideFileAccess({
+			isChild,
+			isWrite,
+			rawPath,
+			absolutePath: absolute,
+			projectRoot: root,
+			docsDir: () => repoDocsDir(ctx.cwd),
+			sensitive: isSensitivePath(absolute),
+			readOnly: process.env[CHILD_ENV.READ_ONLY] === "1",
+			surfaces: isChild ? childAllowedSurfaces() : undefined,
+			agent: process.env[CHILD_ENV.AGENT],
+		});
+
+		let verdict: PathVerdict;
+		if (decision.action === "ask" && decision.kind === "sensitive") {
 			const ok = await confirm(ctx, "brigadev: sensitive file", `${event.toolName} ${rawPath}\n\nThis path commonly holds secrets or credentials. Allow?`);
 			if (!ok) return { block: true, reason: `User declined access to sensitive file ${rawPath}` };
-		}
+			verdict = decision.then;
+		} else verdict = decision;
 
-		if (!isWrite) return undefined;
-
-		if (!isInside(root, absolute)) {
-			if (isChild) return { block: true, reason: `Blocked by brigadev guard: ${rawPath} is outside the project root ${root}.` };
+		if (verdict.action === "block") return { block: true, reason: verdict.reason };
+		if (verdict.action === "ask") {
 			if ([...outsideGrants].some((granted) => isInside(granted, absolute))) return undefined;
-			const target = dirname(absolute);
-			const ok = await confirm(ctx, "brigadev: write outside project", `${event.toolName} ${absolute}\n\nOutside the project root ${root}. Allow writes under ${target} for this session?`);
+			const ok = await confirm(ctx, "brigadev: write outside project", `${event.toolName} ${absolute}\n\nOutside the project root ${root}. Allow writes under ${verdict.target} for this session?`);
 			if (!ok) return { block: true, reason: `User declined write outside the project root: ${absolute}` };
-			outsideGrants.add(target);
-			return undefined;
-		}
-
-		if (isChild) {
-			if (process.env[CHILD_ENV.READ_ONLY] === "1") {
-				return { block: true, reason: `Blocked by brigadev guard: ${process.env[CHILD_ENV.AGENT] ?? "this agent"} is read-only.` };
-			}
-			const surfaces = childAllowedSurfaces();
-			const rel = relative(root, absolute).split(sep).join("/");
-			if (surfaces && !isWithinSurfaces(rel, surfaces)) {
-				return {
-					block: true,
-					reason: `Blocked by brigadev guard: ${rel} is outside the allowed edit surfaces (${surfaces.join(", ")}). Stop and report status: interaction_required with the path you need.`,
-				};
-			}
+			outsideGrants.add(verdict.target);
 		}
 		return undefined;
 	});

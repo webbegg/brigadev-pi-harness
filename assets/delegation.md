@@ -21,6 +21,7 @@ Run `/brigadev:agents` to see the effective list, including user (`~/.pi/agent/a
 - Launch all independent units in ONE parallel `subagent` call. If they cannot launch together, work inline.
 - Each writer prompt names the existing helpers it must reuse for shared state (records, lists, settings other commands also touch) and the invariants they keep. Parallel writers cannot see each other; this is the only place they learn them.
 - Pass the test-first policy and the exact test commands under a `Verification` heading in the task.
+- Pass `featureDoc` as the absolute path of the document in the repo docs folder named in the orchestrator prompt. Writers read it; only the parent updates it.
 
 ## Allowed edit surfaces
 

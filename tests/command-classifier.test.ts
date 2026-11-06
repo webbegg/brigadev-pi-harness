@@ -219,3 +219,76 @@ describe("dependency changes", () => {
 		assert.equal(hardDenied("npm install"), false);
 	});
 });
+
+describe("shell reserved words before a command", () => {
+	it("classifies the command that follows then, do, else, braces, and the like", () => {
+		assert.deepEqual(kinds("if true; then rm -rf build; fi"), [COMMAND_KIND.DESTRUCTIVE]);
+		assert.deepEqual(kinds("for d in a; do git push --force; done"), [COMMAND_KIND.DESTRUCTIVE]);
+		assert.deepEqual(kinds("{ git push; }"), [COMMAND_KIND.DELIVERY]);
+		assert.deepEqual(kinds("if test -f x; then npm install; else npm ci; fi"), [COMMAND_KIND.DEPENDENCY, COMMAND_KIND.DEPENDENCY]);
+		assert.deepEqual(kinds("while true; do sudo ls; done"), [COMMAND_KIND.PRIVILEGED]);
+		assert.deepEqual(kinds("! git push"), [COMMAND_KIND.DELIVERY]);
+		assert.deepEqual(kinds("if git push; then echo ok; fi"), [COMMAND_KIND.DELIVERY]);
+		assert.deepEqual(kinds("until false; do bash -c 'npm i x'; done"), [COMMAND_KIND.DEPENDENCY]);
+	});
+
+	it("keeps the reason of the command and skips several words in a row", () => {
+		assert.deepEqual(classifyCommand("then git push --force"), [{ kind: COMMAND_KIND.DESTRUCTIVE, reason: "git push rewrites or deletes remote refs" }]);
+		assert.deepEqual(kinds("if ! { git push; }; then true; fi"), [COMMAND_KIND.DELIVERY]);
+	});
+
+	it("marks a commit after a cd inside a group or branch as elsewhere", () => {
+		for (const command of ["{ cd /other/repo; git commit -m x; }", "if true; then cd /other; git commit -m x; fi", "for d in a; do cd /other; git commit -m x; done", "while true; do pushd /other; git commit -m x; done"]) {
+			assert.deepEqual(classifyCommand(command), [{ kind: "delivery", reason: "git commit", commit: true, elsewhere: true }], command);
+		}
+	});
+
+	it("leaves a keyword used as an argument alone", () => {
+		assert.deepEqual(kinds("echo then rm -rf x"), []);
+		assert.deepEqual(kinds("git commit -m then"), [COMMAND_KIND.DELIVERY]);
+	});
+});
+
+describe("commands that rewrite refs", () => {
+	it("flags symbolic-ref writes and not reads", () => {
+		for (const command of ["git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/feat", "git symbolic-ref HEAD refs/heads/main", "git symbolic-ref -m why HEAD refs/heads/x", "git symbolic-ref -d refs/remotes/origin/HEAD", "git -C x symbolic-ref HEAD refs/heads/main"]) {
+			assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+		}
+		for (const command of ["git symbolic-ref HEAD", "git symbolic-ref --short -q HEAD", "git symbolic-ref --short refs/remotes/origin/HEAD"]) {
+			assert.deepEqual(kinds(command), [], command);
+		}
+	});
+
+	it("flags remote set-head", () => {
+		assert.deepEqual(kinds("git remote set-head origin feat/x"), [COMMAND_KIND.DESTRUCTIVE]);
+		assert.deepEqual(kinds("git remote set-head origin -d"), [COMMAND_KIND.DESTRUCTIVE]);
+		assert.deepEqual(kinds("git remote -v"), []);
+		assert.deepEqual(kinds("git remote add origin url"), []);
+	});
+
+	it("flags update-ref writes and keeps the delete reason", () => {
+		assert.deepEqual(kinds("git update-ref refs/remotes/origin/HEAD abc123"), [COMMAND_KIND.DESTRUCTIVE]);
+		assert.deepEqual(kinds("git update-ref --stdin"), [COMMAND_KIND.DESTRUCTIVE]);
+		assert.deepEqual(classifyCommand("git update-ref -d refs/heads/x"), [{ kind: COMMAND_KIND.DESTRUCTIVE, reason: "git update-ref delete" }]);
+	});
+
+	it("flags renaming main or master, and a rename of the current branch", () => {
+		for (const command of ["git branch -m main old", "git branch -M master old", "git branch --move main old", "git branch -m feat main", "git branch -m new-name", "git branch -M new-name"]) {
+			assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+		}
+		for (const command of ["git branch -m old new", "git branch", "git branch --list main", "git branch feat main"]) {
+			assert.deepEqual(kinds(command), [], command);
+		}
+	});
+
+	it("classifies commands behind ! and inside groups", () => {
+		assert.deepEqual(classifyCommand("! git commit -m x"), [{ kind: "delivery", reason: "git commit", commit: true }]);
+		assert.ok(hardDenied("{ rm -rf /; }"));
+		assert.ok(hardDenied("if true; then rm -rf /; fi"));
+		assert.deepEqual(classifyCommand("echo then cd x; git commit -m x"), [{ kind: "delivery", reason: "git commit", commit: true }]);
+	});
+
+	it("leaves read-only ref commands and plain renames alone", () => {
+		for (const command of ["git symbolic-ref -m msg HEAD", "git symbolic-ref -q --short HEAD", "git remote show origin", "git branch -m old new"]) assert.deepEqual(kinds(command), [], command);
+	});
+});
