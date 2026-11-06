@@ -3,12 +3,24 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { askQuestions, composeRequest, gatherFacts, missingRequired, questionDefault, readTestScript, type QuestionUi } from "../lib/workflow-run.ts";
+import { askQuestions, composeRequest, gatherFacts, missingRequired, questionDefault, readTestScript, workflowListLabel, type QuestionUi } from "../lib/workflow-run.ts";
 import type { Workflow, WorkflowQuestion } from "../lib/workflows.ts";
 
 const question = (id: string, extra: Partial<WorkflowQuestion> = {}): WorkflowQuestion => ({ id, label: `Label ${id}`, kind: "text", required: false, ...extra });
 
 const workflow = (body: string, questions: WorkflowQuestion[], name = "Sample"): Workflow => ({ name, description: "d", order: 1, questions, body, source: "package", filePath: "/w.md" });
+
+describe("workflowListLabel", () => {
+	it("shows name, description, and the group label", () => {
+		assert.equal(workflowListLabel({ ...workflow("b", [], "Bug fix"), description: "Reproduce and fix", group: "build" }), "Bug fix — Reproduce and fix [Build]");
+		assert.equal(workflowListLabel({ ...workflow("b", [], "Review"), description: "Look", group: "ship" }), "Review — Look [Review & ship]");
+	});
+
+	it("no group reads as Build; an unknown group keeps its name as written", () => {
+		assert.equal(workflowListLabel({ ...workflow("b", [], "Plain"), description: "d" }), "Plain — d [Build]");
+		assert.equal(workflowListLabel({ ...workflow("b", [], "Notes"), description: "d", group: "Docs work" }), "Notes — d [Docs work]");
+	});
+});
 
 describe("questionDefault", () => {
 	it("fills fact placeholders and drops the default when a fact is missing", () => {

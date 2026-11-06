@@ -3,6 +3,7 @@ name: "Create an issue"
 description: "File a GitHub issue from evidence, after a duplicate search"
 order: 60
 key: "i"
+group: "ship"
 questions:
   - id: type
     label: "What kind of issue is it?"
