@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.12.0] - 2026-11-06
 
 - Launch dashboard: submenus. The top level now lists four groups, Build (`1`: `n b u x d`), Review & ship (`2`: `r p f i`), Inspect (`3`: `g a c s t o`), and Settings (`4`: `m e h y`), then Commands (`k`), Chat (`Enter`), and Quit (`q`). `Enter` or `→` opens a group, `←` or `Esc` goes back (selection returns to the group's row), and `Esc` on the top level still goes to the chat. Every key works from any level: letters run their row, digits open their group. New rows: Cost (`/brigadev:cost`), Usage (`/brigadev:usage`), Status (`/brigadev:status`), Panel (`/brigadev:panel`), Doctor (`/brigadev:doctor`), Permission mode (`e`, runs `/brigadev:mode status` only, it never changes the mode), and Launch dashboard on/off (`h`, runs `/brigadev:ui dashboard off` when the automatic start is on, `on` when it is off; when `BRIGADEV_DASHBOARD=0` (or `off`/`false`) is set it sends nothing and says the dashboard is off for this shell).
 - Workflows: optional `group:` frontmatter field (`build`, `ship`, `inspect`, `settings`, or any other name for a new category on the top level after Review & ship, with the next digit `5`–`9`); no field means Build, an empty or non-string value makes the file invalid (empty `group:` line = none), and an override without a `group` keeps the shipped one. The shipped workflows are grouped (Build: new feature, bug fix, UI change, refactor, dependencies; Review & ship: review, open PR, PR feedback, issue). The `alt+w` list stays plain and shows each workflow's group in brackets.
