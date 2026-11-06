@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.0] - 2026-11-06
 
 - Subagents: stall watchdog. A child with no event for 4 minutes (30 while a tool call is in flight) is stopped and its run fails with "stalled for N min after: <last step>"; override with `BRIGADEV_STALL_TIMEOUT_MS` and `BRIGADEV_TOOL_STALL_TIMEOUT_MS`. Stopping a child now really sends SIGKILL 5 s after SIGTERM (the old check never fired).
 
