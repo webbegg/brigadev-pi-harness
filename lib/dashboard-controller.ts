@@ -3,8 +3,9 @@
 // extension supplies the key matcher, the Pi calls, and the timers; this file
 // decides.
 
-import { allEntries, DASHBOARD_HINT, entryForKey, GROUP_HINT, hasInitialPrompt, hasMessageEntries, shouldShowDashboard, wrapSelection, type DashboardAction, type DashboardEntry, type DashboardMenu, type EntryAction } from "./dashboard.ts";
+import { allEntries, DASHBOARD_HINT, entryForKey, GROUP_HINT, hasInitialPrompt, hasMessageEntries, renderDashboard, shouldShowDashboard, wrapSelection, type DashboardAction, type DashboardEntry, type DashboardGroup, type DashboardMenu, type EntryAction } from "./dashboard.ts";
 import { isChildSession, readSettings, type BrigadevSettings } from "./runtime.ts";
+import type { Painter } from "./two-pane.ts";
 
 export const START_COMMAND = "/brigadev:start";
 /** `BRIGADEV_DASHBOARD=0` (or `off`/`false`) skips the automatic open, whatever the settings say. */
@@ -33,13 +34,26 @@ const LEGACY_SEQUENCES: Record<DashboardKey, readonly string[]> = {
 /** Plain terminal sequences only; the default for tests and callers without a terminal library. */
 export const legacyKeys: KeyMatcher = (data, key) => LEGACY_SEQUENCES[key].includes(data);
 
+/** The group the state has open, or undefined on the top level (and for a group the menu does not have). */
+export function openGroup(menu: DashboardMenu, state: DashboardState): DashboardGroup | undefined {
+	return state.level === "group" ? menu.groups.find((candidate) => candidate.id === state.group) : undefined;
+}
+
 /** What the dashboard shows for a state: the rows, the open group's name, and the hint. */
 export function viewFor(menu: DashboardMenu, state: DashboardState): { entries: readonly DashboardEntry[]; heading?: string; hint: string } {
-	const group = state.level === "group" ? menu.groups.find((candidate) => candidate.id === state.group) : undefined;
+	const group = openGroup(menu, state);
 	return group ? { entries: group.items, heading: group.label, hint: GROUP_HINT } : { entries: menu.top, hint: DASHBOARD_HINT };
 }
 
-const openGroup = (menu: DashboardMenu, id: string): { state: DashboardState } | undefined => (menu.groups.some((group) => group.id === id) ? { state: { level: "group", group: id, selected: 0 } } : undefined);
+export const DASHBOARD_TITLE = "brigadev";
+
+/** The dashboard's lines for a state: the view's rows, heading and hint, with the cursor on `state.selected`. `subtitle` is the repo name. */
+export function renderState(menu: DashboardMenu, state: DashboardState, size: { width: number; height: number }, painter: Painter, subtitle?: string): string[] {
+	const { entries, heading, hint } = viewFor(menu, state);
+	return renderDashboard({ ...size, title: DASHBOARD_TITLE, subtitle, entries, selected: state.selected, heading, hint }, painter);
+}
+
+const enterGroup = (menu: DashboardMenu, id: string): { state: DashboardState } | undefined => (menu.groups.some((group) => group.id === id) ? { state: { level: "group", group: id, selected: 0 } } : undefined);
 
 /** The top level with the selection on the group's own row. */
 const backTo = (menu: DashboardMenu, id: string): DashboardState => ({ level: "top", selected: Math.max(0, menu.top.findIndex((entry) => entry.action.kind === "group" && entry.action.id === id)) });
@@ -51,10 +65,11 @@ const backTo = (menu: DashboardMenu, id: string): DashboardState => ({ level: "t
  * the dashboard should close with that action.
  */
 export function reduceKey(state: DashboardState, data: string, menu: DashboardMenu, matches: KeyMatcher = legacyKeys): { state: DashboardState; done?: DashboardAction } {
-	const { entries } = viewFor(menu, state);
-	const openId = state.level === "group" && entries !== menu.top ? state.group : undefined;
+	const group = openGroup(menu, state);
+	const entries = group ? group.items : menu.top;
+	const openId = group?.id;
 	const run = (action: EntryAction | undefined): { state: DashboardState; done?: DashboardAction } => {
-		if (action?.kind === "group") return openGroup(menu, action.id) ?? { state };
+		if (action?.kind === "group") return enterGroup(menu, action.id) ?? { state };
 		return { state, done: action ?? { kind: "chat" } };
 	};
 
@@ -82,6 +97,8 @@ export interface DispatchDeps {
 	notify: (message: string, level: NotifyLevel) => void;
 	/** Reads the brigadev settings when the dashboard toggle runs. Defaults to the settings file. */
 	readSettings?: () => BrigadevSettings;
+	/** The environment the dashboard toggle checks for `BRIGADEV_DASHBOARD`. Defaults to `process.env`. */
+	env?: () => NodeJS.ProcessEnv;
 }
 
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
@@ -98,6 +115,8 @@ export function dispatch(action: DashboardAction | undefined, deps: DispatchDeps
 	if (action?.kind === "workflow") send(`${START_COMMAND} ${action.query}`);
 	else if (action?.kind === "command") send(action.command);
 	else if (action?.kind === "toggle-dashboard") {
+		const env = (deps.env ?? (() => process.env))();
+		if (dashboardDisabledByEnv(env)) return deps.notify(`brigadev: the launch dashboard is off for this shell (${DASHBOARD_ENV}=${env[DASHBOARD_ENV]}); unset it to use the setting`, "info");
 		let enabled: boolean;
 		try {
 			enabled = (deps.readSettings ?? readSettings)().ui?.dashboard !== false;

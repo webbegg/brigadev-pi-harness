@@ -13,8 +13,8 @@ import { basename } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
-import { dispatch, reduceKey, scheduleAutoOpen, shouldOpenOnStart, startState, viewFor, type DashboardState } from "../lib/dashboard-controller.ts";
-import { buildMenu, DASHBOARD_COMMAND, renderDashboard, type DashboardAction } from "../lib/dashboard.ts";
+import { dispatch, reduceKey, renderState, scheduleAutoOpen, shouldOpenOnStart, startState, type DashboardState } from "../lib/dashboard-controller.ts";
+import { buildMenu, DASHBOARD_COMMAND, type DashboardAction } from "../lib/dashboard.ts";
 import { isChildSession, PACKAGE_WORKFLOWS_DIR } from "../lib/runtime.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { loadWorkflows, workflowDirs } from "../lib/workflows.ts";
@@ -50,10 +50,7 @@ export default function (pi: ExtensionAPI) {
 						if (result.done) return done(result.done);
 						tui.requestRender();
 					},
-					render: (width: number) => {
-						const { entries, heading, hint } = viewFor(menu, state);
-						return renderDashboard({ width, height: tui.terminal.rows, title: "brigadev", subtitle: repo, entries, selected: state.selected, heading, hint }, painter);
-					},
+					render: (width: number) => renderState(menu, state, { width, height: tui.terminal.rows }, painter, repo),
 				};
 			}, FULLSCREEN_OVERLAY);
 		} finally {

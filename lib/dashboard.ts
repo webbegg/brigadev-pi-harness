@@ -3,7 +3,7 @@
 // and nothing here imports Pi or the TUI.
 
 import { pad, windowStart, type Painter } from "./two-pane.ts";
-import { workflowGroup, workflowId, type Workflow } from "./workflows.ts";
+import { CUSTOM_GROUP_ORDER, SHIPPED_GROUPS, workflowGroup, workflowId, type Workflow } from "./workflows.ts";
 
 /** What closes the dashboard and runs. */
 export type DashboardAction =
@@ -98,9 +98,7 @@ const TOP_TOOLS: DashboardEntry[] = [
 	{ id: "quit", icon: "✕", label: "Quit", key: "q", action: { kind: "quit" } },
 ];
 
-const GROUP_ICONS: Record<string, string> = { build: "⊞", ship: "⇡", inspect: "◉", settings: "⚙" };
-/** Digits of the shipped groups; new categories take the next ones. */
-const GROUP_DIGITS: Record<string, string> = { build: "1", ship: "2", inspect: "3", settings: "4" };
+/** New categories take the digits after the shipped groups'. */
 const FIRST_CUSTOM_DIGIT = 5;
 const LAST_DIGIT = 9;
 
@@ -124,17 +122,16 @@ export function buildMenu(workflows: readonly Workflow[]): DashboardMenu {
 		bucket.rows.push(workflowRow(workflow));
 		byGroup.set(id, bucket);
 	}
-	const shipped = (id: string, label: string): DashboardGroup => ({ id, label, icon: GROUP_ICONS[id], key: GROUP_DIGITS[id], items: [] });
-	const order = [shipped("build", "Build"), shipped("ship", "Review & ship")];
-	const custom = [...byGroup.entries()].filter(([id]) => !Object.hasOwn(GROUP_DIGITS, id));
+	const order: Array<{ order: number; group: DashboardGroup }> = SHIPPED_GROUPS.map((group) => ({ order: group.order, group: { id: group.id, label: group.label, icon: group.icon, key: group.digit, items: [] } }));
+	const custom = [...byGroup.entries()].filter(([id]) => !SHIPPED_GROUPS.some((group) => group.id === id));
 	custom.forEach(([id, { label }], index) => {
 		const digit = FIRST_CUSTOM_DIGIT + index;
-		order.push({ id, label, icon: DEFAULT_ICON, key: digit <= LAST_DIGIT ? String(digit) : undefined, items: [] });
+		order.push({ order: CUSTOM_GROUP_ORDER, group: { id, label, icon: DEFAULT_ICON, key: digit <= LAST_DIGIT ? String(digit) : undefined, items: [] } });
 	});
-	order.push(shipped("inspect", "Inspect"), shipped("settings", "Settings"));
+	order.sort((a, b) => a.order - b.order);
 
 	const groups = order
-		.map((group) => ({ ...group, items: [...(byGroup.get(group.id)?.rows ?? []), ...(Object.hasOwn(GROUP_TOOLS, group.id) ? GROUP_TOOLS[group.id] : [])] }))
+		.map(({ group }) => ({ ...group, items: [...(byGroup.get(group.id)?.rows ?? []), ...(Object.hasOwn(GROUP_TOOLS, group.id) ? GROUP_TOOLS[group.id] : [])] }))
 		.filter((group) => group.items.length > 0);
 	const groupRows = groups.map((group): DashboardEntry => ({
 		id: `group:${group.id}`,

@@ -29,13 +29,28 @@ export interface WorkflowGroup {
 	label: string;
 }
 
-/** The dashboard's own groups, in display order. A workflow's `group:` matches one by id or label, ignoring case. */
-export const KNOWN_GROUPS: readonly WorkflowGroup[] = [
-	{ id: "build", label: "Build" },
-	{ id: "ship", label: "Review & ship" },
-	{ id: "inspect", label: "Inspect" },
-	{ id: "settings", label: "Settings" },
+/** A group the dashboard ships, with what it needs to show it. */
+export interface ShippedGroup extends WorkflowGroup {
+	/** Display position among the groups; the groups a workflow file adds sit at `CUSTOM_GROUP_ORDER`. */
+	order: number;
+	/** The key that opens the group. */
+	digit: string;
+	icon: string;
+}
+
+/** Where the groups a workflow file adds are shown: after Review & ship, before Inspect. */
+export const CUSTOM_GROUP_ORDER = 50;
+
+/** The one table of the dashboard's own groups. Plain BMP symbols, no Nerd Font glyphs. */
+export const SHIPPED_GROUPS: readonly ShippedGroup[] = [
+	{ id: "build", label: "Build", order: 10, digit: "1", icon: "⊞" },
+	{ id: "ship", label: "Review & ship", order: 20, digit: "2", icon: "⇡" },
+	{ id: "inspect", label: "Inspect", order: 90, digit: "3", icon: "◉" },
+	{ id: "settings", label: "Settings", order: 100, digit: "4", icon: "⚙" },
 ];
+
+/** The dashboard's own groups, in display order. A workflow's `group:` matches one by id or label, ignoring case. */
+export const KNOWN_GROUPS: readonly WorkflowGroup[] = SHIPPED_GROUPS.map(({ id, label }) => ({ id, label }));
 
 const DEFAULT_GROUP = KNOWN_GROUPS[0];
 

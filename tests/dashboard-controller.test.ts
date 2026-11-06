@@ -12,6 +12,7 @@ import {
 	legacyKeys,
 	openFailureMessage,
 	reduceKey,
+	renderState,
 	scheduleAutoOpen,
 	shouldOpenOnStart,
 	START_COMMAND,
@@ -23,7 +24,15 @@ import {
 	type LaunchReaders,
 } from "../lib/dashboard-controller.ts";
 import { CHILD_ENV, readSettings, runUiCommand, settingsPath, type BrigadevSettings } from "../lib/runtime.ts";
+import type { Painter } from "../lib/two-pane.ts";
 import type { Workflow } from "../lib/workflows.ts";
+
+const plain: Painter = {
+	paint: (_tone, text) => text,
+	bold: (text) => text,
+	measure: (text) => text.length,
+	truncate: (text, width) => text.slice(0, width),
+};
 
 const workflow = (name: string, id: string, key?: string, group?: string): Workflow => ({ name, description: "d", order: 1, questions: [], body: "b", source: "package", filePath: `/w/${id}.md`, ...(key ? { key } : {}), ...(group ? { group } : {}) });
 const NINE: Array<[string, string, string, string]> = [
@@ -68,6 +77,51 @@ describe("viewFor", () => {
 
 	it("an unknown group falls back to the top level", () => {
 		assert.equal(viewFor(menu, inGroup("nope")).entries, menu.top);
+	});
+});
+
+describe("renderState", () => {
+	const size = { width: 80, height: 40 };
+	const render = (state: DashboardState) => renderState(menu, state, size, plain, "my-repo");
+	const cursorRows = (lines: string[]) => lines.map((line) => line.trim()).filter((line) => line.startsWith("›"));
+
+	it("a group shows its name, its rows with the cursor on the selection, and the group hint", () => {
+		const lines = render(inGroup("inspect", 2));
+		const text = lines.join("\n");
+		assert.equal(lines.length, size.height);
+		assert.match(text, /brigadev · my-repo/);
+		assert.ok(lines.some((line) => line.trim() === "Inspect"), "heading");
+		assert.ok(text.includes(GROUP_HINT), "group hint");
+		assert.ok(!text.includes(DASHBOARD_HINT), "no top hint");
+		for (const entry of groupItems("inspect")) assert.ok(text.includes(entry.label), entry.label);
+		for (const entry of groupItems("build")) assert.ok(!text.includes(entry.label), entry.label);
+		const cursor = cursorRows(lines);
+		assert.equal(cursor.length, 1);
+		assert.ok(cursor[0].includes(groupItems("inspect")[2].label), cursor[0]);
+	});
+
+	it("the cursor follows state.selected in the group", () => {
+		for (const index of [0, 1, groupItems("settings").length - 1]) {
+			const cursor = cursorRows(render(inGroup("settings", index)));
+			assert.equal(cursor.length, 1);
+			assert.ok(cursor[0].includes(groupItems("settings")[index].label), `${index}: ${cursor[0]}`);
+		}
+	});
+
+	it("the top level shows the top rows and the top hint, with no heading", () => {
+		const lines = render(atTop(topIndex("Chat")));
+		const text = lines.join("\n");
+		assert.ok(text.includes(DASHBOARD_HINT), "top hint");
+		assert.ok(!text.includes(GROUP_HINT), "no group hint");
+		for (const label of TOP) assert.ok(text.includes(label), label);
+		assert.ok(!text.includes("Cost"), "group rows stay hidden");
+		const cursor = cursorRows(lines);
+		assert.equal(cursor.length, 1);
+		assert.ok(cursor[0].includes("Chat"), cursor[0]);
+	});
+
+	it("a state pointing at a missing group renders the top level", () => {
+		assert.deepEqual(render(inGroup("nope", 1)), render(atTop(1)));
 	});
 });
 
@@ -293,6 +347,24 @@ describe("dispatch", () => {
 		assert.deepEqual(calls.map((call) => call[1]), ["/brigadev:ui dashboard off", "/brigadev:ui dashboard on"]);
 	});
 
+	it("BRIGADEV_DASHBOARD turning the dashboard off makes the row send nothing and say why", () => {
+		for (const value of ["0", "off", "false"]) {
+			for (const settings of [{}, { ui: { dashboard: false } }] as BrigadevSettings[]) {
+				const { calls, deps } = make();
+				dispatch({ kind: "toggle-dashboard" }, { ...deps, readSettings: () => settings, env: () => ({ [DASHBOARD_ENV]: value }) });
+				assert.deepEqual(calls, [["notify", `brigadev: the launch dashboard is off for this shell (BRIGADEV_DASHBOARD=${value}); unset it to use the setting`, "info"]], `${value} ${JSON.stringify(settings)}`);
+			}
+		}
+	});
+
+	it("an environment that does not disable the dashboard leaves the toggle as it was", () => {
+		for (const env of [{}, { [DASHBOARD_ENV]: "1" }, { [DASHBOARD_ENV]: "" }] as NodeJS.ProcessEnv[]) {
+			const { calls, deps } = make();
+			dispatch({ kind: "toggle-dashboard" }, { ...deps, readSettings: () => ({}), env: () => env });
+			assert.deepEqual(calls, [["send", "/brigadev:ui dashboard off", { expandPromptTemplates: true }]], JSON.stringify(env));
+		}
+	});
+
 	it("a failing settings read is reported, nothing is sent", () => {
 		const { calls, deps } = make();
 		dispatch({ kind: "toggle-dashboard" }, { ...deps, readSettings: () => { throw new Error("EACCES"); } });
@@ -407,6 +479,18 @@ describe("shouldOpenOnStart (settings read from a temp PI_CODING_AGENT_DIR)", ()
 
 	it("skips inside a subagent", () => {
 		assert.equal(shouldOpenOnStart(fresh, readers({ env: { [CHILD_ENV.CHILD]: "1" } })), false);
+	});
+
+	it("the toggle row reads the real settings file by default", () => {
+		const sent: string[] = [];
+		const deps: DispatchDeps = { sendUserMessage: (text) => void sent.push(text), shutdown: () => {}, notify: () => {}, env: () => ({}) };
+		writeFile({ ui: { dashboard: false } });
+		dispatch({ kind: "toggle-dashboard" }, deps);
+		writeFile({ ui: { dashboard: true } });
+		dispatch({ kind: "toggle-dashboard" }, deps);
+		rmSync(settingsFile(), { force: true });
+		dispatch({ kind: "toggle-dashboard" }, deps);
+		assert.deepEqual(sent, ["/brigadev:ui dashboard on", "/brigadev:ui dashboard off", "/brigadev:ui dashboard off"]);
 	});
 
 	it("`/brigadev:ui dashboard off` then a fresh start does not open; `on` brings it back", () => {

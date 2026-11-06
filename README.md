@@ -218,7 +218,7 @@ Every key works from any level: a letter runs its row, a digit opens its group. 
 | `4` | | Settings | opens the group |
 | `m` | Settings | Model profile | `/brigadev:profile use` (pick a profile) |
 | `e` | Settings | Permission mode | `/brigadev:mode status` (shows the mode; it never changes it, switching stays a typed `/brigadev:mode` command) |
-| `h` | Settings | Launch dashboard on/off | `/brigadev:ui dashboard off` when the automatic start is on, `on` when it is off |
+| `h` | Settings | Launch dashboard on/off | `/brigadev:ui dashboard off` when the automatic start is on, `on` when it is off; with `BRIGADEV_DASHBOARD=0` set it sends nothing and says the dashboard is off for this shell |
 | `y` | Settings | Doctor | `/brigadev:doctor` |
 | `k` | | Commands | `/brigadev:commands` |
 | `Enter` on Chat, or `Esc` on the top level | | Chat | closes the dashboard |

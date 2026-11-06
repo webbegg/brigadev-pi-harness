@@ -6,7 +6,7 @@ import { after, before, describe, it } from "node:test";
 import { type FrontmatterParser } from "../lib/agents.ts";
 import { ASSETS_ROOT } from "../lib/runtime.ts";
 import { composeRequest } from "../lib/workflow-run.ts";
-import { discoverWorkflows, loadWorkflows, parseWorkflow, RESERVED_KEYS, resolveWorkflow, workflowDirs, workflowGroup, workflowId, type Workflow } from "../lib/workflows.ts";
+import { CUSTOM_GROUP_ORDER, discoverWorkflows, KNOWN_GROUPS, loadWorkflows, parseWorkflow, RESERVED_KEYS, resolveWorkflow, SHIPPED_GROUPS, workflowDirs, workflowGroup, workflowId, type Workflow } from "../lib/workflows.ts";
 
 /**
  * Stand-in for Pi's YAML frontmatter parser, so the loader tests run without
@@ -425,6 +425,15 @@ describe("workflowGroup", () => {
 
 	it("an unknown name is its own category, labelled as written", () => {
 		assert.deepEqual(workflowGroup(make("Docs work")), { id: "docs work", label: "Docs work" });
+	});
+
+	it("the shipped groups come from one table: Build 1, Review & ship 2, then new categories, Inspect 3, Settings 4", () => {
+		assert.deepEqual(KNOWN_GROUPS, SHIPPED_GROUPS.map(({ id, label }) => ({ id, label })));
+		const byOrder = [...SHIPPED_GROUPS].sort((a, b) => a.order - b.order);
+		assert.deepEqual(byOrder.map((group) => group.id), ["build", "ship", "inspect", "settings"]);
+		assert.deepEqual(byOrder.map((group) => group.digit), ["1", "2", "3", "4"]);
+		assert.ok(byOrder[1].order < CUSTOM_GROUP_ORDER && CUSTOM_GROUP_ORDER < byOrder[2].order);
+		assert.equal(new Set(SHIPPED_GROUPS.map((group) => group.icon)).size, SHIPPED_GROUPS.length);
 	});
 });
 
