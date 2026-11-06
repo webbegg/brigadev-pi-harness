@@ -1,6 +1,6 @@
 {
 	"name": "brigadev-harness",
-	"version": "0.7.0",
+	"version": "0.8.0",
 	"description": "Opinionated Pi harness: ODD workflow orchestrator, focused subagents with per-agent model routing, cost visibility, 4R and Judgment Day review, safety guard, and delivery skills.",
 	"license": "MIT",
 	"type": "module",

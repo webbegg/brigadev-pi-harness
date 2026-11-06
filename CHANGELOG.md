@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.8.0] - 2026-11-06
 
 - Side panel (`alt+o`, `/brigadev:panel`): an optional right-anchored overlay with Todos, Agents, Changes, and Session sections, shown on terminals at least 140 columns wide. It is a non-capturing overlay that draws over the right 44 columns of the transcript while open (a docked rail would need private Pi internals), and it repaints only on todo, subagent, and cost updates, a throttled git refresh, and a one-second tick while an agent runs.
 
