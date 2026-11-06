@@ -152,4 +152,6 @@ Pure logic lives in `lib/` and is covered by `tests/`. Extensions are thin adapt
 - No "auto" permission mode (classifier-based approvals).
 - Memory mirroring of feature documents is used only when a memory tool such as `mem_save` is available.
 
-See `NOTICE.md` for attribution.
+## License
+
+MIT © 2026 Marcos Juan (see `LICENSE`). brigadev-harness builds on ideas and adapted material from [gentle-shell](https://github.com/Gentleman-Programming/gentle-shell) and Pi's subagent example; credits and their license notices are in `NOTICE.md`.

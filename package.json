@@ -47,6 +47,7 @@
 		"skills/",
 		"README.md",
 		"NOTICE.md",
+		"LICENSE",
 		"CHANGELOG.md"
 	],
 	"scripts": {
