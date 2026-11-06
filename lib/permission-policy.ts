@@ -9,7 +9,7 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
 
 /** One line per mode, appended to the parent's system prompt every turn. */
 export const MODE_PROMPT: Record<PermissionMode, string> = {
-	normal: "Permission mode NORMAL: the guard asks the user before commits, pushes, PR/issue writes, and destructive, publish, privileged, or dependency-changing commands. Run the command; don't ask in chat first.",
+	normal: "Permission mode NORMAL: the guard asks the user before commits on the default branch, pushes, PR/issue writes, and destructive, publish, privileged, or dependency commands. Run the command; don't ask in chat first.",
 	yolo: "Permission mode YOLO: commits, non-force pushes, and PR/issue creation run without asking; destructive, publish, privileged, and dependency (install) commands still ask.",
 };
 
@@ -21,7 +21,8 @@ export type Decision = { action: "allow" } | { action: "confirm"; reason: string
  * - Hard-deny forms are always blocked.
  * - Subagents (no human in the loop) never run destructive, delivery,
  *   publish, privileged, or dependency commands: delivery is parent-owned.
- * - NORMAL asks before every risky kind.
+ * - NORMAL asks before every risky kind (commits on feature branches are
+ *   waived by `decideWithBranchRule` in commit-branch.ts).
  * - YOLO gives standing permission for ordinary delivery (commits,
  *   non-force pushes, PR/issue creation) but still asks for destructive,
  *   publish, privileged, and dependency commands.

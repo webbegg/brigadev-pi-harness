@@ -19,6 +19,14 @@ export interface CommandMatch {
 	reason: string;
 	/** Catastrophic forms that are never allowed, whatever the mode. */
 	hardDeny?: boolean;
+	/** A `git commit` (set on that match only; kind and reason are unchanged). */
+	commit?: boolean;
+	/**
+	 * Set with `commit` when it may not run in the session's directory or on
+	 * its current branch: a preceding `cd`, branch switch, or `-C`/`--git-dir`/
+	 * `--work-tree` style redirection.
+	 */
+	elsewhere?: boolean;
 }
 
 const SEPARATORS = new Set([";", "&&", "||", "|", "&", "\n", "(", ")"]);
@@ -365,6 +373,47 @@ function classifyRm(args: string[], viaXargs: boolean): CommandMatch | undefined
 	return { kind: COMMAND_KIND.DESTRUCTIVE, reason: `rm ${recursive ? "recursive" : "forced"} removal` };
 }
 
+// Git subcommands that neither move HEAD to another branch nor change which
+// repository a later command in the same line acts on.
+const STAYS_ON_BRANCH_GIT = new Set(["add", "rm", "mv", "status", "diff", "log", "show", "apply", "fetch", "pull", "push", "commit", "stash", "tag", "blame", "ls-files", "rev-parse", "remote", "describe"]);
+
+// Variables that point git at another repository, work tree, ref store, or index.
+const GIT_LOCATION_ASSIGNMENT = /^(GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_INDEX_FILE)=/;
+
+/** Any word of the segment assigns a git-location variable (prefix, `env`, `export`, `declare -x`, ...). */
+function setsGitLocation(rawArgv: string[]): boolean {
+	return rawArgv.some((a) => GIT_LOCATION_ASSIGNMENT.test(a));
+}
+
+/** Directory or branch changes by the segment, which make a later `git commit` land somewhere the guard did not inspect. */
+function changesCommitTarget(rawArgv: string[]): boolean {
+	if (setsGitLocation(rawArgv)) return true;
+	const { argv } = unwrap(rawArgv);
+	if (argv.length === 0) return false;
+	const name = basename(argv[0]);
+	const args = argv.slice(1);
+	if (name === "cd" || name === "pushd" || name === "popd") return true;
+	if (name === "git") {
+		const index = gitSubcommand(args);
+		return index === -1 || !STAYS_ON_BRANCH_GIT.has(args[index]);
+	}
+	if (name === "gh") return args.includes("checkout");
+	if (SHELLS.has(name) || name === "eval") {
+		const scriptIndex = name === "eval" ? 0 : args.findIndex((a) => /^-[a-z]*c[a-z]*$/.test(a));
+		const script = name === "eval" ? args.join(" ") : scriptIndex >= 0 ? args[scriptIndex + 1] : undefined;
+		return script !== undefined && tokenize(blankHeredocs(script)).some((segment) => changesCommitTarget(segment.argv));
+	}
+	return false;
+}
+
+/** True when the git invocation targets another repository or work tree than the current directory's. */
+function gitTargetsElsewhere(args: string[], rawArgv: string[]): boolean {
+	const gitAt = rawArgv.findIndex((a) => basename(a) === "git");
+	if (setsGitLocation(rawArgv.slice(0, Math.max(gitAt, 0)))) return true;
+	const index = gitSubcommand(args);
+	return args.slice(0, Math.max(index, 0)).some((a, i) => a === "-C" || a.startsWith("--git-dir") || a.startsWith("--work-tree") || (a === "-c" && /^core\.(worktree|bare)\b/i.test(args[i + 1] ?? "")));
+}
+
 /** Returns the git subcommand index, skipping global options such as -C <dir>. */
 function gitSubcommand(args: string[]): number {
 	for (let i = 0; i < args.length; i++) {
@@ -427,7 +476,7 @@ function classifyGit(args: string[]): CommandMatch | undefined {
 			return { kind: COMMAND_KIND.DELIVERY, reason: "git push" };
 		}
 		case "commit":
-			return { kind: COMMAND_KIND.DELIVERY, reason: hasAny(rest, "--amend") ? "git commit --amend" : "git commit" };
+			return { kind: COMMAND_KIND.DELIVERY, reason: hasAny(rest, "--amend") ? "git commit --amend" : "git commit", commit: true };
 		default:
 			return undefined;
 	}
@@ -477,7 +526,12 @@ function classifySegment(rawArgv: string[], before: string): CommandMatch[] {
 	if (SHELLS.has(name) || name === "eval") {
 		const scriptIndex = name === "eval" ? 0 : args.findIndex((a) => /^-[a-z]*c[a-z]*$/.test(a));
 		const script = name === "eval" ? args.join(" ") : scriptIndex >= 0 ? args[scriptIndex + 1] : undefined;
-		if (script) matches.push(...classifyCommand(script));
+		if (script) {
+			const nested = classifyCommand(script);
+			// A location variable set on the wrapper applies to every git call inside its script.
+			if (setsGitLocation(rawArgv)) for (const match of nested) if (match.commit) match.elsewhere = true;
+			matches.push(...nested);
+		}
 		else if (before === "|") matches.push({ kind: COMMAND_KIND.PRIVILEGED, reason: `piping into ${name} executes downloaded or generated code` });
 		return matches;
 	}
@@ -491,6 +545,7 @@ function classifySegment(rawArgv: string[], before: string): CommandMatch[] {
 			break;
 		case "git":
 			match = classifyGit(args);
+			if (match?.commit && gitTargetsElsewhere(args, rawArgv)) match.elsewhere = true;
 			break;
 		case "gh":
 			match = classifyGh(args);
@@ -586,8 +641,12 @@ function classifySegment(rawArgv: string[], before: string): CommandMatch[] {
 /** Classifies every recognizable risky segment of a shell command. */
 export function classifyCommand(command: string): CommandMatch[] {
 	const matches: CommandMatch[] = [];
+	let moved = false;
 	for (const segment of tokenize(blankHeredocs(command))) {
-		matches.push(...classifySegment(segment.argv, segment.before));
+		const found = classifySegment(segment.argv, segment.before);
+		if (moved) for (const match of found) if (match.commit) match.elsewhere = true;
+		matches.push(...found);
+		moved ||= changesCommitTarget(segment.argv);
 	}
 	return matches;
 }

@@ -10,9 +10,11 @@ import { dirname, relative, resolve, sep } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
+import { decideWithBranchRule, readBranchFacts } from "../lib/commit-branch.ts";
 import { isWithinSurfaces } from "../lib/edit-surfaces.ts";
-import { commandPreview, decideCommand, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
+import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
+import { isRepoDocsPath, repoDocsDir } from "../lib/repo-docs.ts";
 import { appendSystemPromptOnce, CHILD_ENV, childAllowedSurfaces, isChildSession, readSettings, writeSettings } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
 
@@ -85,7 +87,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const decision = decideCommand(classifyCommand(event.input.command), mode, isChild);
+			const decision = await decideWithBranchRule(classifyCommand(event.input.command), mode, isChild, () => readBranchFacts(exec, ctx.cwd));
 			if (decision.action === "block") return { block: true, reason: decision.reason };
 			if (decision.action === "confirm") {
 				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(event.input.command)}\n\nRun it?`);
@@ -118,6 +120,8 @@ export default function (pi: ExtensionAPI) {
 		if (!isWrite) return undefined;
 
 		if (!isInside(root, absolute)) {
+			// The parent's harness documents (feature documents, review ledgers) live outside the project by design.
+			if (!isChild && isRepoDocsPath(repoDocsDir(ctx.cwd), absolute)) return undefined;
 			if (isChild) return { block: true, reason: `Blocked by brigadev guard: ${rawPath} is outside the project root ${root}.` };
 			if ([...outsideGrants].some((granted) => isInside(granted, absolute))) return undefined;
 			const target = dirname(absolute);
