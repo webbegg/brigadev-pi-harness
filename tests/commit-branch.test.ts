@@ -10,7 +10,12 @@ import { type BranchFacts, decideWithBranchRule, parseOriginHead, pickDefaultBra
 import { PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import type { ExecFn } from "../lib/worktree-snapshot.ts";
 
-const FEATURE: BranchFacts = { currentBranch: "feat/x", defaultBranch: "main" };
+const facts = (currentBranch: string | null, defaultBranch: string | null, protectedBranches: string[] = defaultBranch ? [defaultBranch] : []): BranchFacts => ({ currentBranch, defaultBranch, protectedBranches });
+const FEATURE = facts("feat/x", "main");
+
+// Real git must not inherit the caller's GIT_* variables or global signing and hook settings.
+const cleanEnv = (): NodeJS.ProcessEnv => Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("GIT_")));
+const ISOLATED_GIT = ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "-c", "init.defaultBranch=main"];
 
 async function decide(command: string, facts: BranchFacts = FEATURE, mode: PermissionMode = PERMISSION_MODE.NORMAL, isChild = false) {
 	let reads = 0;
@@ -29,15 +34,52 @@ describe("commits on feature branches", () => {
 	});
 
 	it("still ask on the default branch", async () => {
-		assert.equal((await decide("git commit -m x", { currentBranch: "main", defaultBranch: "main" })).action, "confirm");
+		assert.equal((await decide("git commit -m x", facts("main", "main"))).action, "confirm");
 	});
 
 	it("still ask on a detached HEAD", async () => {
-		assert.equal((await decide("git commit -m x", { currentBranch: null, defaultBranch: "main" })).action, "confirm");
+		assert.equal((await decide("git commit -m x", facts(null, "main"))).action, "confirm");
 	});
 
 	it("still ask when the default branch is unknown", async () => {
-		assert.equal((await decide("git commit -m x", { currentBranch: "feat/x", defaultBranch: null })).action, "confirm");
+		assert.equal((await decide("git commit -m x", facts("feat/x", null))).action, "confirm");
+	});
+
+	it("still ask on main or master when origin/HEAD points somewhere else", async () => {
+		assert.equal((await decide("git commit -m x", facts("main", "feat/x", ["feat/x", "main"]))).action, "confirm");
+		assert.equal((await decide("git commit -m x", facts("master", "trunk", ["trunk", "main", "master"]))).action, "confirm");
+		assert.equal((await decide("git commit -m x", facts("feat/x", "trunk", ["trunk", "main"]))).action, "allow");
+	});
+
+	it("still ask for the one-call repoints of origin/HEAD and renames of main", async () => {
+		for (const command of [
+			"git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/feat/x",
+			"git remote set-head origin feat/x",
+			"git update-ref refs/remotes/origin/HEAD abc123",
+			"git branch -m main old",
+		]) {
+			assert.equal((await decide(command)).action, "confirm", command);
+			assert.equal((await decide(command, FEATURE, PERMISSION_MODE.YOLO)).action, "confirm", command);
+		}
+	});
+
+	it("still ask when a group, branch, or loop moves the commit elsewhere", async () => {
+		for (const command of [
+			"{ cd /other/repo; git commit -m x; }",
+			"if true; then cd /other; git commit -m x; fi",
+			"for d in a; do cd /other; git commit -m x; done",
+			"if true; then git checkout main; git commit -m x; fi",
+			"while true; do git -C /other commit -m x; done",
+		]) {
+			assert.equal((await decide(command)).action, "confirm", command);
+		}
+		assert.equal((await decide("if true; then git commit -m x; fi")).action, "allow");
+	});
+
+	it("still ask for destructive and delivery commands after then, do, or a brace", async () => {
+		for (const command of ["if true; then rm -rf build; fi", "for d in a; do git push --force; done", "{ git push; }", "if true; then git push; fi", "while true; do npm install; done"]) {
+			assert.equal((await decide(command)).action, "confirm", command);
+		}
 	});
 
 	it("still ask when the commit runs in another directory", async () => {
@@ -117,7 +159,7 @@ describe("commits on feature branches", () => {
 describe("the rule leaves other decisions alone", () => {
 	it("keeps yolo as it was", async () => {
 		assert.equal((await decide("git commit -m x", FEATURE, PERMISSION_MODE.YOLO)).action, "allow");
-		assert.equal((await decide("git commit -m x", { currentBranch: "main", defaultBranch: "main" }, PERMISSION_MODE.YOLO)).action, "allow");
+		assert.equal((await decide("git commit -m x", facts("main", "main"), PERMISSION_MODE.YOLO)).action, "allow");
 		assert.equal((await decide("git push --force", FEATURE, PERMISSION_MODE.YOLO)).action, "confirm");
 	});
 
@@ -191,29 +233,41 @@ describe("readBranchFacts", () => {
 	const MASTER = "rev-parse --verify --quiet refs/heads/master";
 
 	it("reads the branch and origin/HEAD", async () => {
-		const facts = await readBranchFacts(fakeGit({ [HEAD]: ok("feat/x\n"), [ORIGIN]: ok("origin/main\n") }), "/repo");
-		assert.deepEqual(facts, { currentBranch: "feat/x", defaultBranch: "main" });
+		const found = await readBranchFacts(fakeGit({ [HEAD]: ok("feat/x\n"), [ORIGIN]: ok("origin/main\n"), [MAIN]: ok("abc"), [MASTER]: fail(1) }), "/repo");
+		assert.deepEqual(found, facts("feat/x", "main"));
+	});
+
+	it("protects the origin/HEAD target plus any main or master that exists", async () => {
+		const repointed = await readBranchFacts(fakeGit({ [HEAD]: ok("main\n"), [ORIGIN]: ok("origin/trunk\n"), [MAIN]: ok("abc"), [MASTER]: fail(1) }), "/repo");
+		assert.deepEqual(repointed, facts("main", "trunk", ["trunk", "main"]));
+		const both = await readBranchFacts(fakeGit({ [HEAD]: ok("feat/x\n"), [ORIGIN]: ok("origin/main\n"), [MAIN]: ok("abc"), [MASTER]: ok("def") }), "/repo");
+		assert.deepEqual(both, facts("feat/x", "main", ["main", "master"]));
+	});
+
+	it("protects a main or master it could not look up", async () => {
+		const found = await readBranchFacts(fakeGit({ [HEAD]: ok("feat/x\n"), [ORIGIN]: ok("origin/trunk\n"), [MAIN]: new Error("timeout"), [MASTER]: fail(1) }), "/repo");
+		assert.deepEqual(found, facts("feat/x", "trunk", ["trunk", "main"]));
 	});
 
 	it("falls back to a lone local main when origin/HEAD is not set", async () => {
-		const facts = await readBranchFacts(fakeGit({ [HEAD]: ok("feat/x\n"), [MAIN]: ok("abc\n"), [MASTER]: fail(1) }), "/repo");
-		assert.deepEqual(facts, { currentBranch: "feat/x", defaultBranch: "main" });
+		const found = await readBranchFacts(fakeGit({ [HEAD]: ok("feat/x\n"), [MAIN]: ok("abc\n"), [MASTER]: fail(1) }), "/repo");
+		assert.deepEqual(found, facts("feat/x", "main"));
 	});
 
 	it("reports a detached HEAD as no branch", async () => {
-		const facts = await readBranchFacts(fakeGit({ [HEAD]: fail(1), [ORIGIN]: ok("origin/main") }), "/repo");
-		assert.equal(facts.currentBranch, null);
+		const found = await readBranchFacts(fakeGit({ [HEAD]: fail(1), [ORIGIN]: ok("origin/main") }), "/repo");
+		assert.equal(found.currentBranch, null);
 	});
 
 	it("fails closed when git fails or throws", async () => {
-		assert.deepEqual(await readBranchFacts(fakeGit({}), "/repo"), { currentBranch: null, defaultBranch: null });
+		assert.deepEqual(await readBranchFacts(fakeGit({}), "/repo"), facts(null, null, ["main", "master"]));
 		const boom = fakeGit({ [HEAD]: new Error("spawn git ENOENT"), [ORIGIN]: new Error("spawn git ENOENT"), [MAIN]: new Error("x"), [MASTER]: new Error("x") });
-		assert.deepEqual(await readBranchFacts(boom, "/repo"), { currentBranch: null, defaultBranch: null });
+		assert.deepEqual(await readBranchFacts(boom, "/repo"), facts(null, null, ["main", "master"]));
 	});
 
 	it("does not guess a default branch when a main/master lookup fails", async () => {
-		const facts = await readBranchFacts(fakeGit({ [HEAD]: ok("main\n"), [MAIN]: new Error("timeout"), [MASTER]: ok("abc") }), "/repo");
-		assert.equal(facts.defaultBranch, null);
+		const found = await readBranchFacts(fakeGit({ [HEAD]: ok("main\n"), [MAIN]: new Error("timeout"), [MASTER]: ok("abc") }), "/repo");
+		assert.equal(found.defaultBranch, null);
 	});
 });
 
@@ -221,7 +275,7 @@ describe("readBranchFacts against real git", () => {
 	const run = promisify(execFile);
 	const realExec: ExecFn = async (command, args, options) => {
 		try {
-			const { stdout, stderr } = await run(command, args, { cwd: options.cwd, timeout: options.timeout });
+			const { stdout, stderr } = await run(command, args, { cwd: options.cwd, timeout: options.timeout, env: cleanEnv() });
 			return { stdout, stderr, code: 0 };
 		} catch (error) {
 			const failure = error as { stdout?: string; stderr?: string; code?: number };
@@ -229,23 +283,30 @@ describe("readBranchFacts against real git", () => {
 		}
 	};
 	const dir = realpathSync(mkdtempSync(join(tmpdir(), "commit-branch-")));
-	const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { cwd: dir, stdio: "pipe" });
+	const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", ...ISOLATED_GIT, ...args], { cwd: dir, stdio: "pipe", env: cleanEnv() });
 	after(() => rmSync(dir, { recursive: true, force: true }));
 
 	it("tells a feature branch, the default branch, and a detached HEAD apart", async () => {
 		git("init", "-q", "-b", "main");
 		git("commit", "-q", "--allow-empty", "-m", "init");
-		assert.deepEqual(await readBranchFacts(realExec, dir), { currentBranch: "main", defaultBranch: "main" });
+		assert.deepEqual(await readBranchFacts(realExec, dir), facts("main", "main"));
 		git("switch", "-q", "-c", "feat/x");
-		assert.deepEqual(await readBranchFacts(realExec, dir), { currentBranch: "feat/x", defaultBranch: "main" });
+		assert.deepEqual(await readBranchFacts(realExec, dir), facts("feat/x", "main"));
 		git("switch", "-q", "--detach");
-		assert.deepEqual(await readBranchFacts(realExec, dir), { currentBranch: null, defaultBranch: "main" });
+		assert.deepEqual(await readBranchFacts(realExec, dir), facts(null, "main"));
+	});
+
+	it("keeps main protected after origin/HEAD is repointed", async () => {
+		git("switch", "-q", "main");
+		git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/feat/x");
+		assert.deepEqual(await readBranchFacts(realExec, dir), facts("main", "feat/x", ["feat/x", "main"]));
+		git("symbolic-ref", "--delete", "refs/remotes/origin/HEAD");
 	});
 
 	it("does not guess in a directory that is not a repository", async () => {
 		const plain = realpathSync(mkdtempSync(join(tmpdir(), "commit-branch-plain-")));
 		try {
-			assert.deepEqual(await readBranchFacts(realExec, plain), { currentBranch: null, defaultBranch: null });
+			assert.deepEqual(await readBranchFacts(realExec, plain), facts(null, null, ["main", "master"]));
 		} finally {
 			rmSync(plain, { recursive: true, force: true });
 		}

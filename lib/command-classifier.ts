@@ -30,10 +30,13 @@ export interface CommandMatch {
 }
 
 const SEPARATORS = new Set([";", "&&", "||", "|", "&", "\n", "(", ")"]);
+// Syntax words that can lead a segment (`then rm -rf x`, `{ git push; }`); the command follows them. `time` is a wrapper.
+const RESERVED_WORDS = new Set(["{", "}", "!", "if", "then", "elif", "else", "fi", "while", "until", "do", "done"]);
 const WRAPPERS = new Set(["sudo", "doas", "env", "command", "builtin", "nohup", "time", "nice", "exec", "xargs", "timeout", "caffeinate"]);
 export const SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "ksh"]);
 // Commands whose arguments are data (search patterns, text), not actions.
 const TEXT_COMMANDS = new Set(["grep", "rg", "ag", "echo", "printf", "cat", "less", "head", "tail", "sed", "awk", "jq", "wc"]);
+const PROTECTED_NAMES = new Set(["main", "master"]);
 const CATASTROPHIC_RM_TARGETS = new Set(["/", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/", "${HOME}/", ".", "./", "..", "../", "*", "/Users", "/home", "/usr", "/etc", "/var", "/System"]);
 
 export interface Redirect {
@@ -280,12 +283,16 @@ export function basename(executable: string): string {
 	return slash === -1 ? executable : executable.slice(slash + 1);
 }
 
-/** Strips env assignments and wrapper commands; reports whether sudo was used. */
+/** Strips leading reserved words, env assignments, and wrapper commands; reports whether sudo was used. */
 export function unwrap(argv: string[]): { argv: string[]; privileged: boolean } {
 	let rest = argv;
 	let privileged = false;
 	while (rest.length > 0) {
 		const head = rest[0];
+		if (RESERVED_WORDS.has(head)) {
+			rest = rest.slice(1);
+			continue;
+		}
 		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(head)) {
 			rest = rest.slice(1);
 			continue;
@@ -450,10 +457,20 @@ function classifyGit(args: string[]): CommandMatch | undefined {
 		}
 		case "switch":
 			return hasAny(rest, "--discard-changes", "-f", "--force") ? destructive("switch discards changes") : undefined;
-		case "branch":
-			return hasAny(rest, "-D") || (hasAny(rest, "--delete", "-d") && hasAny(rest, "--force", "-f"))
-				? destructive("branch force-delete")
-				: undefined;
+		case "branch": {
+			if (hasAny(rest, "-D") || (hasAny(rest, "--delete", "-d") && hasAny(rest, "--force", "-f"))) return destructive("branch force-delete");
+			// One name renames the current branch, which may be main or master.
+			const names = rest.filter((a) => !a.startsWith("-"));
+			const renames = hasAny(rest, "--move") || hasShortFlag(rest, "m") || hasShortFlag(rest, "M");
+			return renames && (names.length === 1 || names.some((n) => PROTECTED_NAMES.has(n))) ? destructive("branch rename of main, master, or the current branch") : undefined;
+		}
+		case "symbolic-ref": {
+			// Two names write the ref (`-m` takes a message); one only reads it.
+			const names = rest.filter((a, i) => !a.startsWith("-") && rest[i - 1] !== "-m");
+			return hasAny(rest, "-d", "--delete") || names.length >= 2 ? destructive("symbolic-ref rewrites a ref") : undefined;
+		}
+		case "remote":
+			return rest.find((a) => !a.startsWith("-")) === "set-head" ? destructive("remote set-head rewrites origin/HEAD") : undefined;
 		case "stash":
 			return rest[0] === "drop" || rest[0] === "clear" ? destructive(`stash ${rest[0]}`) : undefined;
 		case "rebase":
@@ -466,7 +483,7 @@ function classifyGit(args: string[]): CommandMatch | undefined {
 		case "gc":
 			return rest.some((a) => a.startsWith("--prune")) ? destructive("gc prune") : undefined;
 		case "update-ref":
-			return hasAny(rest, "-d") ? destructive("update-ref delete") : undefined;
+			return destructive(hasAny(rest, "-d") ? "update-ref delete" : "update-ref rewrites a ref");
 		case "worktree":
 			return rest[0] === "remove" && hasAny(rest, "-f", "--force") ? destructive("worktree force-remove") : undefined;
 		case "push": {

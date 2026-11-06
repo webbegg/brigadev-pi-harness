@@ -32,4 +32,22 @@ describe("paths", () => {
 		assert.equal(isInside(canonicalPath(real), canonicalPath(join(base, "real-project-other", "x.ts"))), false);
 		assert.equal(isInside(canonicalPath(real), canonicalPath(real)), true);
 	});
+
+	it("follows a dangling symlink to where a write would really land", () => {
+		const link = join(real, "src", "dangling.md");
+		symlinkSync(join(base, "outside", "missing.md"), link);
+		assert.equal(canonicalPath(link), join(base, "outside", "missing.md"));
+		assert.equal(isInside(canonicalPath(real), canonicalPath(link)), false);
+		const relativeLink = join(real, "src", "relative.md");
+		symlinkSync("../../outside/rel.md", relativeLink);
+		assert.equal(canonicalPath(relativeLink), join(base, "outside", "rel.md"));
+	});
+
+	it("does not loop on a symlink cycle", () => {
+		const a = join(real, "src", "cycle-a");
+		const b = join(real, "src", "cycle-b");
+		symlinkSync(b, a);
+		symlinkSync(a, b);
+		assert.equal(typeof canonicalPath(a), "string");
+	});
 });

@@ -15,13 +15,21 @@ export interface BranchFacts {
 	currentBranch: string | null;
 	/** Default branch; null when it cannot be determined. */
 	defaultBranch: string | null;
+	/**
+	 * Branches a commit always asks on: the origin/HEAD target plus any `main`
+	 * or `master` that exists (or could not be looked up). origin/HEAD alone is
+	 * not enough, since a command can repoint it. Absent: only `defaultBranch`.
+	 */
+	protectedBranches?: string[];
 }
+
+const WELL_KNOWN_DEFAULTS = ["main", "master"];
 
 /** A commit the guard may let through if the branch facts allow it. */
 const isCandidate = (match: CommandMatch): boolean => match.kind === COMMAND_KIND.DELIVERY && match.commit === true && !match.elsewhere && !match.hardDeny;
 
 function onFeatureBranch(facts: BranchFacts): boolean {
-	return facts.currentBranch !== null && facts.defaultBranch !== null && facts.currentBranch !== facts.defaultBranch;
+	return facts.currentBranch !== null && facts.defaultBranch !== null && facts.currentBranch !== facts.defaultBranch && !(facts.protectedBranches ?? []).includes(facts.currentBranch);
 }
 
 /**
@@ -36,7 +44,7 @@ export async function decideWithBranchRule(matches: CommandMatch[], mode: Permis
 	try {
 		facts = await getFacts();
 	} catch {
-		facts = { currentBranch: null, defaultBranch: null };
+		facts = { currentBranch: null, defaultBranch: null, protectedBranches: [] };
 	}
 	return decideCommand(onFeatureBranch(facts) ? matches.filter((match) => !isCandidate(match)) : matches, mode, isChild);
 }
@@ -56,6 +64,13 @@ export function pickDefaultBranch(found: { originHead: string | null; hasMain: b
 	if (found.hasMain && !found.hasMaster) return "main";
 	if (found.hasMaster && !found.hasMain) return "master";
 	return null;
+}
+
+/** The origin/HEAD target, then `main` and `master` unless a lookup says the branch is absent (a failed lookup keeps it). */
+export function pickProtectedBranches(found: { originHead: string | null; hasMain: boolean | null; hasMaster: boolean | null }): string[] {
+	const exists: Record<string, boolean | null> = { main: found.hasMain, master: found.hasMaster };
+	const names = [...(found.originHead ? [found.originHead] : []), ...WELL_KNOWN_DEFAULTS.filter((name) => exists[name] !== false)];
+	return [...new Set(names)];
 }
 
 /** Branch facts for the repository at `cwd`; anything git cannot answer comes back null. */
@@ -78,6 +93,6 @@ export async function readBranchFacts(exec: ExecFn, cwd: string): Promise<Branch
 
 	const origin = await git("symbolic-ref", "--short", "refs/remotes/origin/HEAD");
 	const originHead = origin?.code === 0 ? parseOriginHead(origin.stdout) : null;
-	if (originHead) return { currentBranch, defaultBranch: originHead };
-	return { currentBranch, defaultBranch: pickDefaultBranch({ originHead, hasMain: await hasBranch("main"), hasMaster: await hasBranch("master") }) };
+	const found = { originHead, hasMain: await hasBranch("main"), hasMaster: await hasBranch("master") };
+	return { currentBranch, defaultBranch: pickDefaultBranch(found), protectedBranches: pickProtectedBranches(found) };
 }
