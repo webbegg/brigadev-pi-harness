@@ -5,7 +5,7 @@
 // or add new workflows. Pure loading and validation; no Pi imports.
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { FrontmatterParser } from "./agents.ts";
 import { brigadevHome, repoDocsDir } from "./repo-docs.ts";
 
@@ -19,6 +19,10 @@ const QUESTION_KINDS: readonly string[] = ["text", "long", "choice"];
 const PLACEHOLDER = /\{\{([^{}]*)\}\}/g;
 const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
 const UNORDERED = 1_000;
+const KEY_PATTERN = /^[a-z]$/;
+
+/** Dashboard keys the tools use (Changes, Agents history, Model profile, Commands, Quit); a workflow cannot take them. */
+export const RESERVED_KEYS: readonly string[] = ["g", "a", "m", "k", "q"];
 
 export interface WorkflowQuestion {
 	id: string;
@@ -36,6 +40,8 @@ export interface Workflow {
 	description: string;
 	/** Menu position: lower first, then by name. */
 	order: number;
+	/** Dashboard key: one lowercase letter, unique among workflows and not reserved; dropped (with a warning) when it is not. */
+	key?: string;
 	questions: WorkflowQuestion[];
 	/** Prompt body with `{{question-id}}` placeholders. */
 	body: string;
@@ -78,6 +84,7 @@ export function parseWorkflow(content: string, filePath: string, source: Workflo
 	if (typeof frontmatter.name !== "string" || !frontmatter.name.trim()) throw new Error("missing name");
 	if (typeof frontmatter.description !== "string" || !frontmatter.description.trim()) throw new Error("missing description");
 	if (!body.trim()) throw new Error("missing prompt body");
+	if (frontmatter.key !== undefined && (typeof frontmatter.key !== "string" || !KEY_PATTERN.test(frontmatter.key))) throw new Error("key must be one lowercase letter");
 	const rawQuestions = frontmatter.questions ?? [];
 	if (!Array.isArray(rawQuestions)) throw new Error("questions must be a list");
 	const questions = rawQuestions.map(parseQuestion);
@@ -93,6 +100,7 @@ export function parseWorkflow(content: string, filePath: string, source: Workflo
 		name: frontmatter.name.trim(),
 		description: frontmatter.description.trim(),
 		order: typeof frontmatter.order === "number" ? frontmatter.order : UNORDERED,
+		...(frontmatter.key !== undefined ? { key: frontmatter.key as string } : {}),
 		questions,
 		body: body.trim(),
 		source,
@@ -135,7 +143,35 @@ export function discoverWorkflows(options: WorkflowDiscoveryOptions): WorkflowDi
 		for (const workflow of loadDir(dir, source, options.parse, warnings)) byName.set(workflow.name.toLowerCase(), workflow);
 	}
 	const workflows = [...byName.values()].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
-	return { workflows, warnings };
+	return { workflows: assignKeys(workflows, warnings), warnings };
+}
+
+/** In menu order the first workflow keeps a key; a reserved or already used one is dropped with a warning, and the workflow stays. */
+function assignKeys(workflows: Workflow[], warnings: string[]): Workflow[] {
+	const owners = new Map<string, Workflow>();
+	return workflows.map((workflow) => {
+		const { key, ...keyless } = workflow;
+		if (key === undefined) return workflow;
+		const owner = owners.get(key);
+		if (RESERVED_KEYS.includes(key)) warnings.push(`${workflow.filePath}: key "${key}" is reserved for the dashboard tools; "${workflow.name}" has no key`);
+		else if (owner) warnings.push(`${workflow.filePath}: key "${key}" is already used by "${owner.name}"; "${workflow.name}" has no key`);
+		else {
+			owners.set(key, workflow);
+			return workflow;
+		}
+		return keyless;
+	});
+}
+
+/** The workflow's file name without `.md`, the id `/brigadev:start` also accepts. */
+export const workflowId = (workflow: Workflow): string => basename(workflow.filePath, ".md");
+
+/** Finds a workflow by name (ignoring case), file id, or key. Throws an Error listing the names when none matches. */
+export function resolveWorkflow(workflows: readonly Workflow[], query: string): Workflow {
+	const wanted = query.trim().toLowerCase();
+	const found = workflows.find((w) => w.name.toLowerCase() === wanted) ?? workflows.find((w) => workflowId(w).toLowerCase() === wanted) ?? workflows.find((w) => w.key !== undefined && w.key === wanted);
+	if (found) return found;
+	throw new Error(`Unknown workflow "${query.trim()}". Workflows: ${workflows.map((w) => (w.key ? `${w.name} (${w.key})` : w.name)).join(", ")}`);
 }
 
 /** The user's global and per-repo workflow folders, under the same root as the repo docs. */

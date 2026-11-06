@@ -89,20 +89,20 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_end", async () => requestRender?.());
 
 	pi.registerCommand("brigadev:ui", {
-		description: "Toggle brigadev UI: footer on|off, phase on|off",
+		description: "Toggle brigadev UI: footer on|off, phase on|off, dashboard on|off",
 		getArgumentCompletions: (prefix) => {
-			const items = ["footer on", "footer off", "phase on", "phase off"].filter((v) => v.startsWith(prefix)).map((value) => ({ value, label: value }));
+			const items = ["footer on", "footer off", "phase on", "phase off", "dashboard on", "dashboard off"].filter((v) => v.startsWith(prefix)).map((value) => ({ value, label: value }));
 			return items.length ? items : null;
 		},
 		handler: async (args, ctx) => {
 			const [feature, value] = args.trim().split(/\s+/);
 			const ui = readSettings().ui ?? {};
-			if ((feature === "footer" || feature === "phase") && (value === "on" || value === "off")) {
+			if ((feature === "footer" || feature === "phase" || feature === "dashboard") && (value === "on" || value === "off")) {
 				writeSettings({ ui: { ...ui, [feature]: value === "on" } });
 				if (feature === "footer") install(ctx);
 				return ctx.ui.notify(`brigadev ${feature} ${value}`, "info");
 			}
-			ctx.ui.notify(`footer: ${ui.footer === false ? "off" : "on"} · phase: ${ui.phase === false ? "off" : "on"}\nUsage: /brigadev:ui footer|phase on|off`, "info");
+			ctx.ui.notify(`footer: ${ui.footer === false ? "off" : "on"} · phase: ${ui.phase === false ? "off" : "on"} · dashboard: ${ui.dashboard === false ? "off" : "on"}\nUsage: /brigadev:ui footer|phase|dashboard on|off`, "info");
 		},
 	});
 }

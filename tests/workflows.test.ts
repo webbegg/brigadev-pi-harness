@@ -6,7 +6,7 @@ import { after, before, describe, it } from "node:test";
 import { type FrontmatterParser } from "../lib/agents.ts";
 import { ASSETS_ROOT } from "../lib/runtime.ts";
 import { composeRequest } from "../lib/workflow-run.ts";
-import { discoverWorkflows, parseWorkflow, workflowDirs } from "../lib/workflows.ts";
+import { discoverWorkflows, parseWorkflow, RESERVED_KEYS, resolveWorkflow, workflowDirs, workflowId } from "../lib/workflows.ts";
 
 /**
  * Stand-in for Pi's YAML frontmatter parser, so the loader tests run without
@@ -60,6 +60,11 @@ describe("package workflows", () => {
 		assert.deepEqual(loaded.warnings, []);
 		assert.deepEqual(loaded.workflows.map((w) => w.name), NINE);
 		assert.ok(loaded.workflows.every((w) => w.source === "package" && w.description.length > 0 && w.body.length > 0));
+	});
+
+	it("gives the nine workflows their dashboard keys: n b r p f i u x d, none reserved", () => {
+		assert.deepEqual(loaded.workflows.map((w) => w.key), ["n", "b", "r", "p", "f", "i", "u", "x", "d"]);
+		assert.ok(loaded.workflows.every((w) => !RESERVED_KEYS.includes(w.key!)));
 	});
 
 	it("declares valid questions for each workflow", () => {
@@ -129,6 +134,18 @@ describe("parseWorkflow", () => {
 			{ id: "what", label: "What?", kind: "long", required: true, default: "{{testScript}} now" },
 			{ id: "kind", label: "Kind?", kind: "choice", required: false, options: ["a", "b"], default: "b" },
 		]);
+	});
+
+	it("reads an optional one-letter key and leaves it off when absent", () => {
+		assert.equal(ok(file("Ship it", 'key: "s"\n')).key, "s");
+		assert.equal(ok(file("Ship it", "key: s\n")).key, "s");
+		assert.equal(ok(file("Ship it")).key, undefined);
+	});
+
+	it("rejects a key that is not exactly one lowercase letter", () => {
+		for (const bad of ['"N"', '"nn"', '""', '"1"', '"-"', "5", "true"]) {
+			assert.throws(() => ok(file("Ship it", `key: ${bad}\n`)), /key/, bad);
+		}
 	});
 
 	it("rejects a file without name, description, or body", () => {
@@ -201,6 +218,67 @@ describe("discoverWorkflows layers", () => {
 		const { workflows, warnings } = discoverWorkflows({ ...dirs(), repoDir: join(scratch, "repo2") });
 		assert.equal(workflows.find((w) => w.name === "Beta")?.source, "package");
 		assert.equal(warnings.length, 1);
+	});
+});
+
+describe("workflow keys across files", () => {
+	let scratch: string;
+	const put = (dir: string, fileName: string, content: string) => {
+		mkdirSync(join(scratch, dir), { recursive: true });
+		writeFileSync(join(scratch, dir, fileName), content);
+	};
+	before(() => {
+		scratch = mkdtempSync(join(tmpdir(), "brigadev-workflow-keys-"));
+		put("pkg", "one.md", file("One", 'order: 1\nkey: "o"\n'));
+		put("pkg", "two.md", file("Two", 'order: 2\nkey: "o"\n'));
+		put("pkg", "three.md", file("Three", 'order: 3\nkey: "g"\n'));
+		put("pkg", "four.md", file("Four", 'order: 4\nkey: "f"\n'));
+		put("user", "five.md", file("Five", 'order: 5\nkey: "f"\n'));
+		put("user", "six.md", file("Six", "order: 6\n"));
+	});
+	after(() => rmSync(scratch, { recursive: true, force: true }));
+
+	it("reserves g a m k q for the tools", () => {
+		assert.deepEqual([...RESERVED_KEYS].sort(), ["a", "g", "k", "m", "q"]);
+	});
+
+	it("keeps the first workflow's key, and makes a duplicate or reserved one keyless with a warning (still valid)", () => {
+		const { workflows, warnings } = discoverWorkflows({ packageDir: join(scratch, "pkg"), userDir: join(scratch, "user"), parse });
+		assert.deepEqual(workflows.map((w) => [w.name, w.key]), [["One", "o"], ["Two", undefined], ["Three", undefined], ["Four", "f"], ["Five", undefined], ["Six", undefined]]);
+		assert.equal(warnings.length, 3);
+		assert.match(warnings.find((w) => w.includes("two.md"))!, /key "o" is already used by "One"/);
+		assert.match(warnings.find((w) => w.includes("three.md"))!, /key "g" is reserved/);
+		assert.match(warnings.find((w) => w.includes("five.md"))!, /key "f" is already used by "Four"/);
+	});
+});
+
+describe("resolveWorkflow", () => {
+	const { workflows } = discoverWorkflows({ packageDir: join(ASSETS_ROOT, "workflows"), parse });
+
+	it("finds a workflow by name, ignoring case", () => {
+		assert.equal(resolveWorkflow(workflows, "Bug fix").name, "Bug fix");
+		assert.equal(resolveWorkflow(workflows, "  upgrade DEPENDENCIES ").name, "Upgrade dependencies");
+	});
+
+	it("finds a workflow by file id", () => {
+		assert.equal(resolveWorkflow(workflows, "bug-fix").name, "Bug fix");
+		assert.equal(resolveWorkflow(workflows, "pr-feedback").name, "Answer PR feedback");
+		assert.equal(workflowId(workflows[0]), "new-feature");
+	});
+
+	it("finds a workflow by key", () => {
+		assert.equal(resolveWorkflow(workflows, "b").name, "Bug fix");
+		assert.equal(resolveWorkflow(workflows, "x").name, "Refactor a component");
+	});
+
+	it("throws for an unknown workflow, listing every name", () => {
+		assert.throws(() => resolveWorkflow(workflows, "zzz"), (error: Error) => {
+			assert.match(error.message, /Unknown workflow "zzz"/);
+			for (const workflow of workflows) assert.ok(error.message.includes(workflow.name), workflow.name);
+			return true;
+		});
+		// Tool keys are not workflow keys.
+		assert.throws(() => resolveWorkflow(workflows, "g"), /Unknown workflow/);
 	});
 });
 

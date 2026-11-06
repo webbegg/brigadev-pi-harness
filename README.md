@@ -34,6 +34,7 @@ Check it loaded: `/brigadev:status`.
 | Ask dialog | `extensions/ask-user.ts` | `ask_user_choice`: focused questions as a dialog with a recommended option. |
 | Model routing | `extensions/profiles.ts` | Named profiles route the orchestrator and every agent to a model and thinking level. |
 | Workflow menu | `extensions/workflow-menu.ts`, `assets/workflows/` | `/brigadev:start` (`alt+w`): pick a day-to-day workflow, answer its questions, review the composed request, and start it. See [Workflows](#workflows). |
+| Launch dashboard | `extensions/dashboard.ts` | Full-screen start menu when Pi opens: the nine workflows and a few tools, one key each. `/brigadev:dashboard` reopens it. See [Launch dashboard](#launch-dashboard). |
 | Cost | `extensions/cost.ts` | API-equivalent pricing for `claude-bridge` turns, session tally, `/brigadev:cost` breakdown. |
 | Delivery skills | `skills/` | work-unit commits, branch/PR, chained PRs, issue creation, comment writer, skill creator. |
 
@@ -43,11 +44,13 @@ Check it loaded: `/brigadev:status`.
 | --- | --- |
 | `/brigadev:status` | Version, prompt on/off, paths, repo docs folder |
 | `alt+w` or `/brigadev:start` | Workflow menu: new feature, bug fix, review, PR, PR feedback, issue, UI change, refactor, dependency upgrade. Asks what each needs, then sends one complete request |
+| `/brigadev:start <workflow>` | Starts that workflow directly: its name, file id, or key (`/brigadev:start bug-fix`, `/brigadev:start b`) |
+| `/brigadev:dashboard` | Launch dashboard: workflows and tools, one key each |
 | `/brigadev:doctor [fix-bridge-hooks]` | Diagnostics, including the repo docs folder; turn off your Claude Code hooks inside claude-bridge turns |
 | `/brigadev:profile …` | Model routing profiles (see below) |
 | `/brigadev:cost` | Session cost: orchestrator per model, subagents per agent, cache hit rate |
 | `/brigadev:usage` | Subscription usage windows (5h, weekly) and their resets |
-| `/brigadev:ui footer\|phase on\|off` | Turn the status bar or the phase label off and on |
+| `/brigadev:ui footer\|phase\|dashboard on\|off` | Turn the status bar, the phase label, or the launch dashboard off and on |
 | `ctrl+shift+t` / `ctrl+shift+a` | Collapse the todo card / the agents card |
 | `alt+g` or `/brigadev:changes` | Changes viewer: uncommitted files and their diffs (`o` opens the file in `$VISUAL` / `$EDITOR`) |
 | `alt+k` or `/brigadev:commands` | Command palette: search the brigadev commands, Enter runs one |
@@ -148,6 +151,7 @@ Workflows are markdown files. Add or override them by name in `~/.brigadev/workf
 name: "Add endpoint"
 description: "One line shown in the menu"
 order: 100          # optional; lower comes first
+key: "e"           # optional; one lowercase letter that runs it from the dashboard
 questions:
   - id: route
     label: "Which route?"
@@ -171,6 +175,34 @@ Add an endpoint, following the normal ODD flow.
 ```
 
 In the body, `{{id}}` is replaced by the answer (a multi-line answer becomes a block quote), and a line is left out only when all of its answers were skipped (a skipped answer on a line with others renders as empty). A multi-line answer sits on its own quoted lines, with any text after the placeholder on the line below. A placeholder that names no question makes the file invalid.
+
+`key` must be one lowercase letter. The letters `g a m k q` belong to the dashboard tools, and a letter two workflows claim stays with the first in menu order; the other workflow loses its key (a warning says so) but still works. An override replaces the whole file, so repeat `key` in it. A workflow without a key is still listed on the dashboard and starts with Enter.
+
+## Launch dashboard
+
+When Pi starts in the terminal UI, a full-screen start menu opens first: a centered list with an icon, a label, and the row's key at the end of the row. Press a key to run that row, move with `↑`/`↓` and press `Enter` to run the selected one, `Esc` to go straight to the chat, or `q` to quit. `/brigadev:dashboard` opens it again at any time.
+
+| Key | Row | Runs |
+| --- | --- | --- |
+| `n` | New feature | the workflow's questions |
+| `b` | Bug fix | the workflow's questions |
+| `r` | Review a PR or branch | the workflow's questions |
+| `p` | Open a PR | the workflow's questions |
+| `f` | Answer PR feedback | the workflow's questions |
+| `i` | Create an issue | the workflow's questions |
+| `u` | UI change from a design or ticket | the workflow's questions |
+| `x` | Refactor a component | the workflow's questions |
+| `d` | Upgrade dependencies | the workflow's questions |
+| `g` | Changes | `/brigadev:changes` |
+| `a` | Agents history | `/brigadev:runs` |
+| `m` | Model profile | `/brigadev:profile use` (pick a profile) |
+| `k` | Commands | `/brigadev:commands` |
+| `Enter` on Chat, or `Esc` anywhere | Chat | closes the dashboard |
+| `q` | Quit | exits Pi |
+
+A workflow row opens that workflow's questions directly (it runs `/brigadev:start <key>`). Your own workflows from `~/.brigadev/workflows/` and `~/.brigadev/<repo>/workflows/` are listed after the nine, with a key if they declare one.
+
+It opens by itself only on a fresh start: not on `/reload`, `/new`, `--continue`, or `--resume` into a session that has messages, not when you launch Pi with a message or an `@file` (`pi "fix the login bug"`), not in print, JSON, or RPC mode, and never inside subagents. Turn the automatic start off with `/brigadev:ui dashboard off` (it writes `"ui": { "dashboard": false }` to `~/.pi/agent/brigadev.json`); `/brigadev:ui dashboard on` brings it back, and `/brigadev:dashboard` keeps working either way.
 
 ## Delivery flow
 

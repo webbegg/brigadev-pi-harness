@@ -29,6 +29,7 @@
 			"./extensions/changes-view.ts",
 			"./extensions/command-palette.ts",
 			"./extensions/workflow-menu.ts",
+			"./extensions/dashboard.ts",
 			"./extensions/usage.ts",
 			"./extensions/fallback.ts",
 			"./extensions/panel.ts"

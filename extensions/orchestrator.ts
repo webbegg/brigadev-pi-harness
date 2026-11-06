@@ -81,7 +81,7 @@ export default function (pi: ExtensionAPI) {
 					`assets: ${ASSETS_ROOT}`,
 					`repo docs: ${repoDocsDir(ctx.cwd)}`,
 					`settings: ${settingsPath()}`,
-					"commands: /brigadev:start (alt+w), /brigadev:doctor, /brigadev:profile, /brigadev:cost, /brigadev:usage, /brigadev:changes (alt+g), /brigadev:runs (alt+a), /brigadev:commands (alt+k), /brigadev:panel (alt+o), /brigadev:mode, /brigadev:agents, /brigadev:ui, /brigadev:harness, /review, /track, /skill:brigadev-judgment-day",
+					"commands: /brigadev:start (alt+w), /brigadev:dashboard, /brigadev:doctor, /brigadev:profile, /brigadev:cost, /brigadev:usage, /brigadev:changes (alt+g), /brigadev:runs (alt+a), /brigadev:commands (alt+k), /brigadev:panel (alt+o), /brigadev:mode, /brigadev:agents, /brigadev:ui, /brigadev:harness, /review, /track, /skill:brigadev-judgment-day",
 				].join("\n"),
 				"info",
 			);

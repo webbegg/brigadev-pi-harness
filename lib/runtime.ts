@@ -52,7 +52,7 @@ export interface BrigadevSettings {
 	/** Price zero-cost claude-bridge turns at the Anthropic list price (default true). */
 	bridgePricing?: boolean;
 	/** UI features, each on by default. */
-	ui?: { footer?: boolean; phase?: boolean };
+	ui?: { footer?: boolean; phase?: boolean; dashboard?: boolean };
 }
 
 export function agentDir(): string {
