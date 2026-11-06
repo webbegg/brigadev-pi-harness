@@ -10,6 +10,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { addUsage, cacheHitRate, CLAUDE_BRIDGE_PROVIDER, emptyTally, formatCost, formatTokens, priceBridgeMessage, type Tally, type UsageLike } from "../lib/cost.ts";
+import { panelState } from "../lib/panel-state.ts";
 import { costCalculator } from "../lib/pi-adapters.ts";
 import { isChildSession, readSettings } from "../lib/runtime.ts";
 
@@ -75,8 +76,9 @@ export default function (pi: ExtensionAPI) {
 	const sessionTotal = () => total([...state.parentByModel.values(), ...state.agents.values()]);
 
 	const publishStatus = (ctx: ExtensionContext) => {
-		if (!ctx.hasUI) return;
 		const sum = sessionTotal();
+		panelState().publish("cost", { cost: sum.cost, apiEquivalent: state.usesBridge });
+		if (!ctx.hasUI) return;
 		ctx.ui.setStatus(STATUS_KEY, sum.cost > 0 ? `${formatCost(sum.cost)}${state.usesBridge ? " API-eq" : ""}` : undefined);
 	};
 

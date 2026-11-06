@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Side panel (`alt+o`, `/brigadev:panel`): an optional right-anchored overlay with Todos, Agents, Changes, and Session sections, shown on terminals at least 140 columns wide. It is a non-capturing overlay that draws over the right 44 columns of the transcript while open (a docked rail would need private Pi internals), and it repaints only on todo, subagent, and cost updates, a throttled git refresh, and a one-second tick while an agent runs.
+
 ## [0.7.0] - 2026-11-05
 
 - Guard: a writer's `bash` can no longer change files outside its allowed edit surfaces unnoticed. Calls that write a literal project path outside the surfaces (redirections, `tee`, `sed -i`, `cp`/`mv`/`install`/`ln`, `touch`, `mkdir`, `truncate`) are blocked; in git repositories a before/after working-tree comparison flags any other change, and the `subagent` result lists files changed outside the writers' surfaces.

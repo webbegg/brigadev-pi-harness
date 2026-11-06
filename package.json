@@ -29,7 +29,8 @@
 			"./extensions/changes-view.ts",
 			"./extensions/command-palette.ts",
 			"./extensions/usage.ts",
-			"./extensions/fallback.ts"
+			"./extensions/fallback.ts",
+			"./extensions/panel.ts"
 		],
 		"skills": [
 			"./skills"

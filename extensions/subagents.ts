@@ -29,6 +29,7 @@ import { blockedReason, fallbackState } from "../lib/fallback-state.ts";
 import { resolveAgentRoute, resolveModelRef, routeFor, type ResolvedRoute } from "../lib/model-routing.ts";
 import { costCalculator, currentModelRef, listPrice, loadAgents, modelCatalog } from "../lib/pi-adapters.ts";
 import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
+import { panelState } from "../lib/panel-state.ts";
 import { canonicalPath } from "../lib/paths.ts";
 import { CHILD_ENV, GUARD_EXTENSION_PATH, isChildSession } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot } from "../lib/worktree-snapshot.ts";
@@ -284,6 +285,8 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const showCard = (ctx: ExtensionContext) => {
+		// The side panel reads copies; the runs below keep mutating while they work.
+		panelState().publish("agents", runs.map((r) => ({ ...r })));
 		if (!ctx.hasUI) return;
 		if (visibleRuns(runs, Date.now()).length === 0) {
 			stopTimers();
