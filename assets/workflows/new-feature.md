@@ -3,6 +3,7 @@ name: "New feature"
 description: "Build something new through the normal ODD flow"
 order: 10
 key: "n"
+group: "build"
 questions:
   - id: what
     label: "What should be built?"

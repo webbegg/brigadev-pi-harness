@@ -3,6 +3,7 @@ name: "Open a PR"
 description: "Review the branch, then prepare and open its pull request"
 order: 40
 key: "p"
+group: "ship"
 questions:
   - id: base
     label: "Base branch"

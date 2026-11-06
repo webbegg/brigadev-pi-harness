@@ -6,7 +6,7 @@ import { after, before, describe, it } from "node:test";
 import { type FrontmatterParser } from "../lib/agents.ts";
 import { ASSETS_ROOT } from "../lib/runtime.ts";
 import { composeRequest } from "../lib/workflow-run.ts";
-import { discoverWorkflows, loadWorkflows, parseWorkflow, RESERVED_KEYS, resolveWorkflow, workflowDirs, workflowId, type Workflow } from "../lib/workflows.ts";
+import { discoverWorkflows, loadWorkflows, parseWorkflow, RESERVED_KEYS, resolveWorkflow, workflowDirs, workflowGroup, workflowId, type Workflow } from "../lib/workflows.ts";
 
 /**
  * Stand-in for Pi's YAML frontmatter parser, so the loader tests run without
@@ -65,6 +65,21 @@ describe("package workflows", () => {
 	it("gives the nine workflows their dashboard keys: n b r p f i u x d, none reserved", () => {
 		assert.deepEqual(loaded.workflows.map((w) => w.key), ["n", "b", "r", "p", "f", "i", "u", "x", "d"]);
 		assert.ok(loaded.workflows.every((w) => !RESERVED_KEYS.includes(w.key!)));
+	});
+
+	it("puts the nine workflows in Build (new feature, bug fix, UI change, refactor, dependencies) and Review & ship (review, PR, feedback, issue)", () => {
+		const groups = Object.fromEntries(loaded.workflows.map((w) => [workflowId(w), w.group]));
+		assert.deepEqual(groups, {
+			"new-feature": "build",
+			"bug-fix": "build",
+			"ui-change": "build",
+			refactor: "build",
+			"upgrade-dependencies": "build",
+			review: "ship",
+			"open-pr": "ship",
+			"pr-feedback": "ship",
+			"create-issue": "ship",
+		});
 	});
 
 	it("declares valid questions for each workflow", () => {
@@ -153,6 +168,26 @@ describe("parseWorkflow", () => {
 		const workflow = parseWorkflow("ignored", "/w/x.md", "user", yamlNull);
 		assert.equal(workflow.key, undefined);
 		assert.ok(!("key" in workflow));
+	});
+
+	it("reads an optional group name, trimmed, and leaves it off when absent", () => {
+		assert.equal(ok(file("Ship it", 'group: "ship"\n')).group, "ship");
+		assert.equal(ok(file("Ship it", 'group: "  Docs work "\n')).group, "Docs work");
+		assert.equal(ok(file("Ship it")).group, undefined);
+		assert.ok(!("group" in ok(file("Ship it"))));
+	});
+
+	it("rejects a group that is not a non-empty string", () => {
+		for (const bad of ['""', '"   "', "5", "true", "[]"]) {
+			assert.throws(() => ok(file("Ship it", `group: ${bad}\n`)), /group/, bad);
+		}
+	});
+
+	it("treats an empty `group:` line (null in real YAML) as no group, not as an invalid file", () => {
+		const yamlNull: FrontmatterParser = () => ({ frontmatter: { name: "Ship it", description: "d", group: null }, body: "Do it" });
+		const workflow = parseWorkflow("ignored", "/w/x.md", "user", yamlNull);
+		assert.equal(workflow.group, undefined);
+		assert.ok(!("group" in workflow));
 	});
 
 	it("rejects a file without name, description, or body", () => {
@@ -257,8 +292,8 @@ describe("workflow keys across files", () => {
 	};
 	before(() => {
 		scratch = mkdtempSync(join(tmpdir(), "brigadev-workflow-keys-"));
-		put("pkg", "one.md", file("One", 'order: 1\nkey: "o"\n'));
-		put("pkg", "two.md", file("Two", 'order: 2\nkey: "o"\n'));
+		put("pkg", "one.md", file("One", 'order: 1\nkey: "j"\n'));
+		put("pkg", "two.md", file("Two", 'order: 2\nkey: "j"\n'));
 		put("pkg", "three.md", file("Three", 'order: 3\nkey: "g"\n'));
 		put("pkg", "four.md", file("Four", 'order: 4\nkey: "f"\n'));
 		put("user", "five.md", file("Five", 'order: 5\nkey: "f"\n'));
@@ -266,15 +301,23 @@ describe("workflow keys across files", () => {
 	});
 	after(() => rmSync(scratch, { recursive: true, force: true }));
 
-	it("reserves g a m k q for the tools", () => {
-		assert.deepEqual([...RESERVED_KEYS].sort(), ["a", "g", "k", "m", "q"]);
+	it("reserves the tool letters a c e g h k m o q s t y", () => {
+		assert.deepEqual([...RESERVED_KEYS].sort(), ["a", "c", "e", "g", "h", "k", "m", "o", "q", "s", "t", "y"]);
+	});
+
+	it("a workflow file using a newly reserved letter becomes keyless with the reserved warning", () => {
+		put("newly", "cost.md", file("Cost report", 'order: 1\nkey: "c"\n'));
+		const { workflows, warnings } = discoverWorkflows({ packageDir: join(scratch, "newly"), parse });
+		assert.deepEqual(workflows.map((w) => [w.name, w.key]), [["Cost report", undefined]]);
+		assert.equal(warnings.length, 1);
+		assert.match(warnings[0], /cost\.md.*key "c" is reserved for the dashboard tools; "Cost report" has no key/);
 	});
 
 	it("within a layer the first workflow in menu order keeps a duplicate key; a reserved key is dropped; a higher layer wins over a lower one (still valid)", () => {
 		const { workflows, warnings } = discoverWorkflows({ packageDir: join(scratch, "pkg"), userDir: join(scratch, "user"), parse });
-		assert.deepEqual(workflows.map((w) => [w.name, w.key]), [["One", "o"], ["Two", undefined], ["Three", undefined], ["Four", undefined], ["Five", "f"], ["Six", undefined]]);
+		assert.deepEqual(workflows.map((w) => [w.name, w.key]), [["One", "j"], ["Two", undefined], ["Three", undefined], ["Four", undefined], ["Five", "f"], ["Six", undefined]]);
 		assert.equal(warnings.length, 3);
-		assert.match(warnings.find((w) => w.includes("two.md"))!, /key "o" is already used by "One"/);
+		assert.match(warnings.find((w) => w.includes("two.md"))!, /key "j" is already used by "One"/);
 		assert.match(warnings.find((w) => w.includes("three.md"))!, /key "g" is reserved/);
 		assert.match(warnings.find((w) => w.includes("four.md"))!, /key "f" is already used by "Five"/);
 	});
@@ -331,6 +374,60 @@ describe("workflow key inheritance and layer precedence", () => {
 	});
 });
 
+describe("workflow group inheritance", () => {
+	let scratch: string;
+	const put = (dir: string, fileName: string, content: string) => {
+		mkdirSync(join(scratch, dir), { recursive: true });
+		writeFileSync(join(scratch, dir, fileName), content);
+	};
+	const groups = (workflows: Workflow[]) => workflows.map((w) => [w.name, w.group, w.source]);
+	before(() => {
+		scratch = mkdtempSync(join(tmpdir(), "brigadev-workflow-groups-"));
+		put("pkg", "review.md", file("Review", 'order: 1\ngroup: "ship"\n'));
+		put("pkg", "bug-fix.md", file("Bug fix", 'order: 2\ngroup: "build"\n'));
+		put("user", "review.md", file("Review", "order: 1\n", "User review {{what}}"));
+		put("user", "bug-fix.md", file("Bug fix", 'order: 2\ngroup: "Quality"\n'));
+		put("repo", "review.md", file("review", "order: 1\n", "Repo review {{what}}"));
+	});
+	after(() => rmSync(scratch, { recursive: true, force: true }));
+
+	it("an override without a group inherits the shipped group", () => {
+		const { workflows, warnings } = discoverWorkflows({ packageDir: join(scratch, "pkg"), userDir: join(scratch, "user"), parse });
+		assert.deepEqual(groups(workflows).find(([name]) => name === "Review"), ["Review", "ship", "user"]);
+		assert.deepEqual(warnings, []);
+	});
+
+	it("an override with its own group keeps it", () => {
+		const { workflows } = discoverWorkflows({ packageDir: join(scratch, "pkg"), userDir: join(scratch, "user"), parse });
+		assert.deepEqual(groups(workflows).find(([name]) => name === "Bug fix"), ["Bug fix", "Quality", "user"]);
+	});
+
+	it("inherits through two layers", () => {
+		const { workflows } = discoverWorkflows({ packageDir: join(scratch, "pkg"), userDir: join(scratch, "user"), repoDir: join(scratch, "repo"), parse });
+		assert.deepEqual(groups(workflows).find(([name]) => name === "review"), ["review", "ship", "repo"]);
+	});
+});
+
+describe("workflowGroup", () => {
+	const make = (group?: string): Workflow => ({ name: "W", description: "d", order: 1, questions: [], body: "b", source: "user", filePath: "/w/w.md", ...(group !== undefined ? { group } : {}) });
+
+	it("no group means Build", () => {
+		assert.deepEqual(workflowGroup(make()), { id: "build", label: "Build" });
+	});
+
+	it("knows the four shipped groups by id or by label, ignoring case", () => {
+		assert.deepEqual(workflowGroup(make("ship")), { id: "ship", label: "Review & ship" });
+		assert.deepEqual(workflowGroup(make("Review & Ship")), { id: "ship", label: "Review & ship" });
+		assert.deepEqual(workflowGroup(make("BUILD")), { id: "build", label: "Build" });
+		assert.deepEqual(workflowGroup(make("inspect")), { id: "inspect", label: "Inspect" });
+		assert.deepEqual(workflowGroup(make("Settings")), { id: "settings", label: "Settings" });
+	});
+
+	it("an unknown name is its own category, labelled as written", () => {
+		assert.deepEqual(workflowGroup(make("Docs work")), { id: "docs work", label: "Docs work" });
+	});
+});
+
 describe("resolveWorkflow", () => {
 	const { workflows } = discoverWorkflows({ packageDir: join(ASSETS_ROOT, "workflows"), parse });
 
@@ -384,7 +481,7 @@ describe("loadWorkflows", () => {
 			assert.equal(clean.warning, undefined);
 			const dirty = loadWorkflows(parse, { packageDir: join(ASSETS_ROOT, "workflows"), userDir: join(scratch, "user") });
 			assert.equal(dirty.workflows.length, 9);
-			assert.match(dirty.warning!, /^brigadev: skipped invalid workflow files\n.*bad\.md: .*unknown question "missing"/);
+			assert.match(dirty.warning!, /^brigadev: workflow file warnings\n.*bad\.md: .*unknown question "missing"/);
 		} finally {
 			rmSync(scratch, { recursive: true, force: true });
 		}

@@ -34,7 +34,7 @@ Check it loaded: `/brigadev:status`.
 | Ask dialog | `extensions/ask-user.ts` | `ask_user_choice`: focused questions as a dialog with a recommended option. |
 | Model routing | `extensions/profiles.ts` | Named profiles route the orchestrator and every agent to a model and thinking level. |
 | Workflow menu | `extensions/workflow-menu.ts`, `assets/workflows/` | `/brigadev:start` (`alt+w`): pick a day-to-day workflow, answer its questions, review the composed request, and start it. See [Workflows](#workflows). |
-| Launch dashboard | `extensions/dashboard.ts` | Full-screen start menu when Pi opens: the nine workflows and a few tools, one key each. `/brigadev:dashboard` reopens it. See [Launch dashboard](#launch-dashboard). |
+| Launch dashboard | `extensions/dashboard.ts` | Full-screen start menu when Pi opens: four groups (Build, Review & ship, Inspect, Settings) holding the workflows and the tools, one key each. `/brigadev:dashboard` reopens it. See [Launch dashboard](#launch-dashboard). |
 | Cost | `extensions/cost.ts` | API-equivalent pricing for `claude-bridge` turns, session tally, `/brigadev:cost` breakdown. |
 | Delivery skills | `skills/` | work-unit commits, branch/PR, chained PRs, issue creation, comment writer, skill creator. |
 
@@ -45,7 +45,7 @@ Check it loaded: `/brigadev:status`.
 | `/brigadev:status` | Version, prompt on/off, paths, repo docs folder |
 | `alt+w` or `/brigadev:start` | Workflow menu: new feature, bug fix, review, PR, PR feedback, issue, UI change, refactor, dependency upgrade. Asks what each needs, then sends one complete request |
 | `/brigadev:start <workflow>` | Starts that workflow directly: its name, file id, or key (`/brigadev:start bug-fix`, `/brigadev:start b`) |
-| `/brigadev:dashboard` | Launch dashboard: workflows and tools, one key each |
+| `/brigadev:dashboard` | Launch dashboard: workflows and tools in groups, one key each |
 | `/brigadev:doctor [fix-bridge-hooks]` | Diagnostics, including the repo docs folder; turn off your Claude Code hooks inside claude-bridge turns |
 | `/brigadev:profile …` | Model routing profiles (see below) |
 | `/brigadev:cost` | Session cost: orchestrator per model, subagents per agent, cache hit rate |
@@ -140,7 +140,7 @@ Harness documents live outside the project, in `~/.brigadev/<repo>/` (`BRIGADEV_
 
 ## Workflows
 
-`/brigadev:start` (or `alt+w`, also listed in the `alt+k` palette) opens a list of workflows; Esc at any step cancels and sends nothing. Nine ship with the package: New feature, Bug fix, Review a PR or branch, Open a PR, Answer PR feedback, Create an issue, UI change from a design or ticket, Refactor a component, Upgrade dependencies.
+`/brigadev:start` (or `alt+w`, also listed in the `alt+k` palette) opens a plain list of workflows, each followed by its dashboard group in brackets (`[Build]`); Esc at any step cancels and sends nothing. Nine ship with the package: New feature, Bug fix, Review a PR or branch, Open a PR, Answer PR feedback, Create an issue, UI change from a design or ticket, Refactor a component, Upgrade dependencies.
 
 Each workflow asks its own questions (one line, multi-line editor, or a choice; required or optional). Required answers cannot be empty (asked again once, then the workflow is cancelled). When you choose Edit answers, an optional text answer is cleared by entering `-` (the title says so), and an optional choice offers a final `(no answer)` option. Answers the session can find are offered as defaults instead of asked blind: the current and default branch (git) and the repo's `package.json` test script. Only local lookups run; nothing touches the network. Before anything is sent you see the composed request and choose Start, Edit answers, or Cancel. The request quotes every answer verbatim, names the skills and commands the workflow needs, and is sent as a normal message, so the ODD flow and the guard apply. The questions use plain select, input, and editor dialogs, so the menu also works over RPC.
 
@@ -151,7 +151,8 @@ Workflows are markdown files. Add or override them by name in `~/.brigadev/workf
 name: "Add endpoint"
 description: "One line shown in the menu"
 order: 100          # optional; lower comes first
-key: "e"           # optional; one lowercase letter that runs it from the dashboard
+key: "w"           # optional; one lowercase letter that runs it from the dashboard
+group: "Build"     # optional; the dashboard category (default Build)
 questions:
   - id: route
     label: "Which route?"
@@ -176,31 +177,54 @@ Add an endpoint, following the normal ODD flow.
 
 In the body, `{{id}}` is replaced by the answer (a multi-line answer becomes a block quote), and a line is left out only when all of its answers were skipped (a skipped answer on a line with others renders as empty). A multi-line answer sits on its own quoted lines, with any text after the placeholder on the line below. A placeholder that names no question makes the file invalid.
 
-`key` must be one lowercase letter (an empty `key:` line means no key). The letters `g a m k q` belong to the dashboard tools. When two workflows claim the same letter, the higher layer keeps it (repo, then your global folder, then the package), and within a layer the first in menu order; the other workflow loses its key (a warning says so) but still works. An override replaces the whole file, but one without a `key` keeps the key of the workflow it overrides (set `key` to give it another). A workflow without a key is still listed on the dashboard and starts with Enter. A workflow folder Pi cannot read (not a folder, or no permission) is reported as a warning and skipped.
+`key` must be one lowercase letter (an empty `key:` line means no key). The letters `a c e g h k m o q s t y` belong to the dashboard tools (a workflow file that asks for one of them has no key and gets a warning). When two workflows claim the same letter, the higher layer keeps it (repo, then your global folder, then the package), and within a layer the first in menu order; the other workflow loses its key (a warning says so) but still works. An override replaces the whole file, but one without a `key` keeps the key of the workflow it overrides (set `key` to give it another). A workflow without a key is still listed on the dashboard and starts with Enter.
+
+`group` is a non-empty name (an empty `group:` line means no group; anything else that is not a name is an invalid file). It picks the dashboard category the workflow sits in: `build`, `ship` (Review & ship), `inspect`, or `settings`, written as the id or the label in any case; no `group` means Build, and any other name becomes a new category of its own (labelled as you wrote it, same name in any case is one category). Like `key`, an override without a `group` keeps the group of the workflow it overrides. A workflow folder Pi cannot read (not a folder, or no permission) is reported as a warning and skipped.
 
 ## Launch dashboard
 
-When Pi starts in the terminal UI, a full-screen start menu opens first: a centered list with an icon, a label, and the row's key at the end of the row. Press a key to run that row, move with `↑`/`↓` and press `Enter` to run the selected one, `Esc` to go straight to the chat, or `q` to quit. `/brigadev:dashboard` opens it again at any time.
+When Pi starts in the terminal UI, a full-screen start menu opens first: a centered list with an icon, a label, and the row's key at the end of the row. The top level lists the groups; `Enter` or `→` opens one, `←` or `Esc` goes back, and `Esc` on the top level goes straight to the chat. Move with `↑`/`↓`. `/brigadev:dashboard` opens it again at any time.
 
-| Key | Row | Runs |
-| --- | --- | --- |
-| `n` | New feature | the workflow's questions |
-| `b` | Bug fix | the workflow's questions |
-| `r` | Review a PR or branch | the workflow's questions |
-| `p` | Open a PR | the workflow's questions |
-| `f` | Answer PR feedback | the workflow's questions |
-| `i` | Create an issue | the workflow's questions |
-| `u` | UI change from a design or ticket | the workflow's questions |
-| `x` | Refactor a component | the workflow's questions |
-| `d` | Upgrade dependencies | the workflow's questions |
-| `g` | Changes | `/brigadev:changes` |
-| `a` | Agents history | `/brigadev:runs` |
-| `m` | Model profile | `/brigadev:profile use` (pick a profile) |
-| `k` | Commands | `/brigadev:commands` |
-| `Enter` on Chat, or `Esc` anywhere | Chat | closes the dashboard |
-| `q` | Quit | exits Pi |
+```
+1 Build          n feature · b bug · u UI change · x refactor · d deps
+2 Review & ship  r review · p open PR · f PR feedback · i issue
+3 Inspect        g changes · a agents history · c cost · s usage · t status · o panel
+4 Settings       m model profile · e mode · h dashboard on/off · y doctor
+k Commands   ↵ Chat   q Quit
+```
 
-A workflow row opens that workflow's questions directly (it runs `/brigadev:start <workflow name>`; the name is unique, so a keyless workflow that shares a file name with another still starts itself). Your own workflows from `~/.brigadev/workflows/` and `~/.brigadev/<repo>/workflows/` are listed after the nine, with a key if they declare one.
+Every key works from any level: a letter runs its row, a digit opens its group. Going back puts the selection on the group you left; opening a group starts on its first row.
+
+| Key | Group | Row | Runs |
+| --- | --- | --- | --- |
+| `1` | | Build | opens the group |
+| `n` | Build | New feature | the workflow's questions |
+| `b` | Build | Bug fix | the workflow's questions |
+| `u` | Build | UI change from a design or ticket | the workflow's questions |
+| `x` | Build | Refactor a component | the workflow's questions |
+| `d` | Build | Upgrade dependencies | the workflow's questions |
+| `2` | | Review & ship | opens the group |
+| `r` | Review & ship | Review a PR or branch | the workflow's questions |
+| `p` | Review & ship | Open a PR | the workflow's questions |
+| `f` | Review & ship | Answer PR feedback | the workflow's questions |
+| `i` | Review & ship | Create an issue | the workflow's questions |
+| `3` | | Inspect | opens the group |
+| `g` | Inspect | Changes | `/brigadev:changes` |
+| `a` | Inspect | Agents history | `/brigadev:runs` |
+| `c` | Inspect | Cost | `/brigadev:cost` |
+| `s` | Inspect | Usage | `/brigadev:usage` |
+| `t` | Inspect | Status | `/brigadev:status` |
+| `o` | Inspect | Panel | `/brigadev:panel` |
+| `4` | | Settings | opens the group |
+| `m` | Settings | Model profile | `/brigadev:profile use` (pick a profile) |
+| `e` | Settings | Permission mode | `/brigadev:mode status` (shows the mode; it never changes it, switching stays a typed `/brigadev:mode` command) |
+| `h` | Settings | Launch dashboard on/off | `/brigadev:ui dashboard off` when the automatic start is on, `on` when it is off |
+| `y` | Settings | Doctor | `/brigadev:doctor` |
+| `k` | | Commands | `/brigadev:commands` |
+| `Enter` on Chat, or `Esc` on the top level | | Chat | closes the dashboard |
+| `q` | | Quit | exits Pi |
+
+A workflow row opens that workflow's questions directly (it runs `/brigadev:start <workflow name>`; the name is unique, so a keyless workflow that shares a file name with another still starts itself). Your own workflows from `~/.brigadev/workflows/` and `~/.brigadev/<repo>/workflows/` are listed in their group, after the shipped ones, with a key if they declare one; with no `group:` they go to Build. A `group:` name that is not one of the four becomes a new category: a row on the top level after Review & ship, with the next digit (`5`, `6`, … up to `9`; later ones have no digit and open with `Enter`).
 
 It opens by itself only on a fresh start: not on `/reload`, `/new`, `--continue`, or `--resume` into a session that has messages, not when you launch Pi with a message or an `@file` (`pi "fix the login bug"`), not in print, JSON, or RPC mode, and never inside subagents. Turn the automatic start off with `/brigadev:ui dashboard off` (it writes `"ui": { "dashboard": false }` to `~/.pi/agent/brigadev.json`); `/brigadev:ui dashboard on` brings it back, and `/brigadev:dashboard` keeps working either way. Setting the environment variable `BRIGADEV_DASHBOARD=0` (or `off`/`false`) skips the automatic start whatever the setting says, e.g. `BRIGADEV_DASHBOARD=0 pi` if the dashboard ever fails to draw. If the automatic start fails, a message says why and how to turn it off.
 

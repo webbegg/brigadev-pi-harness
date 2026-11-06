@@ -3,6 +3,7 @@ name: "Refactor a component"
 description: "Restructure a component without changing what it does"
 order: 80
 key: "x"
+group: "build"
 questions:
   - id: component
     label: "Component path"

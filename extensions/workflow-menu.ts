@@ -10,7 +10,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { isChildSession, PACKAGE_WORKFLOWS_DIR } from "../lib/runtime.ts";
-import { askQuestions, composeRequest, gatherFacts, type Answers } from "../lib/workflow-run.ts";
+import { askQuestions, composeRequest, gatherFacts, workflowListLabel, type Answers } from "../lib/workflow-run.ts";
 import { loadWorkflows, resolveWorkflow, workflowDirs, type Workflow } from "../lib/workflows.ts";
 import type { ExecFn } from "../lib/worktree-snapshot.ts";
 
@@ -38,7 +38,7 @@ export default function (pi: ExtensionAPI) {
 				return ctx.ui.notify(`brigadev: ${error instanceof Error ? error.message : String(error)}`, "error");
 			}
 		} else {
-			const labels = workflows.map((candidate) => `${candidate.name} — ${candidate.description}`);
+			const labels = workflows.map(workflowListLabel);
 			const picked = await ctx.ui.select("Start a workflow", labels);
 			workflow = picked === undefined ? undefined : workflows[labels.indexOf(picked)];
 		}

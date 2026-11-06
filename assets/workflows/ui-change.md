@@ -3,6 +3,7 @@ name: "UI change from a design or ticket"
 description: "Implement a UI change and verify it against the design"
 order: 70
 key: "u"
+group: "build"
 questions:
   - id: source
     label: "Design link, screenshot path, or ticket"

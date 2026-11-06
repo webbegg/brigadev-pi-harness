@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { buildEntries, type DashboardAction, type DashboardEntry } from "../lib/dashboard.ts";
+import { allEntries, buildMenu, DASHBOARD_HINT, GROUP_HINT, type DashboardAction, type DashboardEntry } from "../lib/dashboard.ts";
 import {
 	autoOpen,
 	DASHBOARD_ENV,
@@ -15,6 +15,9 @@ import {
 	scheduleAutoOpen,
 	shouldOpenOnStart,
 	START_COMMAND,
+	startState,
+	viewFor,
+	type DashboardState,
 	type DispatchDeps,
 	type KeyMatcher,
 	type LaunchReaders,
@@ -22,94 +25,212 @@ import {
 import { CHILD_ENV, readSettings, runUiCommand, settingsPath, type BrigadevSettings } from "../lib/runtime.ts";
 import type { Workflow } from "../lib/workflows.ts";
 
-const workflow = (name: string, id: string, key?: string): Workflow => ({ name, description: "d", order: 1, questions: [], body: "b", source: "package", filePath: `/w/${id}.md`, ...(key ? { key } : {}) });
-const NINE: Array<[string, string, string]> = [
-	["New feature", "new-feature", "n"],
-	["Bug fix", "bug-fix", "b"],
-	["Review a PR or branch", "review", "r"],
-	["Open a PR", "open-pr", "p"],
-	["Answer PR feedback", "pr-feedback", "f"],
-	["Create an issue", "create-issue", "i"],
-	["UI change from a design or ticket", "ui-change", "u"],
-	["Refactor a component", "refactor", "x"],
-	["Upgrade dependencies", "upgrade-dependencies", "d"],
+const workflow = (name: string, id: string, key?: string, group?: string): Workflow => ({ name, description: "d", order: 1, questions: [], body: "b", source: "package", filePath: `/w/${id}.md`, ...(key ? { key } : {}), ...(group ? { group } : {}) });
+const NINE: Array<[string, string, string, string]> = [
+	["New feature", "new-feature", "n", "build"],
+	["Bug fix", "bug-fix", "b", "build"],
+	["Review a PR or branch", "review", "r", "ship"],
+	["Open a PR", "open-pr", "p", "ship"],
+	["Answer PR feedback", "pr-feedback", "f", "ship"],
+	["Create an issue", "create-issue", "i", "ship"],
+	["UI change from a design or ticket", "ui-change", "u", "build"],
+	["Refactor a component", "refactor", "x", "build"],
+	["Upgrade dependencies", "upgrade-dependencies", "d", "build"],
 ];
-const entries: DashboardEntry[] = buildEntries(NINE.map(([name, id, key]) => workflow(name, id, key)));
-const rowIndex = (label: string) => entries.findIndex((entry) => entry.label === label);
+const menu = buildMenu([...NINE.map(([name, id, key, group]) => workflow(name, id, key, group)), workflow("Write docs", "write-docs", "w", "Docs")]);
+const everything = allEntries(menu);
 const CHAT: DashboardAction = { kind: "chat" };
 
-const KEYS = { escape: "\x1b", enter: "\r", up: "\x1b[A", down: "\x1b[B", ctrlN: "\x0e", ctrlP: "\x10" };
+const KEYS = { escape: "\x1b", enter: "\r", up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D", ctrlN: "\x0e", ctrlP: "\x10" };
 
-describe("reduceKey", () => {
-	it("Esc goes to the chat from any row", () => {
-		for (const selected of [0, 5, entries.length - 1]) {
-			assert.deepEqual(reduceKey({ selected }, KEYS.escape, entries), { state: { selected }, done: CHAT });
+// Top level: Build, Review & ship, Docs, Inspect, Settings, Commands, Chat, Quit.
+const TOP = menu.top.map((entry) => entry.label);
+const topIndex = (label: string) => TOP.indexOf(label);
+const inGroup = (id: string, selected = 0): DashboardState => ({ level: "group", group: id, selected });
+const atTop = (selected = 0): DashboardState => ({ level: "top", selected });
+const groupItems = (id: string) => menu.groups.find((g) => g.id === id)!.items;
+
+describe("viewFor", () => {
+	it("the top level shows the top rows with the top hint and no heading", () => {
+		const view = viewFor(menu, startState);
+		assert.deepEqual(startState, atTop(0));
+		assert.equal(view.entries, menu.top);
+		assert.equal(view.heading, undefined);
+		assert.equal(view.hint, DASHBOARD_HINT);
+	});
+
+	it("a group shows its rows under its name with the group hint", () => {
+		const view = viewFor(menu, inGroup("inspect"));
+		assert.equal(view.entries, groupItems("inspect"));
+		assert.equal(view.heading, "Inspect");
+		assert.equal(view.hint, GROUP_HINT);
+	});
+
+	it("an unknown group falls back to the top level", () => {
+		assert.equal(viewFor(menu, inGroup("nope")).entries, menu.top);
+	});
+});
+
+describe("reduceKey at the top level", () => {
+	it("Esc goes to the chat from any row, leaving the state alone", () => {
+		for (const selected of [0, 3, menu.top.length - 1]) {
+			assert.deepEqual(reduceKey(atTop(selected), KEYS.escape, menu), { state: atTop(selected), done: CHAT });
 		}
 	});
 
-	it("Enter runs the selected row's action; the Chat row means chat", () => {
-		assert.deepEqual(reduceKey({ selected: 0 }, KEYS.enter, entries).done, { kind: "workflow", query: "New feature" });
-		assert.deepEqual(reduceKey({ selected: rowIndex("Bug fix") }, KEYS.enter, entries).done, { kind: "workflow", query: "Bug fix" });
-		assert.deepEqual(reduceKey({ selected: rowIndex("Changes") }, KEYS.enter, entries).done, { kind: "command", command: "/brigadev:changes" });
-		assert.deepEqual(reduceKey({ selected: rowIndex("Chat") }, KEYS.enter, entries).done, CHAT);
-		assert.deepEqual(reduceKey({ selected: rowIndex("Quit") }, KEYS.enter, entries).done, { kind: "quit" });
+	it("Enter on a group row opens it on its first row, without closing", () => {
+		assert.deepEqual(reduceKey(atTop(topIndex("Inspect")), KEYS.enter, menu), { state: inGroup("inspect", 0) });
+		assert.deepEqual(reduceKey(atTop(0), KEYS.enter, menu), { state: inGroup("build", 0) });
+		assert.deepEqual(reduceKey(atTop(topIndex("Docs")), KEYS.enter, menu), { state: inGroup("docs", 0) });
 	});
 
-	it("Enter does not pick row 0 when another row is selected", () => {
-		assert.notDeepEqual(reduceKey({ selected: 3 }, KEYS.enter, entries).done, entries[0].action);
-		assert.deepEqual(reduceKey({ selected: 3 }, KEYS.enter, entries).done, entries[3].action);
+	it("→ opens the group too, and does nothing on Commands, Chat, or Quit", () => {
+		assert.deepEqual(reduceKey(atTop(topIndex("Review & ship")), KEYS.right, menu), { state: inGroup("ship", 0) });
+		for (const label of ["Commands", "Chat", "Quit"]) assert.deepEqual(reduceKey(atTop(topIndex(label)), KEYS.right, menu), { state: atTop(topIndex(label)) }, label);
 	});
 
-	it("each row's letter runs that row, whatever is selected", () => {
-		const keyed = entries.filter((entry) => entry.key);
-		assert.equal(keyed.length, 14);
-		for (const entry of keyed) {
-			const result = reduceKey({ selected: 2 }, entry.key!, entries);
-			assert.deepEqual(result.done, entry.action, entry.label);
-			assert.deepEqual(result.state, { selected: 2 }, entry.label);
-		}
+	it("← does nothing at the top level", () => {
+		assert.deepEqual(reduceKey(atTop(2), KEYS.left, menu), { state: atTop(2) });
 	});
 
-	it("ignores unknown letters and multi-character input without closing", () => {
-		for (const data of ["z", "nn", "N", "1", " ", "\t"]) assert.deepEqual(reduceKey({ selected: 4 }, data, entries), { state: { selected: 4 } }, JSON.stringify(data));
+	it("Enter on Commands runs it, on Chat means chat, on Quit quits", () => {
+		assert.deepEqual(reduceKey(atTop(topIndex("Commands")), KEYS.enter, menu).done, { kind: "command", command: "/brigadev:commands" });
+		assert.deepEqual(reduceKey(atTop(topIndex("Chat")), KEYS.enter, menu).done, CHAT);
+		assert.deepEqual(reduceKey(atTop(topIndex("Quit")), KEYS.enter, menu).done, { kind: "quit" });
 	});
 
 	it("moves with the arrows and ctrl+n / ctrl+p, wrapping at both ends", () => {
-		assert.deepEqual(reduceKey({ selected: 0 }, KEYS.down, entries), { state: { selected: 1 } });
-		assert.deepEqual(reduceKey({ selected: 0 }, KEYS.ctrlN, entries), { state: { selected: 1 } });
-		assert.deepEqual(reduceKey({ selected: 5 }, KEYS.up, entries), { state: { selected: 4 } });
-		assert.deepEqual(reduceKey({ selected: 5 }, KEYS.ctrlP, entries), { state: { selected: 4 } });
-		assert.deepEqual(reduceKey({ selected: 0 }, KEYS.up, entries), { state: { selected: entries.length - 1 } });
-		assert.deepEqual(reduceKey({ selected: entries.length - 1 }, KEYS.down, entries), { state: { selected: 0 } });
+		const last = menu.top.length - 1;
+		assert.deepEqual(reduceKey(atTop(0), KEYS.down, menu), { state: atTop(1) });
+		assert.deepEqual(reduceKey(atTop(0), KEYS.ctrlN, menu), { state: atTop(1) });
+		assert.deepEqual(reduceKey(atTop(5), KEYS.up, menu), { state: atTop(4) });
+		assert.deepEqual(reduceKey(atTop(5), KEYS.ctrlP, menu), { state: atTop(4) });
+		assert.deepEqual(reduceKey(atTop(0), KEYS.up, menu), { state: atTop(last) });
+		assert.deepEqual(reduceKey(atTop(last), KEYS.down, menu), { state: atTop(0) });
+	});
+});
+
+describe("reduceKey inside a group", () => {
+	it("Enter runs the selected row; the selection starts on the first row", () => {
+		assert.deepEqual(reduceKey(inGroup("build", 0), KEYS.enter, menu), { state: inGroup("build", 0), done: { kind: "workflow", query: "New feature" } });
+		assert.deepEqual(reduceKey(inGroup("build", 1), KEYS.enter, menu).done, { kind: "workflow", query: "Bug fix" });
+		assert.deepEqual(reduceKey(inGroup("inspect", 2), KEYS.enter, menu).done, { kind: "command", command: "/brigadev:cost" });
+		assert.deepEqual(reduceKey(inGroup("settings", 2), KEYS.enter, menu).done, { kind: "toggle-dashboard" });
+		assert.deepEqual(reduceKey(inGroup("docs", 0), KEYS.enter, menu).done, { kind: "workflow", query: "Write docs" });
+	});
+
+	it("← and Esc go back to the top level, on the row of the group they came from", () => {
+		for (const [id, label] of [["build", "Build"], ["ship", "Review & ship"], ["docs", "Docs"], ["inspect", "Inspect"], ["settings", "Settings"]]) {
+			for (const back of [KEYS.left, KEYS.escape]) {
+				assert.deepEqual(reduceKey(inGroup(id, 1), back, menu), { state: atTop(topIndex(label)) }, `${id} ${JSON.stringify(back)}`);
+			}
+		}
+	});
+
+	it("Esc in a group does not go to the chat", () => {
+		assert.equal(reduceKey(inGroup("build"), KEYS.escape, menu).done, undefined);
+	});
+
+	it("→ does nothing on a row", () => {
+		assert.deepEqual(reduceKey(inGroup("build", 1), KEYS.right, menu), { state: inGroup("build", 1) });
+	});
+
+	it("moves within the group's rows, wrapping at both ends", () => {
+		const count = groupItems("inspect").length;
+		assert.deepEqual(reduceKey(inGroup("inspect", 0), KEYS.down, menu), { state: inGroup("inspect", 1) });
+		assert.deepEqual(reduceKey(inGroup("inspect", 0), KEYS.up, menu), { state: inGroup("inspect", count - 1) });
+		assert.deepEqual(reduceKey(inGroup("inspect", count - 1), KEYS.down, menu), { state: inGroup("inspect", 0) });
+		assert.deepEqual(reduceKey(inGroup("inspect", 2), KEYS.ctrlN, menu), { state: inGroup("inspect", 3) });
+		assert.deepEqual(reduceKey(inGroup("inspect", 2), KEYS.ctrlP, menu), { state: inGroup("inspect", 1) });
+	});
+
+	it("an unknown group behaves like the top level", () => {
+		assert.deepEqual(reduceKey(inGroup("nope", 0), KEYS.escape, menu).done, CHAT);
+	});
+});
+
+describe("reduceKey keys from any level", () => {
+	const levels: Array<[string, DashboardState]> = [["top", atTop(2)], ...menu.groups.map((g): [string, DashboardState] => [g.id, inGroup(g.id, 1)])];
+
+	it("every letter runs its row from the top and from inside any group, keeping the state", () => {
+		const letters = everything.filter((entry) => entry.key && /[a-z]/.test(entry.key));
+		// 9 workflows + Write docs + 6 inspect + 4 settings + Commands + Quit
+		assert.equal(letters.length, 22);
+		for (const [name, state] of levels) {
+			for (const entry of letters) {
+				assert.deepEqual(reduceKey(state, entry.key!, menu), { state, done: entry.action }, `${name}: ${entry.label}`);
+			}
+		}
+	});
+
+	it("the new tool letters run their commands from the top level", () => {
+		const commandFor = (key: string) => reduceKey(atTop(0), key, menu).done;
+		assert.deepEqual(commandFor("c"), { kind: "command", command: "/brigadev:cost" });
+		assert.deepEqual(commandFor("s"), { kind: "command", command: "/brigadev:usage" });
+		assert.deepEqual(commandFor("t"), { kind: "command", command: "/brigadev:status" });
+		assert.deepEqual(commandFor("o"), { kind: "command", command: "/brigadev:panel" });
+		assert.deepEqual(commandFor("e"), { kind: "command", command: "/brigadev:mode status" });
+		assert.deepEqual(commandFor("h"), { kind: "toggle-dashboard" });
+		assert.deepEqual(commandFor("y"), { kind: "command", command: "/brigadev:doctor" });
+		assert.deepEqual(commandFor("q"), { kind: "quit" });
+	});
+
+	it("a digit opens its group from any level, on the first row", () => {
+		for (const [name, state] of levels) {
+			assert.deepEqual(reduceKey(state, "1", menu), { state: inGroup("build", 0) }, name);
+			assert.deepEqual(reduceKey(state, "2", menu), { state: inGroup("ship", 0) }, name);
+			assert.deepEqual(reduceKey(state, "3", menu), { state: inGroup("inspect", 0) }, name);
+			assert.deepEqual(reduceKey(state, "4", menu), { state: inGroup("settings", 0) }, name);
+			assert.deepEqual(reduceKey(state, "5", menu), { state: inGroup("docs", 0) }, name);
+		}
+	});
+
+	it("going back after jumping by digit lands on the group you jumped to", () => {
+		const jumped = reduceKey(inGroup("inspect", 4), "2", menu).state;
+		assert.deepEqual(reduceKey(jumped, KEYS.left, menu).state, atTop(topIndex("Review & ship")));
+	});
+
+	it("ignores unknown letters, digits with no group, and multi-character input without closing", () => {
+		for (const [name, state] of levels) {
+			for (const data of ["z", "nn", "N", "6", "0", " ", "\t"]) assert.deepEqual(reduceKey(state, data, menu), { state }, `${name} ${JSON.stringify(data)}`);
+		}
 	});
 
 	it("does not touch the state it was given", () => {
-		const state = { selected: 1 };
-		reduceKey(state, KEYS.down, entries);
-		assert.deepEqual(state, { selected: 1 });
+		const state = atTop(1);
+		reduceKey(state, KEYS.down, menu);
+		reduceKey(state, KEYS.enter, menu);
+		assert.deepEqual(state, atTop(1));
 	});
 
 	it("asks the injected key matcher, so the adapter can use Pi's (Kitty-aware) one", () => {
 		const asked: string[] = [];
 		const matcher: KeyMatcher = (data, key) => {
 			asked.push(key);
-			return data === "<esc>" ? key === "escape" : data === "<down>" ? key === "down" : false;
+			return data === "<esc>" ? key === "escape" : data === "<down>" ? key === "down" : data === "<left>" ? key === "left" : data === "<right>" ? key === "right" : false;
 		};
-		assert.deepEqual(reduceKey({ selected: 0 }, "<esc>", entries, matcher).done, CHAT);
-		assert.deepEqual(reduceKey({ selected: 0 }, "<down>", entries, matcher).state, { selected: 1 });
-		assert.ok(asked.includes("escape") && asked.includes("down"));
+		assert.deepEqual(reduceKey(atTop(0), "<esc>", menu, matcher).done, CHAT);
+		assert.deepEqual(reduceKey(atTop(0), "<down>", menu, matcher).state, atTop(1));
+		assert.deepEqual(reduceKey(atTop(0), "<right>", menu, matcher).state, inGroup("build", 0));
+		assert.deepEqual(reduceKey(inGroup("build", 1), "<left>", menu, matcher).state, atTop(0));
+		assert.ok(["escape", "down", "left", "right"].every((key) => asked.includes(key)));
 		// Without a match, a plain letter still runs its row.
-		assert.deepEqual(reduceKey({ selected: 0 }, "q", entries, matcher).done, { kind: "quit" });
+		assert.deepEqual(reduceKey(atTop(0), "q", menu, matcher).done, { kind: "quit" });
 	});
 
-	it("is safe on an empty list", () => {
-		assert.deepEqual(reduceKey({ selected: 0 }, KEYS.enter, []), { state: { selected: 0 }, done: CHAT });
-		assert.deepEqual(reduceKey({ selected: 0 }, KEYS.down, []), { state: { selected: 0 } });
+	it("is safe on an empty menu", () => {
+		const empty = { groups: [], top: [] };
+		assert.deepEqual(reduceKey(atTop(0), KEYS.enter, empty), { state: atTop(0), done: CHAT });
+		assert.deepEqual(reduceKey(atTop(0), KEYS.down, empty), { state: atTop(0) });
+		assert.deepEqual(reduceKey(atTop(0), KEYS.right, empty), { state: atTop(0) });
 	});
 
 	it("legacy key sequences are distinct", () => {
 		assert.ok(legacyKeys(KEYS.escape, "escape") && !legacyKeys(KEYS.escape, "enter"));
 		assert.ok(legacyKeys("\n", "enter"));
+		assert.ok(legacyKeys(KEYS.left, "left") && !legacyKeys(KEYS.left, "right"));
+		assert.ok(legacyKeys(KEYS.right, "right") && !legacyKeys(KEYS.right, "left"));
+		assert.ok(legacyKeys("\x1bOD", "left") && legacyKeys("\x1bOC", "right"));
 	});
 });
 
@@ -135,6 +256,59 @@ describe("dispatch", () => {
 		const { calls, deps } = make();
 		dispatch({ kind: "command", command: "/brigadev:changes" }, deps);
 		assert.deepEqual(calls, [["send", "/brigadev:changes", { expandPromptTemplates: true }]]);
+	});
+
+	it("runs every new tool row as its own command", () => {
+		const sent = (label: string) => {
+			const { calls, deps } = make();
+			dispatch(everything.find((entry) => entry.label === label)!.action as DashboardAction, deps);
+			return calls;
+		};
+		for (const [label, command] of [["Cost", "/brigadev:cost"], ["Usage", "/brigadev:usage"], ["Status", "/brigadev:status"], ["Panel", "/brigadev:panel"], ["Doctor", "/brigadev:doctor"], ["Permission mode", "/brigadev:mode status"], ["Model profile", "/brigadev:profile use"], ["Changes", "/brigadev:changes"], ["Agents history", "/brigadev:runs"]]) {
+			assert.deepEqual(sent(label), [["send", command, { expandPromptTemplates: true }]], label);
+		}
+	});
+
+	it("the launch dashboard row turns the automatic start off when it is on", () => {
+		for (const settings of [{}, { ui: {} }, { ui: { dashboard: true } }, { ui: { footer: false } }] as BrigadevSettings[]) {
+			const { calls, deps } = make();
+			dispatch({ kind: "toggle-dashboard" }, { ...deps, readSettings: () => settings });
+			assert.deepEqual(calls, [["send", "/brigadev:ui dashboard off", { expandPromptTemplates: true }]], JSON.stringify(settings));
+		}
+	});
+
+	it("the launch dashboard row turns it on when it is off", () => {
+		const { calls, deps } = make();
+		dispatch({ kind: "toggle-dashboard" }, { ...deps, readSettings: () => ({ ui: { dashboard: false } }) });
+		assert.deepEqual(calls, [["send", "/brigadev:ui dashboard on", { expandPromptTemplates: true }]]);
+	});
+
+	it("reads the setting when the row runs, not when the menu was built", () => {
+		let settings: BrigadevSettings = { ui: { dashboard: true } };
+		const { calls, deps } = make();
+		const withSettings = { ...deps, readSettings: () => settings };
+		dispatch({ kind: "toggle-dashboard" }, withSettings);
+		settings = { ui: { dashboard: false } };
+		dispatch({ kind: "toggle-dashboard" }, withSettings);
+		assert.deepEqual(calls.map((call) => call[1]), ["/brigadev:ui dashboard off", "/brigadev:ui dashboard on"]);
+	});
+
+	it("a failing settings read is reported, nothing is sent", () => {
+		const { calls, deps } = make();
+		dispatch({ kind: "toggle-dashboard" }, { ...deps, readSettings: () => { throw new Error("EACCES"); } });
+		assert.deepEqual(calls, [["notify", "Could not toggle the launch dashboard: EACCES", "error"]]);
+	});
+
+	it("no row changes the permission mode: the only mode command sent is `/brigadev:mode status`", () => {
+		const sentTexts: string[] = [];
+		for (const entry of everything) {
+			if (entry.action.kind === "group") continue;
+			const { calls, deps } = make();
+			dispatch(entry.action, { ...deps, readSettings: () => ({}) });
+			for (const call of calls) if (call[0] === "send") sentTexts.push(call[1] as string);
+		}
+		const modeCommands = sentTexts.filter((text) => text.includes("/brigadev:mode") || /\b(yolo|normal)\b/.test(text));
+		assert.deepEqual(modeCommands, ["/brigadev:mode status"]);
 	});
 
 	it("quit shuts the session down and sends nothing", () => {

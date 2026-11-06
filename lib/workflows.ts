@@ -21,8 +21,23 @@ const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
 const UNORDERED = 1_000;
 const KEY_PATTERN = /^[a-z]$/;
 
-/** Dashboard keys the tools use (Changes, Agents history, Model profile, Commands, Quit); a workflow cannot take them. */
-export const RESERVED_KEYS: readonly string[] = ["g", "a", "m", "k", "q"];
+/** Dashboard keys the tools use (Changes, Agents history, Cost, Usage, Status, Panel, Model profile, Permission mode, Launch dashboard, Doctor, Commands, Quit); a workflow cannot take them. */
+export const RESERVED_KEYS: readonly string[] = ["g", "a", "c", "s", "t", "o", "m", "e", "h", "y", "k", "q"];
+
+export interface WorkflowGroup {
+	id: string;
+	label: string;
+}
+
+/** The dashboard's own groups, in display order. A workflow's `group:` matches one by id or label, ignoring case. */
+export const KNOWN_GROUPS: readonly WorkflowGroup[] = [
+	{ id: "build", label: "Build" },
+	{ id: "ship", label: "Review & ship" },
+	{ id: "inspect", label: "Inspect" },
+	{ id: "settings", label: "Settings" },
+];
+
+const DEFAULT_GROUP = KNOWN_GROUPS[0];
 
 export interface WorkflowQuestion {
 	id: string;
@@ -42,6 +57,8 @@ export interface Workflow {
 	order: number;
 	/** Dashboard key: one lowercase letter, unique among workflows and not reserved; dropped (with a warning) when it is not. An override without one inherits the key of the workflow it replaces. */
 	key?: string;
+	/** Dashboard category: a shipped group's id or label, or a new category's name. Absent means Build. An override without one inherits the group of the workflow it replaces. */
+	group?: string;
 	questions: WorkflowQuestion[];
 	/** Prompt body with `{{question-id}}` placeholders. */
 	body: string;
@@ -87,6 +104,10 @@ export function parseWorkflow(content: string, filePath: string, source: Workflo
 	// An empty `key:` line is null in YAML: no key, not an invalid one.
 	const key = frontmatter.key ?? undefined;
 	if (key !== undefined && (typeof key !== "string" || !KEY_PATTERN.test(key))) throw new Error("key must be one lowercase letter");
+	// Same for an empty `group:` line.
+	const rawGroup = frontmatter.group ?? undefined;
+	if (rawGroup !== undefined && (typeof rawGroup !== "string" || !rawGroup.trim())) throw new Error("group must be a non-empty name");
+	const group = rawGroup?.trim();
 	const rawQuestions = frontmatter.questions ?? [];
 	if (!Array.isArray(rawQuestions)) throw new Error("questions must be a list");
 	const questions = rawQuestions.map(parseQuestion);
@@ -103,6 +124,7 @@ export function parseWorkflow(content: string, filePath: string, source: Workflo
 		description: frontmatter.description.trim(),
 		order: typeof frontmatter.order === "number" ? frontmatter.order : UNORDERED,
 		...(key !== undefined ? { key } : {}),
+		...(group !== undefined ? { group } : {}),
 		questions,
 		body: body.trim(),
 		source,
@@ -141,7 +163,7 @@ export interface WorkflowDiscoveryOptions {
 
 /**
  * Later layers override earlier ones by name (ignoring case): package < user < repo. An invalid override leaves the lower layer's workflow in place.
- * An override without a `key` keeps the key of the workflow it replaces.
+ * An override without a `key` or a `group` keeps the one of the workflow it replaces.
  */
 export function discoverWorkflows(options: WorkflowDiscoveryOptions): WorkflowDiscovery {
 	const warnings: string[] = [];
@@ -154,8 +176,12 @@ export function discoverWorkflows(options: WorkflowDiscoveryOptions): WorkflowDi
 	for (const [dir, source] of layers) {
 		for (const workflow of loadDir(dir, source, options.parse, warnings)) {
 			const id = workflow.name.toLowerCase();
-			const inherited = byName.get(id)?.key;
-			byName.set(id, workflow.key === undefined && inherited !== undefined ? { ...workflow, key: inherited } : workflow);
+			const replaced = byName.get(id);
+			byName.set(id, {
+				...workflow,
+				...(workflow.key === undefined && replaced?.key !== undefined ? { key: replaced.key } : {}),
+				...(workflow.group === undefined && replaced?.group !== undefined ? { group: replaced.group } : {}),
+			});
 		}
 	}
 	const workflows = [...byName.values()].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
@@ -196,12 +222,20 @@ export interface LoadedWorkflows extends WorkflowDiscovery {
 	warning?: string;
 }
 
-export const SKIPPED_WORKFLOWS_TITLE = "brigadev: skipped invalid workflow files";
+export const SKIPPED_WORKFLOWS_TITLE = "brigadev: workflow file warnings";
 
 /** `discoverWorkflows` plus the notification text, so every caller words the warning the same way. */
 export function loadWorkflows(parse: FrontmatterParser, dirs: Omit<WorkflowDiscoveryOptions, "parse">): LoadedWorkflows {
 	const found = discoverWorkflows({ ...dirs, parse });
 	return found.warnings.length ? { ...found, warning: `${SKIPPED_WORKFLOWS_TITLE}\n${found.warnings.join("\n")}` } : found;
+}
+
+/** The category a workflow sits in on the dashboard: Build when it names none, a shipped group when the name matches one, else its own category labelled as written. */
+export function workflowGroup(workflow: Workflow): WorkflowGroup {
+	const name = workflow.group?.trim();
+	if (!name) return DEFAULT_GROUP;
+	const wanted = name.toLowerCase();
+	return KNOWN_GROUPS.find((group) => group.id === wanted || group.label.toLowerCase() === wanted) ?? { id: wanted, label: name };
 }
 
 /** The workflow's file name without `.md`, the id `/brigadev:start` also accepts. */

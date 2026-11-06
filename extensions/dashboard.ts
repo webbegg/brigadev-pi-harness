@@ -1,6 +1,7 @@
 /**
  * brigadev launch dashboard (/brigadev:dashboard): a full-screen start menu
- * with the nine workflows and a few tools, one key each. It opens by itself
+ * of four groups (Build, Review & ship, Inspect, Settings, plus any a
+ * workflow file names) with the workflows and tools in them, one key each. It opens by itself
  * once when Pi starts in the terminal UI with an empty session and no initial
  * prompt, never in subagents; `/brigadev:ui dashboard off` (or
  * `BRIGADEV_DASHBOARD=0`) turns that off. Choosing a row closes the dashboard
@@ -12,8 +13,8 @@ import { basename } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
-import { dispatch, reduceKey, scheduleAutoOpen, shouldOpenOnStart, type DashboardState } from "../lib/dashboard-controller.ts";
-import { buildEntries, DASHBOARD_COMMAND, renderDashboard, type DashboardAction } from "../lib/dashboard.ts";
+import { dispatch, reduceKey, scheduleAutoOpen, shouldOpenOnStart, startState, viewFor, type DashboardState } from "../lib/dashboard-controller.ts";
+import { buildMenu, DASHBOARD_COMMAND, renderDashboard, type DashboardAction } from "../lib/dashboard.ts";
 import { isChildSession, PACKAGE_WORKFLOWS_DIR } from "../lib/runtime.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { loadWorkflows, workflowDirs } from "../lib/workflows.ts";
@@ -34,22 +35,25 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const { workflows, warning } = loadWorkflows((content) => parseFrontmatter<Record<string, unknown>>(content), { packageDir: PACKAGE_WORKFLOWS_DIR, ...workflowDirs(ctx.cwd) });
 			if (warning) ctx.ui.notify(warning, "warning");
-			const entries = buildEntries(workflows);
+			const menu = buildMenu(workflows);
 			const repo = basename(ctx.cwd);
 
 			action = await ctx.ui.custom<DashboardAction | undefined>((tui, theme, _kb, done) => {
 				const painter = themePainter(theme);
-				let state: DashboardState = { selected: 0 };
+				let state: DashboardState = startState;
 				closeOverlay = () => done(undefined);
 				return {
 					invalidate() {},
 					handleInput(data: string) {
-						const result = reduceKey(state, data, entries, matchesKey);
+						const result = reduceKey(state, data, menu, matchesKey);
 						state = result.state;
 						if (result.done) return done(result.done);
 						tui.requestRender();
 					},
-					render: (width: number) => renderDashboard({ width, height: tui.terminal.rows, title: "brigadev", subtitle: repo, entries, selected: state.selected }, painter),
+					render: (width: number) => {
+						const { entries, heading, hint } = viewFor(menu, state);
+						return renderDashboard({ width, height: tui.terminal.rows, title: "brigadev", subtitle: repo, entries, selected: state.selected, heading, hint }, painter);
+					},
 				};
 			}, FULLSCREEN_OVERLAY);
 		} finally {
@@ -74,5 +78,5 @@ export default function (pi: ExtensionAPI) {
 		closeOverlay?.();
 	});
 
-	pi.registerCommand(DASHBOARD_COMMAND, { description: "Open the launch dashboard: workflows and tools, one key each", handler: async (_args, ctx) => open(ctx) });
+	pi.registerCommand(DASHBOARD_COMMAND, { description: "Open the launch dashboard: workflows and tools in groups, one key each", handler: async (_args, ctx) => open(ctx) });
 }

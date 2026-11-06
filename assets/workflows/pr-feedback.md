@@ -3,6 +3,7 @@ name: "Answer PR feedback"
 description: "Work through review comments on a pull request"
 order: 50
 key: "f"
+group: "ship"
 questions:
   - id: pr
     label: "PR number or URL"

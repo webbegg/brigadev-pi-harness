@@ -3,27 +3,51 @@
 // and nothing here imports Pi or the TUI.
 
 import { pad, windowStart, type Painter } from "./two-pane.ts";
-import { workflowId, type Workflow } from "./workflows.ts";
+import { workflowGroup, workflowId, type Workflow } from "./workflows.ts";
 
+/** What closes the dashboard and runs. */
 export type DashboardAction =
 	| { kind: "workflow"; query: string }
 	| { kind: "command"; command: string }
+	/** Turns the automatic start off when it is on, and on when it is off (decided when the row runs). */
+	| { kind: "toggle-dashboard" }
 	| { kind: "chat" }
 	| { kind: "quit" };
+
+/** What a row does: run something, or open a group's rows (the dashboard stays open). */
+export type EntryAction = DashboardAction | { kind: "group"; id: string };
 
 export interface DashboardEntry {
 	id: string;
 	icon: string;
 	label: string;
-	/** One lowercase letter that runs the row directly. */
+	/** One lowercase letter (or a digit, for a group) that runs the row directly. */
 	key?: string;
-	/** Shown at the end of the row instead of the key (the Chat row shows Enter). */
+	/** Shown at the end of the row instead of the key (the Chat row shows Enter, a group its digit and ›). */
 	keyLabel?: string;
-	action: DashboardAction;
+	action: EntryAction;
+}
+
+/** A category: a row on the top level, and its own list of rows. */
+export interface DashboardGroup {
+	id: string;
+	label: string;
+	icon: string;
+	/** A digit, for the first nine groups. */
+	key?: string;
+	items: DashboardEntry[];
+}
+
+export interface DashboardMenu {
+	/** In display order. */
+	groups: DashboardGroup[];
+	/** The top level: one row per group, then Commands, Chat, Quit. */
+	top: DashboardEntry[];
 }
 
 export const DASHBOARD_COMMAND = "brigadev:dashboard";
 export const DASHBOARD_HINT = "key or ↑↓ Enter · Esc chat · q quit";
+export const GROUP_HINT = "key or ↑↓ Enter · ← or Esc back · q quit";
 
 const DEFAULT_ICON = "◇";
 const ENTER_LABEL = "↵";
@@ -46,26 +70,85 @@ const WORKFLOW_ICONS: Record<string, string> = {
 	"upgrade-dependencies": "⇧",
 };
 
-const TOOLS: DashboardEntry[] = [
-	{ id: "changes", icon: "±", label: "Changes", key: "g", action: { kind: "command", command: "/brigadev:changes" } },
-	{ id: "runs", icon: "≡", label: "Agents history", key: "a", action: { kind: "command", command: "/brigadev:runs" } },
-	{ id: "profile", icon: "⚙", label: "Model profile", key: "m", action: { kind: "command", command: "/brigadev:profile use" } },
-	{ id: "commands", icon: "⌘", label: "Commands", key: "k", action: { kind: "command", command: "/brigadev:commands" } },
+const command = (id: string, icon: string, label: string, key: string, text: string): DashboardEntry => ({ id, icon, label, key, action: { kind: "command", command: text } });
+
+/** Tool rows by the group they sit in (after that group's workflows). Their letters are the workflows' RESERVED_KEYS. */
+const GROUP_TOOLS: Record<string, DashboardEntry[]> = {
+	inspect: [
+		command("changes", "±", "Changes", "g", "/brigadev:changes"),
+		command("runs", "≡", "Agents history", "a", "/brigadev:runs"),
+		command("cost", "$", "Cost", "c", "/brigadev:cost"),
+		command("usage", "◔", "Usage", "s", "/brigadev:usage"),
+		command("status", "●", "Status", "t", "/brigadev:status"),
+		command("panel", "▯", "Panel", "o", "/brigadev:panel"),
+	],
+	settings: [
+		command("profile", "◇", "Model profile", "m", "/brigadev:profile use"),
+		// Status only: the permission mode (and the yolo switch with it) stays a typed command.
+		command("mode", "⚑", "Permission mode", "e", "/brigadev:mode status"),
+		{ id: "dashboard", icon: "◐", label: "Launch dashboard on/off", key: "h", action: { kind: "toggle-dashboard" } },
+		command("doctor", "✚", "Doctor", "y", "/brigadev:doctor"),
+	],
+};
+
+/** Rows under the groups on the top level. */
+const TOP_TOOLS: DashboardEntry[] = [
+	command("commands", "⌘", "Commands", "k", "/brigadev:commands"),
 	{ id: "chat", icon: "❯", label: "Chat", keyLabel: ENTER_LABEL, action: { kind: "chat" } },
 	{ id: "quit", icon: "✕", label: "Quit", key: "q", action: { kind: "quit" } },
 ];
 
+const GROUP_ICONS: Record<string, string> = { build: "⊞", ship: "⇡", inspect: "◉", settings: "⚙" };
+/** Digits of the shipped groups; new categories take the next ones. */
+const GROUP_DIGITS: Record<string, string> = { build: "1", ship: "2", inspect: "3", settings: "4" };
+const FIRST_CUSTOM_DIGIT = 5;
+const LAST_DIGIT = 9;
+
+const workflowRow = (workflow: Workflow): DashboardEntry => {
+	const id = workflowId(workflow);
+	return { id, icon: WORKFLOW_ICONS[id] ?? DEFAULT_ICON, label: workflow.name, key: workflow.key, action: { kind: "workflow", query: workflow.name } };
+};
+
 /**
- * Workflows in the order given (keyed or not), then the tools. A workflow starts through `/brigadev:start <name>`:
- * the name is the only identity that stays unique after the layers merge (file ids and keys can repeat or be absent).
+ * The groups in display order (Build, Review & ship, any new categories, Inspect, Settings), each with its workflows
+ * in the order given (keyed or not) and then its tools; a group with no rows is left out. A new category (a `group:`
+ * name that is none of the shipped ones) takes the next free digit, 5 to 9, in order of first appearance. The top level
+ * is a row per group, then Commands, Chat, Quit. A workflow starts through `/brigadev:start <name>`: the name is the
+ * only identity that stays unique after the layers merge (file ids and keys can repeat or be absent).
  */
-export function buildEntries(workflows: readonly Workflow[]): DashboardEntry[] {
-	const rows = workflows.map((workflow): DashboardEntry => {
-		const id = workflowId(workflow);
-		return { id, icon: WORKFLOW_ICONS[id] ?? DEFAULT_ICON, label: workflow.name, key: workflow.key, action: { kind: "workflow", query: workflow.name } };
+export function buildMenu(workflows: readonly Workflow[]): DashboardMenu {
+	const byGroup = new Map<string, { label: string; rows: DashboardEntry[] }>();
+	for (const workflow of workflows) {
+		const { id, label } = workflowGroup(workflow);
+		const bucket = byGroup.get(id) ?? { label, rows: [] };
+		bucket.rows.push(workflowRow(workflow));
+		byGroup.set(id, bucket);
+	}
+	const shipped = (id: string, label: string): DashboardGroup => ({ id, label, icon: GROUP_ICONS[id], key: GROUP_DIGITS[id], items: [] });
+	const order = [shipped("build", "Build"), shipped("ship", "Review & ship")];
+	const custom = [...byGroup.entries()].filter(([id]) => !Object.hasOwn(GROUP_DIGITS, id));
+	custom.forEach(([id, { label }], index) => {
+		const digit = FIRST_CUSTOM_DIGIT + index;
+		order.push({ id, label, icon: DEFAULT_ICON, key: digit <= LAST_DIGIT ? String(digit) : undefined, items: [] });
 	});
-	return [...rows, ...TOOLS];
+	order.push(shipped("inspect", "Inspect"), shipped("settings", "Settings"));
+
+	const groups = order
+		.map((group) => ({ ...group, items: [...(byGroup.get(group.id)?.rows ?? []), ...(Object.hasOwn(GROUP_TOOLS, group.id) ? GROUP_TOOLS[group.id] : [])] }))
+		.filter((group) => group.items.length > 0);
+	const groupRows = groups.map((group): DashboardEntry => ({
+		id: `group:${group.id}`,
+		icon: group.icon,
+		label: group.label,
+		key: group.key,
+		keyLabel: group.key ? `${group.key} ${CURSOR}` : CURSOR,
+		action: { kind: "group", id: group.id },
+	}));
+	return { groups, top: [...groupRows, ...TOP_TOOLS] };
 }
+
+/** Every row on any level; a key works from anywhere. A group's digit comes from its row on the top level. */
+export const allEntries = (menu: DashboardMenu): DashboardEntry[] => [...menu.groups.flatMap((group) => group.items), ...menu.top];
 
 /** The row a single typed letter runs, if any. */
 export function entryForKey(entries: readonly DashboardEntry[], data: string): DashboardEntry | undefined {
@@ -137,6 +220,8 @@ export interface DashboardInput {
 	entries: readonly DashboardEntry[];
 	selected: number;
 	hint?: string;
+	/** The open group's name, shown above its rows (when the terminal has room for it). */
+	heading?: string;
 }
 
 const shownKey = (entry: DashboardEntry): string => entry.keyLabel ?? entry.key ?? "";
@@ -155,7 +240,8 @@ export function renderDashboard(input: DashboardInput, p: Painter): string[] {
 	const selected = Math.max(0, Math.min(entries.length - 1, input.selected));
 
 	const full = height >= FULL_CHROME_HEIGHT;
-	const chrome = full ? 4 : height >= 3 ? 1 : 0;
+	const headed = input.heading !== undefined && height >= 3;
+	const chrome = (full ? 4 : height >= 3 ? 1 : 0) + (headed ? (full ? 2 : 1) : 0);
 	const available = Math.max(1, height - chrome);
 	const spaced = entries.length * 2 - 1 <= available;
 	const visible = Math.min(entries.length, spaced ? entries.length : available);
@@ -197,6 +283,10 @@ export function renderDashboard(input: DashboardInput, p: Painter): string[] {
 	if (full) {
 		const subtitle = input.subtitle ? p.paint("dim", ` · ${input.subtitle}`) : "";
 		content.push(centered(p.paint("accent", p.bold(input.title)) + subtitle), "");
+	}
+	if (headed) {
+		content.push(centered(p.paint("accent", p.bold(input.heading!))));
+		if (full) content.push("");
 	}
 	for (let i = 0; i < visible; i++) {
 		if (spaced && i > 0) content.push("");

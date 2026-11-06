@@ -3,6 +3,7 @@ name: "Upgrade dependencies"
 description: "Upgrade packages within a version range and verify the result"
 order: 90
 key: "d"
+group: "build"
 questions:
   - id: packages
     label: "Which packages? A list, or all outdated ones"
