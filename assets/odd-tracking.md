@@ -4,7 +4,7 @@ Parent session only. Load when a task is large (its resume test fails) or the us
 
 ## Feature document
 
-For large authorized work, create `odd/tasks/<feature-name>.md` right after exploration, without asking permission. Use a descriptive, filename-safe name; reuse it on resume; never overwrite another feature's document. It is the spec subagents read by reference, so keep this fixed order (stable content first, growing log last):
+For large authorized work, create `tasks/<feature-name>.md` in the repo docs folder named in the orchestrator prompt (never inside the project) right after exploration, without asking permission. Use a descriptive, filename-safe name; reuse it on resume; never overwrite another feature's document. It is the spec subagents read by reference, so keep this fixed order (stable content first, growing log last):
 
 1. **Header** (2–3 lines): objective, branch, delivery strategy, test runner.
 2. `## Specs`: numbered `S1..Sn` requirements, constraints, and acceptance criteria with their checks. Quote the user's exact strings, error messages, commands, and examples verbatim, in the user's language. Never add requirements the user did not ask for; mark assumptions as assumptions.
@@ -49,7 +49,7 @@ Before the final answer, if any tracked task is still pending, continue it or qu
 
 ## Delivery
 
-- Commit in work units (load `brigadev-work-unit-commits`): one deliverable behavior with its tests and docs per commit. A high-risk unit gets its own commit.
+- Work on a `type/description` feature branch (start one first when on the default branch). Commit each finished work unit automatically (load `brigadev-work-unit-commits`): one deliverable behavior with its tests and docs per commit. A high-risk unit gets its own commit.
 - Use ~400 authored changed lines per PR slice as a planning heuristic, never a hard cap. Never shrink code, delete comments, or drop tests to fit it.
 - When the forecast or running count exceeds ~400 lines, load `brigadev-chained-pr` and apply the feature's delivery strategy (`ask-on-risk` by default). Record slice boundaries in the document.
 - Push, PR creation, and merge remain human decisions.

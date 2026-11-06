@@ -8,7 +8,7 @@ metadata:
 
 ## When to use
 
-The user asks for a review, or a work-unit commit carries a high-risk item. Review is proportionate: never run all four lenses by default.
+The user asks for a review, a work-unit commit carries a high-risk item, or `brigadev-branch-pr` is about to open a PR (review the branch first). Review is proportionate: never run all four lenses by default.
 
 ## Rules
 
@@ -46,7 +46,8 @@ git diff --stat <base>...HEAD
    - **advisory**: WARNING and SUGGESTION.
    Discard claims without evidence, and say so.
 4. **Correct** (only when the user authorized changes): one correction batch for all blockers, then one re-review limited to those blocker IDs by the lens that raised them. Blockers still open after that become one **Needs your decision**.
-5. Remove the scratch directory when done with the literal path `mktemp -d` printed (`rm -rf /var/folders/.../tmp.XXXX`), never `$(…)` or a variable: the guard runs a literal temp-dir path without a confirmation.
+5. **Save** the final ledger (the Output block) to `reviews/<branch with / as ->.md` in the repo docs folder named in the orchestrator prompt, replacing the branch's earlier ledger, and show it. It lives outside the project; never write it into the repository. Before a PR, blockers still open mean asking the user before the PR is opened.
+6. Remove the scratch directory when done with the literal path `mktemp -d` printed (`rm -rf /var/folders/.../tmp.XXXX`), never `$(…)` or a variable: the guard runs a literal temp-dir path without a confirmation.
 
 ## Output
 

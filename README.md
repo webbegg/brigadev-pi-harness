@@ -22,11 +22,11 @@ Check it loaded: `/brigadev:status`.
 | Feature | Where | What |
 | --- | --- | --- |
 | Orchestrator | `extensions/orchestrator.ts`, `assets/orchestrator.md` | Injects the ODD contract into the parent session: task sizing, high-risk list, Risk line, delegation triggers. Re-read on every prompt, so edits apply immediately. |
-| ODD tracking | `assets/odd-tracking.md`, `/track` | Large work gets one feature document at `odd/tasks/<name>.md` (Specs quoted verbatim, Tasks, Log) and a `todo` projection. Small work stays inline with no artifacts. |
+| ODD tracking | `assets/odd-tracking.md`, `/track` | Large work gets one feature document at `<repo docs>/tasks/<name>.md` (Specs quoted verbatim, Tasks, Log) and a `todo` projection. Small work stays inline with no artifacts. See [Repo docs folder](#repo-docs-folder). |
 | Subagents | `extensions/subagents.ts`, `assets/agents/` | `subagent` tool runs each agent in its own `pi` process. Every launch needs a `reason`; the verifier needs `Risk: item N`; writers need narrow `allowedEditSurfaces`, and parallel writers must be disjoint. Specs travel by reference (`featureDoc`), skills by exact path. |
 | Review | `skills/brigadev-review`, `/review` | 4R lenses (Risk, Readability, Reliability, Resilience) on one frozen candidate; only the lenses that fit. |
 | Judgment Day | `skills/brigadev-judgment-day`, `/skill:brigadev-judgment-day` | Two blind judges, frozen ledger, at most two scoped fix and re-judgment rounds. |
-| Safety guard | `extensions/guard.ts` | Confirms destructive, delivery, publish, and privileged commands; hard-denies catastrophic ones; asks before writes outside the project or touching secret files. In subagents: blocks all of those and enforces allowed edit surfaces. |
+| Safety guard | `extensions/guard.ts` | Confirms destructive, delivery, publish, and privileged commands (a commit on a feature branch runs without asking in normal mode); hard-denies catastrophic ones; asks before writes outside the project (the repo docs folder excepted) or touching secret files. In subagents: blocks all of those and enforces allowed edit surfaces. |
 | Todo | `extensions/todo.ts` | Visible task list with `pending / in_progress / done / blocked / dropped`. Kept out of the system prompt so updates never break the prompt cache. |
 | Status bar | `extensions/shell-bar.ts` | One-line footer: repo, branch ±dirty, yolo, model · thinking, context gauge, cost, profile. |
 | Phase label | `extensions/odd-phase.ts` | The working message shows the ODD phase (exploring, implementing, checking, delegating · agent). |
@@ -40,8 +40,8 @@ Check it loaded: `/brigadev:status`.
 
 | Command | Purpose |
 | --- | --- |
-| `/brigadev:status` | Version, prompt on/off, paths |
-| `/brigadev:doctor [fix-bridge-hooks]` | Diagnostics; turn off your Claude Code hooks inside claude-bridge turns |
+| `/brigadev:status` | Version, prompt on/off, paths, repo docs folder |
+| `/brigadev:doctor [fix-bridge-hooks]` | Diagnostics, including the repo docs folder; turn off your Claude Code hooks inside claude-bridge turns |
 | `/brigadev:profile …` | Model routing profiles (see below) |
 | `/brigadev:cost` | Session cost: orchestrator per model, subagents per agent, cache hit rate |
 | `/brigadev:usage` | Subscription usage windows (5h, weekly) and their resets |
@@ -116,14 +116,26 @@ Each profile route can list fallback models. When a run fails on quota, auth, a 
 | Command kind | normal | yolo | subagent |
 | --- | --- | --- | --- |
 | ordinary (`npm test`, `git status`) | run | run | run |
-| delivery (`git commit`, `git push`, `gh pr create`) | ask | run | block |
+| delivery (`git push`, `gh pr create`) | ask | run | block |
+| `git commit` on a feature branch | run | run | block |
+| `git commit` on the default branch, on a detached HEAD, or when the default branch is unknown | ask | run | block |
 | destructive (`rm -rf dir`, `git reset --hard`, `git push --force`, `DROP TABLE`) | ask | ask | block |
 | publish (`npm publish`, `gh pr merge`, `gh release`) | ask | ask | block |
 | privileged (`sudo`, `curl … \| sh`) | ask | ask | block |
 | dependency (`npm install`, `pip install`) | ask | ask | block |
 | catastrophic (`rm -rf ~`, `rm -rf /`, `mkfs`, `dd of=/dev/…`) | block | block | block |
 
+A commit runs without asking only when it targets the session's repository on a branch other than the default branch (the one `origin/HEAD` points to, else a lone local `main` or `master`). It still asks after a `cd`, a branch switch, or `git -C`/`--git-dir`/`--work-tree` earlier in the same command, and a chained `git push` keeps its own prompt. If git cannot answer, it asks.
+
 Without a UI (print mode), "ask" means block. The guard recognizes executable forms; it is not a sandbox.
+
+## Repo docs folder
+
+Harness documents live outside the project, in `~/.brigadev/<repo>/` (`BRIGADEV_HOME` overrides `~/.brigadev`): feature documents in `tasks/`, review ledgers in `reviews/`. `<repo>` is the basename of the main worktree root, so every worktree of a repository shares one folder; outside git it is the directory name. The parent session writes there without asking; subagents still cannot write outside the project. `/brigadev:status` and `/brigadev:doctor` print the resolved folder.
+
+## Delivery flow
+
+An authorized change on the default branch starts a `type/description` branch, and each finished work unit is committed automatically (Conventional Commits, with its tests and docs). Push, PR, and merge stay your decisions. Opening a PR first runs `brigadev-review` on the branch and saves the ledger to `reviews/`; the PR body follows the repository template (else Summary / Changes / Test plan / Risk), and no issue link is added unless you mention one.
 
 ## Customize
 

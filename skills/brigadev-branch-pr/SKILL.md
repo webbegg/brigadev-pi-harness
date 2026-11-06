@@ -18,13 +18,14 @@ Creating or preparing a pull request, or preparing a branch for submission.
 
 ## Workflow
 
-1. Confirm the linked issue if the repository requires one, and ask whether the reference closes it (`Closes #N`) or not (`Refs #N`).
-2. Create a `type/description` branch from the verified default branch when asked.
+1. No issue is required. Link one only when the user mentions it, and ask whether it closes (`Closes #N`) or only references (`Refs #N`) it.
+2. Work on a `type/description` branch from the verified default branch (normally already started by the work-unit flow).
 3. Implement in work units (`brigadev-work-unit-commits`), test-first where applicable, running the applicable checks.
 4. If the change exceeds ~400 changed lines, load `brigadev-chained-pr` before opening anything.
-5. Draft the PR body from the repository template and observed evidence. Show it to the user.
-6. On explicit authorization: push, then open the PR with explicit `--repo` and `--base`.
-7. Report required CI status; never call a PR merge-ready on an unverified green claim.
+5. **Review before the PR**: run `brigadev-review` on `<default>...HEAD` (only the lenses that fit) and write the ledger to `reviews/<branch with / as ->.md` in the repo docs folder named in the orchestrator prompt. Show the ledger. If it has blockers, ask the user before opening the PR.
+6. Draft the PR body from the repository template and observed evidence. Show it to the user.
+7. On explicit authorization: push, then open the PR with explicit `--repo` and `--base`.
+8. Report required CI status; never call a PR merge-ready on an unverified green claim.
 
 ## Branch naming
 
@@ -38,9 +39,6 @@ Use the repository template when present. Otherwise:
 ## Summary
 - <1–3 bullets: what and why>
 
-## Linked issue
-Closes #N | Refs #N | none
-
 ## Changes
 | File | Change |
 | --- | --- |
@@ -52,7 +50,7 @@ Closes #N | Refs #N | none
 none | item N (reason)
 ```
 
-Record only commands you actually ran. Leave unverified checklist items unchecked.
+Add `Closes #N` or `Refs #N` only when the user named an issue. Record only commands you actually ran. Leave unverified checklist items unchecked.
 
 ## Commands
 

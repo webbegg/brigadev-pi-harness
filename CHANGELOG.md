@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+- Repo docs folder: feature documents and review ledgers now live in `~/.brigadev/<repo>/` (`tasks/`, `reviews/`; `BRIGADEV_HOME` overrides the root), never inside the project. `<repo>` is the main worktree's basename, so worktrees share it. The orchestrator prompt names the resolved folder, the parent writes there without a dialog (subagents still cannot write outside the project), and `/brigadev:status` and `/brigadev:doctor` show it. The old `odd/tasks/` location is gone from prompts, skills, and docs.
+- Guard: in normal mode, a `git commit` (amend included) in the parent no longer asks when the repository is on a branch other than the default branch. It still asks on the default branch, a detached HEAD, an unknown default branch, after `cd`/`-C`/a branch switch in the same command, and when git cannot answer. Chained pushes and other kinds keep their prompts; yolo and subagent rules are unchanged.
+- Delivery: authorized changes start a `type/description` branch when on the default branch, and each finished work unit is committed automatically. `brigadev-branch-pr` adds no issue link unless you mention one and uses the repo's PR template (else Summary / Changes / Test plan / Risk); opening a PR first runs `brigadev-review` and saves the ledger to `reviews/`.
+
 ## [0.9.0] - 2026-11-06
 
 - Subagents: stall watchdog. A child with no event for 4 minutes (30 while a tool call is in flight) is stopped and its run fails with "stalled for N min after: <last step>"; override with `BRIGADEV_STALL_TIMEOUT_MS` and `BRIGADEV_TOOL_STALL_TIMEOUT_MS`. Stopping a child now really sends SIGKILL 5 s after SIGTERM (the old check never fired).

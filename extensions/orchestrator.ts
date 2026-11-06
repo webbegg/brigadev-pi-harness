@@ -9,13 +9,15 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { repoDocsDir } from "../lib/repo-docs.ts";
 import { appendSystemPromptOnce, ASSETS_ROOT, isChildSession, PACKAGE_ROOT, settingsPath } from "../lib/runtime.ts";
 
 const HARNESS_ENTRY = "brigadev-harness";
 const STATUS_KEY = "brigadev-harness";
 
-function loadOrchestratorPrompt(): string {
-	return readFileSync(join(ASSETS_ROOT, "orchestrator.md"), "utf8").replaceAll("{{ASSETS_ROOT}}", ASSETS_ROOT);
+/** The orchestrator prompt with the assets root and this session's repo docs folder filled in. */
+export function loadOrchestratorPrompt(cwd: string): string {
+	return readFileSync(join(ASSETS_ROOT, "orchestrator.md"), "utf8").replaceAll("{{ASSETS_ROOT}}", ASSETS_ROOT).replaceAll("{{REPO_DOCS}}", repoDocsDir(cwd));
 }
 
 function packageVersion(): string {
@@ -50,7 +52,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!enabled) return;
 		try {
-			appendSystemPromptOnce(event.systemPromptOptions, loadOrchestratorPrompt());
+			appendSystemPromptOnce(event.systemPromptOptions, loadOrchestratorPrompt(ctx.cwd));
 		} catch (error) {
 			if (ctx.hasUI) ctx.ui.notify(`brigadev: could not load orchestrator prompt (${String(error)})`, "error");
 		}
@@ -77,6 +79,7 @@ export default function (pi: ExtensionAPI) {
 					`brigadev-harness v${packageVersion()}`,
 					`orchestrator prompt: ${enabled ? "on" : "off"}`,
 					`assets: ${ASSETS_ROOT}`,
+					`repo docs: ${repoDocsDir(ctx.cwd)}`,
 					`settings: ${settingsPath()}`,
 					"commands: /brigadev:doctor, /brigadev:profile, /brigadev:cost, /brigadev:usage, /brigadev:changes (alt+g), /brigadev:runs (alt+a), /brigadev:commands (alt+k), /brigadev:panel (alt+o), /brigadev:mode, /brigadev:agents, /brigadev:ui, /brigadev:harness, /review, /track, /skill:brigadev-judgment-day",
 				].join("\n"),
