@@ -2,17 +2,16 @@
  * brigadev workflow menu (alt+w, /brigadev:start): pick a day-to-day workflow,
  * answer the questions it declares, review the composed request, and hand it
  * to the orchestrator. `/brigadev:start <name, file id, or key>` skips the list
- * (the launch dashboard uses it). Workflows are files (assets/workflows/, plus the user's
+ * (the launch dashboard uses it, with the name, which is unique). Workflows are files (assets/workflows/, plus the user's
  * own in ~/.brigadev/workflows/ and ~/.brigadev/<repo>/workflows/). The dialogs
  * are select/input/editor, so the menu works in the TUI and over RPC.
  */
 
-import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import { ASSETS_ROOT, isChildSession } from "../lib/runtime.ts";
+import { isChildSession, PACKAGE_WORKFLOWS_DIR } from "../lib/runtime.ts";
 import { askQuestions, composeRequest, gatherFacts, type Answers } from "../lib/workflow-run.ts";
-import { discoverWorkflows, resolveWorkflow, workflowDirs, type Workflow } from "../lib/workflows.ts";
+import { loadWorkflows, resolveWorkflow, workflowDirs, type Workflow } from "../lib/workflows.ts";
 import type { ExecFn } from "../lib/worktree-snapshot.ts";
 
 const SHORTCUT = "alt+w";
@@ -27,8 +26,8 @@ export default function (pi: ExtensionAPI) {
 
 	const open = async (ctx: ExtensionContext, query = "") => {
 		if (!ctx.hasUI) return;
-		const { workflows, warnings } = discoverWorkflows({ packageDir: join(ASSETS_ROOT, "workflows"), ...workflowDirs(ctx.cwd), parse: (content) => parseFrontmatter<Record<string, unknown>>(content) });
-		if (warnings.length) ctx.ui.notify(`brigadev: skipped invalid workflow files\n${warnings.join("\n")}`, "warning");
+		const { workflows, warning } = loadWorkflows((content) => parseFrontmatter<Record<string, unknown>>(content), { packageDir: PACKAGE_WORKFLOWS_DIR, ...workflowDirs(ctx.cwd) });
+		if (warning) ctx.ui.notify(warning, "warning");
 		if (!workflows.length) return ctx.ui.notify("brigadev: no workflows found", "error");
 
 		let workflow: Workflow | undefined;

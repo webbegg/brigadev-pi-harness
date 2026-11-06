@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { maxScroll, renderTwoPane, windowStart, wrapText, type Painter } from "../lib/two-pane.ts";
+import { maxScroll, pad, renderTwoPane, windowStart, wrapText, type Painter } from "../lib/two-pane.ts";
 
 const plain: Painter = {
 	paint: (_tone, text) => text,
@@ -8,6 +8,14 @@ const plain: Painter = {
 	measure: (text) => text.length,
 	truncate: (text, width) => text.slice(0, width),
 };
+
+describe("pad", () => {
+	it("cuts to the width and fills with spaces up to it", () => {
+		assert.equal(pad(plain, "abc", 6), "abc   ");
+		assert.equal(pad(plain, "abcdefgh", 5), "abcde");
+		assert.equal(pad(plain, "abc", 0), "");
+	});
+});
 
 describe("two-pane layout", () => {
 	const input = {

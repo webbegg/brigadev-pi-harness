@@ -176,7 +176,7 @@ Add an endpoint, following the normal ODD flow.
 
 In the body, `{{id}}` is replaced by the answer (a multi-line answer becomes a block quote), and a line is left out only when all of its answers were skipped (a skipped answer on a line with others renders as empty). A multi-line answer sits on its own quoted lines, with any text after the placeholder on the line below. A placeholder that names no question makes the file invalid.
 
-`key` must be one lowercase letter. The letters `g a m k q` belong to the dashboard tools, and a letter two workflows claim stays with the first in menu order; the other workflow loses its key (a warning says so) but still works. An override replaces the whole file, so repeat `key` in it. A workflow without a key is still listed on the dashboard and starts with Enter.
+`key` must be one lowercase letter (an empty `key:` line means no key). The letters `g a m k q` belong to the dashboard tools. When two workflows claim the same letter, the higher layer keeps it (repo, then your global folder, then the package), and within a layer the first in menu order; the other workflow loses its key (a warning says so) but still works. An override replaces the whole file, but one without a `key` keeps the key of the workflow it overrides (set `key` to give it another). A workflow without a key is still listed on the dashboard and starts with Enter. A workflow folder Pi cannot read (not a folder, or no permission) is reported as a warning and skipped.
 
 ## Launch dashboard
 
@@ -200,9 +200,9 @@ When Pi starts in the terminal UI, a full-screen start menu opens first: a cente
 | `Enter` on Chat, or `Esc` anywhere | Chat | closes the dashboard |
 | `q` | Quit | exits Pi |
 
-A workflow row opens that workflow's questions directly (it runs `/brigadev:start <key>`). Your own workflows from `~/.brigadev/workflows/` and `~/.brigadev/<repo>/workflows/` are listed after the nine, with a key if they declare one.
+A workflow row opens that workflow's questions directly (it runs `/brigadev:start <workflow name>`; the name is unique, so a keyless workflow that shares a file name with another still starts itself). Your own workflows from `~/.brigadev/workflows/` and `~/.brigadev/<repo>/workflows/` are listed after the nine, with a key if they declare one.
 
-It opens by itself only on a fresh start: not on `/reload`, `/new`, `--continue`, or `--resume` into a session that has messages, not when you launch Pi with a message or an `@file` (`pi "fix the login bug"`), not in print, JSON, or RPC mode, and never inside subagents. Turn the automatic start off with `/brigadev:ui dashboard off` (it writes `"ui": { "dashboard": false }` to `~/.pi/agent/brigadev.json`); `/brigadev:ui dashboard on` brings it back, and `/brigadev:dashboard` keeps working either way.
+It opens by itself only on a fresh start: not on `/reload`, `/new`, `--continue`, or `--resume` into a session that has messages, not when you launch Pi with a message or an `@file` (`pi "fix the login bug"`), not in print, JSON, or RPC mode, and never inside subagents. Turn the automatic start off with `/brigadev:ui dashboard off` (it writes `"ui": { "dashboard": false }` to `~/.pi/agent/brigadev.json`); `/brigadev:ui dashboard on` brings it back, and `/brigadev:dashboard` keeps working either way. Setting the environment variable `BRIGADEV_DASHBOARD=0` (or `off`/`false`) skips the automatic start whatever the setting says, e.g. `BRIGADEV_DASHBOARD=0 pi` if the dashboard ever fails to draw. If the automatic start fails, a message says why and how to turn it off.
 
 ## Delivery flow
 

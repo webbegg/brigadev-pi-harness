@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildEntries, DASHBOARD_HINT, entryForKey, hasInitialPrompt, hasMessageEntries, moveSelection, renderDashboard, shouldShowDashboard, type DashboardEntry, type LaunchConditions } from "../lib/dashboard.ts";
+import { buildEntries, DASHBOARD_HINT, entryForKey, hasInitialPrompt, hasMessageEntries, renderDashboard, shouldShowDashboard, wrapSelection, type DashboardEntry, type LaunchConditions } from "../lib/dashboard.ts";
 import type { Painter } from "../lib/two-pane.ts";
-import type { Workflow } from "../lib/workflows.ts";
+import { RESERVED_KEYS, resolveWorkflow, type Workflow } from "../lib/workflows.ts";
 
 const plain: Painter = {
 	paint: (_tone, text) => text,
@@ -44,9 +44,9 @@ describe("buildEntries", () => {
 		);
 	});
 
-	it("maps workflows to the start command by key and tools to their actions", () => {
+	it("maps workflows to the start command by name and tools to their actions", () => {
 		const entries = buildEntries(nine());
-		assert.deepEqual(entries[1].action, { kind: "workflow", query: "b" });
+		assert.deepEqual(entries[1].action, { kind: "workflow", query: "Bug fix" });
 		const action = (label: string) => entries.find((e) => e.label === label)!.action;
 		assert.deepEqual(action("Changes"), { kind: "command", command: "/brigadev:changes" });
 		assert.deepEqual(action("Agents history"), { kind: "command", command: "/brigadev:runs" });
@@ -56,14 +56,31 @@ describe("buildEntries", () => {
 		assert.deepEqual(action("Quit"), { kind: "quit" });
 	});
 
-	it("shows user workflows too, keyless ones start by file id", () => {
+	it("shows user workflows too, keyless ones included, each started by its own name", () => {
 		const entries = buildEntries([...nine(), workflow("Add endpoint", "add-endpoint", "e", "user"), workflow("Release notes", "release-notes", undefined, "repo")]);
 		const added = entries.slice(9, 11);
 		assert.deepEqual(added.map((e) => [e.label, e.key, e.action]), [
-			["Add endpoint", "e", { kind: "workflow", query: "e" }],
-			["Release notes", undefined, { kind: "workflow", query: "release-notes" }],
+			["Add endpoint", "e", { kind: "workflow", query: "Add endpoint" }],
+			["Release notes", undefined, { kind: "workflow", query: "Release notes" }],
 		]);
 		assert.equal(entries[11].label, "Changes");
+	});
+
+	it("starts exactly its own workflow even when two keyless workflows share a file id", () => {
+		const shipped = workflow("Bug fix", "bug-fix");
+		const mine = workflow("Defect triage", "bug-fix", undefined, "user");
+		const workflows = [shipped, mine];
+		const entries = buildEntries(workflows);
+		for (const [index, expected] of workflows.entries()) {
+			const action = entries[index].action;
+			assert.equal(action.kind, "workflow");
+			assert.equal(resolveWorkflow(workflows, (action as { query: string }).query), expected);
+		}
+	});
+
+	it("keeps the reserved workflow keys equal to the keys of the tool rows", () => {
+		const toolKeys = buildEntries([]).flatMap((entry) => (entry.key ? [entry.key] : []));
+		assert.deepEqual([...RESERVED_KEYS].sort(), toolKeys.sort());
 	});
 
 	it("gives every row an icon", () => {
@@ -71,7 +88,7 @@ describe("buildEntries", () => {
 	});
 });
 
-describe("entryForKey and moveSelection", () => {
+describe("entryForKey and wrapSelection", () => {
 	const entries = buildEntries(nine());
 	it("finds a row by its key letter and ignores unknown input", () => {
 		assert.equal(entryForKey(entries, "x")?.label, "Refactor a component");
@@ -82,10 +99,10 @@ describe("entryForKey and moveSelection", () => {
 	});
 
 	it("wraps around at both ends", () => {
-		assert.equal(moveSelection(0, -1, 15), 14);
-		assert.equal(moveSelection(14, 1, 15), 0);
-		assert.equal(moveSelection(3, 1, 15), 4);
-		assert.equal(moveSelection(0, 1, 0), 0);
+		assert.equal(wrapSelection(0, -1, 15), 14);
+		assert.equal(wrapSelection(14, 1, 15), 0);
+		assert.equal(wrapSelection(3, 1, 15), 4);
+		assert.equal(wrapSelection(0, 1, 0), 0);
 	});
 });
 

@@ -2,7 +2,7 @@
 // layout. Pure: painting and width measuring come from the caller's Painter,
 // and nothing here imports Pi or the TUI.
 
-import { windowStart, type Painter } from "./two-pane.ts";
+import { pad, windowStart, type Painter } from "./two-pane.ts";
 import { workflowId, type Workflow } from "./workflows.ts";
 
 export type DashboardAction =
@@ -55,11 +55,14 @@ const TOOLS: DashboardEntry[] = [
 	{ id: "quit", icon: "✕", label: "Quit", key: "q", action: { kind: "quit" } },
 ];
 
-/** Workflows in the order given (keyed or not), then the tools. A workflow starts through `/brigadev:start <key or file id>`. */
+/**
+ * Workflows in the order given (keyed or not), then the tools. A workflow starts through `/brigadev:start <name>`:
+ * the name is the only identity that stays unique after the layers merge (file ids and keys can repeat or be absent).
+ */
 export function buildEntries(workflows: readonly Workflow[]): DashboardEntry[] {
 	const rows = workflows.map((workflow): DashboardEntry => {
 		const id = workflowId(workflow);
-		return { id, icon: WORKFLOW_ICONS[id] ?? DEFAULT_ICON, label: workflow.name, key: workflow.key, action: { kind: "workflow", query: workflow.key ?? id } };
+		return { id, icon: WORKFLOW_ICONS[id] ?? DEFAULT_ICON, label: workflow.name, key: workflow.key, action: { kind: "workflow", query: workflow.name } };
 	});
 	return [...rows, ...TOOLS];
 }
@@ -69,7 +72,8 @@ export function entryForKey(entries: readonly DashboardEntry[], data: string): D
 	return data.length === 1 ? entries.find((entry) => entry.key === data) : undefined;
 }
 
-export function moveSelection(selected: number, delta: number, length: number): number {
+/** Moves the selection by `delta`, wrapping around at both ends. */
+export function wrapSelection(selected: number, delta: number, length: number): number {
 	return length > 0 ? (((selected + delta) % length) + length) % length : 0;
 }
 
@@ -206,8 +210,5 @@ export function renderDashboard(input: DashboardInput, p: Painter): string[] {
 	const top = Math.floor((height - content.length) / 2);
 	const lines = [...Array<string>(top).fill(""), ...content];
 	while (lines.length < height) lines.push("");
-	return lines.map((line) => {
-		const cut = p.truncate(line, width);
-		return cut + " ".repeat(Math.max(0, width - p.measure(cut)));
-	});
+	return lines.map((line) => pad(p, line, width));
 }

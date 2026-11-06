@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { type FrontmatterParser } from "../lib/agents.ts";
 import { ASSETS_ROOT } from "../lib/runtime.ts";
 import { composeRequest } from "../lib/workflow-run.ts";
-import { discoverWorkflows, parseWorkflow, RESERVED_KEYS, resolveWorkflow, workflowDirs, workflowId } from "../lib/workflows.ts";
+import { discoverWorkflows, loadWorkflows, parseWorkflow, RESERVED_KEYS, resolveWorkflow, workflowDirs, workflowId, type Workflow } from "../lib/workflows.ts";
 
 /**
  * Stand-in for Pi's YAML frontmatter parser, so the loader tests run without
@@ -148,6 +148,13 @@ describe("parseWorkflow", () => {
 		}
 	});
 
+	it("treats an empty `key:` line (null in real YAML) as no key, not as an invalid file", () => {
+		const yamlNull: FrontmatterParser = () => ({ frontmatter: { name: "Ship it", description: "d", key: null }, body: "Do it" });
+		const workflow = parseWorkflow("ignored", "/w/x.md", "user", yamlNull);
+		assert.equal(workflow.key, undefined);
+		assert.ok(!("key" in workflow));
+	});
+
 	it("rejects a file without name, description, or body", () => {
 		assert.throws(() => ok("---\ndescription: \"d\"\n---\nbody"), /name/);
 		assert.throws(() => ok("---\nname: \"n\"\n---\nbody"), /description/);
@@ -213,6 +220,27 @@ describe("discoverWorkflows layers", () => {
 		assert.deepEqual(discoverWorkflows({ packageDir: join(scratch, "nope"), parse }), { workflows: [], warnings: [] });
 	});
 
+	it("a folder that is really a file becomes a warning, and the other layers still load", () => {
+		put("notdir", "placeholder.txt", "x");
+		const { workflows, warnings } = discoverWorkflows({ ...dirs(), userDir: join(scratch, "notdir", "placeholder.txt"), repoDir: undefined });
+		assert.deepEqual(workflows.map((w) => w.name), ["Alpha", "Beta"]);
+		assert.equal(warnings.length, 1);
+		assert.match(warnings[0], /placeholder\.txt/);
+	});
+
+	it("an unreadable folder becomes a warning instead of a throw", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+		put("locked", "x.md", file("Locked"));
+		chmodSync(join(scratch, "locked"), 0o000);
+		try {
+			const { workflows, warnings } = discoverWorkflows({ ...dirs(), userDir: join(scratch, "locked"), repoDir: undefined });
+			assert.deepEqual(workflows.map((w) => w.name), ["Alpha", "Beta"]);
+			assert.equal(warnings.length, 1);
+			assert.match(warnings[0], /locked/);
+		} finally {
+			chmodSync(join(scratch, "locked"), 0o755);
+		}
+	});
+
 	it("an invalid override keeps the lower layer's workflow", () => {
 		put("repo2", "beta.md", file("Beta", "", "Uses {{missing}}"));
 		const { workflows, warnings } = discoverWorkflows({ ...dirs(), repoDir: join(scratch, "repo2") });
@@ -242,13 +270,64 @@ describe("workflow keys across files", () => {
 		assert.deepEqual([...RESERVED_KEYS].sort(), ["a", "g", "k", "m", "q"]);
 	});
 
-	it("keeps the first workflow's key, and makes a duplicate or reserved one keyless with a warning (still valid)", () => {
+	it("within a layer the first workflow in menu order keeps a duplicate key; a reserved key is dropped; a higher layer wins over a lower one (still valid)", () => {
 		const { workflows, warnings } = discoverWorkflows({ packageDir: join(scratch, "pkg"), userDir: join(scratch, "user"), parse });
-		assert.deepEqual(workflows.map((w) => [w.name, w.key]), [["One", "o"], ["Two", undefined], ["Three", undefined], ["Four", "f"], ["Five", undefined], ["Six", undefined]]);
+		assert.deepEqual(workflows.map((w) => [w.name, w.key]), [["One", "o"], ["Two", undefined], ["Three", undefined], ["Four", undefined], ["Five", "f"], ["Six", undefined]]);
 		assert.equal(warnings.length, 3);
 		assert.match(warnings.find((w) => w.includes("two.md"))!, /key "o" is already used by "One"/);
 		assert.match(warnings.find((w) => w.includes("three.md"))!, /key "g" is reserved/);
-		assert.match(warnings.find((w) => w.includes("five.md"))!, /key "f" is already used by "Four"/);
+		assert.match(warnings.find((w) => w.includes("four.md"))!, /key "f" is already used by "Five"/);
+	});
+});
+
+describe("workflow key inheritance and layer precedence", () => {
+	let scratch: string;
+	const put = (dir: string, fileName: string, content: string) => {
+		mkdirSync(join(scratch, dir), { recursive: true });
+		writeFileSync(join(scratch, dir, fileName), content);
+	};
+	const discover = (layers: { userDir?: string; repoDir?: string }) => discoverWorkflows({ packageDir: join(scratch, "pkg"), parse, ...layers });
+	const keys = (workflows: Workflow[]) => workflows.map((w) => [w.name, w.key, w.source]);
+	before(() => {
+		scratch = mkdtempSync(join(tmpdir(), "brigadev-workflow-inherit-"));
+		put("pkg", "bug-fix.md", file("Bug fix", 'order: 1\nkey: "b"\n'));
+		put("pkg", "review.md", file("Review", 'order: 2\nkey: "r"\n'));
+		put("user", "bug-fix.md", file("Bug fix", "order: 1\n", "User bug fix"));
+		put("user", "review.md", file("Review", 'order: 2\nkey: "v"\n'));
+		put("repo", "bug-fix.md", file("bug fix", "order: 1\n", "Repo bug fix"));
+		put("claim", "mine.md", file("Mine", 'order: 3\nkey: "b"\n'));
+		put("claimrepo", "theirs.md", file("Theirs", 'order: 4\nkey: "b"\n'));
+	});
+	after(() => rmSync(scratch, { recursive: true, force: true }));
+
+	it("an override without a key inherits the shipped key and warns about nothing", () => {
+		const { workflows, warnings } = discover({ userDir: join(scratch, "user") });
+		const bug = workflows.find((w) => w.name === "Bug fix")!;
+		assert.deepEqual([bug.source, bug.key, bug.body], ["user", "b", "User bug fix"]);
+		assert.deepEqual(warnings, []);
+	});
+
+	it("an override with its own key keeps that key", () => {
+		const { workflows } = discover({ userDir: join(scratch, "user") });
+		assert.deepEqual(keys(workflows).find(([name]) => name === "Review"), ["Review", "v", "user"]);
+	});
+
+	it("a repo override of a user override inherits through both layers", () => {
+		const { workflows, warnings } = discover({ userDir: join(scratch, "user"), repoDir: join(scratch, "repo") });
+		assert.deepEqual(keys(workflows).find(([name]) => name === "bug fix"), ["bug fix", "b", "repo"]);
+		assert.deepEqual(warnings, []);
+	});
+
+	it("a user workflow claiming a package key wins it; the package workflow loses it with a warning", () => {
+		const { workflows, warnings } = discover({ userDir: join(scratch, "claim") });
+		assert.deepEqual(keys(workflows), [["Bug fix", undefined, "package"], ["Review", "r", "package"], ["Mine", "b", "user"]]);
+		assert.equal(warnings.length, 1);
+		assert.match(warnings[0], /bug-fix\.md.*key "b" is already used by "Mine"/);
+	});
+
+	it("a repo workflow beats a user workflow, which beats a package workflow, whatever the menu order", () => {
+		const { workflows } = discover({ userDir: join(scratch, "claim"), repoDir: join(scratch, "claimrepo") });
+		assert.deepEqual(keys(workflows), [["Bug fix", undefined, "package"], ["Review", "r", "package"], ["Mine", undefined, "user"], ["Theirs", "b", "repo"]]);
 	});
 });
 
@@ -271,6 +350,18 @@ describe("resolveWorkflow", () => {
 		assert.equal(resolveWorkflow(workflows, "x").name, "Refactor a component");
 	});
 
+	it("prefers an exact name over a file id or a key, so two workflows sharing a file id each resolve by name", () => {
+		const make = (name: string, id: string, key?: string): Workflow => ({ name, description: "d", order: 1, questions: [], body: "b", source: "user", filePath: `/w/${id}.md`, ...(key ? { key } : {}) });
+		const shared = [make("Bug fix", "bug-fix", "b"), make("Defect triage", "bug-fix"), make("b", "zzz"), make("Other", "bug-fix-2", "o")];
+		assert.equal(resolveWorkflow(shared, "Defect triage"), shared[1]);
+		assert.equal(resolveWorkflow(shared, "Bug fix"), shared[0]);
+		// A workflow named like another's key is reached by its name first.
+		assert.equal(resolveWorkflow(shared, "b"), shared[2]);
+		// A name that is also another workflow's file id still wins.
+		const clash = [make("Alpha", "bug-fix"), make("bug-fix", "other")];
+		assert.equal(resolveWorkflow(clash, "bug-fix"), clash[1]);
+	});
+
 	it("throws for an unknown workflow, listing every name", () => {
 		assert.throws(() => resolveWorkflow(workflows, "zzz"), (error: Error) => {
 			assert.match(error.message, /Unknown workflow "zzz"/);
@@ -279,6 +370,24 @@ describe("resolveWorkflow", () => {
 		});
 		// Tool keys are not workflow keys.
 		assert.throws(() => resolveWorkflow(workflows, "g"), /Unknown workflow/);
+	});
+});
+
+describe("loadWorkflows", () => {
+	it("returns the workflows with one ready-to-show warning text, or none", () => {
+		const scratch = mkdtempSync(join(tmpdir(), "brigadev-load-workflows-"));
+		try {
+			mkdirSync(join(scratch, "user"));
+			writeFileSync(join(scratch, "user", "bad.md"), file("Bad", "", "Uses {{missing}}"));
+			const clean = loadWorkflows(parse, { packageDir: join(ASSETS_ROOT, "workflows") });
+			assert.equal(clean.workflows.length, 9);
+			assert.equal(clean.warning, undefined);
+			const dirty = loadWorkflows(parse, { packageDir: join(ASSETS_ROOT, "workflows"), userDir: join(scratch, "user") });
+			assert.equal(dirty.workflows.length, 9);
+			assert.match(dirty.warning!, /^brigadev: skipped invalid workflow files\n.*bad\.md: .*unknown question "missing"/);
+		} finally {
+			rmSync(scratch, { recursive: true, force: true });
+		}
 	});
 });
 

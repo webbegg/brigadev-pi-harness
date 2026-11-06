@@ -11,7 +11,7 @@ import { basename } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { contextGauge, KNOWN_STATUS_ORDER, layoutSegments, SEPARATOR, statusSegment, type Segment } from "../lib/shell-bar.ts";
-import { isChildSession, readSettings, writeSettings } from "../lib/runtime.ts";
+import { isChildSession, readSettings, runUiCommand } from "../lib/runtime.ts";
 
 const DIRTY_REFRESH_MS = 2000;
 const FILE_TOOLS = new Set(["edit", "write", "bash"]);
@@ -95,14 +95,9 @@ export default function (pi: ExtensionAPI) {
 			return items.length ? items : null;
 		},
 		handler: async (args, ctx) => {
-			const [feature, value] = args.trim().split(/\s+/);
-			const ui = readSettings().ui ?? {};
-			if ((feature === "footer" || feature === "phase" || feature === "dashboard") && (value === "on" || value === "off")) {
-				writeSettings({ ui: { ...ui, [feature]: value === "on" } });
-				if (feature === "footer") install(ctx);
-				return ctx.ui.notify(`brigadev ${feature} ${value}`, "info");
-			}
-			ctx.ui.notify(`footer: ${ui.footer === false ? "off" : "on"} · phase: ${ui.phase === false ? "off" : "on"} · dashboard: ${ui.dashboard === false ? "off" : "on"}\nUsage: /brigadev:ui footer|phase|dashboard on|off`, "info");
+			const { feature, message } = runUiCommand(args);
+			if (feature === "footer") install(ctx);
+			ctx.ui.notify(message, "info");
 		},
 	});
 }
