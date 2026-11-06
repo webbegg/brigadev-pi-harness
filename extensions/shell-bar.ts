@@ -11,7 +11,7 @@ import { basename } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { contextGauge, KNOWN_STATUS_ORDER, layoutSegments, SEPARATOR, statusSegment, type Segment } from "../lib/shell-bar.ts";
-import { isChildSession, readSettings, writeSettings } from "../lib/runtime.ts";
+import { isChildSession, readSettings, runUiCommand } from "../lib/runtime.ts";
 
 const DIRTY_REFRESH_MS = 2000;
 const FILE_TOOLS = new Set(["edit", "write", "bash"]);
@@ -89,20 +89,15 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_end", async () => requestRender?.());
 
 	pi.registerCommand("brigadev:ui", {
-		description: "Toggle brigadev UI: footer on|off, phase on|off",
+		description: "Toggle brigadev UI: footer on|off, phase on|off, dashboard on|off",
 		getArgumentCompletions: (prefix) => {
-			const items = ["footer on", "footer off", "phase on", "phase off"].filter((v) => v.startsWith(prefix)).map((value) => ({ value, label: value }));
+			const items = ["footer on", "footer off", "phase on", "phase off", "dashboard on", "dashboard off"].filter((v) => v.startsWith(prefix)).map((value) => ({ value, label: value }));
 			return items.length ? items : null;
 		},
 		handler: async (args, ctx) => {
-			const [feature, value] = args.trim().split(/\s+/);
-			const ui = readSettings().ui ?? {};
-			if ((feature === "footer" || feature === "phase") && (value === "on" || value === "off")) {
-				writeSettings({ ui: { ...ui, [feature]: value === "on" } });
-				if (feature === "footer") install(ctx);
-				return ctx.ui.notify(`brigadev ${feature} ${value}`, "info");
-			}
-			ctx.ui.notify(`footer: ${ui.footer === false ? "off" : "on"} · phase: ${ui.phase === false ? "off" : "on"}\nUsage: /brigadev:ui footer|phase on|off`, "info");
+			const { feature, message } = runUiCommand(args);
+			if (feature === "footer") install(ctx);
+			ctx.ui.notify(message, "info");
 		},
 	});
 }

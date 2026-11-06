@@ -1,17 +1,17 @@
 /**
  * brigadev workflow menu (alt+w, /brigadev:start): pick a day-to-day workflow,
  * answer the questions it declares, review the composed request, and hand it
- * to the orchestrator. Workflows are files (assets/workflows/, plus the user's
+ * to the orchestrator. `/brigadev:start <name, file id, or key>` skips the list
+ * (the launch dashboard uses it, with the name, which is unique). Workflows are files (assets/workflows/, plus the user's
  * own in ~/.brigadev/workflows/ and ~/.brigadev/<repo>/workflows/). The dialogs
  * are select/input/editor, so the menu works in the TUI and over RPC.
  */
 
-import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import { ASSETS_ROOT, isChildSession } from "../lib/runtime.ts";
+import { isChildSession, PACKAGE_WORKFLOWS_DIR } from "../lib/runtime.ts";
 import { askQuestions, composeRequest, gatherFacts, type Answers } from "../lib/workflow-run.ts";
-import { discoverWorkflows, workflowDirs } from "../lib/workflows.ts";
+import { loadWorkflows, resolveWorkflow, workflowDirs, type Workflow } from "../lib/workflows.ts";
 import type { ExecFn } from "../lib/worktree-snapshot.ts";
 
 const SHORTCUT = "alt+w";
@@ -24,15 +24,24 @@ export default function (pi: ExtensionAPI) {
 	if (isChildSession()) return;
 	const exec: ExecFn = (command, args, options) => pi.exec(command, args, options);
 
-	const open = async (ctx: ExtensionContext) => {
+	const open = async (ctx: ExtensionContext, query = "") => {
 		if (!ctx.hasUI) return;
-		const { workflows, warnings } = discoverWorkflows({ packageDir: join(ASSETS_ROOT, "workflows"), ...workflowDirs(ctx.cwd), parse: (content) => parseFrontmatter<Record<string, unknown>>(content) });
-		if (warnings.length) ctx.ui.notify(`brigadev: skipped invalid workflow files\n${warnings.join("\n")}`, "warning");
+		const { workflows, warning } = loadWorkflows((content) => parseFrontmatter<Record<string, unknown>>(content), { packageDir: PACKAGE_WORKFLOWS_DIR, ...workflowDirs(ctx.cwd) });
+		if (warning) ctx.ui.notify(warning, "warning");
 		if (!workflows.length) return ctx.ui.notify("brigadev: no workflows found", "error");
 
-		const labels = workflows.map((workflow) => `${workflow.name} — ${workflow.description}`);
-		const picked = await ctx.ui.select("Start a workflow", labels);
-		const workflow = picked === undefined ? undefined : workflows[labels.indexOf(picked)];
+		let workflow: Workflow | undefined;
+		if (query.trim()) {
+			try {
+				workflow = resolveWorkflow(workflows, query);
+			} catch (error) {
+				return ctx.ui.notify(`brigadev: ${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+		} else {
+			const labels = workflows.map((candidate) => `${candidate.name} — ${candidate.description}`);
+			const picked = await ctx.ui.select("Start a workflow", labels);
+			workflow = picked === undefined ? undefined : workflows[labels.indexOf(picked)];
+		}
 		if (!workflow) return;
 
 		const facts = await gatherFacts(exec, ctx.cwd);
@@ -60,6 +69,6 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(`${workflow.name}: cancelled, nothing sent`, "info");
 	};
 
-	pi.registerCommand(COMMAND, { description: "Start a day-to-day workflow: pick one, answer its questions, send the request", handler: async (_args, ctx) => open(ctx) });
+	pi.registerCommand(COMMAND, { description: "Start a day-to-day workflow: pick one (or name it: /brigadev:start bug-fix, /brigadev:start b), answer its questions, send the request", handler: async (args, ctx) => open(ctx, args) });
 	pi.registerShortcut(SHORTCUT, { description: "Open the brigadev workflow menu", handler: async (ctx) => open(ctx) });
 }

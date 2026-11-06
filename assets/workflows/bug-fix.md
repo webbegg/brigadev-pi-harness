@@ -2,6 +2,7 @@
 name: "Bug fix"
 description: "Reproduce, fix at the root cause, and prove it with a test"
 order: 20
+key: "b"
 questions:
   - id: where
     label: "Where does it happen?"

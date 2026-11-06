@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 export const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const ASSETS_ROOT = join(PACKAGE_ROOT, "assets");
 export const PACKAGE_AGENTS_DIR = join(ASSETS_ROOT, "agents");
+export const PACKAGE_WORKFLOWS_DIR = join(ASSETS_ROOT, "workflows");
 export const GUARD_EXTENSION_PATH = join(PACKAGE_ROOT, "extensions", "guard.ts");
 
 /** Environment contract between the parent session and subagent processes. */
@@ -52,7 +53,7 @@ export interface BrigadevSettings {
 	/** Price zero-cost claude-bridge turns at the Anthropic list price (default true). */
 	bridgePricing?: boolean;
 	/** UI features, each on by default. */
-	ui?: { footer?: boolean; phase?: boolean };
+	ui?: { footer?: boolean; phase?: boolean; dashboard?: boolean };
 }
 
 export function agentDir(): string {
@@ -78,4 +79,26 @@ export function writeSettings(update: BrigadevSettings): void {
 	const path = settingsPath();
 	mkdirSync(dirname(path), { recursive: true });
 	writeFileSync(path, `${JSON.stringify({ ...readSettings(), ...update }, null, 2)}\n`, "utf8");
+}
+
+const UI_FEATURES = ["footer", "phase", "dashboard"] as const;
+export type UiFeature = (typeof UI_FEATURES)[number];
+
+export interface UiSettingsStore {
+	read: () => BrigadevSettings;
+	write: (update: BrigadevSettings) => void;
+}
+
+/**
+ * `/brigadev:ui <feature> on|off`: saves the setting and names the result. Anything else changes nothing and
+ * answers with the current state and the usage. `feature` is set only when a setting was written.
+ */
+export function runUiCommand(args: string, store: UiSettingsStore = { read: readSettings, write: writeSettings }): { feature?: UiFeature; message: string } {
+	const [feature, value] = args.trim().split(/\s+/);
+	const ui = store.read().ui ?? {};
+	if ((UI_FEATURES as readonly string[]).includes(feature) && (value === "on" || value === "off")) {
+		store.write({ ui: { ...ui, [feature]: value === "on" } });
+		return { feature: feature as UiFeature, message: `brigadev ${feature} ${value}` };
+	}
+	return { message: `footer: ${ui.footer === false ? "off" : "on"} · phase: ${ui.phase === false ? "off" : "on"} · dashboard: ${ui.dashboard === false ? "off" : "on"}\nUsage: /brigadev:ui footer|phase|dashboard on|off` };
 }

@@ -63,7 +63,8 @@ export function listWidth(width: number): number {
 	return Math.max(18, Math.min(48, Math.floor(width * 0.34)));
 }
 
-function pad(p: Painter, text: string, width: number): string {
+/** Cuts `text` to `width` columns and fills the rest with spaces. */
+export function pad(p: Painter, text: string, width: number): string {
 	const cut = p.truncate(text, width);
 	return cut + " ".repeat(Math.max(0, width - p.measure(cut)));
 }

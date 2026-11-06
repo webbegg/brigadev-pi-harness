@@ -4,8 +4,8 @@
 // (global) and `<repo docs folder>/workflows/` (per repo) and override by name
 // or add new workflows. Pure loading and validation; no Pi imports.
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, type Dirent } from "node:fs";
+import { basename, join } from "node:path";
 import type { FrontmatterParser } from "./agents.ts";
 import { brigadevHome, repoDocsDir } from "./repo-docs.ts";
 
@@ -19,6 +19,10 @@ const QUESTION_KINDS: readonly string[] = ["text", "long", "choice"];
 const PLACEHOLDER = /\{\{([^{}]*)\}\}/g;
 const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
 const UNORDERED = 1_000;
+const KEY_PATTERN = /^[a-z]$/;
+
+/** Dashboard keys the tools use (Changes, Agents history, Model profile, Commands, Quit); a workflow cannot take them. */
+export const RESERVED_KEYS: readonly string[] = ["g", "a", "m", "k", "q"];
 
 export interface WorkflowQuestion {
 	id: string;
@@ -36,6 +40,8 @@ export interface Workflow {
 	description: string;
 	/** Menu position: lower first, then by name. */
 	order: number;
+	/** Dashboard key: one lowercase letter, unique among workflows and not reserved; dropped (with a warning) when it is not. An override without one inherits the key of the workflow it replaces. */
+	key?: string;
 	questions: WorkflowQuestion[];
 	/** Prompt body with `{{question-id}}` placeholders. */
 	body: string;
@@ -78,6 +84,9 @@ export function parseWorkflow(content: string, filePath: string, source: Workflo
 	if (typeof frontmatter.name !== "string" || !frontmatter.name.trim()) throw new Error("missing name");
 	if (typeof frontmatter.description !== "string" || !frontmatter.description.trim()) throw new Error("missing description");
 	if (!body.trim()) throw new Error("missing prompt body");
+	// An empty `key:` line is null in YAML: no key, not an invalid one.
+	const key = frontmatter.key ?? undefined;
+	if (key !== undefined && (typeof key !== "string" || !KEY_PATTERN.test(key))) throw new Error("key must be one lowercase letter");
 	const rawQuestions = frontmatter.questions ?? [];
 	if (!Array.isArray(rawQuestions)) throw new Error("questions must be a list");
 	const questions = rawQuestions.map(parseQuestion);
@@ -93,6 +102,7 @@ export function parseWorkflow(content: string, filePath: string, source: Workflo
 		name: frontmatter.name.trim(),
 		description: frontmatter.description.trim(),
 		order: typeof frontmatter.order === "number" ? frontmatter.order : UNORDERED,
+		...(key !== undefined ? { key } : {}),
 		questions,
 		body: body.trim(),
 		source,
@@ -102,8 +112,15 @@ export function parseWorkflow(content: string, filePath: string, source: Workflo
 
 function loadDir(dir: string | undefined, source: WorkflowSource, parse: FrontmatterParser, warnings: string[]): Workflow[] {
 	if (!dir || !existsSync(dir)) return [];
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+	} catch (error) {
+		warnings.push(`${dir}: could not read the folder: ${error instanceof Error ? error.message : String(error)}`);
+		return [];
+	}
 	const found: Workflow[] = [];
-	for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+	for (const entry of entries) {
 		if (!entry.name.endsWith(".md") || !(entry.isFile() || entry.isSymbolicLink())) continue;
 		const filePath = join(dir, entry.name);
 		try {
@@ -122,7 +139,10 @@ export interface WorkflowDiscoveryOptions {
 	parse: FrontmatterParser;
 }
 
-/** Later layers override earlier ones by name (ignoring case): package < user < repo. An invalid override leaves the lower layer's workflow in place. */
+/**
+ * Later layers override earlier ones by name (ignoring case): package < user < repo. An invalid override leaves the lower layer's workflow in place.
+ * An override without a `key` keeps the key of the workflow it replaces.
+ */
 export function discoverWorkflows(options: WorkflowDiscoveryOptions): WorkflowDiscovery {
 	const warnings: string[] = [];
 	const byName = new Map<string, Workflow>();
@@ -132,10 +152,67 @@ export function discoverWorkflows(options: WorkflowDiscoveryOptions): WorkflowDi
 		[options.repoDir, "repo"],
 	];
 	for (const [dir, source] of layers) {
-		for (const workflow of loadDir(dir, source, options.parse, warnings)) byName.set(workflow.name.toLowerCase(), workflow);
+		for (const workflow of loadDir(dir, source, options.parse, warnings)) {
+			const id = workflow.name.toLowerCase();
+			const inherited = byName.get(id)?.key;
+			byName.set(id, workflow.key === undefined && inherited !== undefined ? { ...workflow, key: inherited } : workflow);
+		}
 	}
 	const workflows = [...byName.values()].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
-	return { workflows, warnings };
+	return { workflows: assignKeys(workflows, warnings), warnings };
+}
+
+const LAYER_RANK: Record<WorkflowSource, number> = { package: 0, user: 1, repo: 2 };
+
+/**
+ * A key goes to the highest layer that claims it (repo, then user, then package), and within a layer to the first
+ * workflow in menu order. A reserved or already used key is dropped with a warning, and the workflow stays.
+ */
+function assignKeys(workflows: Workflow[], warnings: string[]): Workflow[] {
+	const owners = new Map<string, Workflow>();
+	const dropped = new Set<Workflow>();
+	// Array.prototype.sort is stable, so menu order breaks ties within a layer.
+	const claims = workflows.filter((workflow) => workflow.key !== undefined).sort((a, b) => LAYER_RANK[b.source] - LAYER_RANK[a.source]);
+	for (const workflow of claims) {
+		const key = workflow.key!;
+		const owner = owners.get(key);
+		if (RESERVED_KEYS.includes(key)) warnings.push(`${workflow.filePath}: key "${key}" is reserved for the dashboard tools; "${workflow.name}" has no key`);
+		else if (owner) warnings.push(`${workflow.filePath}: key "${key}" is already used by "${owner.name}"; "${workflow.name}" has no key`);
+		else {
+			owners.set(key, workflow);
+			continue;
+		}
+		dropped.add(workflow);
+	}
+	return workflows.map((workflow) => {
+		if (!dropped.has(workflow)) return workflow;
+		const { key: _dropped, ...keyless } = workflow;
+		return keyless;
+	});
+}
+
+export interface LoadedWorkflows extends WorkflowDiscovery {
+	/** Ready-to-show text for the skipped files, when there are any. */
+	warning?: string;
+}
+
+export const SKIPPED_WORKFLOWS_TITLE = "brigadev: skipped invalid workflow files";
+
+/** `discoverWorkflows` plus the notification text, so every caller words the warning the same way. */
+export function loadWorkflows(parse: FrontmatterParser, dirs: Omit<WorkflowDiscoveryOptions, "parse">): LoadedWorkflows {
+	const found = discoverWorkflows({ ...dirs, parse });
+	return found.warnings.length ? { ...found, warning: `${SKIPPED_WORKFLOWS_TITLE}\n${found.warnings.join("\n")}` } : found;
+}
+
+/** The workflow's file name without `.md`, the id `/brigadev:start` also accepts. */
+export const workflowId = (workflow: Workflow): string => basename(workflow.filePath, ".md");
+
+/** Finds a workflow by name (ignoring case), file id, or key. Throws an Error listing the names when none matches. */
+export function resolveWorkflow(workflows: readonly Workflow[], query: string): Workflow {
+	const wanted = query.trim().toLowerCase();
+	const found = workflows.find((w) => w.name.toLowerCase() === wanted) ?? workflows.find((w) => workflowId(w).toLowerCase() === wanted) ?? workflows.find((w) => w.key !== undefined && w.key === wanted);
+	if (found) return found;
+	throw new Error(`Unknown workflow "${query.trim()}". Workflows: ${workflows.map((w) => (w.key ? `${w.name} (${w.key})` : w.name)).join(", ")}`);
 }
 
 /** The user's global and per-repo workflow folders, under the same root as the repo docs. */
