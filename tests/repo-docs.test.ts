@@ -7,8 +7,11 @@ import { after, before, describe, it } from "node:test";
 import { loadOrchestratorPrompt } from "../extensions/orchestrator.ts";
 import { brigadevHome, isRepoDocsPath, repoDocsDir, repoName } from "../lib/repo-docs.ts";
 
+// Real git must not inherit the caller's GIT_* variables or global signing and hook settings.
+const cleanEnv = (): NodeJS.ProcessEnv => Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("GIT_")));
+const ISOLATED_GIT = ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "-c", "init.defaultBranch=main"];
 const git = (cwd: string, ...args: string[]) =>
-	execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { cwd, stdio: "pipe" });
+	execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", ...ISOLATED_GIT, ...args], { cwd, stdio: "pipe", env: cleanEnv() });
 
 describe("repo docs folder", () => {
 	let scratch: string;
@@ -16,8 +19,11 @@ describe("repo docs folder", () => {
 	let worktree: string;
 	let plain: string;
 	const home = "/tmp/brigadev-home-for-tests";
+	// The resolver runs git with the process environment, so the GIT_* variables are removed from it for these tests.
+	const inheritedGitEnv = Object.entries(process.env).filter(([name]) => name.startsWith("GIT_"));
 
 	before(() => {
+		for (const [name] of inheritedGitEnv) delete process.env[name];
 		scratch = realpathSync(mkdtempSync(join(tmpdir(), "repo-docs-")));
 		main = join(scratch, "my-repo");
 		worktree = join(scratch, "my-repo-feature");
@@ -29,7 +35,10 @@ describe("repo docs folder", () => {
 		git(main, "worktree", "add", "-q", worktree, "-b", "feat/x");
 	});
 
-	after(() => rmSync(scratch, { recursive: true, force: true }));
+	after(() => {
+		rmSync(scratch, { recursive: true, force: true });
+		for (const [name, value] of inheritedGitEnv) process.env[name] = value;
+	});
 
 	it("names the folder after the main worktree root", () => {
 		assert.equal(repoName(main), "my-repo");

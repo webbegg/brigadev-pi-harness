@@ -119,13 +119,13 @@ Each profile route can list fallback models. When a run fails on quota, auth, a 
 | delivery (`git push`, `gh pr create`) | ask | run | block |
 | `git commit` on a feature branch | run | run | block |
 | `git commit` on the default branch, on a detached HEAD, or when the default branch is unknown | ask | run | block |
-| destructive (`rm -rf dir`, `git reset --hard`, `git push --force`, `DROP TABLE`) | ask | ask | block |
+| destructive (`rm -rf dir`, `git reset --hard`, `git push --force`, `DROP TABLE`; ref rewrites: `git symbolic-ref HEAD <ref>`, `git remote set-head`, `git update-ref`, `git branch -m main …`) | ask | ask | block |
 | publish (`npm publish`, `gh pr merge`, `gh release`) | ask | ask | block |
 | privileged (`sudo`, `curl … \| sh`) | ask | ask | block |
 | dependency (`npm install`, `pip install`) | ask | ask | block |
 | catastrophic (`rm -rf ~`, `rm -rf /`, `mkfs`, `dd of=/dev/…`) | block | block | block |
 
-A commit runs without asking only when it targets the session's repository on a branch other than the default branch (the one `origin/HEAD` points to, else a lone local `main` or `master`). It still asks after a `cd`, a branch switch, or `git -C`/`--git-dir`/`--work-tree` earlier in the same command, and a chained `git push` keeps its own prompt. If git cannot answer, it asks.
+A commit runs without asking only when it targets the session's repository on a branch other than the default branch (the one `origin/HEAD` points to, else a lone local `main` or `master`). `main` and `master` stay protected whenever they exist, even if `origin/HEAD` is repointed. It still asks after a `cd`, a branch switch, or `git -C`/`--git-dir`/`--work-tree` earlier in the same command (inside `{ }`, `then`, and `do` blocks too), and a chained `git push` keeps its own prompt. If git cannot answer, it asks. Commands after `then`, `do`, `else`, `{`, `!`, and similar words are classified like their plain forms.
 
 Without a UI (print mode), "ask" means block. The guard recognizes executable forms; it is not a sandbox.
 
