@@ -35,7 +35,8 @@ export interface ShippedGroup extends WorkflowGroup {
 	order: number;
 	/** The key that opens the group: a letter (New feature) or a digit. Absent for an inline group. */
 	key?: string;
-	icon: string;
+	/** Absent for an inline group, which has no row of its own. */
+	icon?: string;
 	/** True when the group has no submenu: its workflows are rows on the top level, at the group's position. */
 	inline?: boolean;
 }
@@ -46,7 +47,7 @@ export const CUSTOM_GROUP_ORDER = 50;
 /** The one table of the dashboard's own groups. Plain BMP symbols, no Nerd Font glyphs. */
 export const SHIPPED_GROUPS: readonly ShippedGroup[] = [
 	{ id: "feature", label: "New feature", order: 10, key: "n", icon: "✦" },
-	{ id: "main", label: "Main menu", order: 20, icon: "◆", inline: true },
+	{ id: "main", label: "Top level", order: 20, inline: true },
 	{ id: "other", label: "Other workflows", order: 30, key: "1", icon: "⋯" },
 	{ id: "tools", label: "Tools", order: 90, key: "2", icon: "⚙" },
 ];

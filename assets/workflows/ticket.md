@@ -27,7 +27,7 @@ questions:
     options: ["Let the agent decide", "Quick change", "Big feature (plan first)"]
     default: "Let the agent decide"
 ---
-Ticket request, started from the workflow menu. The ticket text below is the requirement: quote it verbatim (in the feature document as L1 when one is created) and add nothing it does not ask for. Follow the normal ODD flow: explore first, then plan and implement.
+Ticket request, started from the workflow menu. The ticket below (key, kind, text, and link) is the requirement: quote it verbatim (as L1 in the feature document when one is created) and add nothing it does not ask for. Follow the normal ODD flow: explore first, then plan and implement.
 
 - Ticket key: {{key}}
 - Kind: {{kind}}
@@ -35,8 +35,10 @@ Ticket request, started from the workflow menu. The ticket text below is the req
 - Design or other link: {{design}}
 - Size: {{size}}
 
-"Bug" means follow the bug-fix flow: reproduce the problem first and write a failing test first when a deterministic one applies, then fix the root cause. "Story or task" means the normal feature flow.
+Normalize the key first: take the first match of `[A-Za-z][A-Za-z0-9]+-[0-9]+` in the ticket key answer (so a pasted ticket URL or a lowercase key works), uppercase it, and use that as <KEY> everywhere below. If there is no match, ask once for the key and stop.
 
-"Quick change" means a Small task: work inline, test first, one commit, never a feature document. "Big feature (plan first)" means Large per `odd-tracking.md`: feature document with the ticket text quoted verbatim as L1 and tasks, then show the plan and stop for the user's approval before the first source write; split delivery with `brigadev-chained-pr` when it exceeds ~400 lines. "Let the agent decide" means apply the usual size rules.
+"Bug" means follow the bug-fix flow: reproduce the problem, then fix the root cause. A Bug always starts with a failing test that reproduces it, whatever the size. "Story or task" means the normal feature flow.
 
-Ticket conventions: name the branch `feat/{{key}}-<short-slug>`, or `fix/{{key}}-<short-slug>` for a Bug; end every commit message with a `Refs: {{key}}` footer; end the PR title with `({{key}})`. These conventions can be changed by overriding this workflow file. Pushing and opening the PR still go through the guard.
+"Quick change" means a Small task: work inline, test first, one work unit and its commit, never a feature document or a plan; if it turns out to need more than that (several work units, a contract change, a decision for the user, or more than a few files), stop and say so instead of growing it. "Big feature (plan first)" means Large per `odd-tracking.md`: feature document with the whole request above (key, kind, ticket text, and link) as L1 verbatim, and tasks, then show the plan and stop for the user's approval before the first source write; split delivery with `brigadev-chained-pr` when it exceeds ~400 lines. "Let the agent decide" means apply the usual size rules.
+
+Ticket conventions: name the branch `feat/<KEY>-<short-slug>`, or `fix/<KEY>-<short-slug>` for a Bug; end every commit message with a `Refs: <KEY>` footer; end the PR title with `(<KEY>)`. These conventions can be changed by overriding this workflow file. Pushing and opening the PR still go through the guard.

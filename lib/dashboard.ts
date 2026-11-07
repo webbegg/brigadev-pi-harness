@@ -21,7 +21,7 @@ export interface DashboardEntry {
 	id: string;
 	icon: string;
 	label: string;
-	/** One lowercase letter (or a letter or digit, for a group) that runs the row directly. */
+	/** A lowercase letter, or a digit for a group, that runs the row directly. */
 	key?: string;
 	/** Shown at the end of the row instead of the key (the Chat row shows Enter, a group its digit and ›). */
 	keyLabel?: string;
@@ -125,7 +125,7 @@ export function buildMenu(workflows: readonly Workflow[]): DashboardMenu {
 		bucket.rows.push(workflowRow(workflow));
 		byGroup.set(id, bucket);
 	}
-	const order: Array<{ order: number; group: DashboardGroup; inline: boolean }> = SHIPPED_GROUPS.map((group) => ({ order: group.order, inline: group.inline === true, group: { id: group.id, label: group.label, icon: group.icon, key: group.key, items: [] } }));
+	const order: Array<{ order: number; group: DashboardGroup; inline: boolean }> = SHIPPED_GROUPS.map((group) => ({ order: group.order, inline: group.inline === true, group: { id: group.id, label: group.label, icon: group.icon ?? DEFAULT_ICON, key: group.key, items: [] } }));
 	const custom = [...byGroup.entries()].filter(([id]) => !SHIPPED_GROUPS.some((group) => group.id === id));
 	custom.forEach(([id, { label }], index) => {
 		const digit = FIRST_CUSTOM_DIGIT + index;

@@ -110,10 +110,17 @@ describe("package workflows", () => {
 		assert.deepEqual(q("size").options, ["Let the agent decide", "Quick change", "Big feature (plan first)"]);
 	});
 
-	it("the two PR workflows pick from a list when no PR is given", () => {
+	it("the two PR workflows word the optional PR input the same way", () => {
 		const label = (id: string) => loaded.workflows.find((w) => workflowId(w) === id)!.questions[0].label;
-		assert.equal(label("team-review"), "PR number or URL (empty: pick from the PRs waiting for your review)");
-		assert.equal(label("pr-feedback"), "PR number or URL (empty: pick from your open PRs)");
+		assert.equal(label("team-review"), "PR number or URL (empty: pick from a list)");
+		assert.equal(label("pr-feedback"), "PR number or URL (empty: pick from a list)");
+	});
+
+	it("the Big feature constraints label is short, and My PRs: feedback names its two modes by what they do", () => {
+		const question = (id: string, q: string) => loaded.workflows.find((w) => workflowId(w) === id)!.questions.find((candidate) => candidate.id === q)!;
+		assert.equal(question("big-feature", "constraints").label, "Constraints (deadlines, what not to touch)");
+		const mode = question("pr-feedback", "mode");
+		assert.deepEqual([mode.options, mode.default], [["Fix and draft replies", "Draft replies only"], "Fix and draft replies"]);
 	});
 
 	it("declares valid questions for each workflow", () => {
@@ -146,10 +153,10 @@ describe("package workflows composed", () => {
 	const facts = { currentBranch: "feat/x", defaultBranch: "main", testScript: "package.json test script: npm run check" };
 	// Names the skill or command each workflow must hand to the orchestrator.
 	const NEEDS: Record<string, string[]> = {
-		"Quick change": ["Small task", "test first", "one commit", "never create a feature document"],
+		"Quick change": ["Small task", "test first", "one work unit", "never create a feature document"],
 		Feature: ["normal ODD flow", "size rules", "L1"],
 		"Big feature (plan first)": ["Large", "odd-tracking.md", "verbatim as L1", "stop for the user's approval before the first source write", "brigadev-chained-pr", "~400"],
-		"Work on a ticket": ["Refs:", "short-slug", "failing test first"],
+		"Work on a ticket": ["Refs:", "short-slug", "failing test that reproduces it"],
 		"Review a team PR": ["brigadev-review", "brigadev-comment-writer", 'gh pr list --search "review-requested:@me" --state open', "gh pr view", "gh pr diff", "path:line", "Post nothing unless the user asks"],
 		"My PRs: feedback": ["brigadev-comment-writer", "gh pr list --author @me --state open", "Draft replies only"],
 		"Bug fix": ["regression test"],
@@ -174,18 +181,44 @@ describe("package workflows composed", () => {
 
 	const compose = (id: string, answers: Record<string, string>) => composeRequest(loaded.workflows.find((w) => workflowId(w) === id)!, answers, facts);
 
-	it("Work on a ticket: the key goes into the branch, the commit footer, and the PR title; a Bug starts from a failing test", () => {
+	it("Work on a ticket: the request normalizes the key first, then uses it in the branch, the commit footer, and the PR title", () => {
 		const text = compose("ticket", { key: "PROJ-123", text: "Title\nAs a user I want X" });
-		for (const needle of ["feat/PROJ-123-<short-slug>", "fix/PROJ-123-<short-slug>", "Refs: PROJ-123", "(PROJ-123)", "Kind: Story or task", "overriding this workflow file", "quote it verbatim", "bug-fix flow", "failing test first"]) {
+		for (const needle of ["- Ticket key: PROJ-123", "[A-Za-z][A-Za-z0-9]+-[0-9]+", "first match", "uppercase", "ask once for the key and stop", "feat/<KEY>-<short-slug>", "fix/<KEY>-<short-slug>", "Refs: <KEY>", "(<KEY>)", "Kind: Story or task", "overriding this workflow file", "quote it verbatim"]) {
 			assert.ok(text.includes(needle), needle);
 		}
 		assert.match(text, /Ticket text:\n> Title\n> As a user I want X/);
+		// The normalization comes before the first use of <KEY>.
+		assert.ok(text.indexOf("uppercase") < text.indexOf("feat/<KEY>"));
 	});
 
-	it("Work on a ticket: the size answer maps to the three sizes", () => {
-		const text = compose("ticket", { key: "PROJ-1", text: "t", size: "Quick change" });
-		assert.ok(text.includes("Size: Quick change"));
-		for (const needle of ["Small task", "never a feature document", "Large", "odd-tracking.md", "stop for the user's approval before the first source write", "usual size rules"]) assert.ok(text.includes(needle), needle);
+	it("Work on a ticket: the request defines all three sizes and quotes the chosen one", () => {
+		for (const size of ["Let the agent decide", "Quick change", "Big feature (plan first)"]) {
+			const text = compose("ticket", { key: "PROJ-1", text: "t", size });
+			assert.ok(text.includes(`- Size: ${size}`), size);
+			for (const needle of ["Small task", "one work unit", "never a feature document", "Large", "odd-tracking.md", "stop for the user's approval before the first source write", "usual size rules"]) assert.ok(text.includes(needle), `${size}: ${needle}`);
+		}
+	});
+
+	it("Work on a ticket: Quick change stops with the same text as the Quick change workflow", () => {
+		const ticket = compose("ticket", { key: "PROJ-1", text: "t", size: "Quick change" });
+		const quick = compose("quick-change", { what: "w" });
+		const condition = (text: string) => /\(several work units[^)]*\)/.exec(text)?.[0];
+		assert.ok(condition(quick));
+		assert.equal(condition(ticket), condition(quick));
+		for (const text of [ticket, quick]) assert.ok(text.includes("stop and say so instead of growing it"));
+	});
+
+	it("Work on a ticket, Big feature: the whole request (key, kind, ticket text, link) is L1 verbatim", () => {
+		const text = compose("ticket", { key: "PROJ-9", text: "Title\nBody", design: "https://figma.example/f", size: "Big feature (plan first)" });
+		assert.ok(text.includes("- Size: Big feature (plan first)"));
+		assert.ok(text.includes("- Design or other link: https://figma.example/f"));
+		assert.ok(text.includes("the whole request above (key, kind, ticket text, and link) as L1 verbatim"));
+		assert.ok(text.includes("split delivery with `brigadev-chained-pr`"));
+	});
+
+	it("Work on a ticket, Bug + Quick change: a failing test that reproduces it comes first, whatever the size", () => {
+		const text = compose("ticket", { key: "PROJ-2", text: "Crash on save", kind: "Bug", size: "Quick change" });
+		for (const needle of ["Kind: Bug", "Size: Quick change", "bug-fix flow", "always starts with a failing test that reproduces it, whatever the size", "one work unit", "fix/<KEY>-<short-slug>"]) assert.ok(text.includes(needle), needle);
 	});
 
 	it("Review a team PR: with a PR it names it, without one it lists the PRs waiting for review; either way it posts nothing unasked", () => {
@@ -201,13 +234,59 @@ describe("package workflows composed", () => {
 		}
 	});
 
+	it("Review a team PR: never checks the PR out in the user's tree; it freezes `gh pr diff`, uses a detached worktree for files, and saves reviews/pr-<number>.md", () => {
+		const text = compose("team-review", {});
+		for (const needle of [
+			"never run `gh pr checkout`",
+			'gh pr diff <number> > "$SCRATCH/candidate.patch"',
+			"replaces the review skill's `git diff` freeze step",
+			"git fetch origin pull/<number>/head",
+			"git worktree add --detach .worktrees/review-pr-<number> FETCH_HEAD",
+			"add `.worktrees/` to `.git/info/exclude`",
+			"remove it after the review",
+			"`reviews/pr-<number>.md`",
+		]) assert.ok(text.includes(needle), needle);
+		assert.ok(!text.includes("or check it out in a separate worktree"));
+	});
+
+	it("Review a team PR: any other focus is that lens only, plus the lens a high-risk item needs", () => {
+		const text = compose("team-review", { focus: "Reliability" });
+		for (const needle of ["Focus: Reliability", "Any other focus means review with that lens only", "unless the change carries a high-risk item", "add the lens that covers it and say so"]) assert.ok(text.includes(needle), needle);
+	});
+
+	it("both PR workflows list the same way: 0 PRs ask for a number, 1-5 get ask_user_choice with one option per PR, more than 5 get the 5 most recently updated", () => {
+		// The paragraph must read the same in both files except for the list command.
+		const listing = (text: string) => /When no pull request is given[^\n]*/.exec(text)?.[0].replace(/`gh pr list[^`]*`/, "`<list>`");
+		const team = compose("team-review", {});
+		const feedback = compose("pr-feedback", {});
+		assert.ok(listing(team));
+		assert.equal(listing(team), listing(feedback));
+		for (const needle of ["ask for a PR number in your reply, then stop", "`ask_user_choice`", "one option per PR (`#number title`)", "free text for another PR", 'add the option "Another PR"', "more than 5", "5 most recently updated"]) assert.ok(team.includes(needle), needle);
+		assert.ok(team.includes('--state open --json number,title,url,updatedAt'));
+		assert.ok(feedback.includes('--author @me --state open --json number,title,url,updatedAt,reviewDecision'));
+	});
+
 	it("My PRs: feedback: lists the user's own open PRs when none is given, and keeps drafts and posting behind the guard", () => {
 		const text = compose("pr-feedback", {});
 		assert.ok(text.includes("gh pr list --author @me --state open"));
 		assert.ok(text.includes("reviewDecision"));
-		assert.ok(text.includes("goes through the guard"));
+		assert.ok(text.includes("go through the guard"));
 		assert.ok(text.includes("Comments to handle: Unresolved comments only"));
-		assert.ok(text.includes("Mode: Apply changes and reply"));
+		assert.ok(text.includes("Mode: Fix and draft replies"));
+	});
+
+	it("My PRs: feedback: switches to the PR's branch only from a clean tree, stops on a fork, and drafts replies until approved", () => {
+		const text = compose("pr-feedback", {});
+		for (const needle of [
+			"if the chosen PR is not the current branch, switch to its branch only when the working tree is clean (otherwise stop and say so)",
+			"stop if the PR's head is in another repository (a fork;",
+			"gh pr view <number> --json headRefName,isCrossRepository",
+			"\"Fix and draft replies\" means",
+			"\"Draft replies only\" means change no code and post nothing",
+			"Replies are drafts until the user approves them",
+			"pushing and posting replies go through the guard",
+		]) assert.ok(text.includes(needle), needle);
+		assert.ok(!text.includes("Apply changes and reply"));
 	});
 
 	it("Quick change never creates a plan; Big feature always does", () => {
@@ -512,7 +591,7 @@ describe("workflowGroup", () => {
 	it("knows the four shipped groups by id or by label, ignoring case", () => {
 		assert.deepEqual(workflowGroup(make("feature")), { id: "feature", label: "New feature" });
 		assert.deepEqual(workflowGroup(make("new FEATURE")), { id: "feature", label: "New feature" });
-		assert.deepEqual(workflowGroup(make("main")), { id: "main", label: "Main menu" });
+		assert.deepEqual(workflowGroup(make("main")), { id: "main", label: "Top level" });
 		assert.deepEqual(workflowGroup(make("other")), { id: "other", label: "Other workflows" });
 		assert.deepEqual(workflowGroup(make("Other Workflows")), { id: "other", label: "Other workflows" });
 		assert.deepEqual(workflowGroup(make("TOOLS")), { id: "tools", label: "Tools" });
@@ -534,7 +613,9 @@ describe("workflowGroup", () => {
 		assert.deepEqual(byOrder.map((group) => group.key), ["n", undefined, "1", "2"]);
 		assert.deepEqual(byOrder.map((group) => group.inline === true), [false, true, false, false]);
 		assert.ok(byOrder[2].order < CUSTOM_GROUP_ORDER && CUSTOM_GROUP_ORDER < byOrder[3].order);
-		assert.equal(new Set(SHIPPED_GROUPS.map((group) => group.icon)).size, SHIPPED_GROUPS.length);
+		// Only a group with a row of its own has an icon; the inline group is shown as its workflows.
+		assert.deepEqual(byOrder.map((group) => group.icon === undefined), [false, true, false, false]);
+		assert.equal(new Set(byOrder.map((group) => group.icon).filter(Boolean)).size, 3);
 		assert.ok(RESERVED_KEYS.includes("n"));
 	});
 });
