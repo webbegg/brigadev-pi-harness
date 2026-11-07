@@ -18,8 +18,8 @@ const parse: FrontmatterParser = (content) => {
 	return { frontmatter, body: match![2].trim() };
 };
 
-const NEWLY_RESERVED = ["c", "e", "h", "o", "s", "t", "y"];
-const SHIPPED_KEYS = ["n", "b", "r", "p", "f", "i", "u", "x", "d"];
+const NEWLY_RESERVED = ["c", "e", "h", "n", "o", "s", "t", "y"];
+const SHIPPED_KEYS = ["j", "r", "f", "b", "v", "p", "i", "u", "x", "d"];
 
 describe("v0.11.0 workflow files under the new reserved letters", () => {
 	let scratch: string;
@@ -33,8 +33,8 @@ describe("v0.11.0 workflow files under the new reserved letters", () => {
 	});
 	after(() => rmSync(scratch, { recursive: true, force: true }));
 
-	it("reserves exactly g a m k q plus c e h o s t y", () => {
-		assert.deepEqual([...RESERVED_KEYS].sort(), ["a", "c", "e", "g", "h", "k", "m", "o", "q", "s", "t", "y"]);
+	it("reserves exactly g a m k q plus c e h o s t y, and n for New feature", () => {
+		assert.deepEqual([...RESERVED_KEYS].sort(), ["a", "c", "e", "g", "h", "k", "m", "n", "o", "q", "s", "t", "y"]);
 	});
 
 	it("warns about a user file only for a reserved letter, and loads every file", () => {
@@ -49,7 +49,7 @@ describe("v0.11.0 workflow files under the new reserved letters", () => {
 	it("a newly reserved key still starts by name and file id, not by the letter", () => {
 		const { workflows, warnings } = discoverWorkflows({ packageDir: join(ASSETS_ROOT, "workflows"), userDir: userDir(), parse });
 		for (const letter of NEWLY_RESERVED) {
-			assert.ok(warnings.some((w) => w.endsWith(`mine-${letter}.md: key "${letter}" is reserved for the dashboard tools; "Mine ${letter}" has no key`)), letter);
+			assert.ok(warnings.some((w) => w.endsWith(`mine-${letter}.md: key "${letter}" is reserved by the dashboard; "Mine ${letter}" has no key`)), letter);
 			assert.equal(resolveWorkflow(workflows, `Mine ${letter}`).name, `Mine ${letter}`);
 			assert.equal(resolveWorkflow(workflows, `mine-${letter}`).name, `Mine ${letter}`);
 			assert.throws(() => resolveWorkflow(workflows, letter), new RegExp(`Unknown workflow "${letter}"`));

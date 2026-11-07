@@ -1,9 +1,9 @@
 ---
-name: "Review a PR or branch"
+name: "Review my branch"
 description: "Risk-scoped 4R review of a branch or a pull request"
-order: 30
-key: "r"
-group: "ship"
+order: 55
+key: "v"
+group: "other"
 questions:
   - id: target
     label: "What should be reviewed? A branch, a PR number, or a PR URL"

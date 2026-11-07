@@ -1,9 +1,9 @@
 ---
 name: "Bug fix"
 description: "Reproduce, fix at the root cause, and prove it with a test"
-order: 20
+order: 50
 key: "b"
-group: "build"
+group: "other"
 questions:
   - id: where
     label: "Where does it happen?"

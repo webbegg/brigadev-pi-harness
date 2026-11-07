@@ -12,12 +12,13 @@ const workflow = (body: string, questions: WorkflowQuestion[], name = "Sample"):
 
 describe("workflowListLabel", () => {
 	it("shows name, description, and the group label", () => {
-		assert.equal(workflowListLabel({ ...workflow("b", [], "Bug fix"), description: "Reproduce and fix", group: "build" }), "Bug fix — Reproduce and fix [Build]");
-		assert.equal(workflowListLabel({ ...workflow("b", [], "Review"), description: "Look", group: "ship" }), "Review — Look [Review & ship]");
+		assert.equal(workflowListLabel({ ...workflow("b", [], "Bug fix"), description: "Reproduce and fix", group: "other" }), "Bug fix — Reproduce and fix [Other workflows]");
+		assert.equal(workflowListLabel({ ...workflow("b", [], "Quick change"), description: "Small", group: "feature" }), "Quick change — Small [New feature]");
+		assert.equal(workflowListLabel({ ...workflow("b", [], "Doctor"), description: "Look", group: "inspect" }), "Doctor — Look [Tools]");
 	});
 
-	it("no group reads as Build; an unknown group keeps its name as written", () => {
-		assert.equal(workflowListLabel({ ...workflow("b", [], "Plain"), description: "d" }), "Plain — d [Build]");
+	it("no group reads as Other workflows; an unknown group keeps its name as written", () => {
+		assert.equal(workflowListLabel({ ...workflow("b", [], "Plain"), description: "d" }), "Plain — d [Other workflows]");
 		assert.equal(workflowListLabel({ ...workflow("b", [], "Notes"), description: "d", group: "Docs work" }), "Notes — d [Docs work]");
 	});
 });
@@ -216,6 +217,20 @@ describe("facts", () => {
 			return reply("", key.endsWith("refs/heads/master") ? 1 : 0);
 		};
 		assert.deepEqual(await gatherFacts(exec, dir), { currentBranch: "feat/x", defaultBranch: "main", testScript: "package.json test script: node --test" });
+	});
+
+	it("only runs local git lookups: no gh, no network command", async () => {
+		const commands: string[] = [];
+		const exec = async (command: string, args: string[]) => {
+			commands.push([command, ...args].join(" "));
+			return { stdout: "", stderr: "", code: 1 };
+		};
+		await gatherFacts(exec, dir);
+		assert.ok(commands.length > 0);
+		for (const command of commands) {
+			assert.match(command, /^git (symbolic-ref|rev-parse)\b/, command);
+			assert.ok(!/\b(gh|fetch|pull|push|ls-remote|clone|curl)\b/.test(command), command);
+		}
 	});
 
 	it("leaves facts out when git cannot answer", async () => {

@@ -21,8 +21,8 @@ const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
 const UNORDERED = 1_000;
 const KEY_PATTERN = /^[a-z]$/;
 
-/** Dashboard keys the tools use (Changes, Agents history, Cost, Usage, Status, Panel, Model profile, Permission mode, Launch dashboard, Doctor, Commands, Quit); a workflow cannot take them. */
-export const RESERVED_KEYS: readonly string[] = ["g", "a", "c", "s", "t", "o", "m", "e", "h", "y", "k", "q"];
+/** Dashboard keys the tools and the New feature submenu use (Changes, Agents history, Cost, Usage, Status, Panel, Model profile, Permission mode, Launch dashboard, Doctor, Commands, Quit, New feature); a workflow cannot take them. */
+export const RESERVED_KEYS: readonly string[] = ["g", "a", "c", "s", "t", "o", "m", "e", "h", "y", "k", "q", "n"];
 
 export interface WorkflowGroup {
 	id: string;
@@ -33,26 +33,37 @@ export interface WorkflowGroup {
 export interface ShippedGroup extends WorkflowGroup {
 	/** Display position among the groups; the groups a workflow file adds sit at `CUSTOM_GROUP_ORDER`. */
 	order: number;
-	/** The key that opens the group. */
-	digit: string;
+	/** The key that opens the group: a letter (New feature) or a digit. Absent for an inline group. */
+	key?: string;
 	icon: string;
+	/** True when the group has no submenu: its workflows are rows on the top level, at the group's position. */
+	inline?: boolean;
 }
 
-/** Where the groups a workflow file adds are shown: after Review & ship, before Inspect. */
+/** Where the groups a workflow file adds are shown: after Other workflows, before Tools. */
 export const CUSTOM_GROUP_ORDER = 50;
 
 /** The one table of the dashboard's own groups. Plain BMP symbols, no Nerd Font glyphs. */
 export const SHIPPED_GROUPS: readonly ShippedGroup[] = [
-	{ id: "build", label: "Build", order: 10, digit: "1", icon: "⊞" },
-	{ id: "ship", label: "Review & ship", order: 20, digit: "2", icon: "⇡" },
-	{ id: "inspect", label: "Inspect", order: 90, digit: "3", icon: "◉" },
-	{ id: "settings", label: "Settings", order: 100, digit: "4", icon: "⚙" },
+	{ id: "feature", label: "New feature", order: 10, key: "n", icon: "✦" },
+	{ id: "main", label: "Main menu", order: 20, icon: "◆", inline: true },
+	{ id: "other", label: "Other workflows", order: 30, key: "1", icon: "⋯" },
+	{ id: "tools", label: "Tools", order: 90, key: "2", icon: "⚙" },
 ];
 
 /** The dashboard's own groups, in display order. A workflow's `group:` matches one by id or label, ignoring case. */
 export const KNOWN_GROUPS: readonly WorkflowGroup[] = SHIPPED_GROUPS.map(({ id, label }) => ({ id, label }));
 
-const DEFAULT_GROUP = KNOWN_GROUPS[0];
+/** Group names of earlier versions (ids and labels, lowercase) and the group each now belongs to. */
+const GROUP_ALIASES: Readonly<Record<string, string>> = {
+	build: "other",
+	ship: "other",
+	"review & ship": "other",
+	inspect: "tools",
+	settings: "tools",
+};
+
+const DEFAULT_GROUP = KNOWN_GROUPS.find((group) => group.id === "other")!;
 
 export interface WorkflowQuestion {
 	id: string;
@@ -72,7 +83,7 @@ export interface Workflow {
 	order: number;
 	/** Dashboard key: one lowercase letter, unique among workflows and not reserved; dropped (with a warning) when it is not. An override without one inherits the key of the workflow it replaces. */
 	key?: string;
-	/** Dashboard category: a shipped group's id or label, or a new category's name. Absent means Build. An override without one inherits the group of the workflow it replaces. */
+	/** Dashboard category: a shipped group's id or label, or a new category's name. Absent means Other workflows. An override without one inherits the group of the workflow it replaces. */
 	group?: string;
 	questions: WorkflowQuestion[];
 	/** Prompt body with `{{question-id}}` placeholders. */
@@ -217,7 +228,7 @@ function assignKeys(workflows: Workflow[], warnings: string[]): Workflow[] {
 	for (const workflow of claims) {
 		const key = workflow.key!;
 		const owner = owners.get(key);
-		if (RESERVED_KEYS.includes(key)) warnings.push(`${workflow.filePath}: key "${key}" is reserved for the dashboard tools; "${workflow.name}" has no key`);
+		if (RESERVED_KEYS.includes(key)) warnings.push(`${workflow.filePath}: key "${key}" is reserved by the dashboard; "${workflow.name}" has no key`);
 		else if (owner) warnings.push(`${workflow.filePath}: key "${key}" is already used by "${owner.name}"; "${workflow.name}" has no key`);
 		else {
 			owners.set(key, workflow);
@@ -245,12 +256,15 @@ export function loadWorkflows(parse: FrontmatterParser, dirs: Omit<WorkflowDisco
 	return found.warnings.length ? { ...found, warning: `${SKIPPED_WORKFLOWS_TITLE}\n${found.warnings.join("\n")}` } : found;
 }
 
-/** The category a workflow sits in on the dashboard: Build when it names none, a shipped group when the name matches one, else its own category labelled as written. */
+/** The category a workflow sits in on the dashboard: Other workflows when it names none, a shipped group when the name matches one (an earlier version's name maps to its new group), else its own category labelled as written. */
 export function workflowGroup(workflow: Workflow): WorkflowGroup {
 	const name = workflow.group?.trim();
 	if (!name) return DEFAULT_GROUP;
 	const wanted = name.toLowerCase();
-	return KNOWN_GROUPS.find((group) => group.id === wanted || group.label.toLowerCase() === wanted) ?? { id: wanted, label: name };
+	const known = KNOWN_GROUPS.find((group) => group.id === wanted || group.label.toLowerCase() === wanted);
+	if (known) return known;
+	const aliased = Object.hasOwn(GROUP_ALIASES, wanted) ? KNOWN_GROUPS.find((group) => group.id === GROUP_ALIASES[wanted]) : undefined;
+	return aliased ?? { id: wanted, label: name };
 }
 
 /** The workflow's file name without `.md`, the id `/brigadev:start` also accepts. */
