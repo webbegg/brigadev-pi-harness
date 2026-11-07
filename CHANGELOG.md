@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+- Launch dashboard layout: the top level is now New feature `n ›`, Work on a ticket `j`, Review a team PR `r`, My PRs: feedback `f`, Other workflows `1 ›`, Tools `2 ›`, then Commands (`k`), Chat (`Enter`), and Quit (`q`).
+- Other workflows holds Bug fix, Review my branch, Open a PR, Create an issue, UI change from a design or ticket, Refactor a component, and Upgrade dependencies (keys unchanged except `v` for Review my branch). Tools holds every tool row that was in Inspect and then Settings, with the same letters.
+- Navigation is unchanged (`Enter`/`→` in, `←`/`Esc` back with the selection restored, `Esc` on the top level goes to the chat, every key from any level). The `alt+w` list shows each workflow's group label; the workflows on the top level show `[Top level]`.
+- New workflows: New feature is a submenu with one row per size, each mapped to its brigadev flow.
+- Quick change is a Small task (inline, test first, one work unit and its commit, never a feature document); it stops and says so when it needs more.
+- Feature is the normal flow where the agent applies the size rules. Big feature (plan first) is Large: feature document with the request quoted verbatim, the plan shown for your approval before the first source write, resumable, `brigadev-chained-pr` past ~400 lines.
+- Work on a ticket (`j`) takes a pasted ticket (key, kind, text, optional design link and size). The agent normalizes the key first (the first `ABC-123`-style key in the answer, uppercased, so a pasted URL or a lowercase key works), then uses it in the branch `feat/<KEY>-<short-slug>` or `fix/<KEY>-<short-slug>`, the `Refs: <KEY>` commit footer, and the PR title ending `(<KEY>)`.
+- A Bug ticket always starts with a failing test that reproduces it. Big feature quotes the whole request (key, kind, text, link) as L1. Pasting only: there is no ticket-system API or credential.
+- Review a team PR (`r`) reviews read-only and drafts comments tied to `path:line`. It never checks the PR out in your working tree: the diff is frozen with `gh pr diff`, files come from a detached worktree under `.worktrees/`, and the ledger is `reviews/pr-<number>.md`.
+- My PRs: feedback (`f`) works through the comments on your PRs with "Fix and draft replies" or "Draft replies only". Fixing switches to the PR's branch only from a clean working tree and stops for a fork.
+- With the PR left empty, both PR entries run `gh pr list` and show the list: no PR asks for a number, 1 to 5 get a choice with free text, more than 5 offer the 5 most recently updated. The menu itself still runs local lookups only. Drafts are never posted unasked, and posting goes through the guard.
+- Workflow groups: the `group:` field now takes `feature` (a submenu), `main` (rows directly on the top level, after New feature; shown as `[Top level]` in `alt+w`), `other`, and `tools`; new categories take digits `3`–`9` between Other workflows and Tools.
+- Existing `group:` names keep working: `build` and `ship` (Review & ship) mean `other`, `inspect` and `settings` mean `tools`, and no `group` now means Other workflows (it was Build).
+- Changed: the shipped workflows were renamed: "New feature" is now "Feature", "Answer PR feedback" is "My PRs: feedback", and "Review a PR or branch" is "Review my branch". A workflow file that overrides one by its old name now adds a separate workflow instead.
+- Changed: the letter `n` is reserved for New feature (a workflow file that claims it loses the key with the existing warning), `r` moved from Review a PR or branch to Review a team PR (Review my branch is `v`), and `j` and `v` are new workflow keys.
+
 ## [0.12.0] - 2026-11-06
 
 - Launch dashboard: submenus. The top level now lists four groups, Build (`1`: `n b u x d`), Review & ship (`2`: `r p f i`), Inspect (`3`: `g a c s t o`), and Settings (`4`: `m e h y`), then Commands (`k`), Chat (`Enter`), and Quit (`q`). `Enter` or `→` opens a group, `←` or `Esc` goes back (selection returns to the group's row), and `Esc` on the top level still goes to the chat. Every key works from any level: letters run their row, digits open their group. New rows: Cost (`/brigadev:cost`), Usage (`/brigadev:usage`), Status (`/brigadev:status`), Panel (`/brigadev:panel`), Doctor (`/brigadev:doctor`), Permission mode (`e`, runs `/brigadev:mode status` only, it never changes the mode), and Launch dashboard on/off (`h`, runs `/brigadev:ui dashboard off` when the automatic start is on, `on` when it is off; when `BRIGADEV_DASHBOARD=0` (or `off`/`false`) is set it sends nothing and says the dashboard is off for this shell).

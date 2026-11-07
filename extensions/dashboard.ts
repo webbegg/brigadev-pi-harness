@@ -1,7 +1,8 @@
 /**
  * brigadev launch dashboard (/brigadev:dashboard): a full-screen start menu
- * of four groups (Build, Review & ship, Inspect, Settings, plus any a
- * workflow file names) with the workflows and tools in them, one key each. It opens by itself
+ * built around the daily work: a New feature submenu (three sizes), the main
+ * workflows (ticket, team PR review, my PRs' feedback) as rows, Other workflows,
+ * and Tools (plus any group a workflow file names), one key each. It opens by itself
  * once when Pi starts in the terminal UI with an empty session and no initial
  * prompt, never in subagents; `/brigadev:ui dashboard off` (or
  * `BRIGADEV_DASHBOARD=0`) turns that off. Choosing a row closes the dashboard

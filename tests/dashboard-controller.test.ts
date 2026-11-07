@@ -35,24 +35,28 @@ const plain: Painter = {
 };
 
 const workflow = (name: string, id: string, key?: string, group?: string): Workflow => ({ name, description: "d", order: 1, questions: [], body: "b", source: "package", filePath: `/w/${id}.md`, ...(key ? { key } : {}), ...(group ? { group } : {}) });
-const NINE: Array<[string, string, string, string]> = [
-	["New feature", "new-feature", "n", "build"],
-	["Bug fix", "bug-fix", "b", "build"],
-	["Review a PR or branch", "review", "r", "ship"],
-	["Open a PR", "open-pr", "p", "ship"],
-	["Answer PR feedback", "pr-feedback", "f", "ship"],
-	["Create an issue", "create-issue", "i", "ship"],
-	["UI change from a design or ticket", "ui-change", "u", "build"],
-	["Refactor a component", "refactor", "x", "build"],
-	["Upgrade dependencies", "upgrade-dependencies", "d", "build"],
+const SHIPPED: Array<[string, string, string | undefined, string]> = [
+	["Quick change", "quick-change", undefined, "feature"],
+	["Feature", "new-feature", undefined, "feature"],
+	["Big feature (plan first)", "big-feature", undefined, "feature"],
+	["Work on a ticket", "ticket", "j", "main"],
+	["Review a team PR", "team-review", "r", "main"],
+	["My PRs: feedback", "pr-feedback", "f", "main"],
+	["Bug fix", "bug-fix", "b", "other"],
+	["Review my branch", "review", "v", "other"],
+	["Open a PR", "open-pr", "p", "other"],
+	["Create an issue", "create-issue", "i", "other"],
+	["UI change from a design or ticket", "ui-change", "u", "other"],
+	["Refactor a component", "refactor", "x", "other"],
+	["Upgrade dependencies", "upgrade-dependencies", "d", "other"],
 ];
-const menu = buildMenu([...NINE.map(([name, id, key, group]) => workflow(name, id, key, group)), workflow("Write docs", "write-docs", "w", "Docs")]);
+const menu = buildMenu([...SHIPPED.map(([name, id, key, group]) => workflow(name, id, key, group)), workflow("Write docs", "write-docs", "w", "Docs")]);
 const everything = allEntries(menu);
 const CHAT: DashboardAction = { kind: "chat" };
 
 const KEYS = { escape: "\x1b", enter: "\r", up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D", ctrlN: "\x0e", ctrlP: "\x10" };
 
-// Top level: Build, Review & ship, Docs, Inspect, Settings, Commands, Chat, Quit.
+// Top level: New feature, three main workflows, Other workflows, Docs, Tools, Commands, Chat, Quit.
 const TOP = menu.top.map((entry) => entry.label);
 const topIndex = (label: string) => TOP.indexOf(label);
 const inGroup = (id: string, selected = 0): DashboardState => ({ level: "group", group: id, selected });
@@ -69,9 +73,9 @@ describe("viewFor", () => {
 	});
 
 	it("a group shows its rows under its name with the group hint", () => {
-		const view = viewFor(menu, inGroup("inspect"));
-		assert.equal(view.entries, groupItems("inspect"));
-		assert.equal(view.heading, "Inspect");
+		const view = viewFor(menu, inGroup("tools"));
+		assert.equal(view.entries, groupItems("tools"));
+		assert.equal(view.heading, "Tools");
 		assert.equal(view.hint, GROUP_HINT);
 	});
 
@@ -86,25 +90,25 @@ describe("renderState", () => {
 	const cursorRows = (lines: string[]) => lines.map((line) => line.trim()).filter((line) => line.startsWith("›"));
 
 	it("a group shows its name, its rows with the cursor on the selection, and the group hint", () => {
-		const lines = render(inGroup("inspect", 2));
+		const lines = render(inGroup("tools", 2));
 		const text = lines.join("\n");
 		assert.equal(lines.length, size.height);
 		assert.match(text, /brigadev · my-repo/);
-		assert.ok(lines.some((line) => line.trim() === "Inspect"), "heading");
+		assert.ok(lines.some((line) => line.trim() === "Tools"), "heading");
 		assert.ok(text.includes(GROUP_HINT), "group hint");
 		assert.ok(!text.includes(DASHBOARD_HINT), "no top hint");
-		for (const entry of groupItems("inspect")) assert.ok(text.includes(entry.label), entry.label);
-		for (const entry of groupItems("build")) assert.ok(!text.includes(entry.label), entry.label);
+		for (const entry of groupItems("tools")) assert.ok(text.includes(entry.label), entry.label);
+		for (const entry of groupItems("other")) assert.ok(!text.includes(entry.label), entry.label);
 		const cursor = cursorRows(lines);
 		assert.equal(cursor.length, 1);
-		assert.ok(cursor[0].includes(groupItems("inspect")[2].label), cursor[0]);
+		assert.ok(cursor[0].includes(groupItems("tools")[2].label), cursor[0]);
 	});
 
 	it("the cursor follows state.selected in the group", () => {
-		for (const index of [0, 1, groupItems("settings").length - 1]) {
-			const cursor = cursorRows(render(inGroup("settings", index)));
+		for (const index of [0, 1, groupItems("feature").length - 1]) {
+			const cursor = cursorRows(render(inGroup("feature", index)));
 			assert.equal(cursor.length, 1);
-			assert.ok(cursor[0].includes(groupItems("settings")[index].label), `${index}: ${cursor[0]}`);
+			assert.ok(cursor[0].includes(groupItems("feature")[index].label), `${index}: ${cursor[0]}`);
 		}
 	});
 
@@ -133,14 +137,20 @@ describe("reduceKey at the top level", () => {
 	});
 
 	it("Enter on a group row opens it on its first row, without closing", () => {
-		assert.deepEqual(reduceKey(atTop(topIndex("Inspect")), KEYS.enter, menu), { state: inGroup("inspect", 0) });
-		assert.deepEqual(reduceKey(atTop(0), KEYS.enter, menu), { state: inGroup("build", 0) });
+		assert.deepEqual(reduceKey(atTop(topIndex("Tools")), KEYS.enter, menu), { state: inGroup("tools", 0) });
+		assert.deepEqual(reduceKey(atTop(0), KEYS.enter, menu), { state: inGroup("feature", 0) });
 		assert.deepEqual(reduceKey(atTop(topIndex("Docs")), KEYS.enter, menu), { state: inGroup("docs", 0) });
 	});
 
-	it("→ opens the group too, and does nothing on Commands, Chat, or Quit", () => {
-		assert.deepEqual(reduceKey(atTop(topIndex("Review & ship")), KEYS.right, menu), { state: inGroup("ship", 0) });
-		for (const label of ["Commands", "Chat", "Quit"]) assert.deepEqual(reduceKey(atTop(topIndex(label)), KEYS.right, menu), { state: atTop(topIndex(label)) }, label);
+	it("Enter on a main workflow row runs it without leaving the top level", () => {
+		for (const label of ["Work on a ticket", "Review a team PR", "My PRs: feedback"]) {
+			assert.deepEqual(reduceKey(atTop(topIndex(label)), KEYS.enter, menu), { state: atTop(topIndex(label)), done: { kind: "workflow", query: label } }, label);
+		}
+	});
+
+	it("→ opens the group too, and does nothing on a workflow row, Commands, Chat, or Quit", () => {
+		assert.deepEqual(reduceKey(atTop(topIndex("Other workflows")), KEYS.right, menu), { state: inGroup("other", 0) });
+		for (const label of ["Work on a ticket", "Commands", "Chat", "Quit"]) assert.deepEqual(reduceKey(atTop(topIndex(label)), KEYS.right, menu), { state: atTop(topIndex(label)) }, label);
 	});
 
 	it("← does nothing at the top level", () => {
@@ -166,15 +176,17 @@ describe("reduceKey at the top level", () => {
 
 describe("reduceKey inside a group", () => {
 	it("Enter runs the selected row; the selection starts on the first row", () => {
-		assert.deepEqual(reduceKey(inGroup("build", 0), KEYS.enter, menu), { state: inGroup("build", 0), done: { kind: "workflow", query: "New feature" } });
-		assert.deepEqual(reduceKey(inGroup("build", 1), KEYS.enter, menu).done, { kind: "workflow", query: "Bug fix" });
-		assert.deepEqual(reduceKey(inGroup("inspect", 2), KEYS.enter, menu).done, { kind: "command", command: "/brigadev:cost" });
-		assert.deepEqual(reduceKey(inGroup("settings", 2), KEYS.enter, menu).done, { kind: "toggle-dashboard" });
+		assert.deepEqual(reduceKey(inGroup("feature", 0), KEYS.enter, menu), { state: inGroup("feature", 0), done: { kind: "workflow", query: "Quick change" } });
+		assert.deepEqual(reduceKey(inGroup("feature", 1), KEYS.enter, menu).done, { kind: "workflow", query: "Feature" });
+		assert.deepEqual(reduceKey(inGroup("feature", 2), KEYS.enter, menu).done, { kind: "workflow", query: "Big feature (plan first)" });
+		assert.deepEqual(reduceKey(inGroup("other", 0), KEYS.enter, menu).done, { kind: "workflow", query: "Bug fix" });
+		assert.deepEqual(reduceKey(inGroup("tools", 2), KEYS.enter, menu).done, { kind: "command", command: "/brigadev:cost" });
+		assert.deepEqual(reduceKey(inGroup("tools", 8), KEYS.enter, menu).done, { kind: "toggle-dashboard" });
 		assert.deepEqual(reduceKey(inGroup("docs", 0), KEYS.enter, menu).done, { kind: "workflow", query: "Write docs" });
 	});
 
 	it("← and Esc go back to the top level, on the row of the group they came from", () => {
-		for (const [id, label] of [["build", "Build"], ["ship", "Review & ship"], ["docs", "Docs"], ["inspect", "Inspect"], ["settings", "Settings"]]) {
+		for (const [id, label] of [["feature", "New feature"], ["other", "Other workflows"], ["docs", "Docs"], ["tools", "Tools"]]) {
 			for (const back of [KEYS.left, KEYS.escape]) {
 				assert.deepEqual(reduceKey(inGroup(id, 1), back, menu), { state: atTop(topIndex(label)) }, `${id} ${JSON.stringify(back)}`);
 			}
@@ -182,20 +194,21 @@ describe("reduceKey inside a group", () => {
 	});
 
 	it("Esc in a group does not go to the chat", () => {
-		assert.equal(reduceKey(inGroup("build"), KEYS.escape, menu).done, undefined);
+		assert.equal(reduceKey(inGroup("feature"), KEYS.escape, menu).done, undefined);
 	});
 
 	it("→ does nothing on a row", () => {
-		assert.deepEqual(reduceKey(inGroup("build", 1), KEYS.right, menu), { state: inGroup("build", 1) });
+		assert.deepEqual(reduceKey(inGroup("feature", 1), KEYS.right, menu), { state: inGroup("feature", 1) });
 	});
 
 	it("moves within the group's rows, wrapping at both ends", () => {
-		const count = groupItems("inspect").length;
-		assert.deepEqual(reduceKey(inGroup("inspect", 0), KEYS.down, menu), { state: inGroup("inspect", 1) });
-		assert.deepEqual(reduceKey(inGroup("inspect", 0), KEYS.up, menu), { state: inGroup("inspect", count - 1) });
-		assert.deepEqual(reduceKey(inGroup("inspect", count - 1), KEYS.down, menu), { state: inGroup("inspect", 0) });
-		assert.deepEqual(reduceKey(inGroup("inspect", 2), KEYS.ctrlN, menu), { state: inGroup("inspect", 3) });
-		assert.deepEqual(reduceKey(inGroup("inspect", 2), KEYS.ctrlP, menu), { state: inGroup("inspect", 1) });
+		const count = groupItems("tools").length;
+		assert.equal(count, 10);
+		assert.deepEqual(reduceKey(inGroup("tools", 0), KEYS.down, menu), { state: inGroup("tools", 1) });
+		assert.deepEqual(reduceKey(inGroup("tools", 0), KEYS.up, menu), { state: inGroup("tools", count - 1) });
+		assert.deepEqual(reduceKey(inGroup("tools", count - 1), KEYS.down, menu), { state: inGroup("tools", 0) });
+		assert.deepEqual(reduceKey(inGroup("tools", 2), KEYS.ctrlN, menu), { state: inGroup("tools", 3) });
+		assert.deepEqual(reduceKey(inGroup("tools", 2), KEYS.ctrlP, menu), { state: inGroup("tools", 1) });
 	});
 
 	it("an unknown group behaves like the top level", () => {
@@ -207,9 +220,9 @@ describe("reduceKey keys from any level", () => {
 	const levels: Array<[string, DashboardState]> = [["top", atTop(2)], ...menu.groups.map((g): [string, DashboardState] => [g.id, inGroup(g.id, 1)])];
 
 	it("every letter runs its row from the top and from inside any group, keeping the state", () => {
-		const letters = everything.filter((entry) => entry.key && /[a-z]/.test(entry.key));
-		// 9 workflows + Write docs + 6 inspect + 4 settings + Commands + Quit
-		assert.equal(letters.length, 22);
+		const letters = everything.filter((entry) => entry.key && /[a-z]/.test(entry.key) && entry.action.kind !== "group");
+		// 10 keyed workflows + Write docs + 10 tools + Commands + Quit
+		assert.equal(letters.length, 23);
 		for (const [name, state] of levels) {
 			for (const entry of letters) {
 				assert.deepEqual(reduceKey(state, entry.key!, menu), { state, done: entry.action }, `${name}: ${entry.label}`);
@@ -231,17 +244,30 @@ describe("reduceKey keys from any level", () => {
 
 	it("a digit opens its group from any level, on the first row", () => {
 		for (const [name, state] of levels) {
-			assert.deepEqual(reduceKey(state, "1", menu), { state: inGroup("build", 0) }, name);
-			assert.deepEqual(reduceKey(state, "2", menu), { state: inGroup("ship", 0) }, name);
-			assert.deepEqual(reduceKey(state, "3", menu), { state: inGroup("inspect", 0) }, name);
-			assert.deepEqual(reduceKey(state, "4", menu), { state: inGroup("settings", 0) }, name);
-			assert.deepEqual(reduceKey(state, "5", menu), { state: inGroup("docs", 0) }, name);
+			assert.deepEqual(reduceKey(state, "1", menu), { state: inGroup("other", 0) }, name);
+			assert.deepEqual(reduceKey(state, "2", menu), { state: inGroup("tools", 0) }, name);
+			assert.deepEqual(reduceKey(state, "3", menu), { state: inGroup("docs", 0) }, name);
+		}
+	});
+
+	it("n opens New feature from any level, on its first row", () => {
+		for (const [name, state] of levels) assert.deepEqual(reduceKey(state, "n", menu), { state: inGroup("feature", 0) }, name);
+	});
+
+	it("the main workflow letters run from any level", () => {
+		for (const [name, state] of levels) {
+			assert.deepEqual(reduceKey(state, "j", menu), { state, done: { kind: "workflow", query: "Work on a ticket" } }, name);
+			assert.deepEqual(reduceKey(state, "r", menu), { state, done: { kind: "workflow", query: "Review a team PR" } }, name);
+			assert.deepEqual(reduceKey(state, "f", menu), { state, done: { kind: "workflow", query: "My PRs: feedback" } }, name);
+			assert.deepEqual(reduceKey(state, "v", menu), { state, done: { kind: "workflow", query: "Review my branch" } }, name);
 		}
 	});
 
 	it("going back after jumping by digit lands on the group you jumped to", () => {
-		const jumped = reduceKey(inGroup("inspect", 4), "2", menu).state;
-		assert.deepEqual(reduceKey(jumped, KEYS.left, menu).state, atTop(topIndex("Review & ship")));
+		const jumped = reduceKey(inGroup("tools", 4), "1", menu).state;
+		assert.deepEqual(reduceKey(jumped, KEYS.left, menu).state, atTop(topIndex("Other workflows")));
+		const fromN = reduceKey(inGroup("tools", 4), "n", menu).state;
+		assert.deepEqual(reduceKey(fromN, KEYS.escape, menu).state, atTop(topIndex("New feature")));
 	});
 
 	it("ignores unknown letters, digits with no group, and multi-character input without closing", () => {
@@ -265,8 +291,8 @@ describe("reduceKey keys from any level", () => {
 		};
 		assert.deepEqual(reduceKey(atTop(0), "<esc>", menu, matcher).done, CHAT);
 		assert.deepEqual(reduceKey(atTop(0), "<down>", menu, matcher).state, atTop(1));
-		assert.deepEqual(reduceKey(atTop(0), "<right>", menu, matcher).state, inGroup("build", 0));
-		assert.deepEqual(reduceKey(inGroup("build", 1), "<left>", menu, matcher).state, atTop(0));
+		assert.deepEqual(reduceKey(atTop(0), "<right>", menu, matcher).state, inGroup("feature", 0));
+		assert.deepEqual(reduceKey(inGroup("feature", 1), "<left>", menu, matcher).state, atTop(0));
 		assert.ok(["escape", "down", "left", "right"].every((key) => asked.includes(key)));
 		// Without a match, a plain letter still runs its row.
 		assert.deepEqual(reduceKey(atTop(0), "q", menu, matcher).done, { kind: "quit" });

@@ -1,9 +1,8 @@
 ---
-name: "New feature"
-description: "Build something new through the normal ODD flow"
+name: "Feature"
+description: "Build something new through the normal ODD flow; the agent picks the size"
 order: 10
-key: "n"
-group: "build"
+group: "feature"
 questions:
   - id: what
     label: "What should be built?"
@@ -18,18 +17,12 @@ questions:
   - id: ticket
     label: "Ticket or link"
     kind: text
-  - id: tracking
-    label: "How should it be tracked?"
-    kind: choice
-    options: ["Let the agent decide", "Track it as large", "Keep it small"]
-    default: "Let the agent decide"
 ---
-New feature request, started from the workflow menu. Follow the normal ODD flow: explore first, then plan and implement.
+Feature request, started from the workflow menu. Follow the normal ODD flow: explore first, then plan and implement. Apply the usual size rules: a small change is done inline without a feature document; a large one is tracked per `odd-tracking.md`.
 
 - What to build: {{what}}
 - Area or files: {{area}}
 - Acceptance criteria: {{criteria}}
 - Ticket or link: {{ticket}}
-- Tracking preference: {{tracking}}
 
-"Track it as large" means treat this as a large ODD task the way `/track` does: feature document and todo before the first source write. "Keep it small" means do not create a feature document. "Let the agent decide" means apply the usual size rules. When a feature document is created, quote the request above verbatim as L1.
+When a feature document is created, quote the request above verbatim as L1.

@@ -21,7 +21,7 @@ export interface DashboardEntry {
 	id: string;
 	icon: string;
 	label: string;
-	/** One lowercase letter (or a digit, for a group) that runs the row directly. */
+	/** A lowercase letter, or a digit for a group, that runs the row directly. */
 	key?: string;
 	/** Shown at the end of the row instead of the key (the Chat row shows Enter, a group its digit and ›). */
 	keyLabel?: string;
@@ -33,15 +33,15 @@ export interface DashboardGroup {
 	id: string;
 	label: string;
 	icon: string;
-	/** A digit, for the first nine groups. */
+	/** A letter (New feature) or a digit, for the first nine groups. */
 	key?: string;
 	items: DashboardEntry[];
 }
 
 export interface DashboardMenu {
-	/** In display order. */
+	/** The groups that open a submenu, in display order. */
 	groups: DashboardGroup[];
-	/** The top level: one row per group, then Commands, Chat, Quit. */
+	/** The top level: a row per group (an inline group's workflows are rows themselves), then Commands, Chat, Quit. */
 	top: DashboardEntry[];
 }
 
@@ -59,11 +59,15 @@ const FULL_CHROME_HEIGHT = 10;
 
 /** Icons for the shipped workflows, by file id; other workflows get a neutral one. Plain BMP symbols, no Nerd Font glyphs. */
 const WORKFLOW_ICONS: Record<string, string> = {
+	"quick-change": "✧",
 	"new-feature": "✦",
-	"bug-fix": "✖",
-	review: "◎",
-	"open-pr": "↗",
+	"big-feature": "❖",
+	ticket: "◆",
+	"team-review": "◎",
 	"pr-feedback": "✎",
+	"bug-fix": "✖",
+	review: "◉",
+	"open-pr": "↗",
 	"create-issue": "◈",
 	"ui-change": "▣",
 	refactor: "↻",
@@ -74,15 +78,13 @@ const command = (id: string, icon: string, label: string, key: string, text: str
 
 /** Tool rows by the group they sit in (after that group's workflows). Their letters are the workflows' RESERVED_KEYS. */
 const GROUP_TOOLS: Record<string, DashboardEntry[]> = {
-	inspect: [
+	tools: [
 		command("changes", "±", "Changes", "g", "/brigadev:changes"),
 		command("runs", "≡", "Agents history", "a", "/brigadev:runs"),
 		command("cost", "$", "Cost", "c", "/brigadev:cost"),
 		command("usage", "◔", "Usage", "s", "/brigadev:usage"),
 		command("status", "●", "Status", "t", "/brigadev:status"),
 		command("panel", "▯", "Panel", "o", "/brigadev:panel"),
-	],
-	settings: [
 		command("profile", "◇", "Model profile", "m", "/brigadev:profile use"),
 		// Status only: the permission mode (and the yolo switch with it) stays a typed command.
 		command("mode", "⚑", "Permission mode", "e", "/brigadev:mode status"),
@@ -98,8 +100,8 @@ const TOP_TOOLS: DashboardEntry[] = [
 	{ id: "quit", icon: "✕", label: "Quit", key: "q", action: { kind: "quit" } },
 ];
 
-/** New categories take the digits after the shipped groups'. */
-const FIRST_CUSTOM_DIGIT = 5;
+/** New categories take the digits after the shipped groups' (1 and 2). */
+const FIRST_CUSTOM_DIGIT = 3;
 const LAST_DIGIT = 9;
 
 const workflowRow = (workflow: Workflow): DashboardEntry => {
@@ -108,11 +110,12 @@ const workflowRow = (workflow: Workflow): DashboardEntry => {
 };
 
 /**
- * The groups in display order (Build, Review & ship, any new categories, Inspect, Settings), each with its workflows
- * in the order given (keyed or not) and then its tools; a group with no rows is left out. A new category (a `group:`
- * name that is none of the shipped ones) takes the next free digit, 5 to 9, in order of first appearance. The top level
- * is a row per group, then Commands, Chat, Quit. A workflow starts through `/brigadev:start <name>`: the name is the
- * only identity that stays unique after the layers merge (file ids and keys can repeat or be absent).
+ * The groups in display order (New feature, the inline main workflows, Other workflows, any new categories, Tools),
+ * each with its workflows in the order given (keyed or not) and then its tools; a group with no rows is left out. A
+ * new category (a `group:` name that is none of the shipped ones) takes the next free digit, 3 to 9, in order of first
+ * appearance. The top level is a row per submenu group and, in place of the inline group, its workflows as rows, then
+ * Commands, Chat, Quit. A workflow starts through `/brigadev:start <name>`: the name is the only identity that stays
+ * unique after the layers merge (file ids and keys can repeat or be absent).
  */
 export function buildMenu(workflows: readonly Workflow[]): DashboardMenu {
 	const byGroup = new Map<string, { label: string; rows: DashboardEntry[] }>();
@@ -122,26 +125,28 @@ export function buildMenu(workflows: readonly Workflow[]): DashboardMenu {
 		bucket.rows.push(workflowRow(workflow));
 		byGroup.set(id, bucket);
 	}
-	const order: Array<{ order: number; group: DashboardGroup }> = SHIPPED_GROUPS.map((group) => ({ order: group.order, group: { id: group.id, label: group.label, icon: group.icon, key: group.digit, items: [] } }));
+	const order: Array<{ order: number; group: DashboardGroup; inline: boolean }> = SHIPPED_GROUPS.map((group) => ({ order: group.order, inline: group.inline === true, group: { id: group.id, label: group.label, icon: group.icon ?? DEFAULT_ICON, key: group.key, items: [] } }));
 	const custom = [...byGroup.entries()].filter(([id]) => !SHIPPED_GROUPS.some((group) => group.id === id));
 	custom.forEach(([id, { label }], index) => {
 		const digit = FIRST_CUSTOM_DIGIT + index;
-		order.push({ order: CUSTOM_GROUP_ORDER, group: { id, label, icon: DEFAULT_ICON, key: digit <= LAST_DIGIT ? String(digit) : undefined, items: [] } });
+		order.push({ order: CUSTOM_GROUP_ORDER, inline: false, group: { id, label, icon: DEFAULT_ICON, key: digit <= LAST_DIGIT ? String(digit) : undefined, items: [] } });
 	});
 	order.sort((a, b) => a.order - b.order);
 
-	const groups = order
-		.map(({ group }) => ({ ...group, items: [...(byGroup.get(group.id)?.rows ?? []), ...(Object.hasOwn(GROUP_TOOLS, group.id) ? GROUP_TOOLS[group.id] : [])] }))
-		.filter((group) => group.items.length > 0);
-	const groupRows = groups.map((group): DashboardEntry => ({
+	const filled = order
+		.map(({ group, inline }) => ({ inline, group: { ...group, items: [...(byGroup.get(group.id)?.rows ?? []), ...(Object.hasOwn(GROUP_TOOLS, group.id) ? GROUP_TOOLS[group.id] : [])] } }))
+		.filter(({ group }) => group.items.length > 0);
+	const groupRow = (group: DashboardGroup): DashboardEntry => ({
 		id: `group:${group.id}`,
 		icon: group.icon,
 		label: group.label,
 		key: group.key,
 		keyLabel: group.key ? `${group.key} ${CURSOR}` : CURSOR,
 		action: { kind: "group", id: group.id },
-	}));
-	return { groups, top: [...groupRows, ...TOP_TOOLS] };
+	});
+	const groups = filled.filter(({ inline }) => !inline).map(({ group }) => group);
+	const rows = filled.flatMap(({ inline, group }) => (inline ? group.items : [groupRow(group)]));
+	return { groups, top: [...rows, ...TOP_TOOLS] };
 }
 
 /** Every row on any level; a key works from anywhere. A group's digit comes from its row on the top level. */
