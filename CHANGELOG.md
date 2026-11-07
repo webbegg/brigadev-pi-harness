@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.13.0] - 2026-11-07
 
 - Launch dashboard layout: the top level is now New feature `n ›`, Work on a ticket `j`, Review a team PR `r`, My PRs: feedback `f`, Other workflows `1 ›`, Tools `2 ›`, then Commands (`k`), Chat (`Enter`), and Quit (`q`).
 - Other workflows holds Bug fix, Review my branch, Open a PR, Create an issue, UI change from a design or ticket, Refactor a component, and Upgrade dependencies (keys unchanged except `v` for Review my branch). Tools holds every tool row that was in Inspect and then Settings, with the same letters.
