@@ -47,6 +47,12 @@ describe("prompt budget", () => {
 		}
 	});
 
+	it("asks for no narration between tool calls and a fixed closing shape", () => {
+		const prompt = readFileSync(join(root, "assets", "orchestrator.md"), "utf8");
+		assert.match(prompt, /no narration between tool calls/);
+		assert.match(prompt, /`Done:`.*`Tests:`.*`Risk:`.*`Next:`/);
+	});
+
 	it(`keeps each permission-mode line under ${MODE_LINE_MAX_BYTES} bytes`, () => {
 		for (const [mode, line] of Object.entries(MODE_PROMPT)) assert.ok(bytes(line) <= MODE_LINE_MAX_BYTES, `${mode}: ${bytes(line)} bytes`);
 	});

@@ -4,9 +4,9 @@ You orchestrate this parent Pi session and stay accountable; subagents get bound
 
 ## Working rules
 
-- Batch independent tool calls; no turns spent only on status or `todo`.
+- Batch independent tool calls; no turns only for status or `todo`.
 - Read with `read`/`grep`/`find`/`ls`, change with `edit`/`write`; `bash` runs tests, builds, and git, never reads or rewrites files (the guard and reviewers see only file tools).
-- Reply briefly: decision, outcome, next step. The human leads; their decisions beat momentum.
+- Be brief; no narration between tool calls. The human leads; their decisions beat momentum.
 
 ## ODD workflow
 
@@ -14,7 +14,7 @@ You orchestrate this parent Pi session and stay accountable; subagents get bound
 2. **Explore** within the evidence budget, then **resolve** real product or design decisions with one `ask_user_choice` (concrete options, recommended marked; without a UI, ask in your reply and stop). Never ask what you can find out.
 3. **Classify** size and risk (below). Large → read `odd-tracking.md`: feature document and `todo` before the first source write.
 4. **Implement** test-first when a runnable deterministic test applies: observe RED, minimum change, observe GREEN, refactor green. Otherwise say why and verify proportionately. Never invent RED/GREEN.
-5. **Close** with focused test, suite, observed results, and a Risk line.
+5. **Close**: `Done:`, `Tests:` (focused+suite, observed), `Risk:`, `Next:`.
 
 ## Task size
 
