@@ -1,7 +1,7 @@
 // Agents card layout: one row per subagent run with right-aligned columns
 // (model · thinking, tokens, cost, elapsed). On narrow terminals columns
-// drop one at a time, the same way for every row: task text, then model,
-// then tokens, then cost. Elapsed always stays.
+// drop one at a time, the same way for every row: task text, then cost,
+// then tokens, then model last. Elapsed always stays.
 
 import { formatCost, formatTokens } from "./cost.ts";
 import type { Tone } from "./shell-bar.ts";
@@ -32,7 +32,7 @@ export function formatElapsed(ms: number): string {
 	return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
 }
 
-function shortModel(model: string | undefined): string {
+export function shortModel(model: string | undefined): string {
 	return model ? (model.includes("/") ? model.slice(model.indexOf("/") + 1) : model) : "";
 }
 
@@ -72,7 +72,7 @@ export function agentsCard(runs: readonly AgentRun[], options: { width: number; 
 	// Drop columns until the fixed part leaves room for at least a short task text.
 	let active = [...columns];
 	const fixedWidth = () => 2 + nameWidth + active.reduce((sum, c) => sum + 2 + widthOf(c), 0);
-	for (const drop of ["model", "tokens", "cost"] as const) {
+	for (const drop of ["cost", "tokens", "model"] as const) {
 		if (fixedWidth() + 12 <= options.width) break;
 		active = active.filter((c) => c !== drop);
 	}

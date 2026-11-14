@@ -37,6 +37,25 @@ describe("agents card", () => {
 		assert.ok(lines[1].text.trimEnd().endsWith("25s"));
 	});
 
+	it("drops cost, then tokens, and keeps the model last (S3a)", () => {
+		const r = run({ model: "claude-bridge/claude-haiku-5-5", thinking: "low" });
+		const at = (width: number) => agentsCard([r], { width, now, collapsed: false })[1].text;
+		assert.match(at(100), /\$0\.0014/);
+		assert.match(at(100), /22k|22\.0k/);
+		const mid = at(68);
+		assert.doesNotMatch(mid, /\$0\.0014/, mid);
+		assert.match(mid, /22k|22\.0k/, mid);
+		assert.match(mid, /claude-haiku-5-5 · low/, mid);
+		const narrow = at(60);
+		assert.doesNotMatch(narrow, /\$0\.0014/, narrow);
+		assert.doesNotMatch(narrow, /22k|22\.0k/, narrow);
+		assert.match(narrow, /claude-haiku-5-5 · low/, narrow);
+		assert.ok(narrow.trimEnd().endsWith("25s"));
+		const tiny = at(40);
+		assert.doesNotMatch(tiny, /haiku/, tiny);
+		assert.ok(tiny.trimEnd().endsWith("25s"));
+	});
+
 	it("collapses to the header", () => {
 		assert.equal(agentsCard([run({})], { width: 80, now, collapsed: true }).length, 1);
 	});
