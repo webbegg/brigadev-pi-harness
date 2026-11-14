@@ -23,6 +23,23 @@
 
 PR #1 targets the default branch; each later PR targets its parent until the parent merges, then rebase or retarget so only the current slice shows.
 
+## Expand–contract (wide refactors)
+
+Use it when one mechanical change (rename, retype a shared symbol, move an API) fans across many call sites and cannot be split by disjoint surfaces, because any single edit breaks callers in every slice.
+
+```text
+PR 1 expand    add the new form beside the old; nothing breaks
+PR 2..N migrate  move callers in batches (per package or directory); the old form still exists, so each batch is green
+PR last contract delete the old form once no caller remains
+```
+
+1. Expand: add the new form next to the old, with its tests. Old callers still work.
+2. Migrate: one slice per batch, sized by blast radius and the ~400-line budget, each depending on the expand. Check each batch against the old and new forms.
+3. Contract: remove the old form only after a search shows no caller left. This slice depends on every migrate batch and is the hardest to undo; verify it with the full suite.
+4. If the batches cannot stay green alone, put them on a shared integration branch and promise a green build only on the final integrate slice, which depends on all of them. Say so in the Chain Context.
+
+In the feature chain strategy the slices are the chain; stacked, each lands on the default branch in order, which is why every step before the contract must keep the old form working.
+
 ## Chain Context section
 
 Append to each child PR body (never for a single PR):

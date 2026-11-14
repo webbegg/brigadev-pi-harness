@@ -23,7 +23,7 @@ Creating or preparing a pull request, or preparing a branch for submission.
 3. Implement in work units (`brigadev-work-unit-commits`), test-first where applicable, running the applicable checks.
 4. If the change exceeds ~400 changed lines, load `brigadev-chained-pr` before opening anything.
 5. **Review before the PR**: run `brigadev-review` on `<default>...HEAD` (only the lenses that fit) and write the ledger to `reviews/<branch with / as ->.md` in the repo docs folder named in the orchestrator prompt. Show the ledger. If it has blockers, ask the user before opening the PR.
-6. Draft the PR body from the repository template and observed evidence. Show it to the user.
+6. Draft the PR body from the repository template (or, with none, the evidence-based body below) and observed evidence. Show it to the user.
 7. On explicit authorization: push, then open the PR with explicit `--repo` and `--base`.
 8. Report required CI status; never call a PR merge-ready on an unverified green claim.
 
@@ -33,7 +33,7 @@ Creating or preparing a pull request, or preparing a branch for submission.
 
 ## PR body
 
-Use the repository template when present. Otherwise:
+Use the repository template when present. Otherwise build the body from the evidence log (next section):
 
 ```markdown
 ## Summary
@@ -43,14 +43,36 @@ Use the repository template when present. Otherwise:
 | File | Change |
 | --- | --- |
 
-## Test plan
-- `<exact command>`: <observed result>
+## Blast radius
+- Consumers: <who or what uses the changed surfaces: callers, exports, CLI flags, config, other packages>
+- Undo: <easy (revert the PR) | hard (data, published artifact, contract others consume) and why>
+
+## Evidence
+- Before: `<command>` → <fail, with the symptom from its tail> (the run that reproduced the bug, or the RED run)
+- After: `<command>` → <pass> (the last passing run)
+- Other checks: `<command>` → <outcome>
+- Forced commits: <disclosure, only when the log has any>
 
 ## Risk
 none | item N (reason)
 ```
 
 Add `Closes #N` or `Refs #N` only when the user named an issue. Record only commands you actually ran. Leave unverified checklist items unchecked.
+
+### Evidence log
+
+The log is `<repo docs>/evidence/<branch with / as ->.jsonl`, in the repo docs folder named in the orchestrator prompt. Read it with `read` or `grep`; it is JSON lines, and the guard blocks writing it, so never edit it.
+
+- `type:"run"` records: `command`, `kind` (`test` or `check`), `exitCode`, `outcome` (`pass`, `fail`, or `unknown`), `ts`, `tree`, `agent`, and `tail` (the end of the output).
+- `type:"force"` records: the user forced a commit past the evidence gate. State this in the body under Forced commits, with its time; never leave it out.
+- Before: the earliest `fail` run for the bug or the RED test, quoting its `command` and what `tail` shows. Without one (no bug, or nothing was recorded), write `none recorded` instead of inventing it.
+- After: the latest `pass` run, quoting `command` and `outcome`. Prefer a `test` run whose `tree` is the final one; if the last edit came after it, say so.
+- Quote commands and outcomes as logged. Treat `unknown` as not verified. Never claim a check that is not in the log; a check you ran outside the log may be listed as run without a log record.
+- No log file: say the PR has no recorded evidence, and list only what you observed yourself.
+
+### Blast radius
+
+Name who or what consumes each changed surface (use `grep` for callers, exports, flags, and config keys), and how hard the change is to undo: a plain revert is easy; data, format, published, or contract changes that others already consume are hard. Keep it to what you found; if you did not look, say so.
 
 ## Commands
 
