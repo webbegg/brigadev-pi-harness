@@ -73,6 +73,10 @@ function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.Proc
 		proc: undefined as FakeChild | undefined,
 		spawned: undefined as { command: string; args: string[]; options: Parameters<SpawnFn>[2]; promptFile?: string } | undefined,
 		updates: 0,
+		/** The result the last update carried (the live snapshot). */
+		last: undefined as RunResult | undefined,
+		/** Child clock for the partial-update throttle; defaults to a frozen 42. */
+		clock: 42,
 		start: () => {
 			const spawn: SpawnFn = (command, args, options) => {
 				const at = args.indexOf("--append-system-prompt");
@@ -90,7 +94,10 @@ function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.Proc
 				schema: over.schema,
 				price: over.price ?? (() => undefined),
 				signal: over.signal,
-				onUpdate: () => void h.updates++,
+				onUpdate: (r) => {
+					h.updates++;
+					h.last = r;
+				},
 			};
 			const promise = runChild(options, {
 				spawn,
@@ -98,7 +105,7 @@ function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.Proc
 				env: { PATH: "/bin", ...over.env },
 				setTimer: time.setTimer,
 				clearTimer: time.clearTimer,
-				now: () => 42,
+				now: () => h.clock,
 				tmpRoot,
 				docsDir: () => docs,
 			});
@@ -170,6 +177,58 @@ describe("runChild: output folding", () => {
 		proc.line(assistant("ok", { provider: "claude-bridge", model: "claude-x", usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }));
 		proc.close(0);
 		assert.equal((await promise).usage.cost, 0.5);
+	});
+});
+
+const delta = (text: string) => ({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text } });
+
+describe("runChild: live partial text", () => {
+	it("folds streaming deltas into result.partial, updates at most every 100 ms, and clears it on the matching message_end", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "message_start", message: { role: "assistant", content: [] } });
+		assert.equal(h.updates, 0, "nothing was buffered, so nothing changed");
+		h.clock = 1000;
+		proc.line(delta("Hel"));
+		assert.equal(h.updates, 1);
+		assert.equal(h.last!.partial, "Hel");
+		h.clock = 1050;
+		proc.line(delta("lo"));
+		assert.equal(h.updates, 1, "throttled");
+		assert.equal(h.last!.partial, "Hello", "the snapshot is current even when no update was sent");
+		h.clock = 1100;
+		proc.line(delta(" world"));
+		assert.equal(h.updates, 2);
+		proc.line(assistant("Hello world"));
+		assert.equal(h.updates, 3, "a finished message is never throttled");
+		assert.equal(h.last!.partial, undefined);
+		proc.close(0);
+		const result = await promise;
+		assert.equal(result.partial, undefined);
+		assert.equal(JSON.parse(h.saved(result, "result.json")).output, "Hello world");
+	});
+
+	it("a child killed mid-message does not keep the partial text in its result", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line(delta("half a sent"));
+		assert.equal(h.last!.partial, "half a sent");
+		proc.close(1);
+		assert.equal((await promise).partial, undefined);
+	});
+
+	it("streaming deltas are signs of life for the stall watchdog", async () => {
+		const h = harness({ env: { BRIGADEV_STALL_TIMEOUT_MS: "60000" } });
+		const promise = h.start();
+		const proc = await h.ready();
+		h.time.advance(59_000);
+		proc.line(delta("still thinking"));
+		h.time.advance(59_000);
+		assert.deepEqual(proc.kills, []);
+		proc.close(0);
+		await promise;
 	});
 });
 

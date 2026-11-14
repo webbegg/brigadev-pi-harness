@@ -4,6 +4,7 @@ import type { RunResult } from "../lib/child-run.ts";
 import { emptyTally } from "../lib/cost.ts";
 import type { ActiveWriter } from "../lib/delegation.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
+import { activeTasks } from "../lib/subagent-status.ts";
 import { runLaunch, toResult, type AgentCall, type FallbackStep, type LaunchHooks, type LaunchTask } from "../lib/subagent-launch.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -68,6 +69,10 @@ function rig(specs: Spec[], options: { limit?: number; chain?: (index: number) =
 		notices,
 		labels,
 		tasks,
+		/** Fresh placeholders, as the extension builds them. */
+		placeholders: results,
+		/** Makes `view.start` throw for the given task (a stale context after /reload). */
+		startError: undefined as ((index: number) => Error | undefined) | undefined,
 		runner: (fn: typeof run) => void (run = fn),
 		/** Another launch's writer registers (as the extension's shared list would report it). */
 		registerOther(writer: ActiveWriter) {
@@ -103,7 +108,11 @@ function rig(specs: Spec[], options: { limit?: number; chain?: (index: number) =
 						onAdd: (listener) => (addListeners.add(listener), () => void addListeners.delete(listener)),
 					},
 					view: {
-						start: (i) => void events.push(`start:${i}`),
+						start: (i) => {
+							events.push(`start:${i}`);
+							const error = h.startError?.(i);
+							if (error) throw error;
+						},
 						attempt: (i) => void events.push(`attempt:${i}`),
 						update: (i) => void events.push(`update:${i}`),
 						finish: (i) => void events.push(`finish:${i}`),
@@ -292,6 +301,40 @@ describe("runLaunch: slots and writers on every exit path", () => {
 		const { details } = await launch;
 		assert.equal(details.results[0].stopReason, "aborted");
 		assert.deepEqual(details.results[0].fallbacks, ["m1 (provider_unavailable)"]);
+		assertClean(h);
+	});
+});
+
+describe("runLaunch: a throwing view.start leaks nothing (A6)", () => {
+	it("the task that could not start settles, so the running count (derived from launch state) returns to zero", async () => {
+		const h = rig([{ writer: true }, {}]);
+		h.startError = (i) => (i === 0 ? new Error("stale ctx") : undefined);
+		const placeholders = h.placeholders();
+		assert.equal(activeTasks([placeholders]), 2, "both tasks are queued, so both count");
+		const sibling = manual();
+		h.runner(() => sibling.promise);
+		const launch = h.launch("parallel", {}, undefined, placeholders);
+		const outcome = launch.catch((error: Error) => error);
+		await settle();
+		// The launch is still waiting for the sibling, but the task that could not start is no longer running.
+		assert.equal(activeTasks([placeholders]), 1, "only the sibling is still counted");
+		sibling.resolve(reply("task 1", "ok"));
+		assert.match(String(await outcome), /stale ctx/);
+		assert.deepEqual(h.started, [1], "the sibling still ran");
+		assert.equal(activeTasks([placeholders]), 0, "no task is left counted as running");
+		assert.ok(placeholders[0].endedAt !== undefined, "the placeholder that never started is settled");
+		assert.equal(placeholders[0].stopReason, "error");
+		assert.equal(placeholders[0].errorMessage, "stale ctx");
+		assert.notEqual(placeholders[0].cancelled, true, "a start failure is not a cancellation");
+		assertClean(h);
+	});
+
+	it("async mode (abort tolerated) rethrows too and leaves nothing running", async () => {
+		const h = rig([{}]);
+		h.startError = () => new Error("stale ctx");
+		const placeholders = h.placeholders();
+		await assert.rejects(h.launch("single", { tolerateAbort: true, async: true }, new AbortController().signal, placeholders), /stale ctx/);
+		assert.equal(activeTasks([placeholders]), 0);
 		assertClean(h);
 	});
 });

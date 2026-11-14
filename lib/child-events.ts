@@ -5,6 +5,9 @@
 import type { Message } from "@earendil-works/pi-ai";
 import { addUsage, emptyTally, type Tally } from "./cost.ts";
 
+/** Longest live text kept for an in-progress assistant message; older text is dropped (the final message is authoritative). */
+export const MAX_PARTIAL_CHARS = 64 * 1024;
+
 export type ChildEvent =
 	/** A finished message (assistant, tool result, or user). */
 	| { type: "message"; message: Message }
@@ -12,6 +15,8 @@ export type ChildEvent =
 	| { type: "tool_start"; id: string; name: string }
 	/** A tool call returned its result. */
 	| { type: "tool_end"; id: string; name: string }
+	/** Streaming text of the assistant message in progress (Pi json.md `message_update` / `text_delta`); `reset` starts a new message. */
+	| { type: "partial"; delta: string; reset?: boolean }
 	/** Any other sign of life from the child. */
 	| { type: "activity"; label: string };
 
@@ -22,6 +27,8 @@ export interface ChildSnapshot {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
+	/** Live text of the assistant message in progress, cleared when its `message_end` arrives. Bounded by MAX_PARTIAL_CHARS. */
+	partial?: string;
 }
 
 export const emptySnapshot = (): ChildSnapshot => ({ messages: [], usage: emptyTally() });
@@ -35,6 +42,15 @@ export function parseChildLine(line: string): ChildEvent[] {
 	} catch {
 		return [];
 	}
+	// Streaming (Pi docs/json.md: `message_update` carries only deltas; `message_end` is the authoritative message).
+	// Every update is a sign of life; only text deltas become live text.
+	if (event?.type === "message_update") {
+		const update = event.assistantMessageEvent;
+		const events: ChildEvent[] = [{ type: "activity", label: "message_update" }];
+		if (update?.type === "text_delta" && typeof update.delta === "string" && update.delta) events.push({ type: "partial", delta: update.delta });
+		return events;
+	}
+	if (event?.type === "message_start" && event.message?.role === "assistant") return [{ type: "activity", label: "message_start" }, { type: "partial", delta: "", reset: true }];
 	const message = event?.type === "message_end" ? event.message : undefined;
 	if (!message) return [{ type: "activity", label: String(event?.type ?? "event") }];
 
@@ -54,10 +70,22 @@ export function parseChildLine(line: string): ChildEvent[] {
 
 /** Applies one event to the snapshot. Returns true when the snapshot changed. */
 export function foldChildEvent(snapshot: ChildSnapshot, event: ChildEvent): boolean {
+	if (event.type === "partial") {
+		if (event.reset) {
+			if (snapshot.partial === undefined) return false;
+			delete snapshot.partial;
+			return true;
+		}
+		const text = (snapshot.partial ?? "") + event.delta;
+		snapshot.partial = text.length > MAX_PARTIAL_CHARS ? `…${text.slice(-MAX_PARTIAL_CHARS)}` : text;
+		return true;
+	}
 	if (event.type !== "message") return false;
 	const msg = event.message;
 	snapshot.messages.push(msg);
 	if (msg.role === "assistant") {
+		// The finished message replaces the live text.
+		delete snapshot.partial;
 		addUsage(snapshot.usage, msg.usage);
 		if (msg.model) snapshot.model = msg.provider ? `${msg.provider}/${msg.model}` : msg.model;
 		if (msg.stopReason) snapshot.stopReason = msg.stopReason;

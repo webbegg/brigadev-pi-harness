@@ -9,15 +9,17 @@
 
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { agentsCard, FINISHED_TTL_MS, formatElapsed, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
-import { threadRows } from "../lib/agent-thread.ts";
+import { agentsCard, FINISHED_TTL_MS, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
+import { autoScroll, buildEntries, entryDetail, listRow, moveSelection, resolveSelection, scrollView, viewerTitle, type RecordedRun, type Selection, type TrackedRun } from "../lib/subagent-viewer.ts";
+import { formatStatus, statusCounts } from "../lib/subagent-status.ts";
 import { queuedFields, runState, subagentRow, syncRowTimer, type RowInput, type RowTimerState } from "../lib/subagent-row.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
-import { listWidth, maxScroll, renderTwoPane, type Row } from "../lib/two-pane.ts";
+import { listWidth, renderTwoPane } from "../lib/two-pane.ts";
 import { emptyTally, formatCost, formatTokens } from "../lib/cost.ts";
 import { failed, output, runChild, type RunResult } from "../lib/child-run.ts";
 import { newRunId } from "../lib/run-artifacts.ts";
@@ -45,6 +47,8 @@ const STATUS_KEY = "brigadev-agents";
 const CARD_KEY = "brigadev-agents-card";
 const CARD_COLLAPSE_KEY = "ctrl+shift+a";
 const VIEWER_KEY = "alt+a";
+/** Settled runs this process remembers for the viewer (older ones are still on the session branch when collected). */
+const MAX_SETTLED_VIEW_RUNS = 100;
 /** Tool results that carry finished runs: a sync call, or an async launch collected by wait/cancel. */
 const VIEWER_TOOLS = new Set(["subagent", "subagent_wait", "subagent_cancel"]);
 
@@ -139,7 +143,16 @@ export default function (pi: ExtensionAPI) {
 	const activeWriters: ActiveWriter[] = [];
 	// Async launches record the writers other launches register while they run (the A1 backstop exclusion).
 	const writerListeners = new Set<(writers: readonly ActiveWriter[]) => void>();
-	let running = 0;
+	// Launches in flight, sync or async, by id: their result placeholders are the one source of the footer's running count
+	// and of the viewer's live rows, so nothing is counted by hand and no exit path can leave a count behind.
+	const launches = new Map<RunResult[], number>();
+	let launchSeq = 0;
+	// Runs of launches that ended in this session, for the viewer (async launches stay visible before they are collected).
+	let settled: TrackedRun[] = [];
+	// Bumped on session start: a launch left from the previous session must not add to the new one.
+	let epoch = 0;
+	// Repaint hook of the open Agents viewer.
+	let repaintViewer: (() => void) | undefined;
 
 	// One concurrency cap for every launch in this process, sync or async.
 	const slots = createSemaphore(MAX_CONCURRENCY);
@@ -180,11 +193,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Agents card: live rows above the editor while subagents run.
 	let runs: AgentRun[] = [];
-	// Live results by card run id, for the Agents viewer while a run is in flight.
-	const liveResults = new Map<string, RunResult>();
 	let cardCollapsed = false;
-	// True while the agents card widget is installed (collapsed or not).
-	let widgetShown = false;
 	let renderCard: (() => void) | undefined;
 	let ticker: ReturnType<typeof setInterval> | undefined;
 	let expiry: ReturnType<typeof setTimeout> | undefined;
@@ -195,9 +204,14 @@ export default function (pi: ExtensionAPI) {
 		ticker = expiry = undefined;
 	};
 
-	// The footer count duplicates the card, so it only shows while the card does not.
+	// Footer: `agents: 2 running · 3 done · alt+a`, counted across sync and async launches. Done follows the card's lifetime.
 	const syncStatus = (ctx: ExtensionContext) => {
-		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, running > 0 && !widgetShown ? `◐ ${running} agent${running === 1 ? "" : "s"}` : undefined);
+		if (!ctx.hasUI) return;
+		try {
+			ctx.ui.setStatus(STATUS_KEY, formatStatus(statusCounts(launches.keys(), runs, Date.now()), VIEWER_KEY));
+		} catch {
+			// A stale context (session replaced): the new session sets its own status.
+		}
 	};
 
 	const showCard = (ctx: ExtensionContext) => {
@@ -207,14 +221,11 @@ export default function (pi: ExtensionAPI) {
 		if (visibleRuns(runs, Date.now()).length === 0) {
 			stopTimers();
 			renderCard = undefined;
-			widgetShown = false;
 			ctx.ui.setWidget(CARD_KEY, undefined);
 			syncStatus(ctx);
 			return;
 		}
 		if (!renderCard) {
-			widgetShown = true;
-			syncStatus(ctx);
 			ctx.ui.setWidget(CARD_KEY, (tui, theme) => {
 				renderCard = () => tui.requestRender();
 				return {
@@ -232,9 +243,15 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 		renderCard?.();
-		// Tick the elapsed column while work runs; drop finished rows after their TTL.
+		syncStatus(ctx);
+		// Tick the elapsed column while work runs; drop finished rows after their TTL (the footer's done count expires with them).
 		const anyRunning = runs.some((r) => r.state === "running");
-		if (anyRunning && !ticker) ticker = setInterval(() => renderCard?.(), 1000);
+		if (anyRunning && !ticker) {
+			ticker = setInterval(() => {
+				renderCard?.();
+				syncStatus(ctx);
+			}, 1000);
+		}
 		if (!anyRunning) {
 			if (ticker) clearInterval(ticker);
 			ticker = undefined;
@@ -249,6 +266,9 @@ export default function (pi: ExtensionAPI) {
 		delivery.reset();
 		registry.clear();
 		runs = [];
+		launches.clear();
+		settled = [];
+		epoch++;
 		showCard(ctx);
 	});
 	// Children of running async launches get the usual SIGTERM, then SIGKILL after 5 s.
@@ -266,11 +286,6 @@ export default function (pi: ExtensionAPI) {
 			showCard(ctx);
 		},
 	});
-
-	const setRunning = (ctx: ExtensionContext, delta: number) => {
-		running += delta;
-		syncStatus(ctx);
-	};
 
 	// The parent is idle for good (not between retries or queued continuations): deliver what settled meanwhile.
 	pi.on("agent_settled", async (_event, ctx) => {
@@ -364,33 +379,37 @@ export default function (pi: ExtensionAPI) {
 				};
 				const view: TaskView = {
 					start(index, info) {
-						setRunning(ctx, 1);
 						const cardRun: AgentRun = { id: randomUUID().slice(0, 8), agent: info.agent, task: info.task, state: "running", model: info.model, thinking: info.thinking, tokens: 0, cost: 0, startedAt: info.startedAt };
 						cards.set(index, cardRun);
 						runs.push(cardRun);
 						showCard(ctx);
-						liveResults.set(cardRun.id, results[index]);
+						repaintViewer?.();
 					},
 					attempt(index, result) {
 						const cardRun = cards.get(index)!;
 						Object.assign(cardRun, { model: result.model, thinking: result.thinking });
-						liveResults.set(cardRun.id, result);
+						repaintViewer?.();
 					},
 					update(index, partial) {
 						const cardRun = cards.get(index)!;
-						liveResults.set(cardRun.id, partial);
 						syncCard(cardRun, partial);
+						repaintViewer?.();
 					},
 					finish(index, result) {
 						const cardRun = cards.get(index)!;
 						syncCard(cardRun, result);
 						cardRun.state = failed(result) || result.exitCode === -1 ? "failed" : "done";
 						cardRun.endedAt = Date.now();
-						liveResults.delete(cardRun.id);
 						showCard(ctx);
-						setRunning(ctx, -1);
+						repaintViewer?.();
 					},
 				};
+
+				const id = launchSeq++;
+				const launchEpoch = epoch;
+				launches.set(results, id);
+				syncStatus(ctx);
+				repaintViewer?.();
 
 				return runLaunch(
 					{ mode, tasks, results, signal, hooks },
@@ -429,7 +448,22 @@ export default function (pi: ExtensionAPI) {
 						view,
 						snapshot: () => takeSnapshot(exec, canonicalPath(ctx.cwd)),
 					},
-				);
+				).finally(() => {
+					// Whatever way the launch ended: it no longer counts as running, its rows settle, and its runs stay viewable.
+					if (launchEpoch !== epoch) return;
+					launches.delete(results);
+					for (const cardRun of cards.values()) if (cardRun.state === "running") Object.assign(cardRun, { state: "failed", endedAt: Date.now() });
+					results.forEach((result, i) => {
+						if (result.exitCode !== -1 || result.endedAt !== undefined) settled.push({ id: `${id}:${i}`, result });
+					});
+					settled = settled.slice(-MAX_SETTLED_VIEW_RUNS);
+					try {
+						showCard(ctx);
+					} catch {
+						// A stale context: the launch's outcome matters more than its card.
+					}
+					repaintViewer?.();
+				});
 			};
 
 			if (!params.async) return toResult(mode, await launch(signal, { onUpdate: onUpdate as LaunchHooks["onUpdate"], tolerateAbort: false }));
@@ -525,97 +559,77 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	interface ViewerRun {
-		result: RunResult;
-		state: "running" | "done" | "failed";
-		startedAt?: number;
-		elapsed?: string;
-	}
-
-	/** Runs in flight plus every finished run recorded on this branch, newest first. */
-	const viewerRuns = (ctx: ExtensionContext): ViewerRun[] => {
-		const finished: ViewerRun[] = [];
+	/** Every run: those this process tracks (queued, running, and settled since the session started, async ones included) plus the finished ones recorded on this branch. */
+	const viewerEntries = (ctx: ExtensionContext) => {
+		const tracked: TrackedRun[] = [...settled];
+		for (const [results, id] of launches) results.forEach((result, i) => tracked.push({ id: `${id}:${i}`, result }));
+		const recorded: RecordedRun[] = [];
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "message" || entry.message.role !== "toolResult" || !VIEWER_TOOLS.has(entry.message.toolName)) continue;
 			const details = entry.message.details as Details | undefined;
 			// An async launch's immediate return (and a timed-out wait) holds placeholders, not final results.
 			if (details?.pending) continue;
 			const at = Date.parse(entry.timestamp);
-			for (const result of details?.results ?? []) finished.push({ result, state: failed(result) ? "failed" : "done", startedAt: at });
+			for (const result of details?.results ?? []) recorded.push({ result, at });
 		}
-		const live: ViewerRun[] = runs
-			.filter((r) => r.state === "running" && liveResults.has(r.id))
-			.map((r) => ({ result: liveResults.get(r.id)!, state: "running", startedAt: r.startedAt, elapsed: formatElapsed(Date.now() - r.startedAt) }));
-		return [...live, ...finished.reverse()];
+		return buildEntries({ tracked, recorded, now: Date.now() });
 	};
 
 	const openViewer = async (ctx: ExtensionContext) => {
 		if (ctx.mode !== "tui") return ctx.ui.notify("The Agents viewer needs the interactive UI", "error");
 		await ctx.ui.custom<void>((tui, theme, _kb, done) => {
 			const painter = themePainter(theme);
-			let selected = 0;
-			let scroll = 0;
+			let selection: Selection = { key: undefined, index: 0 };
+			let view = scrollView.initial();
 			let detailOnly = false;
-			let follow = true;
-			// Live runs stream new messages; repaint while the viewer is open.
+			// The list changes while the viewer is open: repaint on every progress update, and once a second so elapsed times tick.
+			repaintViewer = () => tui.requestRender();
 			const timer = setInterval(() => tui.requestRender(), 1000);
 			const close = () => {
 				clearInterval(timer);
+				repaintViewer = undefined;
 				done();
 			};
-			const glyph = { running: "◐", done: "✓", failed: "✗" } as const;
-			const tone = { running: "accent", done: "success", failed: "error" } as const;
-
-			const detailFor = (run: ViewerRun | undefined, width: number): Row[] => {
-				if (!run) return [];
-				const r = run.result;
-				const u = r.usage;
-				const header = [
-					`${r.agent} · ${run.state}${run.elapsed ? ` · ${run.elapsed}` : ""}`,
-					`${r.model ?? "?"}${r.thinking ? ` · ${r.thinking}` : ""}${r.route ? ` · ${r.route}` : ""}`,
-					`${u.turns} turns · ↑${formatTokens(u.input + u.cacheRead + u.cacheWrite)} ↓${formatTokens(u.output)} · ${formatCost(u.cost)}`,
-					`task: ${r.task.split("\n")[0]}`,
-				];
-				const rows = threadRows(header, r.messages, width);
-				if (run.state === "failed" && (r.errorMessage || r.stderr)) rows.push({ text: `error: ${(r.errorMessage || r.stderr).split("\n")[0]}`, tone: "error" });
-				return rows;
-			};
+			const detailWidth = (width: number) => (detailOnly ? width - 2 : width - listWidth(width) - 4);
+			const home = os.homedir();
 
 			return {
 				invalidate() {},
 				handleInput(data: string) {
-					const list = viewerRuns(ctx);
+					const entries = viewerEntries(ctx);
+					selection = resolveSelection(entries, selection);
+					const entry = entries[selection.index];
 					const bodyHeight = Math.max(1, tui.terminal.rows - 3);
-					const width = tui.terminal.columns;
-					const detail = detailFor(list[selected], detailOnly ? width - 2 : width - listWidth(width) - 4);
+					const total = entryDetail(entry, detailWidth(tui.terminal.columns), home).length;
+					// Scroll keys act on what is on screen (a pinned thread is at its end).
+					const shown = { scroll: autoScroll(view, total, bodyHeight, entry?.active ?? false), follow: view.follow };
 					if (matchesKey(data, Key.escape) || data === "q") return close();
-					if (matchesKey(data, Key.down) || data === "j") [selected, scroll, follow] = [Math.min(list.length - 1, selected + 1), 0, true];
-					else if (matchesKey(data, Key.up) || data === "k") [selected, scroll, follow] = [Math.max(0, selected - 1), 0, true];
-					else if (matchesKey(data, Key.pageDown) || data === " " || data === "J") [scroll, follow] = [Math.min(maxScroll(detail.length, bodyHeight), scroll + 10), false];
-					else if (matchesKey(data, Key.pageUp) || data === "K") [scroll, follow] = [Math.max(0, scroll - 10), false];
-					else if (data === "g") [scroll, follow] = [0, false];
-					else if (data === "G") [scroll, follow] = [maxScroll(detail.length, bodyHeight), true];
+					if (matchesKey(data, Key.down) || data === "j") [selection, view] = [moveSelection(entries, selection, 1), scrollView.initial()];
+					else if (matchesKey(data, Key.up) || data === "k") [selection, view] = [moveSelection(entries, selection, -1), scrollView.initial()];
+					else if (matchesKey(data, Key.pageDown) || data === " " || data === "J") view = scrollView.by(shown, 10, total, bodyHeight);
+					else if (matchesKey(data, Key.pageUp) || data === "K") view = scrollView.by(shown, -10, total, bodyHeight);
+					else if (data === "g") view = scrollView.to(shown, "top", total, bodyHeight);
+					else if (data === "G") view = scrollView.to(shown, "bottom", total, bodyHeight);
 					else if (data === "F") detailOnly = !detailOnly;
 					tui.requestRender();
 				},
 				render(width: number): string[] {
-					const list = viewerRuns(ctx);
-					selected = Math.min(selected, Math.max(0, list.length - 1));
-					const run = list[selected];
-					const detail = detailFor(run, detailOnly ? width - 2 : width - listWidth(width) - 4);
+					const entries = viewerEntries(ctx);
+					selection = resolveSelection(entries, selection);
+					const entry = entries[selection.index];
+					const detail = entryDetail(entry, detailWidth(width), home);
 					const bodyHeight = Math.max(1, tui.terminal.rows - 3);
-					// A running thread follows its newest lines until the user scrolls.
-					if (follow && run?.state === "running") scroll = maxScroll(detail.length, bodyHeight);
-					const running = list.filter((r) => r.state === "running").length;
+					// A queued or running thread follows its newest lines until the user scrolls up.
+					view = { scroll: autoScroll(view, detail.length, bodyHeight, entry?.active ?? false), follow: view.follow };
 					return renderTwoPane(
 						{
 							width,
 							height: tui.terminal.rows,
-							title: `Agents · ${running} running · ${list.length - running} finished`,
-							list: list.map((r) => ({ text: `${glyph[r.state]} ${r.result.agent} · ${r.result.task.split("\n")[0]}`, tone: tone[r.state] })),
-							selected,
+							title: viewerTitle(entries),
+							list: entries.map(listRow),
+							selected: selection.index,
 							detail,
-							detailScroll: scroll,
+							detailScroll: view.scroll,
 							detailOnly,
 							empty: "No subagent runs in this session yet",
 							footer: "j/k run · space/J/K scroll · g/G top/end · F thread only · q close",

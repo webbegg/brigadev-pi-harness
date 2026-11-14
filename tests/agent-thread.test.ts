@@ -22,4 +22,20 @@ describe("agent thread", () => {
 		assert.ok(one.includes("  … 1 more line"));
 		assert.equal(rows.find((r) => r.text === "  boom")?.tone, "error");
 	});
+
+	it("appends in-progress assistant text after the finished messages, wrapped, with a cursor", () => {
+		const messages = [{ role: "assistant", content: [{ type: "text", text: "done part" }] }];
+		const rows = threadRows(["h"], messages, 20, "streaming words that wrap around\nsecond line");
+		const texts = rows.map((r) => r.text);
+		assert.ok(texts.indexOf("done part") < texts.indexOf("streaming words that"));
+		assert.equal(texts.at(-1), "second line ▍");
+		assert.ok(rows.slice(texts.indexOf("streaming words that")).every((r) => r.tone === "text"));
+	});
+
+	it("shows nothing extra for an empty or blank partial", () => {
+		const base = threadRows(["h"], [], 40).map((r) => r.text);
+		assert.deepEqual(threadRows(["h"], [], 40, "").map((r) => r.text), base);
+		assert.deepEqual(threadRows(["h"], [], 40, "  \n ").map((r) => r.text), base);
+		assert.deepEqual(threadRows(["h"], [], 40, undefined).map((r) => r.text), base);
+	});
 });

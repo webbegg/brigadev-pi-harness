@@ -288,6 +288,10 @@ export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<L
 				}
 			} catch (error) {
 				errors.push(error);
+				// A task that threw before it could settle (e.g. its view hook failed) must not stay counted as running
+				// while its siblings finish: the footer count is derived from these placeholders.
+				const r = results[index];
+				if (r.exitCode === -1 && r.endedAt === undefined) Object.assign(r, { endedAt: now(), stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error) });
 			} finally {
 				removeWriter(writers[index]);
 			}
