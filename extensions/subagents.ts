@@ -32,7 +32,7 @@ import { costCalculator, currentModelRef, listPrice, loadAgents, modelCatalog } 
 import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
 import { panelState } from "../lib/panel-state.ts";
 import { canonicalPath } from "../lib/paths.ts";
-import { CHILD_ENV, GUARD_EXTENSION_PATH, isChildSession, STRUCTURED_OUTPUT_EXTENSION_PATH } from "../lib/runtime.ts";
+import { CHILD_ENV, EVIDENCE_EXTENSION_PATH, GUARD_EXTENSION_PATH, isChildSession, STRUCTURED_OUTPUT_EXTENSION_PATH } from "../lib/runtime.ts";
 import { checkStructuredRun, formatStructured, loadOutputSchema, STRUCTURED_OUTPUT_TOOL, type JsonSchema } from "../lib/structured-output.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot } from "../lib/worktree-snapshot.ts";
 
@@ -130,7 +130,7 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 	const { agent, request } = options;
 	const result: RunResult = { agent: agent.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally() };
 
-	const args = ["--mode", "json", "-p", "--no-session", "-e", GUARD_EXTENSION_PATH];
+	const args = ["--mode", "json", "-p", "--no-session", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
 	const structured = Boolean(options.schema && agent.outputSchema);
 	if (structured) args.push("-e", STRUCTURED_OUTPUT_EXTENSION_PATH);
 	const { model, thinking } = options.route;

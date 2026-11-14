@@ -9,6 +9,8 @@ export const ASSETS_ROOT = join(PACKAGE_ROOT, "assets");
 export const PACKAGE_AGENTS_DIR = join(ASSETS_ROOT, "agents");
 export const PACKAGE_WORKFLOWS_DIR = join(ASSETS_ROOT, "workflows");
 export const GUARD_EXTENSION_PATH = join(PACKAGE_ROOT, "extensions", "guard.ts");
+/** Loaded with -e in every child (and from package.json in the parent): records check runs as evidence. */
+export const EVIDENCE_EXTENSION_PATH = join(PACKAGE_ROOT, "extensions", "evidence.ts");
 /** Child-only: loaded with -e for agents that declare an output schema; not in package.json. */
 export const STRUCTURED_OUTPUT_EXTENSION_PATH = join(PACKAGE_ROOT, "extensions", "structured-output.ts");
 

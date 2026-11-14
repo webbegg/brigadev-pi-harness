@@ -57,6 +57,7 @@ Check it loaded: `/brigadev:status`.
 | `alt+a` or `/brigadev:runs` | Agents viewer: subagent runs with their threads |
 | `alt+o` or `/brigadev:panel` | Side panel: todos, agents, changes, and session at a glance. Needs a terminal at least 140 columns wide. It draws over the right 44 columns of the transcript while open; a docked rail would need private Pi internals. (`alt+p` is Pi's own "previous model" key on Windows and WSL, so the panel uses `alt+o`.) |
 | `/brigadev:mode [normal\|yolo\|default <mode>]` | Permission mode for this session, or the default for new sessions |
+| `/brigadev:force-commit` | One-shot: the next `git commit` of the current working tree skips the evidence gate (see below). Only you can run it |
 | `/brigadev:agents` | Effective agent list (package, user, trusted project) |
 | `/brigadev:harness on\|off` | Toggle the orchestrator prompt for this session (A/B testing) |
 | `/review [base or focus]` | 4R review |
@@ -133,6 +134,18 @@ Each profile route can list fallback models. When a run fails on quota, auth, a 
 A commit runs without asking only when it targets the session's repository on a branch other than the default branch (the one `origin/HEAD` points to, else a lone local `main` or `master`). `main` and `master` stay protected whenever they exist, even if `origin/HEAD` is repointed. It still asks after a `cd`, a branch switch, or `git -C`/`--git-dir`/`--work-tree` earlier in the same command (inside `{ }`, `then`, and `do` blocks too), and a chained `git push` keeps its own prompt. If git cannot answer, it asks. Commands after `then`, `do`, `else`, `{`, `!`, and similar words are classified like their plain forms.
 
 Without a UI (print mode), "ask" means block. The guard recognizes executable forms; it is not a sandbox.
+
+## Evidence gate
+
+Every check command (tests, lint, typecheck, build) run through bash, by you or by any subagent, is recorded with its command, exit code, time, directory, agent, and output tail in `~/.brigadev/<repo>/evidence/<branch>.jsonl`, an append-only log keyed to the content of the working tree it ran on. Outside git nothing is recorded.
+
+A `git commit` with source changes is blocked unless a passing test run is recorded for the current working tree. Any edit after the last passing run changes the tree and blocks the commit until the tests run again; committing without new edits does not. Only the `test` kind counts (`npm test`, `node --test`, `pytest`, `go test`, ...), not lint or build. A commit that runs in another directory or on another branch cannot be checked, so it is blocked too.
+
+The pipefail rule: a run counts only when its exit code is the test's. Run the tests in their own bash command, or chain them with `&&`. A later `;`, `||`, `&`, or `|` (without `set -o pipefail`) hands the exit code to another command, so the run is recorded as unknown and does not pass the gate.
+
+Only you can force it. With a UI, the guard shows why the commit is blocked and asks whether to commit anyway. Without one, run `/brigadev:force-commit` before the commit: it applies once and only to the working tree as it is now, so editing a file first cancels it. Each force is logged in the evidence file. The model has no flag, environment variable, or command text that forces the gate, and subagents never reach it (they cannot commit).
+
+Changes that touch only prose (`.md`, `.txt`, `.rst`, `LICENSE`, ...) pass without a test run. The gate applies in every permission mode, including yolo.
 
 ## Repo docs folder
 
