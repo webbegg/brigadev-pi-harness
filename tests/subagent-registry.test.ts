@@ -326,6 +326,53 @@ describe("subagent registry: lifecycle", () => {
 		assert.equal(registry.markConsumed(id), false, "already consumed");
 	});
 
+	it("records how a launch was consumed: wait, cancel, or delivered (and nothing before)", async () => {
+		const { registry } = setup();
+		const waited = manualRun();
+		const cancelled = manualRun();
+		const delivered = manualRun();
+		const a = registry.start({ total: 1, run: waited.run });
+		const b = registry.start({ total: 1, run: cancelled.run });
+		const c = registry.start({ total: 1, run: delivered.run });
+		for (const id of [a, b, c]) assert.equal("consumedBy" in registry.get(id)!, false, "unconsumed launches carry no consumedBy");
+		waited.resolve("w");
+		delivered.resolve("d");
+		await tick();
+		assert.equal(registry.get(a)?.consumed, false);
+		assert.equal("consumedBy" in registry.get(a)!, false);
+		await registry.wait(a, 1000);
+		const cancelling = registry.cancel(b);
+		cancelled.resolve("partial");
+		await cancelling;
+		assert.equal(registry.markConsumed(c), true);
+		assert.equal(registry.get(a)?.consumedBy, "wait");
+		assert.equal(registry.get(b)?.consumedBy, "cancel");
+		assert.equal(registry.get(c)?.consumedBy, "delivered");
+	});
+
+	it("the first consumer is kept: a later wait or cancel never rewrites it, and the outcome shows it", async () => {
+		const { registry } = setup();
+		const m = manualRun();
+		const id = registry.start({ total: 1, run: m.run });
+		m.resolve("result");
+		await tick();
+		registry.markConsumed(id);
+		const again = await registry.wait(id, 1000);
+		assert.equal(again.status === "settled" && again.launch.consumedBy, "delivered", "wait after delivery reports it was delivered");
+		assert.equal(again.status === "settled" && again.result, "result", "the registry still holds the result");
+		const cancelled = await registry.cancel(id); // already settled: the abort is a no-op
+		assert.equal(cancelled.status === "settled" && cancelled.launch.consumedBy, "delivered");
+
+		const n = manualRun();
+		const other = registry.start({ total: 1, run: n.run });
+		n.resolve("x");
+		const first = await registry.wait(other, 1000);
+		assert.equal(first.status === "settled" && first.launch.consumedBy, "wait");
+		assert.equal(registry.markConsumed(other), false);
+		const second = await registry.wait(other, 1000);
+		assert.equal(second.status === "settled" && second.launch.consumedBy, "wait", "a launch collected by wait is collected again as before");
+	});
+
 	it("counts running and settled launches", async () => {
 		const { registry } = setup();
 		const a = manualRun();

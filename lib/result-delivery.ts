@@ -109,6 +109,19 @@ export function resultMessage(id: string, text: string, failed: boolean) {
 	return { customType: RESULT_MESSAGE_TYPE, content: `${header}\n\n${text}`, display: true, details: { launchId: id, failed } satisfies ResultMessageDetails };
 }
 
+/**
+ * What `subagent_wait` answers for a launch whose result the idle delivery already put in the session: the launch id,
+ * that it was delivered, and each task's saved folder (run-artifacts.ts), so the full text can still be read. Not the result.
+ */
+export function alreadyDeliveredText(id: string, tasks: ReadonlyArray<{ agent: string; artifactsDir?: string }>): string {
+	const lines = [`Launch ${id} was already delivered to this session: its result is in the conversation above, so it is not repeated here.`];
+	if (tasks.length > 0) {
+		lines.push("Saved folders (the full text is in result.json):");
+		lines.push(...tasks.map((t) => `- ${t.agent}: ${t.artifactsDir ?? "(no saved folder)"}`));
+	}
+	return lines.join("\n");
+}
+
 export interface CardLine {
 	text: string;
 	tone: "success" | "error" | "dim" | "muted";

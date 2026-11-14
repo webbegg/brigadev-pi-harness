@@ -16,7 +16,7 @@ import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@ear
 import { Box, Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { agentsCard, FINISHED_TTL_MS, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
-import { autoScroll, buildEntries, canTakeOver, entryDetail, listRow, moveSelection, openTakeover, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, viewerFooter, viewerTitle, type RecordedRun, type Selection, type TakeoverKey, type TakeoverState, type TrackedRun } from "../lib/subagent-viewer.ts";
+import { ABORT_PROMPT, abortArmFor, autoScroll, buildEntries, canTakeOver, entryDetail, listRow, moveSelection, openTakeover, pressAbort, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, takeoverNotice, viewerFooter, viewerTitle, type AbortArm, type RecordedRun, type Selection, type TakeoverKey, type TakeoverState, type TrackedRun } from "../lib/subagent-viewer.ts";
 import type { ChildControl } from "../lib/child-rpc.ts";
 import { formatStatus, statusCounts } from "../lib/subagent-status.ts";
 import { queuedFields, runState, subagentRow, syncRowTimer, type RowInput, type RowTimerState } from "../lib/subagent-row.ts";
@@ -27,7 +27,7 @@ import { failed, output, runChild, type RunResult } from "../lib/child-run.ts";
 import { newRunId } from "../lib/run-artifacts.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
 import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
-import { createResultDelivery, resultCard, resultMessage, RESULT_MESSAGE_TYPE, type ResultMessageDetails } from "../lib/result-delivery.ts";
+import { alreadyDeliveredText, createResultDelivery, resultCard, resultMessage, RESULT_MESSAGE_TYPE, type ResultMessageDetails } from "../lib/result-delivery.ts";
 import { createSubagentRegistry, type WaitOutcome } from "../lib/subagent-registry.ts";
 import { admitLaunch, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
 import { cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
@@ -558,7 +558,13 @@ export default function (pi: ExtensionAPI) {
 		parameters: WaitParams,
 		async execute(_id, params, signal) {
 			const seconds = Math.min(WAIT_MAX_SECONDS, Math.max(1, params.timeoutSeconds ?? WAIT_DEFAULT_SECONDS));
-			return collected(params.runId, await registry.wait(params.runId, seconds * 1000, signal), seconds);
+			const outcome = await registry.wait(params.runId, seconds * 1000, signal);
+			// The idle delivery already put this result in the session: point at the saved folders instead of repeating it.
+			if (outcome.status === "settled" && outcome.launch.consumedBy === "delivered") {
+				const tasks = (outcome.result?.details.results ?? []).map((r) => ({ agent: r.agent, artifactsDir: r.artifactsDir }));
+				return { content: [{ type: "text", text: alreadyDeliveredText(params.runId, tasks) }], details: { mode: "single", results: [], launchId: params.runId, pending: true } } as LaunchResult;
+			}
+			return collected(params.runId, outcome, seconds);
 		},
 	});
 
@@ -598,18 +604,28 @@ export default function (pi: ExtensionAPI) {
 			// Takeover: the open input line (steer / follow up), and a one-line result shown in the footer until the next key.
 			let takeover: TakeoverState | undefined;
 			let notice: string | undefined;
+			// `x` pressed once on a run: a second one within 3 s aborts it (pure state in lib/subagent-viewer.ts).
+			let armed: AbortArm | undefined;
+			let closed = false;
 			// What the user typed goes to the child as an RPC steer while it is streaming, as a follow_up between turns.
 			const sendTakeover = (key: string, text: string): string => {
 				const control = controls.get(key);
 				if (!control) return "Not sent: the run has finished";
 				const kind = takeoverKind(control.isStreaming());
-				const sent = kind === "steer" ? control.steer(text) : control.followUp(text);
-				return sent ? (kind === "steer" ? "Steering message sent" : "Follow-up queued") : "Not sent: the run has finished";
+				// The notice reports Pi's answer to this command (matched by id), not that the write succeeded.
+				const answer = kind === "steer" ? control.steer(text) : control.followUp(text);
+				void answer.then((outcome) => {
+					if (closed) return;
+					notice = takeoverNotice(kind, outcome);
+					tui.requestRender();
+				});
+				return kind === "steer" ? "Steering message sent, waiting for Pi…" : "Follow-up sent, waiting for Pi…";
 			};
 			// The list changes while the viewer is open: repaint on every progress update, and once a second so elapsed times tick.
 			repaintViewer = () => tui.requestRender();
 			const timer = setInterval(() => tui.requestRender(), 1000);
 			const close = () => {
+				closed = true;
 				clearInterval(timer);
 				repaintViewer = undefined;
 				done();
@@ -625,6 +641,8 @@ export default function (pi: ExtensionAPI) {
 					const entry = entries[selection.index];
 					notice = undefined;
 					if (takeover && !controls.has(takeover.key)) [takeover, notice] = [undefined, "The run finished"];
+					// Only an `x` on the same run, within the timeout, completes an abort; any other key disarms it.
+					armed = takeover || data !== "x" ? undefined : abortArmFor(armed, entry?.key, Date.now());
 					if (takeover) {
 						// The input line owns every key until Enter or Esc, so j/k/q/x are typed, not commands.
 						const typed = printableText(data);
@@ -664,7 +682,12 @@ export default function (pi: ExtensionAPI) {
 						if (!takeover) notice = "Only a running agent can be steered";
 					} else if (data === "x") {
 						const control = entry && controls.get(entry.key);
-						notice = canTakeOver(entry, control !== undefined) && control?.abort() ? "Abort sent" : "Only a running agent can be aborted";
+						if (!canTakeOver(entry, control !== undefined)) notice = "Only a running agent can be aborted";
+						else {
+							const press = pressAbort(armed, entry.key, Date.now());
+							armed = press.armed;
+							if (press.abort) notice = control?.abort() ? "Abort sent" : "Only a running agent can be aborted";
+						}
 					}
 					tui.requestRender();
 				},
@@ -688,7 +711,7 @@ export default function (pi: ExtensionAPI) {
 							detailScroll: view.scroll,
 							detailOnly,
 							empty: "No subagent runs in this session yet",
-							footer: takeover ? takeoverFooter(takeover, takeoverKind(controls.get(takeover.key)?.isStreaming() ?? false), width) : (notice ?? viewerFooter(canTakeOver(entry, entry !== undefined && controls.has(entry.key)))),
+							footer: takeover ? takeoverFooter(takeover, takeoverKind(controls.get(takeover.key)?.isStreaming() ?? false), width) : (notice ?? (abortArmFor(armed, entry?.key, Date.now()) ? ABORT_PROMPT : viewerFooter(canTakeOver(entry, entry !== undefined && controls.has(entry.key))))),
 						},
 						painter,
 					);

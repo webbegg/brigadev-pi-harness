@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { createResultDelivery, RESULT_MESSAGE_TYPE, resultCard, resultMessage } from "../lib/result-delivery.ts";
+import { alreadyDeliveredText, createResultDelivery, RESULT_MESSAGE_TYPE, resultCard, resultMessage } from "../lib/result-delivery.ts";
 import { createSubagentRegistry, type LaunchSummary } from "../lib/subagent-registry.ts";
 
 const summary = (id: string, over: Partial<LaunchSummary> = {}): LaunchSummary => ({ id, status: "settled", total: 1, done: 1, startedAt: 0, settledAt: 1, consumed: false, error: undefined, ...over });
@@ -233,6 +233,44 @@ describe("result delivery with the registry", () => {
 		h.delivery.flush();
 		assert.ok(!h.delivered.some((d) => d.startsWith(`${first}:`)));
 		assert.equal(h.delivered.length, 6);
+		assert.equal(h.registry.get(first)?.consumedBy, "wait");
+	});
+
+	it("a wait after delivery sees that the launch was delivered, not collected", async () => {
+		const h = wired(5);
+		h.setIdle(true);
+		const id = h.registry.start({ total: 1, run: async () => "the report" });
+		await tick();
+		assert.deepEqual(h.delivered, [`${id}:the report`]);
+		const outcome = await h.registry.wait(id, 1000);
+		assert.equal(outcome.status === "settled" && outcome.launch.consumedBy, "delivered");
+	});
+});
+
+describe("alreadyDeliveredText: what subagent_wait says about a launch whose result was delivered", () => {
+	it("names the launch, says it was delivered to this session, and lists each task's saved folder", () => {
+		const text = alreadyDeliveredText("launch-7", [
+			{ agent: "scout", artifactsDir: "/docs/runs/scout-1" },
+			{ agent: "reviewer", artifactsDir: "/docs/runs/reviewer-2" },
+		]);
+		assert.match(text, /launch-7/);
+		assert.match(text, /already delivered to this session/);
+		assert.ok(text.includes("scout: /docs/runs/scout-1"));
+		assert.ok(text.includes("reviewer: /docs/runs/reviewer-2"));
+		assert.ok(text.includes("result.json"), "says where the full text is");
+	});
+
+	it("a task without a saved folder says so; no tasks at all still names the launch", () => {
+		assert.ok(alreadyDeliveredText("L1", [{ agent: "scout" }]).includes("scout: (no saved folder)"));
+		const bare = alreadyDeliveredText("L2", []);
+		assert.match(bare, /L2/);
+		assert.match(bare, /already delivered to this session/);
+		assert.ok(!bare.includes("result.json"));
+	});
+
+	it("carries none of the result text", () => {
+		const text = alreadyDeliveredText("L1", [{ agent: "scout", artifactsDir: "/d/r" }]);
+		assert.ok(text.split("\n").length <= 4);
 	});
 });
 

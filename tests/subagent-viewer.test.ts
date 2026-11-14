@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { RunResult } from "../lib/child-run.ts";
 import { emptyTally } from "../lib/cost.ts";
-import { autoScroll, buildEntries, canTakeOver, entryDetail, listRow, moveSelection, openTakeover, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, viewerFooter, viewerTitle, type RecordedRun, type TrackedRun, type ViewerEntry } from "../lib/subagent-viewer.ts";
+import { ABORT_CONFIRM_MS, ABORT_PROMPT, abortArmFor, autoScroll, buildEntries, canTakeOver, pressAbort, takeoverNotice, entryDetail, listRow, moveSelection, openTakeover, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, viewerFooter, viewerTitle, type RecordedRun, type TrackedRun, type ViewerEntry } from "../lib/subagent-viewer.ts";
 
 const NOW = 1_000_000;
 const result = (over: Partial<RunResult> = {}): RunResult => ({ agent: "scout", task: "map the code", exitCode: 0, messages: [], stderr: "", usage: emptyTally(), stopReason: "stop", ...over });
@@ -306,9 +306,59 @@ describe("takeover: steer, follow up, abort (pure state)", () => {
 		assert.ok(narrow.includes("…fghij▍"), narrow);
 	});
 
+	it("the notice reports what Pi answered, not that the write succeeded", () => {
+		assert.equal(takeoverNotice("steer", { status: "accepted", disposition: "queued" }), "Steering message accepted by Pi (queued)");
+		assert.equal(takeoverNotice("follow_up", { status: "accepted", disposition: "queued" }), "Follow-up accepted by Pi (queued)");
+		assert.equal(takeoverNotice("steer", { status: "accepted", disposition: "handled" }), "Steering message accepted by Pi (handled)");
+		assert.equal(takeoverNotice("follow_up", { status: "accepted" }), "Follow-up accepted by Pi");
+		assert.equal(takeoverNotice("steer", { status: "rejected", error: "Agent is not running" }), "Pi rejected the steering message: Agent is not running");
+		assert.equal(takeoverNotice("follow_up", { status: "rejected", error: "nope" }), "Pi rejected the follow-up: nope");
+		assert.equal(takeoverNotice("steer", { status: "not_delivered" }), "Not delivered: the run ended before Pi answered");
+	});
+
 	it("the key hints list steering and abort only where they work", () => {
 		assert.ok(!viewerFooter(false).includes("steer"));
 		assert.ok(viewerFooter(true).includes("enter steer") && viewerFooter(true).includes("x abort"));
 		assert.ok(viewerFooter(false).includes("q close") && viewerFooter(true).includes("q close"));
+	});
+});
+
+describe("abort needs `x` twice on the same run within 3 s (pure state, injected clock)", () => {
+	it("the first x arms and does not abort; the footer asks for a second", () => {
+		assert.equal(ABORT_CONFIRM_MS, 3000);
+		assert.equal(ABORT_PROMPT, "press x again to abort");
+		assert.deepEqual(pressAbort(undefined, "L1:0", 100), { abort: false, armed: { key: "L1:0", at: 100 } });
+	});
+
+	it("a second x on the same run within 3 s aborts and disarms", () => {
+		const armed = pressAbort(undefined, "L1:0", 100).armed;
+		assert.deepEqual(pressAbort(armed, "L1:0", 100 + 3000), { abort: true }, "3 s exactly is still within");
+		assert.deepEqual(pressAbort(armed, "L1:0", 101), { abort: true });
+	});
+
+	it("a second x after the timeout only re-arms", () => {
+		const armed = pressAbort(undefined, "L1:0", 100).armed;
+		assert.deepEqual(pressAbort(armed, "L1:0", 100 + 3001), { abort: false, armed: { key: "L1:0", at: 3101 } });
+	});
+
+	it("an x on another run arms that run instead of aborting", () => {
+		const armed = pressAbort(undefined, "L1:0", 100).armed;
+		assert.deepEqual(pressAbort(armed, "L1:1", 200), { abort: false, armed: { key: "L1:1", at: 200 } });
+	});
+
+	it("abortArmFor shows the arm only for the selected run and only until the timeout (selection change or timeout disarm)", () => {
+		const armed = { key: "L1:0", at: 100 };
+		assert.deepEqual(abortArmFor(armed, "L1:0", 100 + 3000), armed);
+		assert.equal(abortArmFor(armed, "L1:0", 100 + 3001), undefined, "timeout");
+		assert.equal(abortArmFor(armed, "L1:1", 200), undefined, "selection changed");
+		assert.equal(abortArmFor(armed, undefined, 200), undefined, "nothing selected");
+		assert.equal(abortArmFor(undefined, "L1:0", 200), undefined);
+	});
+
+	it("a selection change disarms for good: coming back to the run needs the first x again", () => {
+		let armed: ReturnType<typeof pressAbort>["armed"] = pressAbort(undefined, "L1:0", 100).armed;
+		// the viewer re-reads the arm for the selected run on every key and keeps what it returns
+		armed = abortArmFor(armed, "L1:1", 200);
+		assert.equal(pressAbort(abortArmFor(armed, "L1:0", 300), "L1:0", 300).abort, false);
 	});
 });

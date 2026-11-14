@@ -209,6 +209,69 @@ describe("runChild: output folding", () => {
 
 const delta = (text: string) => ({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text } });
 
+describe("runChild: multi-byte UTF-8 split across stdout/stderr chunks stays intact", () => {
+	const TEXT = "é 日本 😀 end";
+
+	it("a streamed delta and a final message fold intact when every byte arrives in its own chunk", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		const feed = (text: string) => {
+			for (const byte of Buffer.from(text)) proc.stdout.emit("data", Buffer.from([byte]));
+		};
+		feed(`${JSON.stringify(delta(TEXT))}\n`);
+		assert.equal(h.last!.partial, TEXT);
+		feed(`${JSON.stringify(assistant(TEXT))}\n`);
+		proc.close(0);
+		const result = await promise;
+		assert.equal(output(result), TEXT);
+		assert.ok(!output(result).includes("�"));
+	});
+
+	it("a split in the middle of each character (2-, 3- and 4-byte) folds intact", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		const bytes = Buffer.from(`${JSON.stringify(delta(TEXT))}\n`);
+		for (const word of ["é", "日", "😀"]) {
+			const at = bytes.indexOf(Buffer.from(word)) + 1; // one byte into the character
+			assert.ok(at > 0);
+			h.clock += 1000;
+			proc.stdout.emit("data", bytes.subarray(0, at));
+			proc.stdout.emit("data", bytes.subarray(at));
+			assert.equal(h.last!.partial?.endsWith(TEXT), true, `split inside ${word}`);
+			assert.ok(!h.last!.partial!.includes("�"), `no replacement character after splitting ${word}`);
+		}
+		proc.close(0);
+		await promise;
+	});
+
+	it("stderr decodes the same way, and a character cut off by the end of the stream is flushed on close", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		const bytes = Buffer.from("日本 oops");
+		proc.stderr.emit("data", bytes.subarray(0, 1));
+		proc.stderr.emit("data", bytes.subarray(1));
+		proc.stderr.emit("data", Buffer.from([0xe6, 0x97])); // a 3-byte character that never completes
+		proc.close(1);
+		const result = await promise;
+		assert.equal(result.stderr, "日本 oops�");
+	});
+
+	it("a final line without a newline is flushed through the decoder on close", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		const bytes = Buffer.from(JSON.stringify(assistant(TEXT)));
+		const at = bytes.indexOf(Buffer.from("日")) + 1;
+		proc.stdout.emit("data", bytes.subarray(0, at));
+		proc.stdout.emit("data", bytes.subarray(at));
+		proc.close(0);
+		assert.equal(output(await promise), TEXT);
+	});
+});
+
 describe("runChild: live partial text", () => {
 	it("folds streaming deltas into result.partial, updates at most every 100 ms, and clears it on the matching message_end", async () => {
 		const h = harness();
@@ -453,14 +516,138 @@ describe("runChild: the steering handle (S4)", () => {
 		const proc = await h.ready();
 		assert.equal(seen.length, 1);
 		const control = seen[0]!;
-		assert.equal(control.steer("go left"), true);
-		assert.equal(control.followUp("then right"), true);
-		assert.deepEqual(proc.stdin.records().slice(1), [
-			{ type: "steer", message: "go left" },
-			{ type: "follow_up", message: "then right" },
-		]);
+		void control.steer("go left");
+		void control.followUp("then right");
+		const [steer, followUp] = proc.stdin.records().slice(1);
+		assert.deepEqual({ ...steer, id: undefined }, { type: "steer", message: "go left", id: undefined });
+		assert.deepEqual({ ...followUp, id: undefined }, { type: "follow_up", message: "then right", id: undefined });
+		assert.ok(steer.id && followUp.id && steer.id !== followUp.id, "each command has its own id (rpc.md:37-44)");
 		proc.close(0);
 		await promise;
+	});
+
+	it("accepted: the outcome settles from Pi's response to that command, with its disposition", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		const outcome = seen[0]!.steer("go left");
+		const { id } = proc.stdin.records().at(-1);
+		proc.line({ type: "response", id, command: "steer", success: true, data: { disposition: "queued" } });
+		assert.deepEqual(await outcome, { status: "accepted", disposition: "queued" });
+		proc.close(0);
+		await promise;
+	});
+
+	it("rejected: Pi's error for that command is the outcome", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		const outcome = seen[0]!.followUp("later");
+		const { id } = proc.stdin.records().at(-1);
+		proc.line({ type: "response", id, command: "follow_up", success: false, error: "Agent is shutting down" });
+		assert.deepEqual(await outcome, { status: "rejected", error: "Agent is shutting down" });
+		proc.close(0);
+		await promise;
+	});
+
+	it("responses out of order settle their own commands (T7's smoke: Pi answers out of order)", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		const first = seen[0]!.steer("one");
+		const second = seen[0]!.followUp("two");
+		const [a, b] = proc.stdin.records().slice(1);
+		proc.line({ type: "response", id: b.id, command: "follow_up", success: false, error: "nope" });
+		proc.line({ type: "response", id: a.id, command: "steer", success: true, data: { disposition: "queued" } });
+		assert.deepEqual(await second, { status: "rejected", error: "nope" });
+		assert.deepEqual(await first, { status: "accepted", disposition: "queued" });
+		proc.close(0);
+		await promise;
+	});
+
+	it("a response with another id (or none) never settles a command", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		let outcome: unknown = "pending";
+		void seen[0]!.steer("one").then((o) => (outcome = o));
+		proc.line({ type: "response", command: "steer", success: true });
+		proc.line({ type: "response", id: "other", command: "steer", success: true });
+		await tick();
+		assert.equal(outcome, "pending");
+		proc.close(0);
+		await promise;
+		await tick();
+		assert.deepEqual(outcome, { status: "not_delivered" });
+	});
+
+	it("not delivered: the agent settles (input ends) before Pi answers; a late response changes nothing", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		const outcome = seen[0]!.steer("too late to matter");
+		const { id } = proc.stdin.records().at(-1);
+		proc.line(settled());
+		assert.deepEqual(await outcome, { status: "not_delivered" });
+		proc.line({ type: "response", id, command: "steer", success: true });
+		proc.close(0);
+		await promise;
+	});
+
+	it("not delivered: the child exits before responding", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		const outcome = seen[0]!.followUp("anyone there?");
+		proc.close(1);
+		await promise;
+		assert.deepEqual(await outcome, { status: "not_delivered" });
+	});
+
+	it("not delivered: the child fails to start, or its stdin breaks", async () => {
+		const a = controlled();
+		const failing = a.h.start();
+		const procA = await a.h.ready();
+		const outcomeA = a.seen[0]!.steer("x");
+		procA.emit("error", new Error("ENOENT pi"));
+		await failing;
+		assert.deepEqual(await outcomeA, { status: "not_delivered" });
+
+		const b = controlled();
+		const broken = b.h.start();
+		const procB = await b.h.ready();
+		const outcomeB = b.seen[0]!.steer("x");
+		procB.stdin.emit("error", new Error("EPIPE"));
+		assert.deepEqual(await outcomeB, { status: "not_delivered" });
+		procB.close(1);
+		await broken;
+	});
+
+	it("commands sent to a finished run are not delivered and write nothing", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line(settled());
+		assert.deepEqual(await seen[0]!.steer("x"), { status: "not_delivered" });
+		assert.deepEqual(await seen[0]!.followUp("x"), { status: "not_delivered" });
+		assert.equal(proc.stdin.late, 0);
+		proc.close(0);
+		await promise;
+	});
+
+	it("no command is left pending after the run ends (every outcome settled, no timer left)", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		const outcomes = [seen[0]!.steer("a"), seen[0]!.followUp("b"), seen[0]!.steer("c")];
+		const [first] = proc.stdin.records().slice(1);
+		proc.line({ type: "response", id: first.id, command: "steer", success: true });
+		proc.close(0);
+		await promise;
+		const settledOutcomes = await Promise.all(outcomes);
+		assert.deepEqual(settledOutcomes.map((o) => o.status), ["accepted", "not_delivered", "not_delivered"]);
+		assert.equal(h.time.pending(), 0);
 	});
 
 	it("knows whether the child is streaming (agent_start .. agent_end)", async () => {
@@ -486,7 +673,7 @@ describe("runChild: the steering handle (S4)", () => {
 		const control = seen[0]!;
 		proc.line(settled());
 		assert.equal(seen.at(-1), undefined);
-		assert.equal(control.steer("too late"), false);
+		assert.deepEqual(await control.steer("too late"), { status: "not_delivered" });
 		assert.equal(control.abort(), false);
 		assert.equal(proc.stdin.late, 0);
 		proc.close(0);

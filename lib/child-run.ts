@@ -11,11 +11,12 @@ import { spawn as nodeSpawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentDefinition } from "./agents.ts";
 import { foldChildEvent, parseChildLine } from "./child-events.ts";
 import { childLaunch } from "./child-launch.ts";
-import { answerUiRequest, createChildControl, encodeCommand, type ChildControl, type RpcCommand, type UiResponse } from "./child-rpc.ts";
+import { answerUiRequest, createChildControl, createCommandTracker, encodeCommand, type ChildControl, type RpcCommand, type UiResponse } from "./child-rpc.ts";
 import { emptyTally, priceBridgeMessage, type CostCalculator, type Tally } from "./cost.ts";
 import type { LaunchRequest } from "./delegation.ts";
 import type { ResolvedRoute } from "./model-routing.ts";
@@ -191,6 +192,8 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			let forcedExit = false;
 			let streaming = false;
 			let inputOpen = true;
+			// steer/follow_up commands wait here for Pi's response (matched by id); nothing is left waiting once input ends.
+			const commands = createCommandTracker();
 
 			// Commands and UI answers go to the child as one JSON record per line (rpc.md:50-56); false once the pipe is closed.
 			const send = (record: RpcCommand | UiResponse): boolean => {
@@ -207,6 +210,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				if (!inputOpen) return;
 				inputOpen = false;
 				withdraw();
+				commands.settleAll();
 				try {
 					proc.stdin.end();
 				} catch {
@@ -217,6 +221,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			proc.stdin.on("error", () => {
 				inputOpen = false;
 				withdraw();
+				commands.settleAll();
 			});
 
 			// SIGTERM now, SIGKILL after the grace period if the child has not exited by then.
@@ -261,6 +266,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					// A child that does not stop on its own is terminated like any other.
 					abortTimer ??= setTimer(() => !exited && terminate(), KILL_GRACE_MS);
 				},
+				commands,
 			});
 			// The task is the first command (rpc.md:20; the child has no positional prompt).
 			send({ type: "prompt", message: options.taskText });
@@ -277,6 +283,8 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 						// `agent_end` can be followed by retries, compaction, or queued messages; `agent_settled` is the end (rpc.md:69).
 						if (event.phase === "settled") finishInput();
 					} else if (event.type === "response") {
+						// The answer to a steer/follow_up settles that command's outcome (rpc.md:35-44).
+						commands.respond(event);
 						// A rejected prompt starts no run, and a handled one starts none either (rpc.md:67): neither will ever settle.
 						if (event.command === "prompt" && !event.success) {
 							Object.assign(result, { stopReason: "error", errorMessage: `Pi rejected the task: ${event.error ?? "unknown error"}` });
@@ -300,18 +308,23 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				}
 			};
 
+			// A multi-byte UTF-8 character can be split across chunks: a decoder holds the partial bytes until the rest arrives.
+			// (Not `setEncoding`: the injected child of a test has no such method.)
+			const stdoutDecoder = new StringDecoder("utf8");
+			const stderrDecoder = new StringDecoder("utf8");
 			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
+				buffer += typeof data === "string" ? data : stdoutDecoder.write(data);
 				const lines = buffer.split("\n");
 				buffer = lines.pop() ?? "";
 				for (const line of lines) processLine(line);
 			});
 			proc.stderr.on("data", (data) => {
-				result.stderr += data.toString();
+				result.stderr += typeof data === "string" ? data : stderrDecoder.write(data);
 			});
 			const cleanup = () => {
 				exited = true;
 				inputOpen = false;
+				commands.settleAll();
 				watchdog.stop();
 				if (killTimer !== undefined) clearTimer(killTimer);
 				if (abortTimer !== undefined) clearTimer(abortTimer);
@@ -320,6 +333,9 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			};
 			proc.on("close", (code: number | null) => {
 				cleanup();
+				// Flush what the decoders still hold (a character cut off by the end of the stream).
+				buffer += stdoutDecoder.end();
+				result.stderr += stderrDecoder.end();
 				if (buffer.trim()) processLine(buffer);
 				// The user's abort is the cause, whatever the child reported on its way out.
 				if (userAborted) Object.assign(result, { stopReason: "aborted", errorMessage: "Aborted by the user" });
