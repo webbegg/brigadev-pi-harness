@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { COLLAPSED_CALLS, modelSegment, rowHeader, subagentRow, type RowInput } from "../lib/subagent-row.ts";
+import { COLLAPSED_CALLS, modelSegment, queuedFields, rowHeader, runState, settleQueued, subagentRow, syncRowTimer, type RowInput } from "../lib/subagent-row.ts";
+
+const sr = { queuedFields, runState, settleQueued, syncRowTimer };
 
 describe("subagent row", () => {
 	const now = 100_000;
@@ -55,6 +57,74 @@ describe("subagent row", () => {
 		assert.doesNotMatch(rowHeader(input({ route: "definition" }), now), /↑/);
 		// after a fallback the model no longer comes from the parent
 		assert.doesNotMatch(rowHeader(input({ route: "parent ↪ fallback", fallbacks: ["p/a (quota)"] }), now), /claude-sonnet-5-5 ↑/);
+	});
+
+	it("marks ↑ from the resolved route source, not the label: a profile that sets only thinking inherits the model (R3-003)", () => {
+		const header = rowHeader(input({ route: "profile:fast/worker", inherited: true }), now);
+		assert.match(header, /· claude-sonnet-5-5 ↑ ·/);
+		assert.doesNotMatch(rowHeader(input({ route: "parent", inherited: false }), now), /↑/);
+		assert.doesNotMatch(rowHeader(input({ route: "profile:fast/worker", inherited: true, fallbacks: ["p/a (quota)"] }), now), /claude-sonnet-5-5 ↑/);
+	});
+
+	it("a queued placeholder shows its routed model and queued, no elapsed (R3-002)", () => {
+		const route = { model: "claude-bridge/claude-opus-5-5", thinking: "high", modelSource: "parent" } as const;
+		const queued = input({ ...sr.queuedFields(route, "parent"), startedAt: undefined, calls: [], cost: 0 });
+		assert.equal(rowHeader(queued, now), "○ brigadev-worker · claude-opus-5-5 ↑ · high · queued");
+		assert.equal(subagentRow(queued, { now, expanded: false })[0].tone, "muted");
+		assert.doesNotMatch(rowHeader(input({ ...sr.queuedFields({ model: "p/m", modelSource: "profile" }, "profile:x/y"), startedAt: undefined, calls: [], cost: 0 }), now), /↑|default/);
+	});
+
+	it("a run aborted before it started settles as cancelled, not running (R3-002)", () => {
+		const placeholder = { exitCode: -1, queued: true as boolean | undefined, cancelled: undefined as boolean | undefined, endedAt: undefined as number | undefined };
+		const started = { exitCode: -1, endedAt: undefined as number | undefined };
+		const done = { exitCode: 0, endedAt: 5 };
+		assert.equal(sr.runState(placeholder, false), "running");
+		assert.equal(sr.settleQueued([placeholder, started, done], 9_000), 1);
+		assert.equal(placeholder.endedAt, 9_000);
+		assert.equal(placeholder.cancelled, true);
+		assert.equal(started.endedAt, undefined);
+		assert.equal(done.endedAt, 5);
+		assert.equal(sr.runState(placeholder, false), "failed");
+		const header = rowHeader(input({ state: "failed", cancelled: true, startedAt: undefined, calls: [], cost: 0 }), now);
+		assert.equal(header, "✗ brigadev-worker · claude-sonnet-5-5 · high · cancelled");
+	});
+
+	it("the row timer ticks while drawn and stops itself when the row is no longer drawn (R4-001)", () => {
+		const clock = { now: 0 };
+		const timers: Array<{ fn: () => void; stopped: boolean; ms: number }> = [];
+		const deps = { now: () => clock.now, every: (fn: () => void, ms: number) => { const t = { fn, ms, stopped: false }; timers.push(t); return () => { t.stopped = true; }; } };
+		const state = {};
+		let invalidated = 0;
+		const touch = sr.syncRowTimer(state, { live: true, invalidate: () => invalidated++ }, deps);
+		assert.equal(timers.length, 1);
+		assert.equal(timers[0].ms, 1000);
+		sr.syncRowTimer(state, { live: true, invalidate: () => invalidated++ }, deps);
+		assert.equal(timers.length, 1);
+		clock.now = 1_000;
+		touch();
+		timers[0].fn();
+		clock.now = 3_500;
+		timers[0].fn();
+		assert.equal(timers[0].stopped, false);
+		assert.equal(invalidated, 2);
+		clock.now = 4_500;
+		timers[0].fn();
+		assert.equal(timers[0].stopped, true);
+		assert.equal(invalidated, 2);
+	});
+
+	it("the row timer stops when the run settles, and never starts for a settled row (R4-001)", () => {
+		const timers: Array<{ stopped: boolean }> = [];
+		const deps = { now: () => 0, every: () => { const t = { stopped: false }; timers.push(t); return () => { t.stopped = true; }; } };
+		const state = {};
+		sr.syncRowTimer(state, { live: true, invalidate: () => {} }, deps);
+		sr.syncRowTimer(state, { live: false, invalidate: () => {} }, deps);
+		assert.equal(timers[0].stopped, true);
+		sr.syncRowTimer({}, { live: false, invalidate: () => {} }, deps);
+		assert.equal(timers.length, 1);
+		// no state holder (export, replay): nothing to keep, nothing started
+		sr.syncRowTimer(undefined, { live: true, invalidate: () => {} }, deps);
+		assert.equal(timers.length, 1);
 	});
 
 	it("shows the route source only when expanded", () => {

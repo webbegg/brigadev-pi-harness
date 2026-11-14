@@ -19,7 +19,7 @@ import { Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, vi
 import { Type } from "typebox";
 import { agentsCard, FINISHED_TTL_MS, formatElapsed, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
 import { threadRows } from "../lib/agent-thread.ts";
-import { subagentRow, type RowInput } from "../lib/subagent-row.ts";
+import { queuedFields, runState, settleQueued, subagentRow, syncRowTimer, type RowInput, type RowTimerState } from "../lib/subagent-row.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { listWidth, maxScroll, renderTwoPane, type Row } from "../lib/two-pane.ts";
 import type { AgentDefinition } from "../lib/agents.ts";
@@ -56,6 +56,12 @@ interface RunResult {
 	thinking?: string;
 	/** Where the model came from: "profile:<name>/<key>", "definition", or "parent". */
 	route?: string;
+	/** True when the model came from the parent session (resolved route source), for the row's `↑`. */
+	inherited?: boolean;
+	/** Placeholder of a task that is waiting for a concurrency slot. */
+	queued?: boolean;
+	/** Settled without ever starting (aborted while queued). */
+	cancelled?: boolean;
 	/** Models that failed before this one, with the failure category. */
 	fallbacks?: string[];
 	/** Epoch ms when the run was launched (first attempt); drives the row's elapsed time. */
@@ -144,7 +150,7 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 	if (model) args.push("--model", model);
 	if (thinking) args.push("--thinking", thinking);
 	if (agent.tools?.length) args.push("--tools", [...agent.tools, ...(structured ? [STRUCTURED_OUTPUT_TOOL] : [])].join(","));
-	Object.assign(result, { model, thinking, route: options.routeLabel });
+	Object.assign(result, { model, thinking, route: options.routeLabel, inherited: options.route.modelSource === "parent" });
 
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "brigadev-agent-"));
 	try {
@@ -327,8 +333,7 @@ function formatUsage(r: RunResult): string {
 
 /** Row state: an aborted placeholder (exitCode -1 with an end time) counts as failed. */
 function rowState(r: RunResult): RunState {
-	if (r.exitCode === -1) return r.endedAt === undefined ? "running" : "failed";
-	return failed(r) ? "failed" : "done";
+	return runState(r, failed(r));
 }
 
 function rowInput(r: RunResult): RowInput {
@@ -339,6 +344,9 @@ function rowInput(r: RunResult): RowInput {
 		model: r.model,
 		thinking: r.thinking,
 		route: r.route,
+		inherited: r.inherited,
+		queued: r.queued,
+		cancelled: r.cancelled,
 		fallbacks: r.fallbacks,
 		startedAt: r.startedAt,
 		endedAt: r.endedAt,
@@ -492,7 +500,16 @@ export default function (pi: ExtensionAPI) {
 			});
 			if (problems.length > 0) return reject(`Launch rejected by brigadev delegation rules:\n- ${problems.join("\n- ")}`);
 
-			const results: RunResult[] = resolved.map(({ request }) => ({ agent: request.agent, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally() }));
+			// Placeholders carry the routed model so a queued task (beyond MAX_CONCURRENCY) already shows it.
+			const results: RunResult[] = resolved.map(({ request }, i) => ({
+				agent: request.agent,
+				task: request.task,
+				exitCode: -1,
+				messages: [],
+				stderr: "",
+				usage: emptyTally(),
+				...(routes[i] ? queuedFields(routes[i]!, routeLabel(routes[i]!, profile.name)) : { queued: true }),
+			}));
 			const emit = () => {
 				const done = results.filter((r) => r.exitCode !== -1).length;
 				onUpdate?.({
@@ -511,7 +528,12 @@ export default function (pi: ExtensionAPI) {
 			const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);
 			const treeBefore = watchTree ? await takeSnapshot(exec, canonicalPath(ctx.cwd)) : undefined;
 
-			await mapLimited(resolved, MAX_CONCURRENCY, async ({ request, agent }, index) => {
+			// A placeholder that never started (aborted while queued) settles as cancelled instead of staying "running".
+			const settleCancelled = () => {
+				if (settleQueued(results, Date.now()) > 0) emit();
+			};
+			signal?.addEventListener("abort", settleCancelled, { once: true });
+			const pool = mapLimited(resolved, MAX_CONCURRENCY, async ({ request, agent }, index) => {
 				const { text, missingSkills } = buildChildTask(request, agent!, skills);
 				if (missingSkills.length) warnings.push(`${agent!.name}: unknown skills ${missingSkills.join(", ")}`);
 				const writer: ActiveWriter | undefined = agent!.writer ? { id: randomUUID().slice(0, 8), agent: agent!.name, surfaces: request.allowedEditSurfaces ?? [] } : undefined;
@@ -551,7 +573,7 @@ export default function (pi: ExtensionAPI) {
 						const label = `${routeLabel(route, profile.name)}${attempt.model !== route.model ? " ↪ fallback" : ""}`;
 						// Live row data from the first moment: the attempt's model and the trail so far.
 						const trail = () => (failedModels.length ? { fallbacks: [...failedModels] } : {});
-						results[index] = { agent: agent!.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), model: stepRoute.model, thinking: stepRoute.thinking, route: label, startedAt: cardRun.startedAt, ...trail() };
+						results[index] = { agent: agent!.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), model: stepRoute.model, thinking: stepRoute.thinking, route: label, inherited: stepRoute.modelSource === "parent", startedAt: cardRun.startedAt, ...trail() };
 						liveResults.set(cardRun.id, results[index]);
 						emit();
 						results[index] = await runAgent({
@@ -599,6 +621,12 @@ export default function (pi: ExtensionAPI) {
 				}
 				emit();
 			});
+			try {
+				await pool;
+			} finally {
+				signal?.removeEventListener("abort", settleCancelled);
+				settleQueued(results, Date.now());
+			}
 
 			const details: Details = { mode, results };
 			const treeAfter = treeBefore ? await takeSnapshot(exec, canonicalPath(ctx.cwd)) : undefined;
@@ -634,16 +662,6 @@ export default function (pi: ExtensionAPI) {
 				return new Text(first?.type === "text" ? first.text : "(no output)", 0, 0);
 			}
 			const now = Date.now();
-			// Re-render once a second while a run is live so the elapsed time ticks.
-			const live = details.results.some((r) => rowState(r) === "running");
-			const tick = context?.state as { tick?: ReturnType<typeof setInterval> } | undefined;
-			if (tick) {
-				if (live && context.isPartial) tick.tick ??= setInterval(() => context.invalidate(), 1000);
-				else if (tick.tick) {
-					clearInterval(tick.tick);
-					tick.tick = undefined;
-				}
-			}
 			const container = new Container();
 			for (const r of details.results) {
 				subagentRow(rowInput(r), { now, expanded }).forEach((line, i) => {
@@ -659,7 +677,17 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 			if (!expanded) container.addChild(new Text(theme.fg("muted", "(Ctrl+O to expand)"), 0, 0));
-			return container;
+			// Redraw once a second while a run is live so the elapsed time ticks. Started only now that the rows
+			// were built, and it stops itself when this component is no longer drawn (chat rebuild).
+			const live = details.results.some((r) => rowState(r) === "running");
+			const touch = syncRowTimer(context?.state as RowTimerState | undefined, { live: live && Boolean(context?.isPartial), invalidate: () => context?.invalidate() });
+			return {
+				render: (width: number) => {
+					touch();
+					return container.render(width);
+				},
+				invalidate: () => container.invalidate(),
+			};
 		},
 	});
 
