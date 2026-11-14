@@ -20,6 +20,7 @@
 			"./extensions/subagents.ts",
 			"./extensions/todo.ts",
 			"./extensions/compact-tools.ts",
+			"./extensions/tidy.ts",
 			"./extensions/profiles.ts",
 			"./extensions/cost.ts",
 			"./extensions/context-backstop.ts",

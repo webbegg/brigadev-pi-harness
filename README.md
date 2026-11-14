@@ -47,6 +47,7 @@ Check it loaded: `/brigadev:status`.
 | `alt+w` or `/brigadev:start` | Workflow menu: Quick change, Feature, Big feature (plan first), Work on a ticket, Review a team PR, My PRs: feedback, Bug fix, Review my branch, Open a PR, Create an issue, UI change from a design or ticket, Refactor a component, Upgrade dependencies. Asks what each needs, then sends one complete request |
 | `/brigadev:start <workflow>` | Starts that workflow directly: its name, file id, or key (`/brigadev:start bug-fix`, `/brigadev:start b`) |
 | `/brigadev:dashboard` | Launch dashboard: workflows and tools in groups, one key each |
+| `/brigadev:tidy` | With pi-tidy: shows the change that adds `subagent` to pi-tidy's `alwaysShowTools` in `~/.pi/agent/settings.json` (so subagent rows with their model stay visible) and writes it only after you confirm; `/reload` applies it |
 | `/brigadev:doctor [fix-bridge-hooks]` | Diagnostics, including the repo docs folder; turn off your Claude Code hooks inside claude-bridge turns |
 | `/brigadev:profile …` | Model routing profiles (see below) |
 | `/brigadev:cost` | Session cost: orchestrator per model, subagents per agent, cache hit rate |
