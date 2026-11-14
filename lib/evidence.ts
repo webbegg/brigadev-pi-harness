@@ -30,6 +30,8 @@ const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 // A segment starting with one of these can end the shell, replace it, or run other code before the test.
 const CONTROL_WORDS = new Set(["exit", "return", "exec", "trap", "eval", "source", "."]);
 const PIPEFAIL_SETTERS = new Set(["-o", "-eo", "-euo"]);
+// Runner flags that exit 0 without running a test (help, version, listing, dry runs).
+const NO_RUN_FLAGS = new Set(["--help", "-h", "--version", "-V", "--collect-only", "--co", "--listTests", "--list", "--dry-run"]);
 
 export type CheckKind = "test" | "check";
 export type CheckOutcome = "pass" | "fail" | "unknown";
@@ -190,6 +192,9 @@ export function checkOutcome(command: string, exitCode: number | undefined, cont
 	const segments = tokenize(text, { redirections: true });
 	const found = firstCheck(segments);
 	if (!found) return "unknown";
+	// `-v` is verbose for most runners but the version for node (`node --test -v`).
+	const testArgv = segments[found.index].argv;
+	if (testArgv.some((word) => NO_RUN_FLAGS.has(word) || (word === "-v" && testArgv.some((w) => executableName(w) === "node")))) return "unknown";
 
 	const pipefail = isPipefailSetter(segments[0]?.argv) && (segments[1]?.before === ";" || segments[1]?.before === "&&");
 	for (let i = 0; i < segments.length; i++) {

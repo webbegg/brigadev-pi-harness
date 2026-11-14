@@ -22,6 +22,23 @@ describe("checkOutcome: exit 0 must belong to the test (S4)", () => {
 	});
 });
 
+describe("checkOutcome: help and version flags run no tests (S4)", () => {
+	for (const command of [
+		"npm test --help", "npm test -h", "npm run test --help", "yarn test --help", "pnpm test --help",
+		"node --test --help", "node --test --version", "node --test -v",
+		"npx vitest --help", "pytest --version", "go test -h", "cargo test --help",
+		"npm test -- --help", "pytest --collect-only", "jest --listTests", "npm test --dry-run",
+	]) {
+		it(`is not a pass: ${command}`, () => assert.notEqual(checkOutcome(command, 0), "pass"));
+	}
+	it("still passes runner arguments that run tests", () => {
+		assert.equal(checkOutcome("npm test -- --test-name-pattern=gate", 0), "pass");
+		assert.equal(checkOutcome("node --test tests/evidence.test.ts", 0), "pass");
+		assert.equal(checkOutcome("go test -v ./...", 0), "pass");
+		assert.equal(checkOutcome("pytest -v", 0), "pass");
+	});
+});
+
 describe("commit gate wiring (S4)", () => {
 	let dir: string;
 	let repo: string;
