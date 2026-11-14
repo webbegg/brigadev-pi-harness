@@ -25,20 +25,23 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("brigadev:tidy", {
 		description: `Add "${TOOL}" to pi-tidy's alwaysShowTools so subagent rows stay visible (shows the change, asks first)`,
 		handler: async (_args, ctx) => {
+			// Without a UI (print/json mode) Pi's notify is a no-op, so the text goes to stderr:
+			// visible in print mode, and it keeps json mode's stdout event stream intact.
+			const say = (text: string, type: "info" | "error") => (ctx.hasUI ? ctx.ui.notify(text, type) : void process.stderr.write(`${text}\n`));
 			const path = join(agentDir(), "settings.json");
 			const shown = readTidyPlan(path, TOOL);
 			const text = describePlan(shown.plan, path, TOOL);
-			if (shown.plan.kind === "refuse") return ctx.ui.notify(text, "error");
-			if (shown.plan.kind === "noop") return ctx.ui.notify(text, "info");
+			if (shown.plan.kind === "refuse") return say(text, "error");
+			if (shown.plan.kind === "noop") return say(text, "info");
 
 			if (!ctx.hasUI) {
-				return ctx.ui.notify(
+				return say(
 					`${text}\n\nNot written (no UI to confirm). To apply it by hand, set ${shown.plan.key}.alwaysShowTools to ${JSON.stringify(shown.plan.after)} in ${path}, then /reload.`,
 					"info",
 				);
 			}
 
-			const ok = await ctx.ui.confirm("Show subagent rows even with pi-tidy?", `${text}\n\nEverything else in the file is kept as is.`);
+			const ok = await ctx.ui.confirm("Show subagent rows even with pi-tidy?", `${text}\n\nOther keys and values are kept; the file is rewritten as 2-space JSON.`);
 			if (!ok) return ctx.ui.notify("Not changed.", "info");
 
 			const result = commitTidyPlan(path, shown, TOOL);
