@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -189,6 +189,17 @@ describe("package workflows composed", () => {
 		assert.match(text, /Ticket text:\n> Title\n> As a user I want X/);
 		// The normalization comes before the first use of <KEY>.
 		assert.ok(text.indexOf("uppercase") < text.indexOf("feat/<KEY>"));
+	});
+
+	it("Bug fix and the Bug path of a ticket point at the lazily read diagnosis loop, which exists and stays short", () => {
+		const path = join(ASSETS_ROOT, "diagnosis.md");
+		assert.ok(existsSync(path), "assets/diagnosis.md");
+		const loop = readFileSync(path, "utf8");
+		assert.ok(loop.split("\n").length <= 70, "diagnosis.md stays short");
+		for (const needle of ["failing test", "RED", "GREEN", "[DEBUG-", "evidence log"]) assert.ok(loop.includes(needle), `diagnosis.md: ${needle}`);
+		const bug = compose("bug-fix", { where: "w", steps: "s", expected: "e", actual: "a" });
+		const ticket = compose("ticket", { key: "PROJ-1", text: "t", kind: "Bug" });
+		for (const [name, text] of [["Bug fix", bug], ["Work on a ticket", ticket]]) assert.ok(text.includes("`diagnosis.md`"), name);
 	});
 
 	it("Work on a ticket: the request defines all three sizes and quotes the chosen one", () => {

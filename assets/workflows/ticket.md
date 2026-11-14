@@ -37,7 +37,7 @@ Ticket request, started from the workflow menu. The ticket below (key, kind, tex
 
 Normalize the key first: take the first match of `[A-Za-z][A-Za-z0-9]+-[0-9]+` in the ticket key answer (so a pasted ticket URL or a lowercase key works), uppercase it, and use that as <KEY> everywhere below. If there is no match, ask once for the key and stop.
 
-"Bug" means follow the bug-fix flow: reproduce the problem, then fix the root cause. A Bug always starts with a failing test that reproduces it, whatever the size. "Story or task" means the normal feature flow.
+"Bug" means follow the bug-fix flow: reproduce the problem, then fix the root cause. A Bug always starts with a failing test that reproduces it, whatever the size, and follows the diagnosis loop in `diagnosis.md` in the assets root named in the orchestrator prompt. "Story or task" means the normal feature flow.
 
 "Quick change" means a Small task: work inline, test first, one work unit and its commit, never a feature document or a plan; if it turns out to need more than that (several work units, a contract change, a decision for the user, or more than a few files), stop and say so instead of growing it. "Big feature (plan first)" means Large per `odd-tracking.md`: feature document with the whole request above (key, kind, ticket text, and link) as L1 verbatim, and tasks, then show the plan and stop for the user's approval before the first source write; split delivery with `brigadev-chained-pr` when it exceeds ~400 lines. "Let the agent decide" means apply the usual size rules.
 
