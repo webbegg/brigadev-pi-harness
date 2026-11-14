@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { it } from "node:test";
-import { output, runChild, type ChildProcessLike, type RunOptions } from "../lib/child-run.ts";
+import { EXIT_GRACE_MS, KILL_GRACE_MS, output, runChild, type ChildProcessLike, type RunOptions } from "../lib/child-run.ts";
 
 // Verifier T9 (S0 in RPC mode): every dialog a child opens is cancelled on the spot, whatever the framing,
 // and no child can outlive the stall watchdog. Probes derived from rpc-extension-ui.md, not from the run loop.
@@ -126,18 +126,51 @@ it("S0: a request split across chunks is answered once complete; 200 requests in
 	h.cleanup();
 });
 
-it("S0: after agent_settled stdin is closed and a late dialog is never written; a child that then never exits is still ended by the watchdog", async () => {
+it("S0: after agent_settled stdin is closed and a late dialog is never written; a child that then never exits is terminated after the exit grace and keeps its answer", async () => {
 	const h = await start({ BRIGADEV_STALL_TIMEOUT_MS: "1000" });
-	settle(h.child);
+	settle(h.child, "good answer");
 	assert.equal(h.child.stdin.ended, true);
 	h.child.line({ type: "extension_ui_request", id: "late", method: "confirm" });
 	assert.equal(h.child.stdin.late, 0);
-	h.time.advance(1000);
+	// The work is done: the stall budget no longer applies, only the exit grace.
+	h.time.advance(EXIT_GRACE_MS - 1);
+	assert.deepEqual(h.child.kills, []);
+	h.time.advance(1);
 	assert.deepEqual(h.child.kills, ["SIGTERM"]);
-	h.time.advance(5000);
+	h.time.advance(KILL_GRACE_MS);
 	assert.deepEqual(h.child.kills, ["SIGTERM", "SIGKILL"]);
 	h.child.emit("close", null);
+	const r = await h.p;
+	assert.equal(r.exitCode, 0);
+	assert.equal(r.stopReason, "stop");
+	assert.equal(r.errorMessage, undefined);
+	assert.equal(output(r), "good answer");
+	h.cleanup();
+});
+
+it("S0: a settled child that reports aborted or exits non-zero on the forced shutdown still keeps its answer", async () => {
+	const h = await start();
+	settle(h.child, "good answer");
+	h.time.advance(EXIT_GRACE_MS);
+	assert.deepEqual(h.child.kills, ["SIGTERM"]);
+	h.child.line({ type: "message_end", message: { role: "assistant", content: [], stopReason: "aborted", errorMessage: "Operation aborted" } });
+	h.child.emit("close", 143);
+	const r = await h.p;
+	assert.equal(r.exitCode, 0);
+	assert.equal(r.stopReason, "stop");
+	assert.equal(r.errorMessage, undefined);
+	assert.equal(output(r), "good answer");
+	h.cleanup();
+});
+
+it("S0: a settled child that exits on its own within the grace is never signalled", async () => {
+	const h = await start();
+	settle(h.child);
+	h.time.advance(EXIT_GRACE_MS - 1);
+	h.child.emit("close", 0);
 	await h.p;
+	h.time.advance(KILL_GRACE_MS * 2);
+	assert.deepEqual(h.child.kills, []);
 	h.cleanup();
 });
 

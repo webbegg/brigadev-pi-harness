@@ -27,6 +27,8 @@ import { checkStructuredRun, formatStructured, type JsonSchema } from "./structu
 
 /** Grace between SIGTERM and SIGKILL when a child ignores the terminate request. */
 export const KILL_GRACE_MS = 5000;
+/** Time a child that finished its work (or will never start one) gets to exit on its own after stdin closes. */
+export const EXIT_GRACE_MS = 5000;
 
 /** Streaming text updates reach `onUpdate` at most this often; the snapshot itself is always current. */
 export const PARTIAL_UPDATE_MS = 100;
@@ -183,6 +185,10 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			let stallError = "";
 			let killTimer: unknown;
 			let abortTimer: unknown;
+			let exitTimer: unknown;
+			// The run's outcome when its input ended; a forced shutdown after that never rewrites it.
+			let finished: { stopReason?: string; errorMessage?: string; messages: number } | undefined;
+			let forcedExit = false;
 			let streaming = false;
 			let inputOpen = true;
 
@@ -233,6 +239,20 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			});
 			watchdog.start();
 
+			// The run is over (settled, or a prompt that will never start one): the stall budget no longer applies.
+			// Closing stdin asks the child to exit; one that has not exited after the grace is terminated, keeping its result.
+			const finishInput = () => {
+				if (finished) return;
+				finished = { stopReason: result.stopReason, errorMessage: result.errorMessage, messages: result.messages.length };
+				endInput();
+				watchdog.stop();
+				exitTimer = setTimer(() => {
+					if (exited) return;
+					forcedExit = true;
+					terminate();
+				}, EXIT_GRACE_MS);
+			};
+
 			const control = createChildControl({
 				send,
 				streaming: () => streaming,
@@ -255,13 +275,13 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					else if (event.type === "run") {
 						streaming = event.phase === "start";
 						// `agent_end` can be followed by retries, compaction, or queued messages; `agent_settled` is the end (rpc.md:69).
-						if (event.phase === "settled") endInput();
+						if (event.phase === "settled") finishInput();
 					} else if (event.type === "response") {
 						// A rejected prompt starts no run, and a handled one starts none either (rpc.md:67): neither will ever settle.
 						if (event.command === "prompt" && !event.success) {
 							Object.assign(result, { stopReason: "error", errorMessage: `Pi rejected the task: ${event.error ?? "unknown error"}` });
-							endInput();
-						} else if (event.command === "prompt" && event.disposition === "handled") endInput();
+							finishInput();
+						} else if (event.command === "prompt" && event.disposition === "handled") finishInput();
 					} else if (event.type === "ui_request") {
 						// S0: a child's dialog is cancelled on the spot, never shown to the user and never left pending.
 						const answer = answerUiRequest(event.request);
@@ -295,6 +315,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				watchdog.stop();
 				if (killTimer !== undefined) clearTimer(killTimer);
 				if (abortTimer !== undefined) clearTimer(abortTimer);
+				if (exitTimer !== undefined) clearTimer(exitTimer);
 				withdraw();
 			};
 			proc.on("close", (code: number | null) => {
@@ -304,7 +325,12 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				if (userAborted) Object.assign(result, { stopReason: "aborted", errorMessage: "Aborted by the user" });
 				// The child may report its own "aborted" on SIGTERM; the stall is the real cause.
 				if (stalled) Object.assign(result, { stopReason: "error", errorMessage: stallError });
-				resolveExit(stalled ? 1 : (code ?? 0));
+				// Our own shutdown of a finished child is not its outcome: drop what it said on the way out and its exit code.
+				if (forcedExit && finished) {
+					result.messages.length = finished.messages;
+					Object.assign(result, { stopReason: finished.stopReason, errorMessage: finished.errorMessage });
+				}
+				resolveExit(stalled ? 1 : forcedExit ? 0 : (code ?? 0));
 			});
 			proc.on("error", (error: unknown) => {
 				cleanup();
