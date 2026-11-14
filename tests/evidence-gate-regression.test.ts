@@ -45,8 +45,11 @@ describe("checkOutcome: help and version flags run no tests (S4)", () => {
 	for (const command of ["npm --help test", "cargo test --no-run", "go test -list .", "npx jest --showConfig", "npm test -- --help=true"]) {
 		it(`is not a pass (listing, config, or flag before test): ${command}`, () => assert.notEqual(checkOutcome(command, 0), "pass"));
 	}
+	for (const command of ["npm test --workspace=pkg-a", "pnpm test --filter api"]) {
+		it(`is not a pass (options before -- are not trusted, by user decision): ${command}`, () => assert.notEqual(checkOutcome(command, 0), "pass"));
+	}
 	for (const command of [
-		"npm test", "npm test --workspace=pkg-a", "pnpm test --filter api", "npm test -- --test-name-pattern=x", "go test -v ./...", "pytest -v",
+		"npm test", "npm test -- --test-name-pattern=x", "go test -v ./...", "pytest -v",
 		"cargo test -v", "npx vitest run", "node --test tests/*.test.ts", "npm run build && npm test",
 	]) {
 		it(`still passes: ${command}`, () => assert.equal(checkOutcome(command, 0), "pass"));

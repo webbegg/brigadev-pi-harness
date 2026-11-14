@@ -35,10 +35,10 @@ const NO_RUN_FLAGS = new Set([
 	"--help", "-h", "-H", "-?", "--usage", "--version", "-V", "--v8-options", "--collect-only", "--co", "--listTests",
 	"--list", "-list", "-help", "--dry-run", "--no-run", "--showConfig",
 ]);
-// The only options a package manager may read before the script runs; anything else (`-v`, `--h`, `--help=true`) might not run it.
-const PM_FLAGS = new Set(["--silent", "-s", "--quiet", "-q", "--if-present", "--workspaces", "-ws", "--include-workspace-root", "--no-color"]);
-const PM_EQUALS_FLAGS = new Set(["--workspace", "--filter", "--loglevel", "--color"]);
-const PM_VALUE_FLAGS = new Set(["--workspace", "-w", "--filter", "-F", "--loglevel"]);
+// The only option a package manager may read before `--` and still vouch for a pass; any other (`-v`, `-w pkg`, `--color=-v`) might not run the script.
+const PM_SILENT = new Set(["--silent", "-s"]);
+// npm, pnpm, and yarn read their config from these variables (`npm_config_usage=true` prints usage and runs nothing).
+const PM_CONFIG_ENV = /^(npm|pnpm|yarn)_config_/i;
 
 export type CheckKind = "test" | "check";
 export type CheckOutcome = "pass" | "fail" | "unknown";
@@ -154,35 +154,18 @@ export function checkKind(command: string): CheckKind | undefined {
 	return firstCheck(parse(command))?.kind;
 }
 
-/** Words consumed by an allowed package-manager option at `i` (1, or 2 with a separate value); 0 when it is not allowed. */
-function packageManagerOption(words: string[], i: number): number {
-	const word = words[i];
-	if (PM_FLAGS.has(word)) return 1;
-	const eq = word.indexOf("=");
-	if (eq > 0 && eq < word.length - 1 && PM_EQUALS_FLAGS.has(word.slice(0, eq))) return 1;
-	return PM_VALUE_FLAGS.has(word) && i + 1 < words.length ? 2 : 0;
-}
-
-/** Index of the first non-option word from `from` (words.length if none), or undefined at an option that is not allowed. */
+/** Index of the first non-option word from `from` (words.length if none), or undefined at an option other than `-s`/`--silent`. */
 function nextPositional(words: string[], from: number): number | undefined {
 	let i = from;
 	while (i < words.length && words[i].startsWith("-")) {
-		const used = packageManagerOption(words, i);
-		if (used === 0) return undefined;
-		i += used;
+		if (!PM_SILENT.has(words[i])) return undefined;
+		i++;
 	}
 	return i;
 }
 
-function allowedPackageManagerOptions(words: string[]): boolean {
-	let i = 0;
-	while (i < words.length) {
-		if (!words[i].startsWith("-")) i++;
-		else if (packageManagerOption(words, i) === 0) return false;
-		else i += packageManagerOption(words, i);
-	}
-	return true;
-}
+/** True when no word after the script (before `--`) is an option other than `-s`/`--silent`; a plain argument is no option, and every option that could take a value is already refused. */
+const onlySilent = (words: string[]): boolean => words.every((word) => !word.startsWith("-") || PM_SILENT.has(word));
 
 /** True when a no-run flag is among `words`; `-v` counts unless `verboseOk` (it means verbose for go test, pytest, cargo test). */
 function hasNoRunFlag(words: string[], verboseOk: boolean): boolean {
@@ -210,8 +193,9 @@ function toolMayRunNoTests(words: string[]): boolean {
 
 /**
  * True when the check segment might print help, a version, or a listing and
- * exit 0 without running a test. Package managers read only a short list of
- * options before the script; words after `--` go to the script.
+ * exit 0 without running a test. A package-manager test run vouches for a
+ * pass only with no option before `--` except `-s`/`--silent`; words after
+ * `--` go to the script and are checked against the no-run flags.
  */
 function mayRunNoTests(argv: string[]): boolean {
 	let start = 0;
@@ -231,7 +215,7 @@ function mayRunNoTests(argv: string[]): boolean {
 	if (at === undefined || at >= before.length) return true;
 	const script = before[at];
 	if (TEST_SCRIPT.test(script) || CHECK_SCRIPT.test(script)) {
-		return !allowedPackageManagerOptions(before.slice(at + 1)) || hasNoRunFlag(after, false);
+		return !onlySilent(before.slice(at + 1)) || hasNoRunFlag(after, false);
 	}
 	return toolMayRunNoTests([...before.slice(at), ...after]);
 }
@@ -282,6 +266,14 @@ export function checkOutcome(command: string, exitCode: number | undefined, cont
 	const found = firstCheck(segments);
 	if (!found) return "unknown";
 	if (mayRunNoTests(segments[found.index].argv)) return "unknown";
+	// npm config can come from the environment (`npm_config_usage=true`), set on the segment or by an earlier one.
+	for (let i = 0; i <= found.index; i++) {
+		const { argv } = segments[i];
+		let leading = 0;
+		while (leading < argv.length && (ASSIGNMENT.test(argv[leading]) || argv[leading] === "!")) leading++;
+		// Earlier segments: any word (`export npm_config_x=1`, `npm_config_x=1 true`); the check itself: only its leading assignments.
+		if (argv.slice(0, i === found.index ? leading : argv.length).some((word) => PM_CONFIG_ENV.test(word))) return "unknown";
+	}
 
 	const pipefail = isPipefailSetter(segments[0]?.argv) && (segments[1]?.before === ";" || segments[1]?.before === "&&");
 	for (let i = 0; i < segments.length; i++) {
