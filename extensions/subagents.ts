@@ -25,7 +25,10 @@ import { listWidth, maxScroll, renderTwoPane, type Row } from "../lib/two-pane.t
 import type { AgentDefinition } from "../lib/agents.ts";
 import { emptyTally, formatCost, formatTokens, priceBridgeMessage, type CostCalculator, type Tally } from "../lib/cost.ts";
 import { foldChildEvent, parseChildLine } from "../lib/child-events.ts";
+import { childLaunch } from "../lib/child-launch.ts";
 import { newRunId, writeRunArtifacts } from "../lib/run-artifacts.ts";
+import { createSemaphore } from "../lib/semaphore.ts";
+import { createSubagentRegistry, type WaitOutcome } from "../lib/subagent-registry.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { createStallWatchdog, resolveStallTimeouts, stallMessage } from "../lib/stall-watchdog.ts";
 import { admitLaunch, buildChildTask, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
@@ -36,17 +39,21 @@ import { costCalculator, currentModelRef, listPrice, loadAgents, modelCatalog } 
 import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
 import { panelState } from "../lib/panel-state.ts";
 import { canonicalPath } from "../lib/paths.ts";
-import { CHILD_ENV, EVIDENCE_EXTENSION_PATH, GUARD_EXTENSION_PATH, isChildSession, STRUCTURED_OUTPUT_EXTENSION_PATH } from "../lib/runtime.ts";
-import { checkStructuredRun, formatStructured, loadOutputSchema, STRUCTURED_OUTPUT_TOOL, type JsonSchema } from "../lib/structured-output.ts";
+import { isChildSession } from "../lib/runtime.ts";
+import { checkStructuredRun, formatStructured, loadOutputSchema, type JsonSchema } from "../lib/structured-output.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot } from "../lib/worktree-snapshot.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
+const WAIT_DEFAULT_SECONDS = 60;
+const WAIT_MAX_SECONDS = 300;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 const STATUS_KEY = "brigadev-agents";
 const CARD_KEY = "brigadev-agents-card";
 const CARD_COLLAPSE_KEY = "ctrl+shift+a";
 const VIEWER_KEY = "alt+a";
+/** Tool results that carry finished runs: a sync call, or an async launch collected by wait/cancel. */
+const VIEWER_TOOLS = new Set(["subagent", "subagent_wait", "subagent_cancel"]);
 
 interface RunResult {
 	agent: string;
@@ -86,6 +93,31 @@ interface Details {
 	results: RunResult[];
 	/** Files the batch changed outside every writer's surfaces (set when writers ran in a git repo). */
 	outsideSurfaces?: string[];
+	/** Async launch id (subagent_wait / subagent_cancel collect it). */
+	launchId?: string;
+	/** True on the immediate async return and on a wait that timed out: the results are not final. */
+	pending?: boolean;
+}
+
+/** A finished launch as the tool returns it; the registry keeps it for `subagent_wait`. */
+interface LaunchResult {
+	content: Array<{ type: "text"; text: string }>;
+	details: Details;
+	isError?: boolean;
+}
+
+interface Launched {
+	details: Details;
+	warnings: string[];
+}
+
+interface LaunchHooks {
+	/** Streams partial results to the tool call (sync mode). */
+	onUpdate?: (result: AgentToolResult<Details>) => void;
+	/** Reports `done/total` to the registry (async mode). */
+	onProgress?: (done: number, total: number) => void;
+	/** Async launches settle with partial results when aborted; sync ones throw as they always did. */
+	tolerateAbort: boolean;
 }
 
 
@@ -119,19 +151,6 @@ function piInvocation(args: string[]): { command: string; args: string[] } {
 	return /^(node|bun)(\.exe)?$/.test(exec) ? { command: "pi", args } : { command: process.execPath, args };
 }
 
-async function mapLimited<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
-	const results: R[] = new Array(items.length);
-	let next = 0;
-	const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
-		while (next < items.length) {
-			const index = next++;
-			results[index] = await fn(items[index], index);
-		}
-	});
-	await Promise.all(workers);
-	return results;
-}
-
 interface RunOptions {
 	cwd: string;
 	agent: AgentDefinition;
@@ -150,46 +169,39 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 	const { agent, request } = options;
 	const result: RunResult = { agent: agent.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), runId: newRunId(agent.name) };
 
-	const args = ["--mode", "json", "-p", "--no-session", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
 	const structured = Boolean(options.schema && agent.outputSchema);
-	if (structured) args.push("-e", STRUCTURED_OUTPUT_EXTENSION_PATH);
 	const { model, thinking } = options.route;
-	if (model) args.push("--model", model);
-	if (thinking) args.push("--thinking", thinking);
-	if (agent.tools?.length) args.push("--tools", [...agent.tools, ...(structured ? [STRUCTURED_OUTPUT_TOOL] : [])].join(","));
 	Object.assign(result, { model, thinking, route: options.routeLabel, inherited: options.route.modelSource === "parent" });
 
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "brigadev-agent-"));
 	try {
+		let systemPromptPath: string | undefined;
 		if (agent.systemPrompt.trim()) {
-			const promptPath = path.join(tmpDir, "system.md");
-			await fs.promises.writeFile(promptPath, agent.systemPrompt, { encoding: "utf8", mode: 0o600 });
-			args.push("--append-system-prompt", promptPath);
+			systemPromptPath = path.join(tmpDir, "system.md");
+			await fs.promises.writeFile(systemPromptPath, agent.systemPrompt, { encoding: "utf8", mode: 0o600 });
 		}
-		args.push(options.taskText);
 
 		// One spelling of the working directory: an inherited PWD that differs
 		// from the real cwd (macOS /tmp -> /private/tmp, a symlinked checkout)
 		// shows the child two directories, and it then runs every lookup twice.
 		const cwd = canonicalPath(options.cwd);
-		const env: NodeJS.ProcessEnv = {
-			...process.env,
-			PWD: cwd,
-			[CHILD_ENV.CHILD]: "1",
-			[CHILD_ENV.AGENT]: agent.name,
-			[CHILD_ENV.PROJECT_ROOT]: cwd,
-			[CHILD_ENV.READ_ONLY]: agent.writer ? "0" : "1",
-		};
-		if (agent.writer && request.allowedEditSurfaces) env[CHILD_ENV.ALLOWED_SURFACES] = JSON.stringify(request.allowedEditSurfaces);
-		else delete env[CHILD_ENV.ALLOWED_SURFACES];
-		if (structured) env[CHILD_ENV.OUTPUT_SCHEMA] = agent.outputSchema;
-		else delete env[CHILD_ENV.OUTPUT_SCHEMA];
+		// Argv, env and stdio for every child come from one pure function (lib/child-launch.ts).
+		const { args, env, stdio } = childLaunch({
+			agent,
+			allowedEditSurfaces: request.allowedEditSurfaces,
+			route: options.route,
+			structured,
+			cwd,
+			taskText: options.taskText,
+			systemPromptPath,
+			parentEnv: process.env,
+		});
 
 		let aborted = false;
 		let stalled = false;
 		result.exitCode = await new Promise<number>((resolveExit) => {
 			const invocation = piInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, { cwd, env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+			const proc = spawn(invocation.command, invocation.args, { cwd, env, shell: false, stdio });
 			let buffer = "";
 			let exited = false;
 			let stallError = "";
@@ -324,7 +336,14 @@ const Params = Type.Object({
 	featureDoc: described.featureDoc,
 	skills: described.skills,
 	tasks: Type.Optional(Type.Array(Type.Object(launchFields(false)), { description: `Parallel independent units (max ${MAX_PARALLEL_TASKS}), same fields` })),
+	async: Type.Optional(Type.Boolean({ description: "Return a launch id now; collect it with subagent_wait" })),
 });
+
+const WaitParams = Type.Object({
+	runId: Type.String({ description: "Launch id from an async subagent call" }),
+	timeoutSeconds: Type.Optional(Type.Number({ description: `Default ${WAIT_DEFAULT_SECONDS}, max ${WAIT_MAX_SECONDS}` })),
+});
+const CancelParams = Type.Object({ runId: Type.String({ description: "Launch id from an async subagent call" }) });
 
 function formatUsage(r: RunResult): string {
 	const u = r.usage;
@@ -377,6 +396,15 @@ export default function (pi: ExtensionAPI) {
 	let skills: SkillRef[] = [];
 	const activeWriters: ActiveWriter[] = [];
 	let running = 0;
+
+	// One concurrency cap for every launch in this process, sync or async.
+	const slots = createSemaphore(MAX_CONCURRENCY);
+	// Async launches: each runs under its own AbortController, collected by subagent_wait / subagent_cancel.
+	const registry = createSubagentRegistry<LaunchResult>({
+		setTimer: (fn, ms) => setTimeout(fn, ms),
+		clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
+		newId: () => newRunId("launch"),
+	});
 
 	// Agents card: live rows above the editor while subagents run.
 	let runs: AgentRun[] = [];
@@ -444,10 +472,16 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		// Launches left from a previous session in this process are stopped and forgotten.
+		registry.clear();
 		runs = [];
 		showCard(ctx);
 	});
-	pi.on("session_shutdown", async () => stopTimers());
+	// Children of running async launches get the usual SIGTERM, then SIGKILL after 5 s.
+	pi.on("session_shutdown", async () => {
+		registry.abortAll();
+		stopTimers();
+	});
 
 	pi.registerShortcut(CARD_COLLAPSE_KEY, {
 		description: "Collapse or expand the brigadev agents card",
@@ -520,143 +554,202 @@ export default function (pi: ExtensionAPI) {
 				usage: emptyTally(),
 				...(routes[i] ? queuedFields(routes[i]!, routeLabel(routes[i]!, profile.name)) : { queued: true }),
 			}));
-			const emit = () => {
-				const done = results.filter((r) => r.exitCode !== -1).length;
-				onUpdate?.({
-					content: [{ type: "text", text: mode === "parallel" ? `${done}/${results.length} done` : finalText(results[0].messages) || "(running...)" }],
-					details: { mode, results: [...results] },
-				} as AgentToolResult<Details>);
-			};
-
-			const price = costCalculator(ctx);
-			const warnings: string[] = [];
-
-			// Backstop for writers: the parent is idle during the call, so any change
-			// outside the union of the writers' surfaces came from a child.
-			const writerSurfaces = resolved.flatMap(({ request, agent }) => (agent?.writer ? (request.allowedEditSurfaces ?? []) : []));
-			const watchTree = resolved.some(({ agent }) => agent?.writer);
-			const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);
-			const treeBefore = watchTree ? await takeSnapshot(exec, canonicalPath(ctx.cwd)) : undefined;
-
-			// A placeholder that never started (aborted while queued) settles as cancelled instead of staying "running".
-			const settleCancelled = () => {
-				if (settleQueued(results, Date.now()) > 0) emit();
-			};
-			signal?.addEventListener("abort", settleCancelled, { once: true });
-			const pool = mapLimited(resolved, MAX_CONCURRENCY, async ({ request, agent }, index) => {
-				const { text, missingSkills } = buildChildTask(request, agent!, skills);
-				if (missingSkills.length) warnings.push(`${agent!.name}: unknown skills ${missingSkills.join(", ")}`);
-				const writer: ActiveWriter | undefined = agent!.writer ? { id: randomUUID().slice(0, 8), agent: agent!.name, surfaces: request.allowedEditSurfaces ?? [] } : undefined;
-				if (writer) activeWriters.push(writer);
-				setRunning(ctx, 1);
-				const cardRun: AgentRun = {
-					id: randomUUID().slice(0, 8),
-					agent: agent!.name,
-					task: request.task.split("\n")[0],
-					state: "running",
-					model: routes[index]!.model,
-					thinking: routes[index]!.thinking,
-					tokens: 0,
-					cost: 0,
-					startedAt: Date.now(),
+			// The launch body, shared by both modes: validation is done, so everything from here on runs the children.
+			const launch = async (signal: AbortSignal | undefined, hooks: LaunchHooks): Promise<Launched> => {
+				const emit = () => {
+					const done = results.filter((r) => r.exitCode !== -1).length;
+					hooks.onProgress?.(done, results.length);
+					hooks.onUpdate?.({
+						content: [{ type: "text", text: mode === "parallel" ? `${done}/${results.length} done` : finalText(results[0].messages) || "(running...)" }],
+						details: { mode, results: [...results] },
+					} as AgentToolResult<Details>);
 				};
-				runs.push(cardRun);
-				showCard(ctx);
-				liveResults.set(cardRun.id, results[index]);
-				const syncCard = (r: RunResult) => {
-					cardRun.tokens = r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output;
-					cardRun.cost = r.usage.cost;
-					if (r.model) cardRun.model = r.model;
+
+				const price = costCalculator(ctx);
+				const warnings: string[] = [];
+
+				// Writers are registered before the first await, so a launch admitted right after this one
+				// already sees their surfaces, even while they wait for a concurrency slot.
+				const writers: Array<ActiveWriter | undefined> = resolved.map(({ request, agent }) => (agent?.writer ? { id: randomUUID().slice(0, 8), agent: agent.name, surfaces: request.allowedEditSurfaces ?? [] } : undefined));
+				activeWriters.push(...writers.filter((w): w is ActiveWriter => w !== undefined));
+				const removeWriter = (writer: ActiveWriter | undefined) => {
+					const at = writer ? activeWriters.indexOf(writer) : -1;
+					if (at >= 0) activeWriters.splice(at, 1);
 				};
-				// Fallback chain: the primary, then the profile's fallbacks, with cooling
-				// or out-of-quota models moved behind usable ones.
-				const route = routes[index]!;
-				const chain = route.model
-					? launchOrder({ model: route.model, thinking: route.thinking }, routeFor(profile.profile, agent!.name)?.entry.fallbacks ?? [], (m) => blockedReason(m, Date.now()) !== undefined)
-					: [{ model: route.model, thinking: route.thinking }];
-				const failedModels: string[] = [];
-				try {
-					for (let step = 0; step < chain.length; step++) {
-						const attempt = chain[step];
-						const stepRoute: ResolvedRoute = { ...route, model: attempt.model, thinking: attempt.thinking ?? route.thinking };
-						Object.assign(cardRun, { model: stepRoute.model, thinking: stepRoute.thinking });
-						const label = `${routeLabel(route, profile.name)}${attempt.model !== route.model ? " ↪ fallback" : ""}`;
-						// Live row data from the first moment: the attempt's model and the trail so far.
-						const trail = () => (failedModels.length ? { fallbacks: [...failedModels] } : {});
-						results[index] = { agent: agent!.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), model: stepRoute.model, thinking: stepRoute.thinking, route: label, inherited: stepRoute.modelSource === "parent", startedAt: cardRun.startedAt, ...trail() };
-						liveResults.set(cardRun.id, results[index]);
-						emit();
-						results[index] = await runAgent({
-							cwd: ctx.cwd,
-							agent: agent!,
-							request,
-							taskText: text,
-							route: stepRoute,
-							routeLabel: label,
-							schema: schemas[index],
-							price,
-							signal,
-							onUpdate: (partial) => {
-								Object.assign(partial, { startedAt: cardRun.startedAt, ...trail() });
-								results[index] = partial;
-								liveResults.set(cardRun.id, partial);
-								syncCard(partial);
-								emit();
-							},
-						});
-						const r = results[index];
-						Object.assign(r, { startedAt: cardRun.startedAt, endedAt: Date.now(), ...trail() });
-						if (!failed(r) || !attempt.model) break;
-						const category = classifyFailure(r.stopReason ?? "error", r.errorMessage || r.stderr);
-						if (!category) break;
-						fallbackState().cooldowns.cool(attempt.model, Date.now() + cooldownMs(category));
-						failedModels.push(`${attempt.model} (${category})`);
-						const next = chain[step + 1];
-						if (!next?.model) break;
-						pi.appendEntry("brigadev-fallback", { agent: agent!.name, from: attempt.model, to: next.model, category });
-						if (ctx.hasUI) {
-							ctx.ui.notify(`brigadev: ${agent!.name} hit ${category} on ${attempt.model} → retrying on ${next.model}${priceNote(listPrice(ctx, attempt.model), listPrice(ctx, next.model))}`, "warning");
-						}
-					}
-					if (failedModels.length) results[index].fallbacks = failedModels;
-				} finally {
-					results[index].endedAt ??= Date.now();
-					syncCard(results[index]);
-					cardRun.state = failed(results[index]) || results[index].exitCode === -1 ? "failed" : "done";
-					cardRun.endedAt = Date.now();
-					liveResults.delete(cardRun.id);
+
+				// A placeholder that never started (aborted while queued) settles as cancelled instead of staying "running".
+				const settleCancelled = () => {
+					if (settleQueued(results, Date.now()) > 0) emit();
+				};
+
+				// Backstop for writers: the parent is idle during a sync call (an async launch cannot promise that,
+				// so it may also report the parent's own edits), so any change outside the union of the writers'
+				// surfaces is attributed to a child.
+				const writerSurfaces = resolved.flatMap(({ request, agent }) => (agent?.writer ? (request.allowedEditSurfaces ?? []) : []));
+				const watchTree = resolved.some(({ agent }) => agent?.writer);
+				const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);
+
+				const runTask = async ({ request, agent }: (typeof resolved)[number], index: number) => {
+					const { text, missingSkills } = buildChildTask(request, agent!, skills);
+					if (missingSkills.length) warnings.push(`${agent!.name}: unknown skills ${missingSkills.join(", ")}`);
+					setRunning(ctx, 1);
+					const cardRun: AgentRun = {
+						id: randomUUID().slice(0, 8),
+						agent: agent!.name,
+						task: request.task.split("\n")[0],
+						state: "running",
+						model: routes[index]!.model,
+						thinking: routes[index]!.thinking,
+						tokens: 0,
+						cost: 0,
+						startedAt: Date.now(),
+					};
+					runs.push(cardRun);
 					showCard(ctx);
-					setRunning(ctx, -1);
-					if (writer) activeWriters.splice(activeWriters.indexOf(writer), 1);
-				}
-				emit();
-			});
-			try {
-				await pool;
-			} finally {
-				signal?.removeEventListener("abort", settleCancelled);
-				settleQueued(results, Date.now());
-			}
+					liveResults.set(cardRun.id, results[index]);
+					const syncCard = (r: RunResult) => {
+						cardRun.tokens = r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output;
+						cardRun.cost = r.usage.cost;
+						if (r.model) cardRun.model = r.model;
+					};
+					// Fallback chain: the primary, then the profile's fallbacks, with cooling
+					// or out-of-quota models moved behind usable ones.
+					const route = routes[index]!;
+					const chain = route.model
+						? launchOrder({ model: route.model, thinking: route.thinking }, routeFor(profile.profile, agent!.name)?.entry.fallbacks ?? [], (m) => blockedReason(m, Date.now()) !== undefined)
+						: [{ model: route.model, thinking: route.thinking }];
+					const failedModels: string[] = [];
+					try {
+						for (let step = 0; step < chain.length; step++) {
+							const attempt = chain[step];
+							const stepRoute: ResolvedRoute = { ...route, model: attempt.model, thinking: attempt.thinking ?? route.thinking };
+							Object.assign(cardRun, { model: stepRoute.model, thinking: stepRoute.thinking });
+							const label = `${routeLabel(route, profile.name)}${attempt.model !== route.model ? " ↪ fallback" : ""}`;
+							// Live row data from the first moment: the attempt's model and the trail so far.
+							const trail = () => (failedModels.length ? { fallbacks: [...failedModels] } : {});
+							results[index] = { agent: agent!.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), model: stepRoute.model, thinking: stepRoute.thinking, route: label, inherited: stepRoute.modelSource === "parent", startedAt: cardRun.startedAt, ...trail() };
+							liveResults.set(cardRun.id, results[index]);
+							emit();
+							try {
+								results[index] = await runAgent({
+									cwd: ctx.cwd,
+									agent: agent!,
+									request,
+									taskText: text,
+									route: stepRoute,
+									routeLabel: label,
+									schema: schemas[index],
+									price,
+									signal,
+									onUpdate: (partial) => {
+										Object.assign(partial, { startedAt: cardRun.startedAt, ...trail() });
+										results[index] = partial;
+										liveResults.set(cardRun.id, partial);
+										syncCard(partial);
+										emit();
+									},
+								});
+							} catch (error) {
+								if (!hooks.tolerateAbort || !signal?.aborted) throw error;
+								// Cancelled or shut down: keep what the child produced so far and settle the row as aborted.
+								const partial = results[index];
+								Object.assign(partial, { stopReason: "aborted", errorMessage: partial.errorMessage ?? "Subagent was aborted", startedAt: cardRun.startedAt, endedAt: Date.now(), ...trail() });
+								break;
+							}
+							const r = results[index];
+							Object.assign(r, { startedAt: cardRun.startedAt, endedAt: Date.now(), ...trail() });
+							if (!failed(r) || !attempt.model) break;
+							const category = classifyFailure(r.stopReason ?? "error", r.errorMessage || r.stderr);
+							if (!category) break;
+							fallbackState().cooldowns.cool(attempt.model, Date.now() + cooldownMs(category));
+							failedModels.push(`${attempt.model} (${category})`);
+							const next = chain[step + 1];
+							if (!next?.model) break;
+							pi.appendEntry("brigadev-fallback", { agent: agent!.name, from: attempt.model, to: next.model, category });
+							if (ctx.hasUI) {
+								ctx.ui.notify(`brigadev: ${agent!.name} hit ${category} on ${attempt.model} → retrying on ${next.model}${priceNote(listPrice(ctx, attempt.model), listPrice(ctx, next.model))}`, "warning");
+							}
+						}
+						if (failedModels.length) results[index].fallbacks = failedModels;
+					} finally {
+						results[index].endedAt ??= Date.now();
+						syncCard(results[index]);
+						cardRun.state = failed(results[index]) || results[index].exitCode === -1 ? "failed" : "done";
+						cardRun.endedAt = Date.now();
+						liveResults.delete(cardRun.id);
+						showCard(ctx);
+						setRunning(ctx, -1);
+						removeWriter(writers[index]);
+					}
+					emit();
+				};
 
-			const details: Details = { mode, results };
-			const treeAfter = treeBefore ? await takeSnapshot(exec, canonicalPath(ctx.cwd)) : undefined;
-			if (treeBefore && treeAfter) {
-				details.outsideSurfaces = outsideSurfaces(diffSnapshots(treeBefore, treeAfter), writerSurfaces);
-				if (details.outsideSurfaces.length > 0) warnings.push(`files changed outside the writers' allowed edit surfaces: ${details.outsideSurfaces.join(", ")}`);
-			}
-			const warningText = warnings.length ? `\n\nWarnings: ${warnings.join("; ")}` : "";
-			if (mode === "single") {
-				const r = results[0];
-				return { content: [{ type: "text", text: (failed(r) ? `Agent ${r.stopReason ?? "failed"}: ` : "") + output(r) + warningText }], details, isError: failed(r) };
-			}
-			const ok = results.filter((r) => !failed(r)).length;
-			const sections = results.map((r) => `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${sectionOutput(r)}`);
-			return { content: [{ type: "text", text: `Parallel: ${ok}/${results.length} succeeded\n\n${sections.join("\n\n---\n\n")}${warningText}` }], details };
+				try {
+					const treeBefore = watchTree ? await takeSnapshot(exec, canonicalPath(ctx.cwd)) : undefined;
+					signal?.addEventListener("abort", settleCancelled, { once: true });
+					// Every task waits for a slot of the process-wide cap; one aborted while waiting never starts.
+					const pool = Promise.all(
+						resolved.map(async (item, index) => {
+							let release: () => void;
+							try {
+								release = await slots.acquire(signal);
+							} catch {
+								if (!hooks.tolerateAbort) throw new Error("Subagent was aborted");
+								return;
+							}
+							try {
+								await runTask(item, index);
+							} finally {
+								release();
+							}
+						}),
+					);
+					try {
+						await pool;
+					} finally {
+						signal?.removeEventListener("abort", settleCancelled);
+						settleQueued(results, Date.now());
+					}
+
+					const details: Details = { mode, results };
+					const treeAfter = treeBefore ? await takeSnapshot(exec, canonicalPath(ctx.cwd)) : undefined;
+					if (treeBefore && treeAfter) {
+						details.outsideSurfaces = outsideSurfaces(diffSnapshots(treeBefore, treeAfter), writerSurfaces);
+						if (details.outsideSurfaces.length > 0) warnings.push(`files changed outside the writers' allowed edit surfaces: ${details.outsideSurfaces.join(", ")}`);
+					}
+					return { details, warnings };
+				} finally {
+					writers.forEach(removeWriter);
+				}
+			};
+
+			// The content the model reads: the same text for a sync call and for `subagent_wait`.
+			const toResult = ({ details, warnings }: Launched): LaunchResult => {
+				const warningText = warnings.length ? `\n\nWarnings: ${warnings.join("; ")}` : "";
+				if (mode === "single") {
+					const r = details.results[0];
+					return { content: [{ type: "text", text: (failed(r) ? `Agent ${r.stopReason ?? "failed"}: ` : "") + output(r) + warningText }], details, isError: failed(r) };
+				}
+				const ok = details.results.filter((r) => !failed(r)).length;
+				const sections = details.results.map((r) => `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${sectionOutput(r)}`);
+				return { content: [{ type: "text", text: `Parallel: ${ok}/${details.results.length} succeeded\n\n${sections.join("\n\n---\n\n")}${warningText}` }], details };
+			};
+
+			if (!params.async) return toResult(await launch(signal, { onUpdate, tolerateAbort: false }));
+
+			// Async: the launch runs under the registry's own AbortController (the tool call's signal ends with the call).
+			// Admission errors were already returned above, before anything started.
+			const id = registry.start({ total: results.length, run: async (runSignal, control) => toResult(await launch(runSignal, { onProgress: control.progress, tolerateAbort: true })) });
+			const names = [...new Set(requests.map((r) => r.agent))].join(", ");
+			return {
+				content: [{ type: "text", text: `Started async launch ${id} (${results.length} task${results.length === 1 ? "" : "s"}: ${names}). Collect it with subagent_wait {"runId":"${id}"}; stop it with subagent_cancel.` }],
+				details: { mode, results: results.map((r) => ({ ...r })), launchId: id, pending: true } as Details,
+			};
 		},
 
 		renderCall(args, theme) {
 			const launches = args.tasks?.length ? args.tasks : [{ agent: args.agent ?? "...", task: args.task ?? "", reason: args.reason ?? "" }];
-			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", launches.length > 1 ? `parallel (${launches.length})` : launches[0].agent);
+			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", launches.length > 1 ? `parallel (${launches.length})` : launches[0].agent) + (args.async ? theme.fg("muted", " async") : "");
 			for (const l of launches.slice(0, 4)) {
 				const preview = l.task.length > 60 ? `${l.task.slice(0, 60)}…` : l.task;
 				text += `\n  ${launches.length > 1 ? `${theme.fg("accent", l.agent)} ` : ""}${theme.fg("dim", preview)}`;
@@ -667,7 +760,8 @@ export default function (pi: ExtensionAPI) {
 
 		renderResult(result, { expanded }, theme, context) {
 			const details = result.details as Details | undefined;
-			if (!details?.results.length) {
+			// An async launch's immediate return shows its text (launch id, how to collect), not rows that would never update.
+			if (!details?.results.length || details.pending) {
 				const first = result.content[0];
 				return new Text(first?.type === "text" ? first.text : "(no output)", 0, 0);
 			}
@@ -701,6 +795,39 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	/** What `subagent_wait` / `subagent_cancel` answer for each registry outcome. */
+	const collected = (id: string, outcome: WaitOutcome<LaunchResult>, waitedSeconds?: number): LaunchResult => {
+		const text = (t: string, isError?: boolean): LaunchResult => ({ content: [{ type: "text", text: t }], details: { mode: "single", results: [], launchId: id, pending: true }, ...(isError ? { isError } : {}) });
+		if (outcome.status === "unknown") return text(`Unknown launch id "${id}" (not started in this session, or pruned).`, true);
+		if (outcome.status === "running") {
+			const { done, total } = outcome.launch;
+			return text(`Launch ${id} still running: ${done}/${total} done${waitedSeconds === undefined ? "" : ` after ${waitedSeconds}s`}. Call subagent_wait again, or subagent_cancel.`);
+		}
+		if (outcome.error !== undefined || !outcome.result) return text(`Launch ${id} failed: ${outcome.error ?? "no result"}`, true);
+		return { ...outcome.result, details: { ...outcome.result.details, launchId: id } };
+	};
+
+	pi.registerTool({
+		name: "subagent_wait",
+		label: "Subagent wait",
+		description: `Wait for an async subagent launch (default ${WAIT_DEFAULT_SECONDS}s, max ${WAIT_MAX_SECONDS}s). Returns its result, or its progress if still running.`,
+		parameters: WaitParams,
+		async execute(_id, params, signal) {
+			const seconds = Math.min(WAIT_MAX_SECONDS, Math.max(1, params.timeoutSeconds ?? WAIT_DEFAULT_SECONDS));
+			return collected(params.runId, await registry.wait(params.runId, seconds * 1000, signal), seconds);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_cancel",
+		label: "Subagent cancel",
+		description: "Cancel an async subagent launch; returns the partial results.",
+		parameters: CancelParams,
+		async execute(_id, params) {
+			return collected(params.runId, await registry.cancel(params.runId));
+		},
+	});
+
 	interface ViewerRun {
 		result: RunResult;
 		state: "running" | "done" | "failed";
@@ -712,8 +839,10 @@ export default function (pi: ExtensionAPI) {
 	const viewerRuns = (ctx: ExtensionContext): ViewerRun[] => {
 		const finished: ViewerRun[] = [];
 		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type !== "message" || entry.message.role !== "toolResult" || entry.message.toolName !== "subagent") continue;
+			if (entry.type !== "message" || entry.message.role !== "toolResult" || !VIEWER_TOOLS.has(entry.message.toolName)) continue;
 			const details = entry.message.details as Details | undefined;
+			// An async launch's immediate return (and a timed-out wait) holds placeholders, not final results.
+			if (details?.pending) continue;
 			const at = Date.parse(entry.timestamp);
 			for (const result of details?.results ?? []) finished.push({ result, state: failed(result) ? "failed" : "done", startedAt: at });
 		}
