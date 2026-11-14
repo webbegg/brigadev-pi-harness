@@ -124,6 +124,9 @@ export function createSubagentRegistry<R>(deps: RegistryDeps): SubagentRegistry<
 				emit({ type: "settle", launch: snapshot(entry), ...(error === undefined ? { result } : {}) });
 				prune();
 			};
+			// `start` goes out before the body runs, so a body that reports progress (or settles) synchronously
+			// is still observed in order. The body itself is invoked synchronously, right here: writer admission relies on it.
+			emit({ type: "start", launch: snapshot(entry) });
 			entry.settled = new Promise<void>((resolve) => {
 				const body = new Promise<R>((res) => res(run(controller.signal, { progress: (done, t) => registry.progress(id, done, t) })));
 				body.then(
@@ -131,7 +134,6 @@ export function createSubagentRegistry<R>(deps: RegistryDeps): SubagentRegistry<
 					(error) => (finish(undefined, error instanceof Error ? error.message : String(error)), resolve()),
 				);
 			});
-			emit({ type: "start", launch: snapshot(entry) });
 			return id;
 		},
 

@@ -7,32 +7,25 @@
  * allowed edit surfaces, and requirements travel by reference.
  */
 
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Message } from "@earendil-works/pi-ai";
 import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { agentsCard, FINISHED_TTL_MS, formatElapsed, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
 import { threadRows } from "../lib/agent-thread.ts";
-import { queuedFields, runState, settleQueued, subagentRow, syncRowTimer, type RowInput, type RowTimerState } from "../lib/subagent-row.ts";
+import { queuedFields, runState, subagentRow, syncRowTimer, type RowInput, type RowTimerState } from "../lib/subagent-row.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { listWidth, maxScroll, renderTwoPane, type Row } from "../lib/two-pane.ts";
-import type { AgentDefinition } from "../lib/agents.ts";
-import { emptyTally, formatCost, formatTokens, priceBridgeMessage, type CostCalculator, type Tally } from "../lib/cost.ts";
-import { foldChildEvent, parseChildLine } from "../lib/child-events.ts";
-import { childLaunch } from "../lib/child-launch.ts";
-import { newRunId, writeRunArtifacts } from "../lib/run-artifacts.ts";
+import { emptyTally, formatCost, formatTokens } from "../lib/cost.ts";
+import { failed, output, runChild, type RunResult } from "../lib/child-run.ts";
+import { newRunId } from "../lib/run-artifacts.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
+import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
 import { createSubagentRegistry, type WaitOutcome } from "../lib/subagent-registry.ts";
-import { repoDocsDir } from "../lib/repo-docs.ts";
-import { createStallWatchdog, resolveStallTimeouts, stallMessage } from "../lib/stall-watchdog.ts";
-import { admitLaunch, buildChildTask, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
-import { classifyFailure, cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
+import { admitLaunch, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
+import { cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
 import { blockedReason, fallbackState } from "../lib/fallback-state.ts";
 import { resolveAgentRoute, resolveModelRef, routeFor, type ResolvedRoute } from "../lib/model-routing.ts";
 import { costCalculator, currentModelRef, listPrice, loadAgents, modelCatalog } from "../lib/pi-adapters.ts";
@@ -40,14 +33,13 @@ import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
 import { panelState } from "../lib/panel-state.ts";
 import { canonicalPath } from "../lib/paths.ts";
 import { isChildSession } from "../lib/runtime.ts";
-import { checkStructuredRun, formatStructured, loadOutputSchema, type JsonSchema } from "../lib/structured-output.ts";
-import { diffSnapshots, outsideSurfaces, takeSnapshot } from "../lib/worktree-snapshot.ts";
+import { loadOutputSchema } from "../lib/structured-output.ts";
+import { takeSnapshot } from "../lib/worktree-snapshot.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const WAIT_DEFAULT_SECONDS = 60;
 const WAIT_MAX_SECONDS = 300;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
 const STATUS_KEY = "brigadev-agents";
 const CARD_KEY = "brigadev-agents-card";
 const CARD_COLLAPSE_KEY = "ctrl+shift+a";
@@ -55,262 +47,11 @@ const VIEWER_KEY = "alt+a";
 /** Tool results that carry finished runs: a sync call, or an async launch collected by wait/cancel. */
 const VIEWER_TOOLS = new Set(["subagent", "subagent_wait", "subagent_cancel"]);
 
-interface RunResult {
-	agent: string;
-	task: string;
-	exitCode: number; // -1 while running
-	messages: Message[];
-	stderr: string;
-	usage: Tally;
-	model?: string;
-	thinking?: string;
-	/** Where the model came from: "profile:<name>/<key>", "definition", or "parent". */
-	route?: string;
-	/** True when the model came from the parent session (resolved route source), for the row's `↑`. */
-	inherited?: boolean;
-	/** Placeholder of a task that is waiting for a concurrency slot. */
-	queued?: boolean;
-	/** Settled without ever starting (aborted while queued). */
-	cancelled?: boolean;
-	/** Models that failed before this one, with the failure category. */
-	fallbacks?: string[];
-	/** Epoch ms when the run was launched (first attempt); drives the row's elapsed time. */
-	startedAt?: number;
-	/** Epoch ms when the run settled; set for aborted placeholders too. */
-	endedAt?: number;
-	stopReason?: string;
-	errorMessage?: string;
-	/** Validated structured_output payload, for agents that declare an output schema. */
-	structured?: unknown;
-	/** Id of this child attempt; names its saved folder (lib/run-artifacts.ts). */
-	runId?: string;
-	/** Folder holding task.md, transcript.json, and result.json for this attempt. */
-	artifactsDir?: string;
-}
-
-interface Details {
-	mode: "single" | "parallel";
-	results: RunResult[];
-	/** Files the batch changed outside every writer's surfaces (set when writers ran in a git repo). */
-	outsideSurfaces?: string[];
-	/** Async launch id (subagent_wait / subagent_cancel collect it). */
-	launchId?: string;
-	/** True on the immediate async return and on a wait that timed out: the results are not final. */
-	pending?: boolean;
-}
-
-/** A finished launch as the tool returns it; the registry keeps it for `subagent_wait`. */
-interface LaunchResult {
-	content: Array<{ type: "text"; text: string }>;
-	details: Details;
-	isError?: boolean;
-}
-
-interface Launched {
-	details: Details;
-	warnings: string[];
-}
-
-interface LaunchHooks {
-	/** Streams partial results to the tool call (sync mode). */
-	onUpdate?: (result: AgentToolResult<Details>) => void;
-	/** Reports `done/total` to the registry (async mode). */
-	onProgress?: (done: number, total: number) => void;
-	/** Async launches settle with partial results when aborted; sync ones throw as they always did. */
-	tolerateAbort: boolean;
-}
-
-
-function finalText(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role !== "assistant") continue;
-		for (const part of msg.content) if (part.type === "text") return part.text;
-	}
-	return "";
-}
-
-const failed = (r: RunResult) => r.exitCode > 0 || r.stopReason === "error" || r.stopReason === "aborted";
-const output = (r: RunResult) =>
-	(failed(r) ? r.errorMessage || r.stderr.trim() || finalText(r.messages) : r.structured !== undefined ? formatStructured(r.structured) : finalText(r.messages)) || "(no output)";
-
-/** One parallel section's body: a structured result is never cut (compact JSON above the cap); prose is capped. */
-const sectionOutput = (r: RunResult): string => (!failed(r) && r.structured !== undefined ? formatStructured(r.structured, PER_TASK_OUTPUT_CAP) : capOutput(output(r)));
-
-function capOutput(text: string): string {
-	if (Buffer.byteLength(text, "utf8") <= PER_TASK_OUTPUT_CAP) return text;
-	let cut = text.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(cut, "utf8") > PER_TASK_OUTPUT_CAP) cut = cut.slice(0, -1);
-	return `${cut}\n\n[Output truncated. Full output is in the tool details.]`;
-}
-
 function piInvocation(args: string[]): { command: string; args: string[] } {
 	const script = process.argv[1];
 	if (script && !script.startsWith("/$bunfs/root/") && fs.existsSync(script)) return { command: process.execPath, args: [script, ...args] };
 	const exec = path.basename(process.execPath).toLowerCase();
 	return /^(node|bun)(\.exe)?$/.test(exec) ? { command: "pi", args } : { command: process.execPath, args };
-}
-
-interface RunOptions {
-	cwd: string;
-	agent: AgentDefinition;
-	request: LaunchRequest;
-	taskText: string;
-	route: ResolvedRoute;
-	routeLabel: string;
-	/** The agent's output schema, loaded and checked before launch. */
-	schema?: JsonSchema;
-	price: CostCalculator;
-	signal?: AbortSignal;
-	onUpdate: (result: RunResult) => void;
-}
-
-async function runAgent(options: RunOptions): Promise<RunResult> {
-	const { agent, request } = options;
-	const result: RunResult = { agent: agent.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), runId: newRunId(agent.name) };
-
-	const structured = Boolean(options.schema && agent.outputSchema);
-	const { model, thinking } = options.route;
-	Object.assign(result, { model, thinking, route: options.routeLabel, inherited: options.route.modelSource === "parent" });
-
-	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "brigadev-agent-"));
-	try {
-		let systemPromptPath: string | undefined;
-		if (agent.systemPrompt.trim()) {
-			systemPromptPath = path.join(tmpDir, "system.md");
-			await fs.promises.writeFile(systemPromptPath, agent.systemPrompt, { encoding: "utf8", mode: 0o600 });
-		}
-
-		// One spelling of the working directory: an inherited PWD that differs
-		// from the real cwd (macOS /tmp -> /private/tmp, a symlinked checkout)
-		// shows the child two directories, and it then runs every lookup twice.
-		const cwd = canonicalPath(options.cwd);
-		// Argv, env and stdio for every child come from one pure function (lib/child-launch.ts).
-		const { args, env, stdio } = childLaunch({
-			agent,
-			allowedEditSurfaces: request.allowedEditSurfaces,
-			route: options.route,
-			structured,
-			cwd,
-			taskText: options.taskText,
-			systemPromptPath,
-			parentEnv: process.env,
-		});
-
-		let aborted = false;
-		let stalled = false;
-		result.exitCode = await new Promise<number>((resolveExit) => {
-			const invocation = piInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, { cwd, env, shell: false, stdio });
-			let buffer = "";
-			let exited = false;
-			let stallError = "";
-			let killTimer: NodeJS.Timeout | undefined;
-
-			// SIGTERM now, SIGKILL after 5 s if the child has not exited by then.
-			const terminate = () => {
-				proc.kill("SIGTERM");
-				killTimer ??= setTimeout(() => !exited && proc.kill("SIGKILL"), 5000);
-			};
-
-			const watchdog = createStallWatchdog({
-				...resolveStallTimeouts(process.env),
-				setTimer: (fn, ms) => setTimeout(fn, ms),
-				clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
-				onStall: (info) => {
-					stalled = true;
-					result.stopReason = "error";
-					stallError = stallMessage(info);
-					result.errorMessage = stallError;
-					terminate();
-				},
-			});
-			watchdog.start();
-
-			const processLine = (line: string) => {
-				for (const event of parseChildLine(line)) {
-					if (event.type === "tool_start") watchdog.toolStarted(event.id, `tool ${event.name}`);
-					else if (event.type === "tool_end") watchdog.toolFinished(event.id, `result of ${event.name}`);
-					else if (event.type === "activity") watchdog.activity(event.label);
-					// Bridge turns report $0; price them at list price (see lib/cost.ts).
-					else event.message = (priceBridgeMessage(event.message, options.price) ?? event.message) as Message;
-					if (foldChildEvent(result, event)) options.onUpdate(result);
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() ?? "";
-				for (const line of lines) processLine(line);
-			});
-			proc.stderr.on("data", (data) => {
-				result.stderr += data.toString();
-			});
-			proc.on("close", (code) => {
-				exited = true;
-				watchdog.stop();
-				clearTimeout(killTimer);
-				if (buffer.trim()) processLine(buffer);
-				// The child may report its own "aborted" on SIGTERM; the stall is the real cause.
-				if (stalled) Object.assign(result, { stopReason: "error", errorMessage: stallError });
-				resolveExit(stalled ? 1 : (code ?? 0));
-			});
-			proc.on("error", (error) => {
-				exited = true;
-				watchdog.stop();
-				clearTimeout(killTimer);
-				result.stderr += String(error);
-				resolveExit(1);
-			});
-
-			if (options.signal) {
-				const kill = () => {
-					aborted = true;
-					terminate();
-				};
-				if (options.signal.aborted) kill();
-				else options.signal.addEventListener("abort", kill, { once: true });
-			}
-		});
-		if (aborted) throw new Error("Subagent was aborted");
-		if (structured && !failed(result)) {
-			const check = checkStructuredRun(result.messages, options.schema!);
-			if (check.ok) result.structured = check.value;
-			else Object.assign(result, { stopReason: "error", errorMessage: check.error });
-		}
-		return result;
-	} finally {
-		saveArtifacts(options, result);
-		await fs.promises.rm(tmpDir, { recursive: true, force: true });
-	}
-}
-
-/** Saves the attempt's folder under the repo docs; a failed write never fails the run. */
-function saveArtifacts(options: RunOptions, result: RunResult): void {
-	if (!result.runId) return;
-	try {
-		result.artifactsDir = writeRunArtifacts(repoDocsDir(options.cwd), {
-			runId: result.runId,
-			agent: result.agent,
-			task: result.task,
-			reason: options.request.reason,
-			taskText: options.taskText,
-			model: result.model,
-			thinking: result.thinking,
-			route: result.route,
-			exitCode: result.exitCode,
-			stopReason: result.stopReason,
-			errorMessage: result.errorMessage,
-			startedAt: result.startedAt,
-			endedAt: result.endedAt ?? Date.now(),
-			usage: result.usage,
-			output: output(result),
-			messages: result.messages,
-		});
-	} catch {
-		// Artifacts are a record for the user, not part of the run's outcome.
-	}
 }
 
 // Field descriptions live on the top-level fields only; parallel items reuse
@@ -555,191 +296,88 @@ export default function (pi: ExtensionAPI) {
 				...(routes[i] ? queuedFields(routes[i]!, routeLabel(routes[i]!, profile.name)) : { queued: true }),
 			}));
 			// The launch body, shared by both modes: validation is done, so everything from here on runs the children.
-			const launch = async (signal: AbortSignal | undefined, hooks: LaunchHooks): Promise<Launched> => {
-				const emit = () => {
-					const done = results.filter((r) => r.exitCode !== -1).length;
-					hooks.onProgress?.(done, results.length);
-					hooks.onUpdate?.({
-						content: [{ type: "text", text: mode === "parallel" ? `${done}/${results.length} done` : finalText(results[0].messages) || "(running...)" }],
-						details: { mode, results: [...results] },
-					} as AgentToolResult<Details>);
-				};
-
+			const tasks: LaunchTask[] = resolved.map(({ request, agent }, i) => ({ request, agent: agent!, route: routes[i]!, routeLabel: routeLabel(routes[i]!, profile.name) }));
+			const launch = (signal: AbortSignal | undefined, hooks: LaunchHooks) => {
 				const price = costCalculator(ctx);
-				const warnings: string[] = [];
-
-				// Writers are registered before the first await, so a launch admitted right after this one
-				// already sees their surfaces, even while they wait for a concurrency slot.
-				const writers: Array<ActiveWriter | undefined> = resolved.map(({ request, agent }) => (agent?.writer ? { id: randomUUID().slice(0, 8), agent: agent.name, surfaces: request.allowedEditSurfaces ?? [] } : undefined));
-				activeWriters.push(...writers.filter((w): w is ActiveWriter => w !== undefined));
-				const removeWriter = (writer: ActiveWriter | undefined) => {
-					const at = writer ? activeWriters.indexOf(writer) : -1;
-					if (at >= 0) activeWriters.splice(at, 1);
-				};
-
-				// A placeholder that never started (aborted while queued) settles as cancelled instead of staying "running".
-				const settleCancelled = () => {
-					if (settleQueued(results, Date.now()) > 0) emit();
-				};
-
-				// Backstop for writers: the parent is idle during a sync call (an async launch cannot promise that,
-				// so it may also report the parent's own edits), so any change outside the union of the writers'
-				// surfaces is attributed to a child.
-				const writerSurfaces = resolved.flatMap(({ request, agent }) => (agent?.writer ? (request.allowedEditSurfaces ?? []) : []));
-				const watchTree = resolved.some(({ agent }) => agent?.writer);
 				const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);
 
-				const runTask = async ({ request, agent }: (typeof resolved)[number], index: number) => {
-					const { text, missingSkills } = buildChildTask(request, agent!, skills);
-					if (missingSkills.length) warnings.push(`${agent!.name}: unknown skills ${missingSkills.join(", ")}`);
-					setRunning(ctx, 1);
-					const cardRun: AgentRun = {
-						id: randomUUID().slice(0, 8),
-						agent: agent!.name,
-						task: request.task.split("\n")[0],
-						state: "running",
-						model: routes[index]!.model,
-						thinking: routes[index]!.thinking,
-						tokens: 0,
-						cost: 0,
-						startedAt: Date.now(),
-					};
-					runs.push(cardRun);
-					showCard(ctx);
-					liveResults.set(cardRun.id, results[index]);
-					const syncCard = (r: RunResult) => {
-						cardRun.tokens = r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output;
-						cardRun.cost = r.usage.cost;
-						if (r.model) cardRun.model = r.model;
-					};
-					// Fallback chain: the primary, then the profile's fallbacks, with cooling
-					// or out-of-quota models moved behind usable ones.
-					const route = routes[index]!;
-					const chain = route.model
-						? launchOrder({ model: route.model, thinking: route.thinking }, routeFor(profile.profile, agent!.name)?.entry.fallbacks ?? [], (m) => blockedReason(m, Date.now()) !== undefined)
-						: [{ model: route.model, thinking: route.thinking }];
-					const failedModels: string[] = [];
-					try {
-						for (let step = 0; step < chain.length; step++) {
-							const attempt = chain[step];
-							const stepRoute: ResolvedRoute = { ...route, model: attempt.model, thinking: attempt.thinking ?? route.thinking };
-							Object.assign(cardRun, { model: stepRoute.model, thinking: stepRoute.thinking });
-							const label = `${routeLabel(route, profile.name)}${attempt.model !== route.model ? " ↪ fallback" : ""}`;
-							// Live row data from the first moment: the attempt's model and the trail so far.
-							const trail = () => (failedModels.length ? { fallbacks: [...failedModels] } : {});
-							results[index] = { agent: agent!.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), model: stepRoute.model, thinking: stepRoute.thinking, route: label, inherited: stepRoute.modelSource === "parent", startedAt: cardRun.startedAt, ...trail() };
-							liveResults.set(cardRun.id, results[index]);
-							emit();
-							try {
-								results[index] = await runAgent({
-									cwd: ctx.cwd,
-									agent: agent!,
-									request,
-									taskText: text,
-									route: stepRoute,
-									routeLabel: label,
-									schema: schemas[index],
-									price,
-									signal,
-									onUpdate: (partial) => {
-										Object.assign(partial, { startedAt: cardRun.startedAt, ...trail() });
-										results[index] = partial;
-										liveResults.set(cardRun.id, partial);
-										syncCard(partial);
-										emit();
-									},
-								});
-							} catch (error) {
-								if (!hooks.tolerateAbort || !signal?.aborted) throw error;
-								// Cancelled or shut down: keep what the child produced so far and settle the row as aborted.
-								const partial = results[index];
-								Object.assign(partial, { stopReason: "aborted", errorMessage: partial.errorMessage ?? "Subagent was aborted", startedAt: cardRun.startedAt, endedAt: Date.now(), ...trail() });
-								break;
-							}
-							const r = results[index];
-							Object.assign(r, { startedAt: cardRun.startedAt, endedAt: Date.now(), ...trail() });
-							if (!failed(r) || !attempt.model) break;
-							const category = classifyFailure(r.stopReason ?? "error", r.errorMessage || r.stderr);
-							if (!category) break;
-							fallbackState().cooldowns.cool(attempt.model, Date.now() + cooldownMs(category));
-							failedModels.push(`${attempt.model} (${category})`);
-							const next = chain[step + 1];
-							if (!next?.model) break;
-							pi.appendEntry("brigadev-fallback", { agent: agent!.name, from: attempt.model, to: next.model, category });
-							if (ctx.hasUI) {
-								ctx.ui.notify(`brigadev: ${agent!.name} hit ${category} on ${attempt.model} → retrying on ${next.model}${priceNote(listPrice(ctx, attempt.model), listPrice(ctx, next.model))}`, "warning");
-							}
-						}
-						if (failedModels.length) results[index].fallbacks = failedModels;
-					} finally {
-						results[index].endedAt ??= Date.now();
-						syncCard(results[index]);
-						cardRun.state = failed(results[index]) || results[index].exitCode === -1 ? "failed" : "done";
+				// Agents card rows, one per task that got a slot.
+				const cards = new Map<number, AgentRun>();
+				const syncCard = (cardRun: AgentRun, r: RunResult) => {
+					cardRun.tokens = r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output;
+					cardRun.cost = r.usage.cost;
+					if (r.model) cardRun.model = r.model;
+				};
+				const view: TaskView = {
+					start(index, info) {
+						setRunning(ctx, 1);
+						const cardRun: AgentRun = { id: randomUUID().slice(0, 8), agent: info.agent, task: info.task, state: "running", model: info.model, thinking: info.thinking, tokens: 0, cost: 0, startedAt: info.startedAt };
+						cards.set(index, cardRun);
+						runs.push(cardRun);
+						showCard(ctx);
+						liveResults.set(cardRun.id, results[index]);
+					},
+					attempt(index, result) {
+						const cardRun = cards.get(index)!;
+						Object.assign(cardRun, { model: result.model, thinking: result.thinking });
+						liveResults.set(cardRun.id, result);
+					},
+					update(index, partial) {
+						const cardRun = cards.get(index)!;
+						liveResults.set(cardRun.id, partial);
+						syncCard(cardRun, partial);
+					},
+					finish(index, result) {
+						const cardRun = cards.get(index)!;
+						syncCard(cardRun, result);
+						cardRun.state = failed(result) || result.exitCode === -1 ? "failed" : "done";
 						cardRun.endedAt = Date.now();
 						liveResults.delete(cardRun.id);
 						showCard(ctx);
 						setRunning(ctx, -1);
-						removeWriter(writers[index]);
-					}
-					emit();
+					},
 				};
 
-				try {
-					const treeBefore = watchTree ? await takeSnapshot(exec, canonicalPath(ctx.cwd)) : undefined;
-					signal?.addEventListener("abort", settleCancelled, { once: true });
-					// Every task waits for a slot of the process-wide cap; one aborted while waiting never starts.
-					const pool = Promise.all(
-						resolved.map(async (item, index) => {
-							let release: () => void;
-							try {
-								release = await slots.acquire(signal);
-							} catch {
-								if (!hooks.tolerateAbort) throw new Error("Subagent was aborted");
-								return;
-							}
-							try {
-								await runTask(item, index);
-							} finally {
-								release();
-							}
-						}),
-					);
-					try {
-						await pool;
-					} finally {
-						signal?.removeEventListener("abort", settleCancelled);
-						settleQueued(results, Date.now());
-					}
-
-					const details: Details = { mode, results };
-					const treeAfter = treeBefore ? await takeSnapshot(exec, canonicalPath(ctx.cwd)) : undefined;
-					if (treeBefore && treeAfter) {
-						details.outsideSurfaces = outsideSurfaces(diffSnapshots(treeBefore, treeAfter), writerSurfaces);
-						if (details.outsideSurfaces.length > 0) warnings.push(`files changed outside the writers' allowed edit surfaces: ${details.outsideSurfaces.join(", ")}`);
-					}
-					return { details, warnings };
-				} finally {
-					writers.forEach(removeWriter);
-				}
+				return runLaunch(
+					{ mode, tasks, results, signal, hooks },
+					{
+						slots,
+						runAgent: (call) =>
+							runChild(
+								{ cwd: ctx.cwd, agent: tasks[call.index].agent, request: tasks[call.index].request, taskText: call.taskText, route: call.route, routeLabel: call.routeLabel, schema: schemas[call.index], price, signal: call.signal, onUpdate: call.onUpdate },
+								{ piInvocation },
+							),
+						skills: () => skills,
+						// The primary, then the profile's fallbacks, with cooling or out-of-quota models moved behind usable ones.
+						chain: (index): FallbackStep[] => {
+							const { route, agent } = tasks[index];
+							return route.model
+								? launchOrder({ model: route.model, thinking: route.thinking }, routeFor(profile.profile, agent.name)?.entry.fallbacks ?? [], (m) => blockedReason(m, Date.now()) !== undefined)
+								: [{ model: route.model, thinking: route.thinking }];
+						},
+						coolModel: (model, category) => fallbackState().cooldowns.cool(model, Date.now() + cooldownMs(category)),
+						fallbackNotice: ({ agent, from, to, category }) => {
+							pi.appendEntry("brigadev-fallback", { agent, from, to, category });
+							if (ctx.hasUI) ctx.ui.notify(`brigadev: ${agent} hit ${category} on ${from} → retrying on ${to}${priceNote(listPrice(ctx, from), listPrice(ctx, to))}`, "warning");
+						},
+						writers: {
+							add: (writers) => void activeWriters.push(...writers),
+							remove: (writer) => {
+								const at = activeWriters.indexOf(writer);
+								if (at >= 0) activeWriters.splice(at, 1);
+							},
+						},
+						view,
+						snapshot: () => takeSnapshot(exec, canonicalPath(ctx.cwd)),
+					},
+				);
 			};
 
-			// The content the model reads: the same text for a sync call and for `subagent_wait`.
-			const toResult = ({ details, warnings }: Launched): LaunchResult => {
-				const warningText = warnings.length ? `\n\nWarnings: ${warnings.join("; ")}` : "";
-				if (mode === "single") {
-					const r = details.results[0];
-					return { content: [{ type: "text", text: (failed(r) ? `Agent ${r.stopReason ?? "failed"}: ` : "") + output(r) + warningText }], details, isError: failed(r) };
-				}
-				const ok = details.results.filter((r) => !failed(r)).length;
-				const sections = details.results.map((r) => `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${sectionOutput(r)}`);
-				return { content: [{ type: "text", text: `Parallel: ${ok}/${details.results.length} succeeded\n\n${sections.join("\n\n---\n\n")}${warningText}` }], details };
-			};
-
-			if (!params.async) return toResult(await launch(signal, { onUpdate, tolerateAbort: false }));
+			if (!params.async) return toResult(mode, await launch(signal, { onUpdate: onUpdate as LaunchHooks["onUpdate"], tolerateAbort: false }));
 
 			// Async: the launch runs under the registry's own AbortController (the tool call's signal ends with the call).
 			// Admission errors were already returned above, before anything started.
-			const id = registry.start({ total: results.length, run: async (runSignal, control) => toResult(await launch(runSignal, { onProgress: control.progress, tolerateAbort: true })) });
+			const id = registry.start({ total: results.length, run: async (runSignal, control) => toResult(mode, await launch(runSignal, { onProgress: control.progress, tolerateAbort: true })) });
 			const names = [...new Set(requests.map((r) => r.agent))].join(", ");
 			return {
 				content: [{ type: "text", text: `Started async launch ${id} (${results.length} task${results.length === 1 ? "" : "s"}: ${names}). Collect it with subagent_wait {"runId":"${id}"}; stop it with subagent_cancel.` }],
