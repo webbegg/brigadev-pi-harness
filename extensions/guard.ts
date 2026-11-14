@@ -6,13 +6,13 @@
  * Subagents load this file explicitly (`-e`), so it must work standalone.
  */
 
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
 import { appendEvidence, commitGateWithForce, evidenceFile, forceRecord, gateDialog, readEvidence, type ForceRecord } from "../lib/evidence.ts";
-import { decideBashCommand, decideFileAccess, type PathVerdict } from "../lib/guard-rules.ts";
+import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
@@ -73,12 +73,16 @@ export default function (pi: ExtensionAPI) {
 	/**
 	 * Evidence gate for `git commit` (parent only, every permission mode): blocks a commit with source
 	 * changes unless a passing test is recorded for the current tree. Only the user can force it.
-	 * Returns a block reason, or undefined to let the normal rules continue.
+	 * Returns a block reason, or a `settle` to call once the remaining rules let the commit run: the
+	 * user's force (one-shot or dialog) is spent and logged then, not when a later rule declines.
 	 */
-	const evidenceGate = async (command: string, ctx: ExtensionContext): Promise<string | undefined> => {
+	const evidenceGate = async (command: string, ctx: ExtensionContext): Promise<{ reason?: string; settle: () => void }> => {
+		const nothing = { settle: () => {} };
 		const commits = classifyCommand(command).filter((match) => match.commit);
-		if (commits.length === 0) return undefined;
-		const root = projectRoot(ctx);
+		if (commits.length === 0) return nothing;
+		// The whole repository, not the session folder: a session in a subdirectory commits files elsewhere too.
+		const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: projectRoot(ctx), timeout: 15_000 }).catch(() => undefined);
+		const root = top?.code === 0 && top.stdout.trim() ? canonicalPath(top.stdout.trim()) : projectRoot(ctx);
 		const tree = await worktreeTree(root);
 		const snapshot = tree === undefined ? undefined : await takeSnapshot(exec, root);
 		const branch = (await readBranchFacts(exec, ctx.cwd)).currentBranch;
@@ -99,20 +103,22 @@ export default function (pi: ExtensionAPI) {
 			records: readEvidence(file),
 			forcedTree,
 		});
-		if (consumedForce) {
-			forcedTree = undefined;
-			log("command");
+		if (decision.action === "allow") {
+			return consumedForce
+				? {
+						settle: () => {
+							forcedTree = undefined;
+							log("command");
+						},
+					}
+				: nothing;
 		}
-		if (decision.action === "allow") return undefined;
 
 		if (!isChild && ctx.hasUI) {
 			const dialog = gateDialog(decision.reason, command);
-			if (await ctx.ui.confirm(dialog.title, dialog.body)) {
-				log("dialog");
-				return undefined;
-			}
+			if (await ctx.ui.confirm(dialog.title, dialog.body)) return { settle: () => log("dialog") };
 		}
-		return decision.reason;
+		return { reason: decision.reason, settle: () => {} };
 	};
 
 	pi.on("session_start", async (_event, ctx) => restoreMode(ctx));
@@ -125,6 +131,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (isToolCallEventType("bash", event)) {
+			// Nobody forges a recorded test result: the evidence log is written only by the recorder. (Textual rule; reading stays allowed.)
+			if (event.input.command.includes("evidence") && bashWritesEvidence(event.input.command, [join(repoDocsDir(ctx.cwd), "evidence")])) return { block: true, reason: EVIDENCE_BLOCK };
 			const surfaces = writerSurfaces();
 			if (surfaces) {
 				const outside = writesOutsideSurfaces(event.input.command, ctx.cwd, projectRoot(ctx), surfaces);
@@ -138,14 +146,14 @@ export default function (pi: ExtensionAPI) {
 
 			const decision = await decideBashCommand({ command: event.input.command, mode, isChild, cwd: ctx.cwd, readFacts: (cwd) => readBranchFacts(exec, cwd) });
 			if (decision.action === "block") return { block: true, reason: decision.reason };
-			if (!isChild) {
-				const gated = await evidenceGate(event.input.command, ctx);
-				if (gated) return { block: true, reason: gated };
-			}
+			const gated = isChild ? undefined : await evidenceGate(event.input.command, ctx);
+			if (gated?.reason) return { block: true, reason: gated.reason };
 			if (decision.action === "confirm") {
 				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(event.input.command)}\n\nRun it?`);
 				if (!ok) return { block: true, reason: `User declined: ${decision.reason}` };
 			}
+			// Every rule allowed the commit: only now is the user's force spent and logged.
+			gated?.settle();
 
 			// The command will run: remember the tree so tool_result can see what it changed.
 			if (surfaces) {

@@ -31,13 +31,38 @@ describe("checkKind", () => {
 		assert.equal(checkKind("git status"), undefined);
 		assert.equal(checkKind("echo npm"), undefined);
 	});
+
+	it("reads the runner from the command word, never from an argument", () => {
+		for (const command of ["echo npm test", `grep -n "node --test" package.json`, "true # npm test", ": npm test", `echo "npm test"`, "cat vitest.config.ts", "git commit -m 'npm test'"]) {
+			assert.equal(checkKind(command), undefined, command);
+		}
+	});
+
+	it("sees the runner behind assignments, runners, a negation, and a path", () => {
+		for (const command of ["CI=1 npm test", "npx vitest run", "pnpm exec jest", "yarn vitest", "yarn test", "./node_modules/.bin/mocha", "! npm test", "npm run build && npm test", "git diff | cat && pytest", "./gradlew test", "python -m pytest"]) {
+			assert.equal(checkKind(command), "test", command);
+		}
+		assert.equal(checkKind("npx tsc --noEmit"), "check");
+		assert.equal(checkKind("npm run lint && cargo build"), "check");
+	});
+
+	it("ignores a runner name inside quoted text with separators", () => {
+		assert.equal(checkKind(`echo "a; npm test | cat"`), undefined);
+	});
 });
 
 describe("checkOutcome", () => {
+	const inRepo = { cwd: "/work/repo", topLevel: "/work/repo", home: "/home/u" };
+
 	it("passes only when the exit code belongs to the check", () => {
 		assert.equal(checkOutcome("npm test", 0), "pass");
 		assert.equal(checkOutcome("npm test", 1), "fail");
-		assert.equal(checkOutcome("cd x && npm test && echo ok", 0), "pass");
+		assert.equal(checkOutcome("cd x && npm test && echo ok", 0, inRepo), "pass");
+		assert.equal(checkOutcome("CI=1 npm test 2>&1", 0), "pass");
+		assert.equal(checkOutcome("npm run build && npm test", 0), "pass");
+		assert.equal(checkOutcome("set -euo pipefail; npm test | tail -5", 0), "pass");
+		assert.equal(checkOutcome("set -eo pipefail; npm test | tail -5", 1), "fail");
+		assert.equal(checkOutcome(`npm test -- --grep "a;b|c"`, 0), "pass");
 		assert.equal(checkOutcome("set -o pipefail; npm test 2>&1 | tail -5", 0), "pass");
 		assert.equal(checkOutcome("set -o pipefail; npm test 2>&1 | tail -5", 1), "fail");
 	});
@@ -49,6 +74,56 @@ describe("checkOutcome", () => {
 		assert.equal(checkOutcome("npm test &", 0), "unknown");
 		assert.equal(checkOutcome("npm test\necho done", 0), "unknown");
 		assert.equal(checkOutcome("npm test", undefined), "unknown");
+	});
+
+	it("is never a pass when the test does not own the exit code (verifier forms)", () => {
+		const forms = [
+			"echo npm test",
+			`grep -n "node --test" package.json`,
+			"true # npm test",
+			": npm test",
+			"! npm test",
+			"true || npm test",
+			"exit 0 && npm test",
+			"echo pipefail; npm test | cat",
+			"npm test # all",
+			"echo $(npm test)",
+			"echo `npm test`",
+			"(npm test)",
+			"(cd x && npm test)",
+			"true && (npm test)",
+			"return 0 && npm test",
+			"exec true && npm test",
+			"trap true EXIT && npm test",
+			"eval true && npm test",
+			"source ./x.sh && npm test",
+			". ./x.sh && npm test",
+			"npm test\ntrue",
+			"npm test &",
+			"true & npm test",
+			"npm test | cat",
+			"npm test 2>&1 | tail -5",
+			"set -o pipefail; true; npm test",
+			"set -o nounset; npm test",
+			"cat <<EOF\nnpm test\nEOF",
+		];
+		for (const command of forms) for (const code of [0, 1]) assert.equal(checkOutcome(command, code, inRepo), "unknown", `${command} (exit ${code})`);
+	});
+
+	it("keeps a quoted separator inside an argument from hiding the test", () => {
+		assert.equal(checkOutcome(`npm test -- -t "x|y; z"`, 0), "pass");
+		assert.equal(checkOutcome(`echo "a;b" && npm test`, 0), "pass");
+	});
+
+	it("trusts a cd before the test only when it stays inside the repository", () => {
+		assert.equal(checkOutcome("cd sub/dir && npm test", 0, inRepo), "pass");
+		assert.equal(checkOutcome("cd sub && cd .. && npm test", 0, inRepo), "pass");
+		assert.equal(checkOutcome("cd /work/repo/app && npm test", 0, inRepo), "pass");
+		assert.equal(checkOutcome("cd ~/app && npm test", 0, { ...inRepo, home: "/work/repo" }), "pass");
+		for (const command of ["cd .. && npm test", "cd /tmp && npm test", "cd ~ && npm test", "cd - && npm test", "cd $X && npm test", "cd sub/../../x && npm test", "cd a b && npm test", "popd && npm test"]) {
+			assert.equal(checkOutcome(command, 0, inRepo), "unknown", command);
+		}
+		assert.equal(checkOutcome("cd sub && npm test", 0), "unknown", "no directory context");
 	});
 
 	it("does not read || or a pipe before the check as owning the exit code", () => {
@@ -93,8 +168,8 @@ describe("records", () => {
 
 describe("isSourcePath", () => {
 	it("treats prose files as docs and everything else as source", () => {
-		for (const path of ["README.md", "docs/guide.mdx", "CHANGELOG.md", "notes.txt", "LICENSE", "NOTICE"]) assert.equal(isSourcePath(path), false, path);
-		for (const path of ["lib/a.ts", "package.json", "tests/a.test.ts", "assets/agents/x.schema.json", "Makefile"]) assert.equal(isSourcePath(path), true, path);
+		for (const path of ["README.md", "docs/guide.markdown", "CHANGELOG.md", "docs/a.rst", "docs/a.adoc", "LICENSE", "NOTICE", "COPYING", "AUTHORS", "sub/LICENSE"]) assert.equal(isSourcePath(path), false, path);
+		for (const path of ["lib/a.ts", "package.json", "tests/a.test.ts", "assets/agents/x.schema.json", "Makefile", "requirements.txt", "CMakeLists.txt", "docs/guide.mdx", "LICENSE.ts"]) assert.equal(isSourcePath(path), true, path);
 	});
 });
 
