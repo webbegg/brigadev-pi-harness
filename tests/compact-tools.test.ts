@@ -84,6 +84,21 @@ describe("compact rows: one line per tool when collapsed (S1, S7)", () => {
 		assert.deepEqual(text(compactRow(done("read", { path: "a.ts", offset: 10, limit: 20 }, { text: "a\nb" }))), ["✓ read a.ts:10-29 (2 lines)"]);
 	});
 
+	it("read: counts real lines, blank ones included, and not a single trailing newline (R3-001)", () => {
+		assert.deepEqual(text(compactRow(done("read", { path: "a.md" }, { text: "a\n\nb\n\n\nc" }))), ["✓ read a.md (6 lines)"]);
+		assert.deepEqual(text(compactRow(done("read", { path: "a.md" }, { text: "a\nb\n" }))), ["✓ read a.md (2 lines)"]);
+		assert.deepEqual(text(compactRow(done("read", { path: "a.md" }, { text: "a\n\n" }))), ["✓ read a.md (2 lines)"]);
+	});
+
+	it("read: a file that ends with a [...] block keeps it; only Pi's own notices are stripped (R3-001)", () => {
+		assert.deepEqual(text(compactRow(done("read", { path: "README.md" }, { text: "intro\n\n[link]" }))), ["✓ read README.md (3 lines)"]);
+		assert.deepEqual(text(compactRow(done("read", { path: "x.ini" }, { text: "a\n\n[section]" }))), ["✓ read x.ini (3 lines)"]);
+		assert.deepEqual(text(compactRow(done("read", { path: "a.ts" }, { text: "a\nb\n\n[Showing lines 1-2 of 10. Use offset=3 to continue.]" }))), ["✓ read a.ts (2 lines)"]);
+		assert.deepEqual(text(compactRow(done("read", { path: "a.ts" }, { text: "a\nb\n\n[Showing lines 1-2 of 10 (50KB limit). Use offset=3 to continue.]" }))), ["✓ read a.ts (2 lines)"]);
+		assert.deepEqual(text(compactRow(done("read", { path: "a.ts", limit: 2 }, { text: "a\nb\n\n[8 more lines in file. Use offset=3 to continue.]" }))), ["✓ read a.ts:1-2 (2 lines)"]);
+		assert.deepEqual(text(compactRow(done("read", { path: "a.ts" }, { text: "[Line 1 is 60KB, exceeds 50KB limit. Use bash: sed -n '1p' a.ts | head -c 51200]" }))), ["✓ read a.ts"]);
+	});
+
 	it("paths under cwd are shown relative", () => {
 		assert.deepEqual(text(compactRow(done("read", { path: "/repo/lib/a.ts" }, { text: "a", cwd: "/repo" }))), ["✓ read lib/a.ts (1 line)"]);
 	});
@@ -250,6 +265,8 @@ describe("compactToolResolver", () => {
 		const call = r.renderCall!(running.args, "t", running as never) as Comp;
 		assert.equal(timers.length, 1);
 		assert.equal(timers[0]!.stopped, false);
+		clock.now = 14_000;
+		call.lines!(); // the row is being drawn, so the timer keeps going
 		clock.now = 15_000;
 		timers[0]!.fn();
 		assert.equal(invalidated, 1);
@@ -278,6 +295,47 @@ describe("compactToolResolver", () => {
 		const settled = ctx({ isPartial: false, state });
 		r.renderResult!({ content: [{ type: "text", text: "ok" }] }, { expanded: true, isPartial: false }, "t", settled as never);
 		assert.equal(timers[0]!.stopped, true);
+	});
+
+	it("the timer stops itself once the row has not been drawn for 3s, and keeps ticking while it is drawn (R4-002)", () => {
+		const clock = { now: 0 };
+		const timers: Array<{ fn: () => void; stopped: boolean }> = [];
+		const r = compactToolResolver(fakeDeps(clock, timers))("bash", () => baseRenderers)!;
+		let invalidated = 0;
+		const running = ctx({ isPartial: true, invalidate: () => invalidated++ });
+		const call = r.renderCall!(running.args, "t", running as never) as Comp;
+		assert.equal(timers.length, 1);
+		clock.now = 1_000;
+		call.lines!(); // drawn
+		timers[0]!.fn();
+		clock.now = 2_000;
+		call.lines!();
+		timers[0]!.fn();
+		clock.now = 4_500; // 2.5s since the last draw: still alive
+		timers[0]!.fn();
+		assert.equal(timers[0]!.stopped, false);
+		assert.equal(invalidated, 3);
+		clock.now = 5_500; // 3.5s without a draw: orphaned
+		timers[0]!.fn();
+		assert.equal(timers[0]!.stopped, true);
+		assert.equal(invalidated, 3);
+	});
+
+	it("a row that is never drawn stops its timer, and a later render starts a fresh one (R4-002)", () => {
+		const clock = { now: 0 };
+		const timers: Array<{ fn: () => void; stopped: boolean }> = [];
+		const r = compactToolResolver(fakeDeps(clock, timers))("bash", () => baseRenderers)!;
+		const running = ctx({ isPartial: true });
+		r.renderCall!(running.args, "t", running as never);
+		for (const t of [1_000, 2_000, 3_000, 4_000]) {
+			clock.now = t;
+			timers[0]!.fn();
+		}
+		assert.equal(timers[0]!.stopped, true);
+		clock.now = 10_000;
+		r.renderCall!(running.args, "t", running as never);
+		assert.equal(timers.length, 2);
+		assert.equal(timers[1]!.stopped, false);
 	});
 
 	it("a replayed result without a start time or duration shows no timer", () => {

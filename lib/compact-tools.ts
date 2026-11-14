@@ -79,7 +79,7 @@ function pathOf(args: Record<string, unknown>, cwd: string | undefined): string 
 	return clip(rel, MAX_PATH);
 }
 
-/** Result text without Pi's trailing `[notice]` block (limits, truncation). */
+/** Result text without Pi's trailing `[notice]` block (limits, truncation). For grep/find/ls. */
 function body(text: string | undefined): string {
 	const trimmed = (text ?? "").replace(/\s+$/, "");
 	const at = trimmed.lastIndexOf("\n\n[");
@@ -87,6 +87,26 @@ function body(text: string | undefined): string {
 	return /^\[[^\n]*\]$/.test(trimmed) ? "" : trimmed;
 }
 
+// The notices core/tools/read.js appends (and nothing else): a file may itself end with a `[...]` block.
+const READ_NOTICES = [
+	/\n\n\[Showing lines \d+-\d+ of \d+(?: \([^()\n]*\))?\. Use offset=\d+ to continue\.\]$/,
+	/\n\n\[\d+ more lines in file\. Use offset=\d+ to continue\.\]$/,
+];
+const READ_FIRST_LINE_TOO_BIG = /^\[Line \d+ is [^\n]*, exceeds [^\n]* limit\. Use bash: [^\n]*\]$/;
+
+/** Read result text without Pi's own appended notices; whitespace and `[...]` blocks of the file stay. */
+function readBody(text: string | undefined): string {
+	const raw = text ?? "";
+	if (READ_FIRST_LINE_TOO_BIG.test(raw)) return "";
+	for (const notice of READ_NOTICES) if (notice.test(raw)) return raw.replace(notice, "");
+	return raw;
+}
+
+/** Real line count: blank lines count, one trailing newline does not. */
+const countLines = (text: string): number => (text === "" ? 0 : text.replace(/\n$/, "").split("\n").length);
+
+// Blank lines are skipped on purpose: grep/find/ls print one entry per line, so a blank line is
+// separator noise (the `[notice]` gap), never an entry or a match.
 const lineList = (text: string) => text.split("\n").filter((l) => l.trim() !== "");
 
 function lineRange(args: Record<string, unknown>): string {
@@ -193,7 +213,7 @@ function doneRow(input: RowInput, args: Record<string, unknown>): RowLine {
 		}
 		case "read": {
 			const truncation = record(record(input.details).truncation);
-			const shown = lineList(out).length;
+			const shown = countLines(readBody(input.text));
 			const lines =
 				truncation.truncated === true && typeof truncation.outputLines === "number" && typeof truncation.totalLines === "number"
 					? `${truncation.outputLines} of ${truncation.totalLines} lines`
@@ -256,6 +276,65 @@ export interface CompactDeps<C, T> {
 
 const STATE_KEY = "__brigadevCompact";
 
+/** A live timer stops itself once its row has not been drawn for this long. */
+export const DRAW_IDLE_MS = 3000;
+
+/** `setInterval` that never keeps the process alive; returns the stop function. */
+export const defaultEvery = (fn: () => void, ms: number) => {
+	const id = setInterval(fn, ms);
+	(id as { unref?: () => void }).unref?.();
+	return () => clearInterval(id);
+};
+
+export interface TickerDeps {
+	now?: () => number;
+	/** Calls `fn` every `ms` until the returned function is called. */
+	every?: (fn: () => void, ms: number) => () => void;
+}
+
+export interface DrawnTicker {
+	/** Start ticking (no-op when already ticking). The start counts as a draw. */
+	start(): void;
+	stop(): void;
+	/** Call from the component's render(): a detached row is never drawn, so it stops ticking. */
+	touch(): void;
+	readonly active: boolean;
+}
+
+/**
+ * A once-a-second tick that stops itself when nothing draws the row any more.
+ * Pi re-draws attached rows after `tick` invalidates them; a component dropped
+ * by a chat rebuild (/tree, fork, compaction) is never drawn again.
+ */
+export function drawnTicker(tick: () => void, deps: TickerDeps = {}, idleMs = DRAW_IDLE_MS): DrawnTicker {
+	const now = deps.now ?? Date.now;
+	const every = deps.every ?? defaultEvery;
+	let stopFn: (() => void) | undefined;
+	let lastDrawn = now();
+	const stop = () => {
+		const fn = stopFn;
+		stopFn = undefined;
+		fn?.();
+	};
+	return {
+		start() {
+			if (stopFn) return;
+			lastDrawn = now();
+			stopFn = every(() => {
+				if (now() - lastDrawn > idleMs) stop();
+				else tick();
+			}, 1000);
+		},
+		stop,
+		touch() {
+			lastDrawn = now();
+		},
+		get active() {
+			return stopFn !== undefined;
+		},
+	};
+}
+
 interface RowState {
 	args?: unknown;
 	cwd?: string;
@@ -266,16 +345,10 @@ interface RowState {
 	startedAt?: number;
 	endedAt?: number;
 	durationMs?: number;
-	stop?: () => void;
+	ticker?: DrawnTicker;
 	ownCall?: unknown;
 	ownResult?: unknown;
 }
-
-const defaultEvery = (fn: () => void, ms: number) => {
-	const id = setInterval(fn, ms);
-	(id as { unref?: () => void }).unref?.();
-	return () => clearInterval(id);
-};
 
 const resultText = (result: CompactResult | undefined) =>
 	(result?.content ?? []).filter((c) => c.type === "text").map((c) => c.text ?? "").join("\n");
@@ -291,7 +364,9 @@ export function compactToolResolver<C, T, R extends CompactRenderers<C, T> = Com
 
 	function stateOf(context: CompactContext): RowState {
 		const holder = (context.state ?? {}) as Record<string, RowState | undefined>;
-		return (holder[STATE_KEY] ??= { isError: false, settled: false });
+		const s = (holder[STATE_KEY] ??= { isError: false, settled: false });
+		s.ticker ??= drawnTicker(() => s.invalidate?.(), { now, every });
+		return s;
 	}
 
 	/** Record what the context shows and keep the one timer in step with it. */
@@ -306,15 +381,14 @@ export function compactToolResolver<C, T, R extends CompactRenderers<C, T> = Com
 		const running = context.isPartial && !context.isError;
 		if (running) {
 			s.settled = false;
-			if (s.startedAt !== undefined && !s.stop) s.stop = every(() => s.invalidate?.(), 1000);
+			if (s.startedAt !== undefined) s.ticker?.start();
 			return;
 		}
 		if (!s.settled) {
 			s.settled = true;
 			s.endedAt = now();
 		}
-		s.stop?.();
-		s.stop = undefined;
+		s.ticker?.stop();
 	}
 
 	function rowOf(s: RowState, tool: string): RowLine[] {
@@ -346,7 +420,10 @@ export function compactToolResolver<C, T, R extends CompactRenderers<C, T> = Com
 				const s = stateOf(context);
 				observe(s, context);
 				if (context.expanded && base?.renderCall) return base.renderCall(args, theme, scrub(s, context));
-				const component = context.expanded ? deps.empty() : deps.row(() => rowOf(s, toolName), theme);
+				const component = context.expanded ? deps.empty() : deps.row(() => {
+						s.ticker?.touch();
+						return rowOf(s, toolName);
+					}, theme);
 				s.ownCall = component;
 				return component;
 			},
