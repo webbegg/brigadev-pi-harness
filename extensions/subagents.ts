@@ -25,6 +25,8 @@ import { listWidth, maxScroll, renderTwoPane, type Row } from "../lib/two-pane.t
 import type { AgentDefinition } from "../lib/agents.ts";
 import { emptyTally, formatCost, formatTokens, priceBridgeMessage, type CostCalculator, type Tally } from "../lib/cost.ts";
 import { foldChildEvent, parseChildLine } from "../lib/child-events.ts";
+import { newRunId, writeRunArtifacts } from "../lib/run-artifacts.ts";
+import { repoDocsDir } from "../lib/repo-docs.ts";
 import { createStallWatchdog, resolveStallTimeouts, stallMessage } from "../lib/stall-watchdog.ts";
 import { admitLaunch, buildChildTask, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
 import { classifyFailure, cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
@@ -73,6 +75,10 @@ interface RunResult {
 	errorMessage?: string;
 	/** Validated structured_output payload, for agents that declare an output schema. */
 	structured?: unknown;
+	/** Id of this child attempt; names its saved folder (lib/run-artifacts.ts). */
+	runId?: string;
+	/** Folder holding task.md, transcript.json, and result.json for this attempt. */
+	artifactsDir?: string;
 }
 
 interface Details {
@@ -142,7 +148,7 @@ interface RunOptions {
 
 async function runAgent(options: RunOptions): Promise<RunResult> {
 	const { agent, request } = options;
-	const result: RunResult = { agent: agent.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally() };
+	const result: RunResult = { agent: agent.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), runId: newRunId(agent.name) };
 
 	const args = ["--mode", "json", "-p", "--no-session", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
 	const structured = Boolean(options.schema && agent.outputSchema);
@@ -263,7 +269,35 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 		}
 		return result;
 	} finally {
+		saveArtifacts(options, result);
 		await fs.promises.rm(tmpDir, { recursive: true, force: true });
+	}
+}
+
+/** Saves the attempt's folder under the repo docs; a failed write never fails the run. */
+function saveArtifacts(options: RunOptions, result: RunResult): void {
+	if (!result.runId) return;
+	try {
+		result.artifactsDir = writeRunArtifacts(repoDocsDir(options.cwd), {
+			runId: result.runId,
+			agent: result.agent,
+			task: result.task,
+			reason: options.request.reason,
+			taskText: options.taskText,
+			model: result.model,
+			thinking: result.thinking,
+			route: result.route,
+			exitCode: result.exitCode,
+			stopReason: result.stopReason,
+			errorMessage: result.errorMessage,
+			startedAt: result.startedAt,
+			endedAt: result.endedAt ?? Date.now(),
+			usage: result.usage,
+			output: output(result),
+			messages: result.messages,
+		});
+	} catch {
+		// Artifacts are a record for the user, not part of the run's outcome.
 	}
 }
 
