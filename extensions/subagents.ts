@@ -647,7 +647,9 @@ export default function (pi: ExtensionAPI) {
 			const container = new Container();
 			for (const r of details.results) {
 				subagentRow(rowInput(r), { now, expanded }).forEach((line, i) => {
-					container.addChild(new Text(theme.fg(line.tone, i === 0 ? theme.bold(line.text) : line.text), 0, 0));
+					// The header stays one line: it truncates from the end (cost, calls) and keeps agent and model.
+					if (i === 0) container.addChild({ render: (width: number) => [theme.fg(line.tone, theme.bold(truncateToWidth(line.text, Math.max(1, width), "…")))], invalidate: () => {} });
+					else container.addChild(new Text(theme.fg(line.tone, line.text), 0, 0));
 				});
 				if (expanded && formatUsage(r)) container.addChild(new Text(theme.fg("dim", `  ${formatUsage(r)}`), 0, 0));
 				if (expanded && r.exitCode !== -1) {
