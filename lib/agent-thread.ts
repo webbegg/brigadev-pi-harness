@@ -21,7 +21,7 @@ export interface MessageLike {
 
 const RESULT_PREVIEW_LINES = 3;
 
-function argPreview(name: string, args: Record<string, unknown> | undefined): string {
+export function argPreview(name: string, args: Record<string, unknown> | undefined): string {
 	if (!args) return "";
 	if (name === "bash" && typeof args.command === "string") return `$ ${args.command.split("\n")[0]}`;
 	if (typeof args.path === "string") return args.path;

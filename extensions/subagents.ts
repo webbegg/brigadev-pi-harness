@@ -17,8 +17,9 @@ import type { Message } from "@earendil-works/pi-ai";
 import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { agentsCard, FINISHED_TTL_MS, formatElapsed, visibleRuns, type AgentRun } from "../lib/agents-card.ts";
+import { agentsCard, FINISHED_TTL_MS, formatElapsed, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
 import { threadRows } from "../lib/agent-thread.ts";
+import { subagentRow, type RowInput } from "../lib/subagent-row.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { listWidth, maxScroll, renderTwoPane, type Row } from "../lib/two-pane.ts";
 import type { AgentDefinition } from "../lib/agents.ts";
@@ -39,7 +40,6 @@ import { diffSnapshots, outsideSurfaces, takeSnapshot } from "../lib/worktree-sn
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
-const COLLAPSED_ITEMS = 6;
 const STATUS_KEY = "brigadev-agents";
 const CARD_KEY = "brigadev-agents-card";
 const CARD_COLLAPSE_KEY = "ctrl+shift+a";
@@ -58,6 +58,10 @@ interface RunResult {
 	route?: string;
 	/** Models that failed before this one, with the failure category. */
 	fallbacks?: string[];
+	/** Epoch ms when the run was launched (first attempt); drives the row's elapsed time. */
+	startedAt?: number;
+	/** Epoch ms when the run settled; set for aborted placeholders too. */
+	endedAt?: number;
 	stopReason?: string;
 	errorMessage?: string;
 	/** Validated structured_output payload, for agents that declare an output schema. */
@@ -321,6 +325,29 @@ function formatUsage(r: RunResult): string {
 		.join(" · ");
 }
 
+/** Row state: an aborted placeholder (exitCode -1 with an end time) counts as failed. */
+function rowState(r: RunResult): RunState {
+	if (r.exitCode === -1) return r.endedAt === undefined ? "running" : "failed";
+	return failed(r) ? "failed" : "done";
+}
+
+function rowInput(r: RunResult): RowInput {
+	const calls = r.messages.flatMap((m) => (m.role === "assistant" ? m.content.filter((p) => p.type === "toolCall") : []));
+	return {
+		agent: r.agent,
+		state: rowState(r),
+		model: r.model,
+		thinking: r.thinking,
+		route: r.route,
+		fallbacks: r.fallbacks,
+		startedAt: r.startedAt,
+		endedAt: r.endedAt,
+		cost: r.usage.cost,
+		calls: calls.flatMap((c) => (c.type === "toolCall" ? [{ name: c.name, arguments: c.arguments as Record<string, unknown> }] : [])),
+		error: r.errorMessage,
+	};
+}
+
 function routeLabel(route: ResolvedRoute, profileName: string | undefined): string {
 	if (route.profileKey && profileName) return `profile:${profileName}/${route.profileKey}`;
 	return route.modelSource === "none" ? "pi default" : route.modelSource;
@@ -338,6 +365,8 @@ export default function (pi: ExtensionAPI) {
 	// Live results by card run id, for the Agents viewer while a run is in flight.
 	const liveResults = new Map<string, RunResult>();
 	let cardCollapsed = false;
+	// True while the agents card widget is installed (collapsed or not).
+	let widgetShown = false;
 	let renderCard: (() => void) | undefined;
 	let ticker: ReturnType<typeof setInterval> | undefined;
 	let expiry: ReturnType<typeof setTimeout> | undefined;
@@ -348,6 +377,11 @@ export default function (pi: ExtensionAPI) {
 		ticker = expiry = undefined;
 	};
 
+	// The footer count duplicates the card, so it only shows while the card does not.
+	const syncStatus = (ctx: ExtensionContext) => {
+		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, running > 0 && !widgetShown ? `◐ ${running} agent${running === 1 ? "" : "s"}` : undefined);
+	};
+
 	const showCard = (ctx: ExtensionContext) => {
 		// The side panel reads copies; the runs below keep mutating while they work.
 		panelState().publish("agents", runs.map((r) => ({ ...r })));
@@ -355,10 +389,14 @@ export default function (pi: ExtensionAPI) {
 		if (visibleRuns(runs, Date.now()).length === 0) {
 			stopTimers();
 			renderCard = undefined;
+			widgetShown = false;
 			ctx.ui.setWidget(CARD_KEY, undefined);
+			syncStatus(ctx);
 			return;
 		}
 		if (!renderCard) {
+			widgetShown = true;
+			syncStatus(ctx);
 			ctx.ui.setWidget(CARD_KEY, (tui, theme) => {
 				renderCard = () => tui.requestRender();
 				return {
@@ -403,7 +441,7 @@ export default function (pi: ExtensionAPI) {
 
 	const setRunning = (ctx: ExtensionContext, delta: number) => {
 		running += delta;
-		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, running > 0 ? `◐ ${running} agent${running === 1 ? "" : "s"}` : undefined);
+		syncStatus(ctx);
 	};
 
 	pi.on("before_agent_start", async (event) => {
@@ -510,17 +548,24 @@ export default function (pi: ExtensionAPI) {
 						const attempt = chain[step];
 						const stepRoute: ResolvedRoute = { ...route, model: attempt.model, thinking: attempt.thinking ?? route.thinking };
 						Object.assign(cardRun, { model: stepRoute.model, thinking: stepRoute.thinking });
+						const label = `${routeLabel(route, profile.name)}${attempt.model !== route.model ? " ↪ fallback" : ""}`;
+						// Live row data from the first moment: the attempt's model and the trail so far.
+						const trail = () => (failedModels.length ? { fallbacks: [...failedModels] } : {});
+						results[index] = { agent: agent!.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), model: stepRoute.model, thinking: stepRoute.thinking, route: label, startedAt: cardRun.startedAt, ...trail() };
+						liveResults.set(cardRun.id, results[index]);
+						emit();
 						results[index] = await runAgent({
 							cwd: ctx.cwd,
 							agent: agent!,
 							request,
 							taskText: text,
 							route: stepRoute,
-							routeLabel: `${routeLabel(route, profile.name)}${attempt.model !== route.model ? " ↪ fallback" : ""}`,
+							routeLabel: label,
 							schema: schemas[index],
 							price,
 							signal,
 							onUpdate: (partial) => {
+								Object.assign(partial, { startedAt: cardRun.startedAt, ...trail() });
 								results[index] = partial;
 								liveResults.set(cardRun.id, partial);
 								syncCard(partial);
@@ -528,6 +573,7 @@ export default function (pi: ExtensionAPI) {
 							},
 						});
 						const r = results[index];
+						Object.assign(r, { startedAt: cardRun.startedAt, endedAt: Date.now(), ...trail() });
 						if (!failed(r) || !attempt.model) break;
 						const category = classifyFailure(r.stopReason ?? "error", r.errorMessage || r.stderr);
 						if (!category) break;
@@ -542,6 +588,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					if (failedModels.length) results[index].fallbacks = failedModels;
 				} finally {
+					results[index].endedAt ??= Date.now();
 					syncCard(results[index]);
 					cardRun.state = failed(results[index]) || results[index].exitCode === -1 ? "failed" : "done";
 					cardRun.endedAt = Date.now();
@@ -580,24 +627,29 @@ export default function (pi: ExtensionAPI) {
 			return new Text(text, 0, 0);
 		},
 
-		renderResult(result, { expanded }, theme) {
+		renderResult(result, { expanded }, theme, context) {
 			const details = result.details as Details | undefined;
 			if (!details?.results.length) {
 				const first = result.content[0];
 				return new Text(first?.type === "text" ? first.text : "(no output)", 0, 0);
 			}
+			const now = Date.now();
+			// Re-render once a second while a run is live so the elapsed time ticks.
+			const live = details.results.some((r) => rowState(r) === "running");
+			const tick = context?.state as { tick?: ReturnType<typeof setInterval> } | undefined;
+			if (tick) {
+				if (live && context.isPartial) tick.tick ??= setInterval(() => context.invalidate(), 1000);
+				else if (tick.tick) {
+					clearInterval(tick.tick);
+					tick.tick = undefined;
+				}
+			}
 			const container = new Container();
 			for (const r of details.results) {
-				const icon = r.exitCode === -1 ? theme.fg("warning", "⏳") : failed(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
-				container.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold(r.agent))} ${theme.fg("dim", formatUsage(r))}`, 0, 0));
-				const calls = r.messages.flatMap((m) => (m.role === "assistant" ? m.content.filter((p) => p.type === "toolCall") : []));
-				const shown = expanded ? calls : calls.slice(-COLLAPSED_ITEMS);
-				for (const call of shown) {
-					if (call.type !== "toolCall") continue;
-					const preview = JSON.stringify(call.arguments);
-					container.addChild(new Text(theme.fg("muted", "  → ") + theme.fg("accent", call.name) + theme.fg("dim", ` ${preview.length > 70 ? `${preview.slice(0, 70)}…` : preview}`), 0, 0));
-				}
-				if (failed(r) && r.errorMessage) container.addChild(new Text(theme.fg("error", `  ${r.errorMessage}`), 0, 0));
+				subagentRow(rowInput(r), { now, expanded }).forEach((line, i) => {
+					container.addChild(new Text(theme.fg(line.tone, i === 0 ? theme.bold(line.text) : line.text), 0, 0));
+				});
+				if (expanded && formatUsage(r)) container.addChild(new Text(theme.fg("dim", `  ${formatUsage(r)}`), 0, 0));
 				if (expanded && r.exitCode !== -1) {
 					container.addChild(new Spacer(1));
 					container.addChild(new Markdown(output(r).trim(), 0, 0, getMarkdownTheme()));
