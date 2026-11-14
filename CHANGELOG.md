@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Structured subagent results: an agent definition may declare `output: <file>.schema.json`. Its child process gets a `structured_output` tool whose parameters are that schema; an accepted call ends the run, a run that settles without one gets a single reminder, and the parent validates the payload and fails the run when it is missing or does not match. A schema that cannot be read rejects the launch. Agents without `output` keep their prose results.
+
 ## [0.13.0] - 2026-11-07
 
 - Launch dashboard layout: the top level is now New feature `n ›`, Work on a ticket `j`, Review a team PR `r`, My PRs: feedback `f`, Other workflows `1 ›`, Tools `2 ›`, then Commands (`k`), Chat (`Enter`), and Quit (`q`).

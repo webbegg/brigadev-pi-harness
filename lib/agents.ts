@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 export type AgentSource = "package" | "user" | "project";
 
@@ -13,6 +13,8 @@ export interface AgentDefinition {
 	writer: boolean;
 	/** "risk": launch requires a named high-risk item in the reason. */
 	admission?: "risk";
+	/** Absolute path of the JSON Schema the agent's result must match (frontmatter `output`, relative to the agent file). */
+	outputSchema?: string;
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
@@ -37,6 +39,7 @@ export function parseAgent(content: string, filePath: string, source: AgentSourc
 		thinking: typeof frontmatter.thinking === "string" ? frontmatter.thinking : undefined,
 		writer: frontmatter.writer === true,
 		admission: frontmatter.admission === "risk" ? "risk" : undefined,
+		outputSchema: typeof frontmatter.output === "string" && frontmatter.output.trim() ? resolve(dirname(filePath), frontmatter.output.trim()) : undefined,
 		systemPrompt: body,
 		source,
 		filePath,

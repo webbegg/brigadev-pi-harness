@@ -9,6 +9,8 @@ export const ASSETS_ROOT = join(PACKAGE_ROOT, "assets");
 export const PACKAGE_AGENTS_DIR = join(ASSETS_ROOT, "agents");
 export const PACKAGE_WORKFLOWS_DIR = join(ASSETS_ROOT, "workflows");
 export const GUARD_EXTENSION_PATH = join(PACKAGE_ROOT, "extensions", "guard.ts");
+/** Child-only: loaded with -e for agents that declare an output schema; not in package.json. */
+export const STRUCTURED_OUTPUT_EXTENSION_PATH = join(PACKAGE_ROOT, "extensions", "structured-output.ts");
 
 /** Environment contract between the parent session and subagent processes. */
 export const CHILD_ENV = {
@@ -17,6 +19,8 @@ export const CHILD_ENV = {
 	PROJECT_ROOT: "BRIGADEV_PROJECT_ROOT",
 	ALLOWED_SURFACES: "BRIGADEV_ALLOWED_SURFACES",
 	READ_ONLY: "BRIGADEV_READ_ONLY",
+	/** Absolute path of the agent's output JSON Schema. */
+	OUTPUT_SCHEMA: "BRIGADEV_OUTPUT_SCHEMA",
 } as const;
 
 export function isChildSession(env: NodeJS.ProcessEnv = process.env): boolean {

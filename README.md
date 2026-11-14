@@ -248,7 +248,7 @@ An authorized change on the default branch starts a `type/description` branch, a
 
 ## Customize
 
-- **Agents**: override any package agent by name in `~/.pi/agent/agents/<name>.md` or `.pi/agents/<name>.md` (trusted projects). Frontmatter: `name`, `description`, `tools`, `model`, `thinking`, `writer: true`, `admission: risk`.
+- **Agents**: override any package agent by name in `~/.pi/agent/agents/<name>.md` or `.pi/agents/<name>.md` (trusted projects). Frontmatter: `name`, `description`, `tools`, `model`, `thinking`, `writer: true`, `admission: risk`, `output: <file>.schema.json` (a JSON Schema next to the agent file: the agent must return its result through a `structured_output` tool, the parent validates it, and a run without a valid result fails after one reminder).
 - **Orchestrator rules**: edit `assets/orchestrator.md` and the lazy files next to it.
 - **Skills**: edit `skills/*/SKILL.md`, then `/reload`.
 - **Default mode**: `/brigadev:mode default yolo` writes `~/.pi/agent/brigadev.json`.
