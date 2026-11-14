@@ -19,6 +19,7 @@
 			"./extensions/evidence.ts",
 			"./extensions/subagents.ts",
 			"./extensions/todo.ts",
+			"./extensions/compact-tools.ts",
 			"./extensions/profiles.ts",
 			"./extensions/cost.ts",
 			"./extensions/context-backstop.ts",

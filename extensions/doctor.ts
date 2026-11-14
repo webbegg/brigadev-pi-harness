@@ -11,7 +11,7 @@ import { applyBridgeHooksPatch, findBridge, readBridgeStatus } from "../lib/brid
 import { CLAUDE_BRIDGE_PROVIDER } from "../lib/cost.ts";
 import { profilesPath, readProfiles } from "../lib/profiles-store.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
-import { isChildSession, readSettings, settingsPath } from "../lib/runtime.ts";
+import { isChildSession, readSettings, resolveCompactTools, settingsPath } from "../lib/runtime.ts";
 
 const FIX = "fix-bridge-hooks";
 
@@ -70,6 +70,12 @@ export default function (pi: ExtensionAPI) {
 			else mark(profiles.problems.length === 0, `profiles: ${Object.keys(profiles.file.profiles).length} in ${profilesPath()}, default ${profiles.file.active ?? "none"}${profiles.problems.length ? ` — ${profiles.problems.join("; ")}` : ""}`);
 			const settings = readSettings();
 			mark(true, `settings: ${settingsPath()} (default mode ${settings.defaultMode ?? "normal"}, bridge pricing ${settings.bridgePricing === false ? "off" : "on"}, footer ${settings.ui?.footer === false ? "off" : "on"}, phase ${settings.ui?.phase === false ? "off" : "on"})`);
+			let packages: unknown[] | undefined;
+			try {
+				packages = pi.getSettings().packages;
+			} catch {}
+			const compact = resolveCompactTools(packages);
+			mark(true, `compact tool rows: ${compact.ours ? "on" : "off"} (${compact.reason})`);
 			mark(true, `repo docs: ${repoDocsDir(ctx.cwd)} (feature documents in tasks/, review ledgers in reviews/)`);
 			mark(true, `model: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none"}`);
 			ctx.ui.notify(lines.join("\n"), "info");
