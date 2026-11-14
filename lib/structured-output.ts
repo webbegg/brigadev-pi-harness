@@ -51,11 +51,12 @@ function check(schema: JsonSchema, value: unknown, path: string, errors: string[
 	if (typeOf(value) === "object") {
 		const record = value as Record<string, unknown>;
 		const properties = (schema.properties ?? {}) as Record<string, JsonSchema>;
+		// Own keys only: a payload key such as "constructor" must not resolve to Object.prototype.
 		for (const key of Array.isArray(schema.required) ? (schema.required as string[]) : []) {
-			if (!(key in record)) errors.push(`${path}.${key}: required`);
+			if (!Object.hasOwn(record, key)) errors.push(`${path}.${key}: required`);
 		}
 		for (const [key, child] of Object.entries(record)) {
-			if (properties[key]) check(properties[key], child, `${path}.${key}`, errors);
+			if (Object.hasOwn(properties, key)) check(properties[key], child, `${path}.${key}`, errors);
 			else if (schema.additionalProperties === false) errors.push(`${path}.${key}: unexpected property`);
 		}
 	}

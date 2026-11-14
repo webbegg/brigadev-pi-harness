@@ -44,6 +44,12 @@ describe("validateAgainstSchema", () => {
 		]);
 	});
 
+	it("treats prototype-named keys as ordinary properties", () => {
+		const payload = JSON.parse('{"verdict":"pass","findings":[],"constructor":1,"toString":2,"__proto__":{"x":1}}');
+		assert.deepEqual(validateAgainstSchema(schema, payload).sort(), ["$.__proto__: unexpected property", "$.constructor: unexpected property", "$.toString: unexpected property"]);
+		assert.deepEqual(validateAgainstSchema({ type: "object", required: ["toString"] }, {}), ["$.toString: required"]);
+	});
+
 	it("rejects a wrong root type", () => {
 		assert.deepEqual(validateAgainstSchema(schema, []), ["$: expected object"]);
 	});
