@@ -31,6 +31,26 @@ describe("checkOutcome: help and version flags run no tests (S4)", () => {
 	]) {
 		it(`is not a pass: ${command}`, () => assert.notEqual(checkOutcome(command, 0), "pass"));
 	}
+	for (const command of [
+		"npm test -v", "npm run test -v", "yarn test -v", "pnpm test -v",
+		"npm test --help=true", "npm test --version=true", "npm test -H", "npm test -?", "npm test --usage", "npm test --h",
+		"node --test --help=true", "node --test --v8-options", "npx vitest -v", "npx jest -v",
+	]) {
+		it(`is not a pass (near-variant): ${command}`, () => assert.notEqual(checkOutcome(command, 0), "pass"));
+	}
+	it("still passes npm's own output flags", () => {
+		assert.equal(checkOutcome("npm test --silent", 0), "pass");
+		assert.equal(checkOutcome("npm test -s", 0), "pass");
+	});
+	for (const command of ["npm --help test", "cargo test --no-run", "go test -list .", "npx jest --showConfig", "npm test -- --help=true"]) {
+		it(`is not a pass (listing, config, or flag before test): ${command}`, () => assert.notEqual(checkOutcome(command, 0), "pass"));
+	}
+	for (const command of [
+		"npm test", "npm test --workspace=pkg-a", "pnpm test --filter api", "npm test -- --test-name-pattern=x", "go test -v ./...", "pytest -v",
+		"cargo test -v", "npx vitest run", "node --test tests/*.test.ts", "npm run build && npm test",
+	]) {
+		it(`still passes: ${command}`, () => assert.equal(checkOutcome(command, 0), "pass"));
+	}
 	it("still passes runner arguments that run tests", () => {
 		assert.equal(checkOutcome("npm test -- --test-name-pattern=gate", 0), "pass");
 		assert.equal(checkOutcome("node --test tests/evidence.test.ts", 0), "pass");

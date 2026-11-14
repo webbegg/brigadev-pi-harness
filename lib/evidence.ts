@@ -30,8 +30,15 @@ const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 // A segment starting with one of these can end the shell, replace it, or run other code before the test.
 const CONTROL_WORDS = new Set(["exit", "return", "exec", "trap", "eval", "source", "."]);
 const PIPEFAIL_SETTERS = new Set(["-o", "-eo", "-euo"]);
-// Runner flags that exit 0 without running a test (help, version, listing, dry runs).
-const NO_RUN_FLAGS = new Set(["--help", "-h", "--version", "-V", "--collect-only", "--co", "--listTests", "--list", "--dry-run"]);
+// Runner flags that exit 0 without running a test (help, version, listing, dry runs, config dumps), matched without any `=value`.
+const NO_RUN_FLAGS = new Set([
+	"--help", "-h", "-H", "-?", "--usage", "--version", "-V", "--v8-options", "--collect-only", "--co", "--listTests",
+	"--list", "-list", "-help", "--dry-run", "--no-run", "--showConfig",
+]);
+// The only options a package manager may read before the script runs; anything else (`-v`, `--h`, `--help=true`) might not run it.
+const PM_FLAGS = new Set(["--silent", "-s", "--quiet", "-q", "--if-present", "--workspaces", "-ws", "--include-workspace-root", "--no-color"]);
+const PM_EQUALS_FLAGS = new Set(["--workspace", "--filter", "--loglevel", "--color"]);
+const PM_VALUE_FLAGS = new Set(["--workspace", "-w", "--filter", "-F", "--loglevel"]);
 
 export type CheckKind = "test" | "check";
 export type CheckOutcome = "pass" | "fail" | "unknown";
@@ -147,6 +154,88 @@ export function checkKind(command: string): CheckKind | undefined {
 	return firstCheck(parse(command))?.kind;
 }
 
+/** Words consumed by an allowed package-manager option at `i` (1, or 2 with a separate value); 0 when it is not allowed. */
+function packageManagerOption(words: string[], i: number): number {
+	const word = words[i];
+	if (PM_FLAGS.has(word)) return 1;
+	const eq = word.indexOf("=");
+	if (eq > 0 && eq < word.length - 1 && PM_EQUALS_FLAGS.has(word.slice(0, eq))) return 1;
+	return PM_VALUE_FLAGS.has(word) && i + 1 < words.length ? 2 : 0;
+}
+
+/** Index of the first non-option word from `from` (words.length if none), or undefined at an option that is not allowed. */
+function nextPositional(words: string[], from: number): number | undefined {
+	let i = from;
+	while (i < words.length && words[i].startsWith("-")) {
+		const used = packageManagerOption(words, i);
+		if (used === 0) return undefined;
+		i += used;
+	}
+	return i;
+}
+
+function allowedPackageManagerOptions(words: string[]): boolean {
+	let i = 0;
+	while (i < words.length) {
+		if (!words[i].startsWith("-")) i++;
+		else if (packageManagerOption(words, i) === 0) return false;
+		else i += packageManagerOption(words, i);
+	}
+	return true;
+}
+
+/** True when a no-run flag is among `words`; `-v` counts unless `verboseOk` (it means verbose for go test, pytest, cargo test). */
+function hasNoRunFlag(words: string[], verboseOk: boolean): boolean {
+	return words.some((word) => {
+		if (!word.startsWith("-")) return false;
+		const flag = word.split("=")[0];
+		return NO_RUN_FLAGS.has(flag) || (flag === "-v" && !verboseOk);
+	});
+}
+
+/** `-v` is verbose, not the version, for these runners. */
+function verboseRunner(argv: string[]): boolean {
+	const name = executableName(argv[0] ?? "");
+	if (name === "pytest") return true;
+	if ((name === "python" || name === "python3") && argv[1] === "-m" && argv[2] === "pytest") return true;
+	return (name === "go" || name === "cargo") && argv[1] === "test";
+}
+
+/** A runner reached through `npx`, `pnpm exec`, or `yarn <tool>`: its own words, and the launcher's options before it, are checked. */
+function toolMayRunNoTests(words: string[]): boolean {
+	const tool = skipFlags(words);
+	const launcher = words.slice(0, words.length - tool.length);
+	return hasNoRunFlag(launcher, false) || hasNoRunFlag(tool, verboseRunner(tool));
+}
+
+/**
+ * True when the check segment might print help, a version, or a listing and
+ * exit 0 without running a test. Package managers read only a short list of
+ * options before the script; words after `--` go to the script.
+ */
+function mayRunNoTests(argv: string[]): boolean {
+	let start = 0;
+	while (start < argv.length && (ASSIGNMENT.test(argv[start]) || argv[start] === "!")) start++;
+	const command = argv.slice(start);
+	const name = executableName(command[0] ?? "");
+	if (name === "npx" || name === "bunx") return toolMayRunNoTests(command.slice(1));
+	if (!PACKAGE_MANAGERS.has(name)) return hasNoRunFlag(command, verboseRunner(command));
+
+	const dash = command.indexOf("--");
+	const before = command.slice(1, dash === -1 ? undefined : dash);
+	const after = dash === -1 ? [] : command.slice(dash + 1);
+	let at = nextPositional(before, 0);
+	if (at === undefined || at >= before.length) return true;
+	if (name === "pnpm" && before[at] === "exec") return toolMayRunNoTests([...before.slice(at + 1), ...after]);
+	if (before[at] === "run") at = nextPositional(before, at + 1);
+	if (at === undefined || at >= before.length) return true;
+	const script = before[at];
+	if (TEST_SCRIPT.test(script) || CHECK_SCRIPT.test(script)) {
+		return !allowedPackageManagerOptions(before.slice(at + 1)) || hasNoRunFlag(after, false);
+	}
+	return toolMayRunNoTests([...before.slice(at), ...after]);
+}
+
 /** Where the command runs, so a `cd` before the check can be judged. */
 export interface CheckContext {
 	/** The session's working directory. */
@@ -192,9 +281,7 @@ export function checkOutcome(command: string, exitCode: number | undefined, cont
 	const segments = tokenize(text, { redirections: true });
 	const found = firstCheck(segments);
 	if (!found) return "unknown";
-	// `-v` is verbose for most runners but the version for node (`node --test -v`).
-	const testArgv = segments[found.index].argv;
-	if (testArgv.some((word) => NO_RUN_FLAGS.has(word) || (word === "-v" && testArgv.some((w) => executableName(w) === "node")))) return "unknown";
+	if (mayRunNoTests(segments[found.index].argv)) return "unknown";
 
 	const pipefail = isPipefailSetter(segments[0]?.argv) && (segments[1]?.before === ";" || segments[1]?.before === "&&");
 	for (let i = 0; i < segments.length; i++) {
