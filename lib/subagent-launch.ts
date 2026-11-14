@@ -16,6 +16,12 @@ import { settleQueued } from "./subagent-row.ts";
 import { formatStructured } from "./structured-output.ts";
 import { diffSnapshots, outsideSurfaces, type Snapshot } from "./worktree-snapshot.ts";
 
+const OUTSIDE_WARNING = "files changed outside the writers' allowed edit surfaces";
+const CANCELLED_TEXT = "Cancelled before it started.";
+
+/** A placeholder that never started (aborted while queued): neither a success nor a child failure. */
+const cancelled = (r: RunResult) => r.cancelled === true && r.exitCode === -1;
+
 export const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
 export interface Details {
@@ -48,6 +54,8 @@ export interface LaunchHooks {
 	onProgress?: (done: number, total: number) => void;
 	/** Async launches settle with partial results when aborted; sync ones throw as they always did. */
 	tolerateAbort: boolean;
+	/** Async launch: the parent keeps working meanwhile, so the writer backstop ignores other launches' writers and words its warning honestly. */
+	async?: boolean;
 }
 
 export function capOutput(text: string): string {
@@ -65,10 +73,12 @@ export function toResult(mode: Details["mode"], { details, warnings }: Launched)
 	const warningText = warnings.length ? `\n\nWarnings: ${warnings.join("; ")}` : "";
 	if (mode === "single") {
 		const r = details.results[0];
+		// A task cancelled while queued (async only: a sync abort throws) is an error that says so, not an empty success.
+		if (cancelled(r)) return { content: [{ type: "text", text: `Agent cancelled: ${CANCELLED_TEXT}${warningText}` }], details, isError: true };
 		return { content: [{ type: "text", text: (failed(r) ? `Agent ${r.stopReason ?? "failed"}: ` : "") + output(r) + warningText }], details, isError: failed(r) };
 	}
-	const ok = details.results.filter((r) => !failed(r)).length;
-	const sections = details.results.map((r) => `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${sectionOutput(r)}`);
+	const ok = details.results.filter((r) => !failed(r) && !cancelled(r)).length;
+	const sections = details.results.map((r) => (cancelled(r) ? `### [${r.agent}] cancelled\n\n${CANCELLED_TEXT}` : `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${sectionOutput(r)}`));
 	return { content: [{ type: "text", text: `Parallel: ${ok}/${details.results.length} succeeded\n\n${sections.join("\n\n---\n\n")}${warningText}` }], details };
 }
 
@@ -120,7 +130,14 @@ export interface LaunchDeps {
 	/** The task moves on to the next model. */
 	fallbackNotice: (info: { agent: string; from: string; to: string; category: FailureCategory }) => void;
 	/** The shared list of running writers. */
-	writers: { add: (writers: ActiveWriter[]) => void; remove: (writer: ActiveWriter) => void };
+	writers: {
+		add: (writers: ActiveWriter[]) => void;
+		remove: (writer: ActiveWriter) => void;
+		/** The writers registered right now (any launch). Async launches read it to learn who else was active. */
+		list?: () => readonly ActiveWriter[];
+		/** Calls `listener` with every writer registered from now on (any launch); returns the unsubscribe. */
+		onAdd?: (listener: (writers: readonly ActiveWriter[]) => void) => () => void;
+	};
 	view: TaskView;
 	/** Working-tree snapshot for the writer backstop; undefined without git. */
 	snapshot: () => Promise<Snapshot | undefined>;
@@ -162,6 +179,18 @@ export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<L
 	// already sees their surfaces, even while they wait for a concurrency slot.
 	const newWriterId = deps.newWriterId ?? (() => randomUUID().slice(0, 8));
 	const writers: Array<ActiveWriter | undefined> = tasks.map(({ request, agent }) => (agent.writer ? { id: newWriterId(), agent: agent.name, surfaces: request.allowedEditSurfaces ?? [] } : undefined));
+	// An async launch cannot tell its children's edits from another launch's writers, so it records the surfaces of every
+	// other writer that is active at any time during the launch (already registered, or registering later) and excludes them.
+	const ownIds = new Set(writers.flatMap((w) => (w ? [w.id] : [])));
+	const otherSurfaces: string[] = [];
+	const recordOthers = (others: readonly ActiveWriter[]) => {
+		for (const w of others) if (!ownIds.has(w.id)) otherSurfaces.push(...w.surfaces);
+	};
+	let stopRecording = () => {};
+	if (hooks.async && writers.some(Boolean)) {
+		recordOthers(deps.writers.list?.() ?? []);
+		stopRecording = deps.writers.onAdd?.(recordOthers) ?? stopRecording;
+	}
 	deps.writers.add(writers.filter((w): w is ActiveWriter => w !== undefined));
 	const removeWriter = (writer: ActiveWriter | undefined) => {
 		if (writer) deps.writers.remove(writer);
@@ -172,9 +201,9 @@ export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<L
 		if (settleQueued(results, now()) > 0) emit();
 	};
 
-	// Backstop for writers: the parent is idle during a sync call (an async launch cannot promise that,
-	// so it may also report the parent's own edits), so any change outside the union of the writers'
-	// surfaces is attributed to a child.
+	// Backstop for writers: the parent is idle during a sync call, so any change outside the union of the writers'
+	// surfaces is attributed to a child. An async launch cannot promise that: the parent (and other launches'
+	// writers, excluded above) may edit meanwhile, so its warning says the list may include the parent's edits.
 	const writerSurfaces = tasks.flatMap(({ request, agent }) => (agent.writer ? (request.allowedEditSurfaces ?? []) : []));
 	const watchTree = tasks.some(({ agent }) => agent.writer);
 
@@ -275,11 +304,12 @@ export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<L
 		const details: Details = { mode, results };
 		const treeAfter = treeBefore ? await deps.snapshot() : undefined;
 		if (treeBefore && treeAfter) {
-			details.outsideSurfaces = outsideSurfaces(diffSnapshots(treeBefore, treeAfter), writerSurfaces);
-			if (details.outsideSurfaces.length > 0) warnings.push(`files changed outside the writers' allowed edit surfaces: ${details.outsideSurfaces.join(", ")}`);
+			details.outsideSurfaces = outsideSurfaces(diffSnapshots(treeBefore, treeAfter), hooks.async ? [...writerSurfaces, ...otherSurfaces] : writerSurfaces);
+			if (details.outsideSurfaces.length > 0) warnings.push(`${OUTSIDE_WARNING}${hooks.async ? " (may include edits the parent made meanwhile)" : ""}: ${details.outsideSurfaces.join(", ")}`);
 		}
 		return { details, warnings };
 	} finally {
+		stopRecording();
 		writers.forEach(removeWriter);
 	}
 }

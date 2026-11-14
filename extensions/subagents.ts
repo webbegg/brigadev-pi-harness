@@ -11,7 +11,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { agentsCard, FINISHED_TTL_MS, formatElapsed, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
 import { threadRows } from "../lib/agent-thread.ts";
@@ -23,6 +23,7 @@ import { failed, output, runChild, type RunResult } from "../lib/child-run.ts";
 import { newRunId } from "../lib/run-artifacts.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
 import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
+import { createResultDelivery, resultCard, resultMessage, RESULT_MESSAGE_TYPE, type ResultMessageDetails } from "../lib/result-delivery.ts";
 import { createSubagentRegistry, type WaitOutcome } from "../lib/subagent-registry.ts";
 import { admitLaunch, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
 import { cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
@@ -136,6 +137,8 @@ export default function (pi: ExtensionAPI) {
 
 	let skills: SkillRef[] = [];
 	const activeWriters: ActiveWriter[] = [];
+	// Async launches record the writers other launches register while they run (the A1 backstop exclusion).
+	const writerListeners = new Set<(writers: readonly ActiveWriter[]) => void>();
 	let running = 0;
 
 	// One concurrency cap for every launch in this process, sync or async.
@@ -145,6 +148,34 @@ export default function (pi: ExtensionAPI) {
 		setTimer: (fn, ms) => setTimeout(fn, ms),
 		clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
 		newId: () => newRunId("launch"),
+		// A result held for the idle parent is never pruned before it is delivered or collected.
+		isPinned: (id) => delivery.isHeld(id),
+	});
+
+	// Idle delivery of async results the model did not collect: injected as a custom message that starts a parent turn.
+	// Pi API (docs/extensions.md in the installed pi-coding-agent): `pi.sendMessage(..., { triggerTurn: true, deliverAs: "steer" })`
+	// starts a turn when idle and joins the run when busy (L1627-1649); `ctx.isIdle()` (L1255-1257); `agent_settled` is the
+	// final-idle signal, `agent_end` is not (L336, L661-693); a renderer is registered per customType (L1805, L3165-3200).
+	let parentCtx: ExtensionContext | undefined;
+	const delivery = createResultDelivery<LaunchResult>({
+		isIdle: () => {
+			try {
+				return parentCtx?.isIdle() ?? false;
+			} catch {
+				return false; // a stale context (session replaced): treat as busy; session_start resets the buffer
+			}
+		},
+		isConsumed: (id) => registry.get(id)?.consumed ?? true,
+		markConsumed: (id) => void registry.markConsumed(id),
+		// One message per launch. All of a flush are sent from one idle signal, so the later ones join the turn the first starts.
+		deliver: ({ id, launch, result }) => {
+			const collectedResult = collected(id, launch.error === undefined ? { status: "settled", launch, result } : { status: "settled", launch, error: launch.error });
+			const text = collectedResult.content.map((c) => c.text).join("\n");
+			pi.sendMessage(resultMessage(id, text, collectedResult.isError === true || launch.error !== undefined), { triggerTurn: true, deliverAs: "steer" });
+		},
+	});
+	registry.subscribe((event) => {
+		if (event.type === "settle") delivery.settled(event);
 	});
 
 	// Agents card: live rows above the editor while subagents run.
@@ -213,13 +244,17 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		// Launches left from a previous session in this process are stopped and forgotten.
+		parentCtx = ctx;
+		// Launches left from a previous session in this process are stopped and forgotten, with any result held for them.
+		delivery.reset();
 		registry.clear();
 		runs = [];
 		showCard(ctx);
 	});
 	// Children of running async launches get the usual SIGTERM, then SIGKILL after 5 s.
 	pi.on("session_shutdown", async () => {
+		// Aborted children settle after this; their results must not be sent to a session that is going away.
+		delivery.stop();
 		registry.abortAll();
 		stopTimers();
 	});
@@ -237,6 +272,24 @@ export default function (pi: ExtensionAPI) {
 		syncStatus(ctx);
 	};
 
+	// The parent is idle for good (not between retries or queued continuations): deliver what settled meanwhile.
+	pi.on("agent_settled", async (_event, ctx) => {
+		parentCtx = ctx;
+		delivery.flush();
+	});
+
+	pi.registerMessageRenderer<ResultMessageDetails>(RESULT_MESSAGE_TYPE, (message, { expanded, outputPad, keyHint }, theme) => {
+		const content = typeof message.content === "string" ? message.content : message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
+		const card = resultCard(content, message.details, expanded);
+		const box = new Box(outputPad, 1, (t) => theme.bg("customMessageBg", t));
+		card.lines.forEach((line, i) => {
+			box.addChild({ render: (width: number) => [theme.fg(line.tone, i === 0 ? theme.bold(truncateToWidth(line.text, Math.max(1, width), "…")) : truncateToWidth(line.text, Math.max(1, width), "…"))], invalidate: () => {} });
+		});
+		if (expanded) box.addChild(new Markdown(card.body, 0, 0, getMarkdownTheme()));
+		else if (card.hidden > 0) box.addChild(new Text(theme.fg("muted", `  (${keyHint("app.tools.expand", "to expand")})`), 0, 0));
+		return box;
+	});
+
 	pi.on("before_agent_start", async (event) => {
 		skills = (event.systemPromptOptions.skills ?? []).map((s) => ({ name: s.name, filePath: s.filePath }));
 	});
@@ -248,6 +301,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Params,
 
 		async execute(_id, params, signal, onUpdate, ctx) {
+			parentCtx = ctx;
 			const agents = loadAgents(ctx);
 			const requests: LaunchRequest[] = params.tasks?.length
 				? params.tasks
@@ -361,7 +415,12 @@ export default function (pi: ExtensionAPI) {
 							if (ctx.hasUI) ctx.ui.notify(`brigadev: ${agent} hit ${category} on ${from} → retrying on ${to}${priceNote(listPrice(ctx, from), listPrice(ctx, to))}`, "warning");
 						},
 						writers: {
-							add: (writers) => void activeWriters.push(...writers),
+							list: () => activeWriters,
+							onAdd: (listener) => (writerListeners.add(listener), () => void writerListeners.delete(listener)),
+							add: (writers) => {
+								activeWriters.push(...writers);
+								writerListeners.forEach((listener) => listener(writers));
+							},
 							remove: (writer) => {
 								const at = activeWriters.indexOf(writer);
 								if (at >= 0) activeWriters.splice(at, 1);
@@ -377,7 +436,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Async: the launch runs under the registry's own AbortController (the tool call's signal ends with the call).
 			// Admission errors were already returned above, before anything started.
-			const id = registry.start({ total: results.length, run: async (runSignal, control) => toResult(mode, await launch(runSignal, { onProgress: control.progress, tolerateAbort: true })) });
+			const id = registry.start({ total: results.length, run: async (runSignal, control) => toResult(mode, await launch(runSignal, { onProgress: control.progress, tolerateAbort: true, async: true })) });
 			const names = [...new Set(requests.map((r) => r.agent))].join(", ");
 			return {
 				content: [{ type: "text", text: `Started async launch ${id} (${results.length} task${results.length === 1 ? "" : "s"}: ${names}). Collect it with subagent_wait {"runId":"${id}"}; stop it with subagent_cancel.` }],

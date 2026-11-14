@@ -41,6 +41,8 @@ export interface RegistryDeps {
 	clearTimer: (handle: unknown) => void;
 	newId: () => string;
 	maxSettled?: number;
+	/** A settled launch the prune must keep (a held, undelivered result). Pinned launches do not count against the cap. */
+	isPinned?: (id: string) => boolean;
 }
 
 export interface SubagentRegistry<R> {
@@ -54,6 +56,8 @@ export interface SubagentRegistry<R> {
 	wait(id: string, timeoutMs: number, signal?: AbortSignal): Promise<WaitOutcome<R>>;
 	/** Aborts the launch, waits for its partial result, and consumes it. */
 	cancel(id: string): Promise<WaitOutcome<R>>;
+	/** Marks a settled, unconsumed launch consumed (its result was delivered another way); false when unknown, running, or already consumed. */
+	markConsumed(id: string): boolean;
 	/** Aborts every running launch (session shutdown). */
 	abortAll(): void;
 	/** Aborts every running launch and forgets all of them (session start). */
@@ -89,7 +93,7 @@ export function createSubagentRegistry<R>(deps: RegistryDeps): SubagentRegistry<
 	};
 
 	const prune = () => {
-		const settled = [...entries.values()].filter((e) => e.summary.status === "settled").sort((a, b) => a.seq - b.seq);
+		const settled = [...entries.values()].filter((e) => e.summary.status === "settled" && !deps.isPinned?.(e.summary.id)).sort((a, b) => a.seq - b.seq);
 		for (const entry of settled.slice(0, Math.max(0, settled.length - maxSettled))) entries.delete(entry.summary.id);
 	};
 
@@ -184,6 +188,13 @@ export function createSubagentRegistry<R>(deps: RegistryDeps): SubagentRegistry<
 			await entry.settled;
 			consume(entry);
 			return outcome(entry);
+		},
+
+		markConsumed(id) {
+			const entry = entries.get(id);
+			if (!entry || entry.summary.status !== "settled" || entry.summary.consumed) return false;
+			consume(entry);
+			return true;
 		},
 
 		abortAll() {

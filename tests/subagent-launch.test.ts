@@ -50,6 +50,7 @@ function rig(specs: Spec[], options: { limit?: number; chain?: (index: number) =
 	const notices: string[] = [];
 	const labels: string[] = [];
 	const snapshots = [...(options.snapshots ?? [])];
+	const addListeners = new Set<(ws: ActiveWriter[]) => void>();
 	let run: (call: AgentCall) => Promise<RunResult> = async (call) => reply(`task ${call.index}`, `answer ${call.index}`);
 	const tasks: LaunchTask[] = specs.map((spec, i) => ({
 		request: { agent: spec.writer ? "builder" : "scout", task: `task ${i}`, reason: "Independent units", skills: spec.skills, allowedEditSurfaces: spec.surfaces ?? (spec.writer ? [`src/w${i}/**`] : undefined) },
@@ -68,6 +69,14 @@ function rig(specs: Spec[], options: { limit?: number; chain?: (index: number) =
 		labels,
 		tasks,
 		runner: (fn: typeof run) => void (run = fn),
+		/** Another launch's writer registers (as the extension's shared list would report it). */
+		registerOther(writer: ActiveWriter) {
+			active.push(writer);
+			addListeners.forEach((listener) => listener([writer]));
+		},
+		unregisterOther(writer: ActiveWriter) {
+			active.splice(active.indexOf(writer), 1);
+		},
 		launch(mode: "single" | "parallel", hooks: Partial<LaunchHooks> = {}, signal?: AbortSignal, placeholders = results()) {
 			return runLaunch(
 				{ mode, tasks, results: placeholders, signal, hooks: { tolerateAbort: false, ...hooks } },
@@ -84,7 +93,15 @@ function rig(specs: Spec[], options: { limit?: number; chain?: (index: number) =
 					chain: options.chain ?? (() => [{ model: "m1" }]),
 					coolModel: (model, category) => void cooled.push(`${model}:${category}`),
 					fallbackNotice: (info) => void notices.push(`${info.from}->${info.to}:${info.category}`),
-					writers: { add: (ws) => void active.push(...ws), remove: (w) => void (active.includes(w) && active.splice(active.indexOf(w), 1)) },
+					writers: {
+						add: (ws) => {
+							active.push(...ws);
+							addListeners.forEach((listener) => listener(ws));
+						},
+						remove: (w) => void (active.includes(w) && active.splice(active.indexOf(w), 1)),
+						list: () => [...active],
+						onAdd: (listener) => (addListeners.add(listener), () => void addListeners.delete(listener)),
+					},
 					view: {
 						start: (i) => void events.push(`start:${i}`),
 						attempt: (i) => void events.push(`attempt:${i}`),
@@ -348,6 +365,108 @@ describe("runLaunch: a rejection waits for every sibling (A3)", () => {
 		await assert.rejects(h.launch("parallel"), /first crashed/);
 		assert.deepEqual(h.started, [0, 1]);
 		assertClean(h);
+	});
+});
+
+const WARNING = "files changed outside the writers' allowed edit surfaces";
+const before = new Map([["src/w0/a.ts", "1"]]);
+
+describe("runLaunch: the async writer backstop ignores other writers' surfaces (A1)", () => {
+	const other: ActiveWriter = { id: "o1", agent: "builder", surfaces: ["docs/**"] };
+
+	it("a writer already active when the launch starts is excluded", async () => {
+		const after = new Map([["src/w0/a.ts", "2"], ["docs/guide.md", "x"], ["README.md", "y"]]);
+		const h = rig([{ writer: true }], { snapshots: [before, after] });
+		h.registerOther(other);
+		const launched = await h.launch("single", { async: true, tolerateAbort: true });
+		assert.deepEqual(launched.details.outsideSurfaces, ["README.md"]);
+		h.unregisterOther(other);
+		assertClean(h);
+	});
+
+	it("a writer that registers during the launch, even if it is gone before the end, is excluded", async () => {
+		const after = new Map([["src/w0/a.ts", "2"], ["docs/guide.md", "x"], ["README.md", "y"]]);
+		const h = rig([{ writer: true }], { snapshots: [before, after] });
+		const run = manual();
+		h.runner(() => run.promise);
+		const launch = h.launch("single", { async: true, tolerateAbort: true });
+		await settle();
+		h.registerOther(other);
+		h.unregisterOther(other);
+		run.resolve(reply("task 0", "done"));
+		assert.deepEqual((await launch).details.outsideSurfaces, ["README.md"]);
+		assertClean(h);
+	});
+
+	it("the launch's own surfaces and unrelated files are still handled as before", async () => {
+		const after = new Map([["src/w0/a.ts", "2"], ["src/other/b.ts", "x"]]);
+		const h = rig([{ writer: true }], { snapshots: [before, after] });
+		h.registerOther(other);
+		const launched = await h.launch("single", { async: true, tolerateAbort: true });
+		assert.deepEqual(launched.details.outsideSurfaces, ["src/other/b.ts"]);
+		h.unregisterOther(other);
+		assertClean(h);
+	});
+
+	it("a writer registered after the launch settled does not affect it", async () => {
+		const after = new Map([["src/w0/a.ts", "2"], ["docs/guide.md", "x"]]);
+		const h = rig([{ writer: true }], { snapshots: [before, after] });
+		const launched = await h.launch("single", { async: true, tolerateAbort: true });
+		h.registerOther(other);
+		assert.deepEqual(launched.details.outsideSurfaces, ["docs/guide.md"]);
+		h.unregisterOther(other);
+	});
+
+	it("the async warning says the list may include edits the parent made meanwhile", async () => {
+		const after = new Map([["src/w0/a.ts", "2"], ["README.md", "y"]]);
+		const h = rig([{ writer: true }], { snapshots: [before, after] });
+		const launched = await h.launch("single", { async: true, tolerateAbort: true });
+		assert.deepEqual(launched.warnings, [`${WARNING} (may include edits the parent made meanwhile): README.md`]);
+		assert.equal(toResult("single", launched).content[0].text, `answer 0\n\nWarnings: ${WARNING} (may include edits the parent made meanwhile): README.md`);
+	});
+
+	it("sync mode is unchanged: other writers' files are still reported, with the original wording", async () => {
+		const after = new Map([["src/w0/a.ts", "2"], ["docs/guide.md", "x"], ["README.md", "y"]]);
+		const h = rig([{ writer: true }], { snapshots: [before, after] });
+		h.registerOther(other);
+		const launched = await h.launch("single");
+		assert.deepEqual(launched.details.outsideSurfaces, ["README.md", "docs/guide.md"]);
+		assert.deepEqual(launched.warnings, [`${WARNING}: README.md, docs/guide.md`]);
+		h.unregisterOther(other);
+	});
+});
+
+describe("toResult: a task cancelled while queued (A5)", () => {
+	const cancelled = (agent: string): RunResult => ({ agent, task: "t", exitCode: -1, messages: [], stderr: "", usage: emptyTally(), queued: true, cancelled: true, endedAt: 5 });
+
+	it("parallel: counts as failed and renders as cancelled, not completed", () => {
+		const done = reply("t", "answer");
+		const result = toResult("parallel", { details: { mode: "parallel", results: [done, cancelled("builder")] }, warnings: [] });
+		assert.equal(result.content[0].text, "Parallel: 1/2 succeeded\n\n### [scout] completed\n\nanswer\n\n---\n\n### [builder] cancelled\n\nCancelled before it started.");
+	});
+
+	it("single: reads as a cancelled error", () => {
+		const result = toResult("single", { details: { mode: "single", results: [cancelled("builder")] }, warnings: [] });
+		assert.equal(result.content[0].text, "Agent cancelled: Cancelled before it started.");
+		assert.equal(result.isError, true);
+	});
+
+	it("end to end: an async launch aborted while a task is queued", async () => {
+		const h = rig([{}, { writer: true }], { limit: 1 });
+		h.runner(killedOnAbort);
+		const abort = new AbortController();
+		const launch = h.launch("parallel", { async: true, tolerateAbort: true }, abort.signal);
+		await settle();
+		abort.abort();
+		const text = toResult("parallel", await launch).content[0].text;
+		assert.equal(text, "Parallel: 0/2 succeeded\n\n### [scout] failed\n\nSubagent was aborted\n\n---\n\n### [builder] cancelled\n\nCancelled before it started.");
+	});
+
+	it("sync text is unchanged: a placeholder-free result still says completed/failed", async () => {
+		const h = rig([{}, {}]);
+		h.runner(async (call) => (call.index === 1 ? errored("task 1", "no luck") : reply("task 0", "fine")));
+		const text = toResult("parallel", await h.launch("parallel")).content[0].text;
+		assert.equal(text, "Parallel: 1/2 succeeded\n\n### [scout] completed\n\nfine\n\n---\n\n### [scout] failed\n\nno luck");
 	});
 });
 
