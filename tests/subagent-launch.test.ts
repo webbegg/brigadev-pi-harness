@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { ChildControl } from "../lib/child-rpc.ts";
 import type { RunResult } from "../lib/child-run.ts";
 import { emptyTally } from "../lib/cost.ts";
 import type { ActiveWriter } from "../lib/delegation.ts";
@@ -50,6 +51,7 @@ function rig(specs: Spec[], options: { limit?: number; chain?: (index: number) =
 	const cooled: string[] = [];
 	const notices: string[] = [];
 	const labels: string[] = [];
+	const controls: Array<[number, ChildControl | undefined]> = [];
 	const snapshots = [...(options.snapshots ?? [])];
 	const addListeners = new Set<(ws: ActiveWriter[]) => void>();
 	let run: (call: AgentCall) => Promise<RunResult> = async (call) => reply(`task ${call.index}`, `answer ${call.index}`);
@@ -68,6 +70,7 @@ function rig(specs: Spec[], options: { limit?: number; chain?: (index: number) =
 		cooled,
 		notices,
 		labels,
+		controls,
 		tasks,
 		/** Fresh placeholders, as the extension builds them. */
 		placeholders: results,
@@ -116,6 +119,7 @@ function rig(specs: Spec[], options: { limit?: number; chain?: (index: number) =
 						attempt: (i) => void events.push(`attempt:${i}`),
 						update: (i) => void events.push(`update:${i}`),
 						finish: (i) => void events.push(`finish:${i}`),
+						control: (i, control) => void controls.push([i, control]),
 					},
 					snapshot: async () => snapshots.shift(),
 				},
@@ -302,6 +306,46 @@ describe("runLaunch: slots and writers on every exit path", () => {
 		assert.equal(details.results[0].stopReason, "aborted");
 		assert.deepEqual(details.results[0].fallbacks, ["m1 (provider_unavailable)"]);
 		assertClean(h);
+	});
+});
+
+describe("runLaunch: the steering handle reaches the viewer (S4)", () => {
+	const handle = (): ChildControl => ({ steer: () => true, followUp: () => true, abort: () => true, isStreaming: () => true });
+
+	it("hands each task's handle to the view under its own index, and withdraws it when the child is done", async () => {
+		const h = rig([{}, {}]);
+		const handles = [handle(), handle()];
+		h.runner(async (call) => {
+			call.onControl?.(handles[call.index]);
+			call.onControl?.(undefined);
+			return reply(`task ${call.index}`, `answer ${call.index}`);
+		});
+		await h.launch("parallel");
+		assert.deepEqual(h.controls, [[0, handles[0]], [0, undefined], [1, handles[1]], [1, undefined]]);
+	});
+
+	it("a task that throws before its child ends still leaves no handle behind", async () => {
+		const h = rig([{}]);
+		const given = handle();
+		h.runner(async (call) => {
+			call.onControl?.(given);
+			throw new Error("spawn exploded");
+		});
+		await assert.rejects(h.launch("single"), /spawn exploded/);
+		assert.deepEqual(h.controls.at(-1), [0, undefined], "the view is told the run no longer has a handle");
+	});
+
+	it("a fallback attempt gets its own handle after the first attempt's was withdrawn", async () => {
+		const h = rig([{}], { chain: () => [{ model: "m1" }, { model: "m2" }] });
+		const [first, second] = [handle(), handle()];
+		let attempt = 0;
+		h.runner(async (call) => {
+			call.onControl?.(attempt === 0 ? first : second);
+			call.onControl?.(undefined);
+			return attempt++ === 0 ? errored("task 0", "429 rate limit") : reply("task 0", "ok");
+		});
+		await h.launch("single");
+		assert.deepEqual(h.controls.map(([, c]) => c), [first, undefined, second, undefined]);
 	});
 });
 

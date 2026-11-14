@@ -1,8 +1,10 @@
-// The run loop of one subagent child process: spawn it (argv/env/stdio come from
-// lib/child-launch.ts), fold its JSON lines into a run snapshot, capture stderr,
-// watch for stalls, terminate on abort (SIGTERM, then SIGKILL after 5 s), check
-// structured output, and save the attempt's folder. No Pi runtime imports: the
-// spawn function, timers, Pi invocation, and cost calculator are injected, so a
+// The run loop of one subagent child process: spawn it in Pi's RPC mode (argv/env/stdio
+// come from lib/child-launch.ts), send the task as the RPC `prompt`, fold its JSON lines
+// into a run snapshot, answer its extension UI requests with a cancellation (S0: nothing
+// waits for a person), close its stdin when the agent settles so it exits, expose a
+// steering handle while it runs, capture stderr, watch for stalls, terminate on abort
+// (SIGTERM, then SIGKILL after 5 s), check structured output, and save the attempt's
+// folder. No Pi runtime imports: the spawn function, timers, Pi invocation, and cost calculator are injected, so a
 // test drives it with a fake child.
 
 import { spawn as nodeSpawn } from "node:child_process";
@@ -13,6 +15,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import type { AgentDefinition } from "./agents.ts";
 import { foldChildEvent, parseChildLine } from "./child-events.ts";
 import { childLaunch } from "./child-launch.ts";
+import { answerUiRequest, createChildControl, encodeCommand, type ChildControl, type RpcCommand, type UiResponse } from "./child-rpc.ts";
 import { emptyTally, priceBridgeMessage, type CostCalculator, type Tally } from "./cost.ts";
 import type { LaunchRequest } from "./delegation.ts";
 import type { ResolvedRoute } from "./model-routing.ts";
@@ -80,13 +83,15 @@ export const output = (r: RunResult) =>
 
 /** The part of a child process the run loop touches (node's ChildProcess fits). */
 export interface ChildProcessLike {
+	/** The child's stdin (piped): RPC commands go in, one JSON record per line. */
+	stdin: { write(chunk: string): unknown; end(): unknown; on(event: "error", listener: (error: unknown) => void): unknown };
 	stdout: { on(event: "data", listener: (data: Buffer | string) => void): unknown };
 	stderr: { on(event: "data", listener: (data: Buffer | string) => void): unknown };
 	on(event: string, listener: (...args: any[]) => void): unknown;
 	kill(signal?: NodeJS.Signals): unknown;
 }
 
-export type SpawnFn = (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; shell: false; stdio: ["ignore", "pipe", "pipe"] }) => ChildProcessLike;
+export type SpawnFn = (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; shell: false; stdio: ["pipe", "pipe", "pipe"] }) => ChildProcessLike;
 
 export interface ChildRunDeps {
 	/** Defaults to node:child_process spawn. */
@@ -116,6 +121,11 @@ export interface RunOptions {
 	price: CostCalculator;
 	signal?: AbortSignal;
 	onUpdate: (result: RunResult) => void;
+	/**
+	 * Called with the steering handle once the child is spawned, and with `undefined` when the run has finished
+	 * (the agent settled, the child exited, or it never started). A finished run has no handle.
+	 */
+	onControl?: (control: ChildControl | undefined) => void;
 }
 
 export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise<RunResult> {
@@ -149,7 +159,6 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			route: options.route,
 			structured,
 			cwd,
-			taskText: options.taskText,
 			systemPromptPath,
 			parentEnv: env,
 		});
@@ -158,6 +167,14 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 		let lastPartialUpdate = Number.NEGATIVE_INFINITY;
 		let aborted = false;
 		let stalled = false;
+		// The user aborted this child from the viewer (the RPC `abort`); the run settles as aborted instead of throwing.
+		let userAborted = false;
+		let controlGiven = false;
+		const withdraw = () => {
+			if (!controlGiven) return;
+			controlGiven = false;
+			options.onControl?.(undefined);
+		};
 		result.exitCode = await new Promise<number>((resolveExit) => {
 			const invocation = deps.piInvocation(launch.args);
 			const proc = spawn(invocation.command, invocation.args, { cwd, env: launch.env, shell: false, stdio: launch.stdio });
@@ -165,6 +182,36 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			let exited = false;
 			let stallError = "";
 			let killTimer: unknown;
+			let abortTimer: unknown;
+			let streaming = false;
+			let inputOpen = true;
+
+			// Commands and UI answers go to the child as one JSON record per line (rpc.md:50-56); false once the pipe is closed.
+			const send = (record: RpcCommand | UiResponse): boolean => {
+				if (!inputOpen) return false;
+				try {
+					proc.stdin.write(encodeCommand(record));
+					return true;
+				} catch {
+					return false;
+				}
+			};
+			// Closing stdin asks the child to shut down in order (rpc.md:91-93); a finished run takes no more input, so it has no handle.
+			const endInput = () => {
+				if (!inputOpen) return;
+				inputOpen = false;
+				withdraw();
+				try {
+					proc.stdin.end();
+				} catch {
+					// The child is already gone.
+				}
+			};
+			// A child that exited early breaks the pipe; the close event settles the run.
+			proc.stdin.on("error", () => {
+				inputOpen = false;
+				withdraw();
+			});
 
 			// SIGTERM now, SIGKILL after the grace period if the child has not exited by then.
 			const terminate = () => {
@@ -186,11 +233,40 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			});
 			watchdog.start();
 
+			const control = createChildControl({
+				send,
+				streaming: () => streaming,
+				onAbort: () => {
+					userAborted = true;
+					// A child that does not stop on its own is terminated like any other.
+					abortTimer ??= setTimer(() => !exited && terminate(), KILL_GRACE_MS);
+				},
+			});
+			// The task is the first command (rpc.md:20; the child has no positional prompt).
+			send({ type: "prompt", message: options.taskText });
+			controlGiven = true;
+			options.onControl?.(control);
+
 			const processLine = (line: string) => {
 				for (const event of parseChildLine(line)) {
 					if (event.type === "tool_start") watchdog.toolStarted(event.id, `tool ${event.name}`);
 					else if (event.type === "tool_end") watchdog.toolFinished(event.id, `result of ${event.name}`);
 					else if (event.type === "activity") watchdog.activity(event.label);
+					else if (event.type === "run") {
+						streaming = event.phase === "start";
+						// `agent_end` can be followed by retries, compaction, or queued messages; `agent_settled` is the end (rpc.md:69).
+						if (event.phase === "settled") endInput();
+					} else if (event.type === "response") {
+						// A rejected prompt starts no run, and a handled one starts none either (rpc.md:67): neither will ever settle.
+						if (event.command === "prompt" && !event.success) {
+							Object.assign(result, { stopReason: "error", errorMessage: `Pi rejected the task: ${event.error ?? "unknown error"}` });
+							endInput();
+						} else if (event.command === "prompt" && event.disposition === "handled") endInput();
+					} else if (event.type === "ui_request") {
+						// S0: a child's dialog is cancelled on the spot, never shown to the user and never left pending.
+						const answer = answerUiRequest(event.request);
+						if (answer) send(answer);
+					}
 					// Bridge turns report $0; price them at list price (see lib/cost.ts).
 					else if (event.type === "message") event.message = (priceBridgeMessage(event.message, options.price) ?? event.message) as Message;
 					if (!foldChildEvent(result, event)) continue;
@@ -213,19 +289,25 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			proc.stderr.on("data", (data) => {
 				result.stderr += data.toString();
 			});
-			proc.on("close", (code: number | null) => {
+			const cleanup = () => {
 				exited = true;
+				inputOpen = false;
 				watchdog.stop();
 				if (killTimer !== undefined) clearTimer(killTimer);
+				if (abortTimer !== undefined) clearTimer(abortTimer);
+				withdraw();
+			};
+			proc.on("close", (code: number | null) => {
+				cleanup();
 				if (buffer.trim()) processLine(buffer);
+				// The user's abort is the cause, whatever the child reported on its way out.
+				if (userAborted) Object.assign(result, { stopReason: "aborted", errorMessage: "Aborted by the user" });
 				// The child may report its own "aborted" on SIGTERM; the stall is the real cause.
 				if (stalled) Object.assign(result, { stopReason: "error", errorMessage: stallError });
 				resolveExit(stalled ? 1 : (code ?? 0));
 			});
 			proc.on("error", (error: unknown) => {
-				exited = true;
-				watchdog.stop();
-				if (killTimer !== undefined) clearTimer(killTimer);
+				cleanup();
 				result.stderr += String(error);
 				resolveExit(1);
 			});
@@ -239,8 +321,6 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				else options.signal.addEventListener("abort", kill, { once: true });
 			}
 		});
-		// A child that ended mid-message leaves no live text behind.
-		// A child that ended mid-message leaves no live text behind.
 		// A child that ended mid-message leaves no live text behind.
 		delete result.partial;
 		if (aborted) throw new Error("Subagent was aborted");

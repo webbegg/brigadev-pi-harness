@@ -1,8 +1,12 @@
 // One shared event format for a subagent child's output stream, and the single
 // fold that builds a run snapshot from it. Pure: no Pi runtime imports, so the
-// run loop, the viewer, and tests all read a child the same way.
+// run loop, the viewer, and tests all read a child the same way. The stream is
+// Pi's RPC output (`--mode rpc`, lib/child-rpc.ts): session events as in json.md
+// plus command responses and extension UI requests, which are events of their
+// own and never transcript messages.
 
 import type { Message } from "@earendil-works/pi-ai";
+import { decodeRecord, type UiRequest } from "./child-rpc.ts";
 import { addUsage, emptyTally, type Tally } from "./cost.ts";
 
 /** Longest live text kept for an in-progress assistant message; older text is dropped (the final message is authoritative). */
@@ -17,6 +21,12 @@ export type ChildEvent =
 	| { type: "tool_end"; id: string; name: string }
 	/** Streaming text of the assistant message in progress (Pi json.md `message_update` / `text_delta`); `reset` starts a new message. */
 	| { type: "partial"; delta: string; reset?: boolean }
+	/** The agent's run phase (json.md:31-48): a low-level run started or ended; `settled` means Pi will not continue by itself (`aborted` when the run was aborted). */
+	| { type: "run"; phase: "start" | "end" | "settled"; aborted?: boolean }
+	/** The answer to one command written to stdin (rpc.md:35-48); `disposition` is the prompt/steer/follow_up outcome. */
+	| { type: "response"; command: string; success: boolean; id?: string; error?: string; disposition?: string }
+	/** An extension in the child asked its UI something (rpc-extension-ui.md); the run loop answers it per lib/child-rpc.ts. */
+	| { type: "ui_request"; request: UiRequest }
 	/** Any other sign of life from the child. */
 	| { type: "activity"; label: string };
 
@@ -33,14 +43,21 @@ export interface ChildSnapshot {
 
 export const emptySnapshot = (): ChildSnapshot => ({ messages: [], usage: emptyTally() });
 
-/** Parses one line of `pi --mode json` output into shared events; blank or broken lines yield none. */
+const RUN_PHASES = { agent_start: "start", agent_end: "end", agent_settled: "settled" } as const;
+
+/** Parses one line of `pi --mode rpc` (or `--mode json`) output into shared events; blank or broken lines yield none. */
 export function parseChildLine(line: string): ChildEvent[] {
-	if (!line.trim()) return [];
-	let event: any;
-	try {
-		event = JSON.parse(line);
-	} catch {
-		return [];
+	const record = decodeRecord(line);
+	if (!record) return [];
+	if (record.kind === "response") {
+		const { kind: _kind, ...response } = record;
+		return [{ type: "activity", label: "response" }, { type: "response", ...response }];
+	}
+	if (record.kind === "ui_request") return [{ type: "activity", label: "extension_ui_request" }, { type: "ui_request", request: record.request }];
+	const event = record.event;
+	if (typeof event?.type === "string" && Object.hasOwn(RUN_PHASES, event.type)) {
+		const phase = RUN_PHASES[event.type as keyof typeof RUN_PHASES];
+		return [{ type: "activity", label: event.type }, phase === "settled" ? { type: "run", phase, aborted: event.aborted === true } : { type: "run", phase }];
 	}
 	// Streaming (Pi docs/json.md: `message_update` carries only deltas; `message_end` is the authoritative message).
 	// Every update is a sign of life; only text deltas become live text.

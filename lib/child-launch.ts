@@ -1,8 +1,12 @@
 // How a subagent child process is launched: argv, environment, and stdio.
 // One pure function for every launch (sync and async), so the S0 guarantee is
 // stated in one place: a child never asks for permission and hangs. It runs
-// non-interactive (`--mode json -p`, stdin ignored), with the guard extension
-// (which denies instead of confirming for children) and the evidence extension.
+// Pi's RPC mode (`--mode rpc --no-session`, stdin piped so a running child can be
+// steered), with the guard extension (which denies instead of confirming for
+// children) and the evidence extension. RPC lets a child's extensions send UI
+// requests and wait for an answer; lib/child-run.ts answers every one with the
+// cancellation response (lib/child-rpc.ts), so no child waits for a person.
+// The task is not an argument: the run loop sends it as the RPC `prompt` command.
 
 import { CHILD_ENV, EVIDENCE_EXTENSION_PATH, GUARD_EXTENSION_PATH, STRUCTURED_OUTPUT_EXTENSION_PATH } from "./runtime.ts";
 import { STRUCTURED_OUTPUT_TOOL } from "./structured-output.ts";
@@ -15,7 +19,6 @@ export interface ChildLaunchInput {
 	structured?: boolean;
 	/** Canonical working directory (one spelling of it, for PWD and the project root). */
 	cwd: string;
-	taskText: string;
 	/** Temp file holding the agent's system prompt, when it has one. */
 	systemPromptPath?: string;
 	parentEnv: NodeJS.ProcessEnv;
@@ -24,20 +27,19 @@ export interface ChildLaunchInput {
 export interface ChildLaunch {
 	args: string[];
 	env: NodeJS.ProcessEnv;
-	stdio: ["ignore", "pipe", "pipe"];
+	stdio: ["pipe", "pipe", "pipe"];
 }
 
 export function childLaunch(input: ChildLaunchInput): ChildLaunch {
 	const { agent, route } = input;
 	const structured = Boolean(input.structured && agent.outputSchema);
 
-	const args = ["--mode", "json", "-p", "--no-session", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
+	const args = ["--mode", "rpc", "--no-session", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
 	if (structured) args.push("-e", STRUCTURED_OUTPUT_EXTENSION_PATH);
 	if (route.model) args.push("--model", route.model);
 	if (route.thinking) args.push("--thinking", route.thinking);
 	if (agent.tools?.length) args.push("--tools", [...agent.tools, ...(structured ? [STRUCTURED_OUTPUT_TOOL] : [])].join(","));
 	if (input.systemPromptPath) args.push("--append-system-prompt", input.systemPromptPath);
-	args.push(input.taskText);
 
 	const env: NodeJS.ProcessEnv = {
 		...input.parentEnv,
@@ -52,5 +54,5 @@ export function childLaunch(input: ChildLaunchInput): ChildLaunch {
 	if (structured && agent.outputSchema) env[CHILD_ENV.OUTPUT_SCHEMA] = agent.outputSchema;
 	else delete env[CHILD_ENV.OUTPUT_SCHEMA];
 
-	return { args, env, stdio: ["ignore", "pipe", "pipe"] };
+	return { args, env, stdio: ["pipe", "pipe", "pipe"] };
 }

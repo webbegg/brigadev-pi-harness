@@ -9,7 +9,6 @@ const input = (over: Partial<ChildLaunchInput> = {}): ChildLaunchInput => ({
 	allowedEditSurfaces: undefined,
 	route: { model: undefined, thinking: undefined },
 	cwd: "/work/repo",
-	taskText: "do the thing",
 	parentEnv: { PATH: "/usr/bin" },
 	...over,
 });
@@ -26,28 +25,38 @@ describe("childLaunch: a child can never ask for permission and hang (S0)", () =
 		["parent env says it is not a child", { parentEnv: { [CHILD_ENV.CHILD]: "0" } }],
 	];
 	for (const [name, over] of variants) {
-		it(`non-interactive json print mode, guard + evidence, stdin ignored, child env: ${name}`, () => {
+		// RPC mode keeps stdin open so a running child can be steered. A child extension's UI request is then answered by the
+		// parent with a cancellation (lib/child-rpc.ts), so nothing a child asks can wait for a person.
+		it(`RPC mode without a session, guard + evidence, stdin piped, no positional task, child env: ${name}`, () => {
 			const { args, env, stdio } = childLaunch(input(over));
-			assert.deepEqual(args.slice(0, 4), ["--mode", "json", "-p", "--no-session"]);
-			assert.ok(!args.includes("rpc"));
+			assert.deepEqual(args.slice(0, 3), ["--mode", "rpc", "--no-session"]);
+			assert.ok(!args.includes("json") && !args.includes("-p") && !args.includes("--print"));
+			assert.ok(!args.includes("--no-extensions"), "the user's own extensions still load");
 			assert.deepEqual(pairs(args, "-e").slice(0, 2), [GUARD_EXTENSION_PATH, EVIDENCE_EXTENSION_PATH]);
-			assert.equal(stdio[0], "ignore");
-			assert.deepEqual(stdio, ["ignore", "pipe", "pipe"]);
+			assert.deepEqual(stdio, ["pipe", "pipe", "pipe"]);
 			assert.equal(env[CHILD_ENV.CHILD], "1");
+		});
+
+		it(`sends the task as an RPC prompt, never in argv (rpc.md:20): ${name}`, () => {
+			const { args } = childLaunch(input(over));
+			// Every argument is a flag or the value of a value-taking flag: no bare positional remains.
+			const valueFlags = new Set(["--mode", "-e", "--model", "--thinking", "--tools", "--append-system-prompt"]);
+			const positional = args.filter((a, i) => !a.startsWith("-") && !valueFlags.has(args[i - 1]));
+			assert.deepEqual(positional, []);
 		});
 	}
 });
 
 describe("childLaunch: arguments", () => {
-	it("ends with the task text, after the system prompt flag", () => {
+	it("ends with the system prompt flag; the task is not an argument", () => {
 		const { args } = childLaunch(input({ systemPromptPath: "/tmp/system.md" }));
-		assert.deepEqual(args.slice(-3), ["--append-system-prompt", "/tmp/system.md", "do the thing"]);
+		assert.deepEqual(args.slice(-2), ["--append-system-prompt", "/tmp/system.md"]);
 	});
 
 	it("omits the system prompt flag without a prompt file", () => {
 		const { args } = childLaunch(input());
 		assert.ok(!args.includes("--append-system-prompt"));
-		assert.equal(args.at(-1), "do the thing");
+		assert.deepEqual(args.slice(0, 3), ["--mode", "rpc", "--no-session"]);
 	});
 
 	it("passes model, thinking and agent tools", () => {
