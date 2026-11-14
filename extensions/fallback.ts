@@ -87,7 +87,8 @@ export default function (pi: ExtensionAPI) {
 							"Pick up the user's latest request exactly where the transcript above stops: do not repeat finished steps and do not start other work.",
 							request ? `\nThe user's latest request:\n${request}` : "",
 						].join("\n"),
-						display: true,
+						// For the model only; the user already got the one-line warning above.
+						display: false,
 					},
 				],
 				continue: true,
