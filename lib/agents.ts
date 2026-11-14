@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export type AgentSource = "package" | "user" | "project";
 
@@ -28,6 +28,15 @@ function toolList(value: unknown): string[] | undefined {
 	return tools.length > 0 ? tools : undefined;
 }
 
+/** Absolute path of the `output` schema, or undefined when it is empty or resolves outside the agent file's directory. */
+function outputSchemaPath(value: unknown, filePath: string): string | undefined {
+	if (typeof value !== "string" || !value.trim()) return undefined;
+	const dir = dirname(filePath);
+	const resolved = resolve(dir, value.trim());
+	const rel = relative(dir, resolved);
+	return rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel) ? undefined : resolved;
+}
+
 export function parseAgent(content: string, filePath: string, source: AgentSource, parse: FrontmatterParser): AgentDefinition | undefined {
 	const { frontmatter, body } = parse(content);
 	if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string") return undefined;
@@ -39,7 +48,7 @@ export function parseAgent(content: string, filePath: string, source: AgentSourc
 		thinking: typeof frontmatter.thinking === "string" ? frontmatter.thinking : undefined,
 		writer: frontmatter.writer === true,
 		admission: frontmatter.admission === "risk" ? "risk" : undefined,
-		outputSchema: typeof frontmatter.output === "string" && frontmatter.output.trim() ? resolve(dirname(filePath), frontmatter.output.trim()) : undefined,
+		outputSchema: outputSchemaPath(frontmatter.output, filePath),
 		systemPrompt: body,
 		source,
 		filePath,

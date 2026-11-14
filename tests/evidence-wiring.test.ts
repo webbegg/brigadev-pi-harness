@@ -212,6 +212,7 @@ describe("the user's force is spent only when the commit goes ahead (A3)", () =>
 	async function session(cwd: string, ui: { hasUI: boolean; confirm: (title: string) => boolean }) {
 		const handlers: Record<string, Function[]> = {};
 		const commands: Record<string, { handler: Function }> = {};
+		const notes: string[] = [];
 		const pi: any = {
 			on: (event: string, handler: Function) => (handlers[event] ??= []).push(handler),
 			registerCommand: (name: string, options: { handler: Function }) => (commands[name] = options),
@@ -226,9 +227,10 @@ describe("the user's force is spent only when the commit goes ahead (A3)", () =>
 			},
 		};
 		(await import(`../extensions/guard.ts?${Math.random()}`)).default(pi);
-		const ctx: any = { cwd, hasUI: ui.hasUI, sessionManager: { getBranch: () => [] }, ui: { confirm: async (title: string) => ui.confirm(title), notify: () => {}, setStatus: () => {} } };
+		const ctx: any = { cwd, hasUI: ui.hasUI, sessionManager: { getBranch: () => [] }, ui: { confirm: async (title: string) => ui.confirm(title), notify: (message: string) => void notes.push(message), setStatus: () => {} } };
 		let id = 0;
 		return {
+			notes,
 			force: () => commands["brigadev:force-commit"].handler("", ctx),
 			async call(command: string) {
 				for (const handler of handlers.tool_call ?? []) {
@@ -262,6 +264,27 @@ describe("the user's force is spent only when the commit goes ahead (A3)", () =>
 		git("checkout", "-q", "-b", "feat/y");
 		assert.equal(await s.call("git commit -am x"), undefined);
 		assert.deepEqual(evidence("feat-y").filter((r) => r.type === "force").map((r) => r.via), ["dialog"]);
+	});
+
+	it("fails closed when the working tree cannot be computed; only the dialog can force it", async () => {
+		const { repo, git, evidence } = makeRepo("feat/q");
+		writeFileSync(join(repo, ".git", "index"), "not an index"); // rev-parse still works, hashing the tree does not
+		const headless = await session(repo, { hasUI: false, confirm: () => false });
+		const reason = String(await headless.call("git commit -am x"));
+		assert.match(reason, /evidence gate/);
+		assert.match(reason, /could not be computed/);
+
+		await headless.force();
+		assert.match(headless.notes.join("\n"), /dialog|fix git/i, "the command says what to do instead");
+		assert.match(String(await headless.call("git commit -am x")), /evidence gate/, "the command grants nothing on an error");
+		assert.deepEqual(evidence("feat-q"), []);
+
+		const asked: string[] = [];
+		const interactive = await session(repo, { hasUI: true, confirm: (title) => (asked.push(title), true) });
+		assert.equal(await interactive.call("git commit -am x"), undefined, "the user can force it in the dialog");
+		assert.match(asked[0], /evidence gate/, "the gate asks first, then the normal commit rule");
+		assert.deepEqual(evidence("feat-q").filter((r) => r.type === "force").map((r) => r.via), ["dialog"]);
+		void git;
 	});
 
 	it("blocks a bash command that writes the evidence log and lets one read it (A1)", async () => {

@@ -1,6 +1,7 @@
 {
 	"type": "object",
 	"additionalProperties": false,
+	"minProperties": 1,
 	"description": "Initial discovery: findings only. Scoped re-judgment: resolutions only.",
 	"properties": {
 		"findings": {

@@ -68,6 +68,7 @@ The log is `<repo docs>/evidence/<branch with / as ->.jsonl`, in the repo docs f
 - Before: the earliest `fail` run for the bug or the RED test, quoting its `command` and what `tail` shows. Without one (no bug, or nothing was recorded), write `none recorded` instead of inventing it.
 - After: the latest `pass` run, quoting `command` and `outcome`. Prefer a `test` run whose `tree` is the final one; if the last edit came after it, say so.
 - Quote commands and outcomes as logged. Treat `unknown` as not verified. Never claim a check that is not in the log; a check you ran outside the log may be listed as run without a log record.
+- Secrets: the log stores commands and output tails in plaintext. Before showing the draft, check every command and output tail quoted from it for secrets, tokens, and credentials, and replace them with `<REDACTED>`.
 - No log file: say the PR has no recorded evidence, and list only what you observed yourself.
 
 ### Blast radius

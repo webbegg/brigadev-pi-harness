@@ -382,8 +382,10 @@ export type GateDecision = { action: "allow"; why: string } | { action: "block";
 export interface GateInput {
 	/** Paths `git status` reports as changed, project-relative. */
 	dirtyPaths: readonly string[];
-	/** Current worktree content tree; undefined when git cannot tell. */
+	/** Current worktree content tree; undefined when there is no git work tree, or when `treeError` says it could not be computed. */
 	tree: string | undefined;
+	/** Why the tree could not be computed (timeout, git failure). Set means the gate fails closed; absent with no tree means no git. */
+	treeError?: string;
 	/** The commit may run in another directory or on another branch. */
 	elsewhere: boolean;
 	records: readonly EvidenceRecord[];
@@ -394,13 +396,19 @@ export interface GateInput {
 const UNBLOCK =
 	"Run the tests in their own bash command, with the runner as the command itself (`npm test`, `node --test`, ...; optionally in an `&&` chain) so its exit code is the test's: no `;`, `||`, `&`, `!`, comment, subshell, or later `|` unless a leading `set -o pipefail;` is set, and no `cd` out of the repository. Then commit again. If the user wants to commit anyway, only they can force it: the guard asks them when a UI is present; otherwise tell them to run /brigadev:force-commit.";
 
+const TREE_ERROR_UNBLOCK =
+	"Retry the commit; if it keeps failing, fix the git problem (a very large untracked file, a corrupt index, a stuck lock) or ignore the file. If the user wants to commit anyway, only they can force it: the guard asks them when a UI is present; /brigadev:force-commit cannot help while the working tree cannot be computed.";
+
 export function decideCommitGate(input: GateInput): GateDecision {
 	if (input.elsewhere) {
 		return { action: "block", reason: `Blocked by brigadev evidence gate: this commit runs in another directory or on another branch, so the recorded test runs cannot vouch for it. Commit from the session's directory. ${UNBLOCK}` };
 	}
+	if (input.treeError !== undefined) {
+		return { action: "block", reason: `Blocked by brigadev evidence gate: the working tree could not be computed (${input.treeError}), so no recorded test run can be matched to this commit. ${TREE_ERROR_UNBLOCK}` };
+	}
 	if (input.tree === undefined) return { action: "allow", why: "no git tree to check" };
 	if (!input.dirtyPaths.some(isSourcePath)) return { action: "allow", why: "docs-only changes" };
-	if (input.forcedTree === input.tree) return { action: "allow", why: "forced by the user" };
+	if (input.forcedTree !== undefined && input.forcedTree === input.tree) return { action: "allow", why: "forced by the user" };
 	const runs = input.records.filter((r): r is RunRecord => r.type === "run" && r.kind === "test" && r.tree === input.tree);
 	if (runs.some((r) => r.outcome === "pass")) return { action: "allow", why: "passing test on this tree" };
 	const last = runs.at(-1);
@@ -459,7 +467,7 @@ export function forceRecord(input: { ts: string; branch: string | null; tree?: s
 export function gateDialog(reason: string, command: string): { title: string; body: string } {
 	const detail = reason
 		.replace(/^Blocked by brigadev evidence gate:\s*/, "")
-		.replace(/\s*(Run the tests in their own|Commit from the session's directory).*$/s, "")
+		.replace(/\s*(Run the tests in their own|Commit from the session's directory|Retry the commit).*$/s, "")
 		.trim();
 	return {
 		title: "brigadev: evidence gate blocked this commit",

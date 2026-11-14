@@ -85,6 +85,9 @@ const failed = (r: RunResult) => r.exitCode > 0 || r.stopReason === "error" || r
 const output = (r: RunResult) =>
 	(failed(r) ? r.errorMessage || r.stderr.trim() || finalText(r.messages) : r.structured !== undefined ? formatStructured(r.structured) : finalText(r.messages)) || "(no output)";
 
+/** One parallel section's body: a structured result is never cut (compact JSON above the cap); prose is capped. */
+const sectionOutput = (r: RunResult): string => (!failed(r) && r.structured !== undefined ? formatStructured(r.structured, PER_TASK_OUTPUT_CAP) : capOutput(output(r)));
+
 function capOutput(text: string): string {
 	if (Buffer.byteLength(text, "utf8") <= PER_TASK_OUTPUT_CAP) return text;
 	let cut = text.slice(0, PER_TASK_OUTPUT_CAP);
@@ -562,7 +565,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: (failed(r) ? `Agent ${r.stopReason ?? "failed"}: ` : "") + output(r) + warningText }], details, isError: failed(r) };
 			}
 			const ok = results.filter((r) => !failed(r)).length;
-			const sections = results.map((r) => `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${capOutput(output(r))}`);
+			const sections = results.map((r) => `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${sectionOutput(r)}`);
 			return { content: [{ type: "text", text: `Parallel: ${ok}/${results.length} succeeded\n\n${sections.join("\n\n---\n\n")}${warningText}` }], details };
 		},
 

@@ -45,6 +45,11 @@ describe("Judgment Day judge schemas", () => {
 			assert.deepEqual(validateAgainstSchema(schema, { resolutions: [{ id: "JD-A-001", outcome: "verified", evidence: "e" }] }), []);
 		});
 
+		it(`${judge} rejects an empty payload, which must not read as clean`, () => {
+			assert.deepEqual(validateAgainstSchema(schemaOf(judge), {}), ["$: expected at least 1 property"]);
+			assert.deepEqual(validateAgainstSchema(schemaOf(judge), { findings: [] }), []);
+		});
+
 		it(`${judge} rejects an unknown outcome`, () => {
 			assert.equal(validateAgainstSchema(schemaOf(judge), { resolutions: [{ id: "x", outcome: "fixed", evidence: "e" }] }).length, 1);
 		});

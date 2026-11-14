@@ -18,7 +18,7 @@ import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { appendSystemPromptOnce, CHILD_ENV, childAllowedSurfaces, isChildSession, readSettings, writeSettings } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
-import { worktreeTree } from "../lib/worktree-tree.ts";
+import { worktreeTreeResult } from "../lib/worktree-tree.ts";
 
 const MODE_ENTRY = "brigadev-mode";
 const STATUS_KEY = "brigadev-mode";
@@ -83,7 +83,9 @@ export default function (pi: ExtensionAPI) {
 		// The whole repository, not the session folder: a session in a subdirectory commits files elsewhere too.
 		const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: projectRoot(ctx), timeout: 15_000 }).catch(() => undefined);
 		const root = top?.code === 0 && top.stdout.trim() ? canonicalPath(top.stdout.trim()) : projectRoot(ctx);
-		const tree = await worktreeTree(root);
+		const treeResult = await worktreeTreeResult(root);
+		const tree = treeResult.kind === "tree" ? treeResult.tree : undefined;
+		const treeError = treeResult.kind === "error" ? treeResult.reason : undefined;
 		const snapshot = tree === undefined ? undefined : await takeSnapshot(exec, root);
 		const branch = (await readBranchFacts(exec, ctx.cwd)).currentBranch;
 		const file = evidenceFile(repoDocsDir(ctx.cwd), branch);
@@ -99,6 +101,7 @@ export default function (pi: ExtensionAPI) {
 			// Unknown dirty paths count as source: a gate that cannot see the change must not pass it.
 			dirtyPaths: snapshot ? [...snapshot.keys()] : ["(unknown)"],
 			tree,
+			treeError,
 			elsewhere: commits.some((match) => match.elsewhere),
 			records: readEvidence(file),
 			forcedTree,
@@ -221,9 +224,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("brigadev:force-commit", {
 		description: "Let the next git commit on the current working tree pass the evidence gate (one-shot; edits cancel it)",
 		handler: async (_args, ctx) => {
-			const tree = await worktreeTree(projectRoot(ctx));
-			if (tree === undefined) return ctx.ui.notify("brigadev: not a git working tree, so the evidence gate does not apply", "error");
-			forcedTree = tree;
+			const result = await worktreeTreeResult(projectRoot(ctx));
+			if (result.kind === "no-git") return ctx.ui.notify("brigadev: not a git working tree, so the evidence gate does not apply", "error");
+			if (result.kind === "error") {
+				return ctx.ui.notify(`brigadev: the working tree could not be computed (${result.reason}), so a force cannot be bound to it. Use the dialog the guard shows when the commit is blocked, or fix git and try again.`, "error");
+			}
+			forcedTree = result.tree;
 			ctx.ui.notify("brigadev: the next commit of the current working tree skips the evidence gate. Editing any file first cancels this.", "info");
 		},
 	});

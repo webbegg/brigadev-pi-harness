@@ -6,7 +6,7 @@
  *
  * The validator covers the JSON Schema subset our agent schemas use: type
  * (string or list), properties, required, additionalProperties: false,
- * items, enum, minItems, minLength. Other keywords are ignored.
+ * items, enum, minItems, minLength, minProperties. Other keywords are ignored.
  */
 
 import { readFileSync } from "node:fs";
@@ -51,6 +51,9 @@ function check(schema: JsonSchema, value: unknown, path: string, errors: string[
 	if (typeOf(value) === "object") {
 		const record = value as Record<string, unknown>;
 		const properties = (schema.properties ?? {}) as Record<string, JsonSchema>;
+		if (typeof schema.minProperties === "number" && Object.keys(record).length < schema.minProperties) {
+			errors.push(`${path}: expected at least ${schema.minProperties} propert${schema.minProperties === 1 ? "y" : "ies"}`);
+		}
 		// Own keys only: a payload key such as "constructor" must not resolve to Object.prototype.
 		for (const key of Array.isArray(schema.required) ? (schema.required as string[]) : []) {
 			if (!Object.hasOwn(record, key)) errors.push(`${path}.${key}: required`);
@@ -120,8 +123,14 @@ export function checkStructuredRun(messages: readonly MessageLike[], schema: Jso
 	return { ok: true, value: output.value };
 }
 
-export function formatStructured(value: unknown): string {
-	return `\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
+/**
+ * The payload as a fenced JSON block. Pretty-printed, unless that exceeds `maxBytes`:
+ * then compact, so the block is still whole and parseable. It is never truncated.
+ */
+export function formatStructured(value: unknown, maxBytes?: number): string {
+	const pretty = JSON.stringify(value, null, 2);
+	const body = maxBytes !== undefined && Buffer.byteLength(pretty, "utf8") > maxBytes ? JSON.stringify(value) : pretty;
+	return `\`\`\`json\n${body}\n\`\`\``;
 }
 
 /** The child gets exactly one reminder when it settles without a result. */

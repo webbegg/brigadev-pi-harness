@@ -17,7 +17,7 @@ import {
 	readEvidence,
 	type EvidenceRecord,
 } from "../lib/evidence.ts";
-import { worktreeTree } from "../lib/worktree-tree.ts";
+import { worktreeTree, worktreeTreeResult } from "../lib/worktree-tree.ts";
 
 describe("checkKind", () => {
 	it("tells test runs from other checks", () => {
@@ -216,6 +216,20 @@ describe("decideCommitGate", () => {
 		assert.equal(decideCommitGate({ ...base, tree: undefined, records: [] }).action, "allow");
 	});
 
+	it("blocks when the tree could not be computed, naming the failure (fails closed)", () => {
+		for (const records of [[], [run({})], [run({ tree: undefined })]]) {
+			const gate = decideCommitGate({ ...base, tree: undefined, treeError: "timed out after 10s", records });
+			assert.equal(gate.action, "block");
+			assert.match(gate.action === "block" ? gate.reason : "", /timed out after 10s/);
+		}
+	});
+
+	it("does not let an undefined forced tree match an undefined tree", () => {
+		const gate = decideCommitGate({ ...base, tree: undefined, treeError: "git failed", records: [], forcedTree: undefined });
+		assert.equal(gate.action, "block");
+		assert.equal(decideCommitGate({ ...base, tree: undefined, treeError: "git failed", records: [], forcedTree: "T" }).action, "block");
+	});
+
 	it("blocks a commit that runs in another directory, even with evidence here", () => {
 		assert.equal(decideCommitGate({ ...base, elsewhere: true }).action, "block");
 	});
@@ -264,5 +278,47 @@ describe("worktreeTree", () => {
 
 	it("is undefined outside a repository", async () => {
 		assert.equal(await worktreeTree(realpathSync(mkdtempSync(join(tmpdir(), "brigadev-nogit-")))), undefined);
+	});
+
+	it("tells a missing repository from a failure", async () => {
+		assert.deepEqual(await worktreeTreeResult(realpathSync(mkdtempSync(join(tmpdir(), "brigadev-nogit-")))), { kind: "no-git" });
+
+		const repo = realpathSync(mkdtempSync(join(tmpdir(), "brigadev-tree-")));
+		git(repo, "init", "-q");
+		writeFileSync(join(repo, "a.ts"), "1");
+		const ok = await worktreeTreeResult(repo);
+		assert.equal(ok.kind, "tree");
+		assert.match(ok.kind === "tree" ? ok.tree : "", /^[0-9a-f]{40,64}$/);
+
+		const expired = await worktreeTreeResult(repo, { timeoutMs: 0 });
+		assert.equal(expired.kind, "error");
+		assert.match(expired.kind === "error" ? expired.reason : "", /timed out/);
+		assert.equal(await worktreeTree(repo, { timeoutMs: 0 }), undefined);
+
+		writeFileSync(join(repo, ".git", "index"), "not an index");
+		const broken = await worktreeTreeResult(repo);
+		assert.equal(broken.kind, "error", "a git failure is not 'no git'");
+	});
+
+	it("writes no objects into the real object store", async () => {
+		const repo = realpathSync(mkdtempSync(join(tmpdir(), "brigadev-tree-")));
+		git(repo, "init", "-q");
+		git(repo, "config", "user.email", "t@t");
+		git(repo, "config", "user.name", "t");
+		writeFileSync(join(repo, "a.ts"), "1");
+		git(repo, "add", "a.ts");
+		git(repo, "commit", "-qm", "init");
+		const objects = () => git(repo, "count-objects", "-v").split("\n").filter((line) => /^(count|in-pack):/.test(line)).join(",");
+		const before = objects();
+
+		writeFileSync(join(repo, "untracked.ts"), "content never hashed before\n");
+		const first = await worktreeTree(repo);
+		assert.match(first ?? "", /^[0-9a-f]{40}$/);
+		assert.equal(objects(), before, "hashing an untracked file leaves the real .git/objects as it was");
+		assert.equal(await worktreeTree(repo), first, "the key is stable");
+
+		writeFileSync(join(repo, "untracked.ts"), "changed\n");
+		assert.notEqual(await worktreeTree(repo), first, "an edit changes the key");
+		assert.equal(objects(), before);
 	});
 });

@@ -58,6 +58,13 @@ describe("validateAgainstSchema", () => {
 		assert.deepEqual(validateAgainstSchema({ type: "array", minItems: 1 }, []), ["$: expected at least 1 item"]);
 		assert.deepEqual(validateAgainstSchema({ type: "string", minLength: 2 }, "a"), ["$: expected at least 2 characters"]);
 	});
+
+	it("checks minProperties on objects", () => {
+		const object = { type: "object", minProperties: 1, properties: { a: { type: "string" } } };
+		assert.deepEqual(validateAgainstSchema(object, {}), ["$: expected at least 1 property"]);
+		assert.deepEqual(validateAgainstSchema({ ...object, minProperties: 2 }, { a: "x" }), ["$: expected at least 2 properties"]);
+		assert.deepEqual(validateAgainstSchema(object, { a: "x" }), []);
+	});
 });
 
 const call = (id: string, args: unknown) => ({ role: "assistant", content: [{ type: "toolCall", id, name: STRUCTURED_OUTPUT_TOOL, arguments: args }] });
@@ -117,6 +124,18 @@ describe("structured output helpers", () => {
 		assert.equal(formatStructured({ a: 1 }), '```json\n{\n  "a": 1\n}\n```');
 	});
 
+	it("switches to compact JSON above the byte cap and never truncates", () => {
+		const value = { findings: Array.from({ length: 400 }, (_, i) => ({ id: `R-${i}`, claim: "é".repeat(60) })) };
+		const cap = 10 * 1024;
+		assert.ok(Buffer.byteLength(JSON.stringify(value, null, 2), "utf8") > cap);
+		const text = formatStructured(value, cap);
+		const match = text.match(/^```json\n([\s\S]*)\n```$/);
+		assert.ok(match, "a complete fenced block");
+		assert.deepEqual(JSON.parse(match[1]), value);
+		assert.equal(match[1], JSON.stringify(value));
+		assert.equal(formatStructured({ a: 1 }, cap), formatStructured({ a: 1 }), "small payloads stay pretty");
+	});
+
 	it("nudges once when the child settles without a result", () => {
 		assert.equal(shouldNudge({ captured: false, nudges: 0 }), true);
 		assert.equal(shouldNudge({ captured: false, nudges: 1 }), false);
@@ -134,6 +153,16 @@ describe("parseAgent output schema", () => {
 	it("resolves the output schema next to the agent file", () => {
 		const agent = parseAgent("---\nname: v\ndescription: d\noutput: v.schema.json\n---\nbody", "/pkg/agents/v.md", "package", parse);
 		assert.equal(agent?.outputSchema, "/pkg/agents/v.schema.json");
+	});
+
+	it("ignores an output path that leaves the agent's directory", () => {
+		for (const output of ["../secret.json", "/etc/passwd", "sub/../../x.json", ".."]) {
+			const agent = parseAgent(`---\nname: v\ndescription: d\noutput: ${output}\n---\nbody`, "/pkg/agents/v.md", "package", parse);
+			assert.ok(agent, output);
+			assert.equal(agent.outputSchema, undefined, output);
+		}
+		const nested = parseAgent("---\nname: v\ndescription: d\noutput: schemas/v.json\n---\nbody", "/pkg/agents/v.md", "package", parse);
+		assert.equal(nested?.outputSchema, "/pkg/agents/schemas/v.json");
 	});
 
 	it("leaves prose agents without a schema", () => {
