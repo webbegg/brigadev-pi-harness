@@ -57,3 +57,28 @@ export function todoCard(todos: readonly Todo[], options: { collapsed: boolean; 
 	const open = visible.filter((t) => t.status !== "done");
 	return { header, rows: [{ text: `✓ ${done} done`, tone: "success" }, ...open.slice(0, maxRows - 1).map(row)] };
 }
+
+/** Ids in `after` that are new or whose status, text, or note differ from `before`, in list order. */
+export function changedIds(before: readonly Todo[], after: readonly Todo[]): string[] {
+	const prev = new Map(before.map((t) => [t.id, t]));
+	return after
+		.filter((t) => {
+			const p = prev.get(t.id);
+			return !p || p.status !== t.status || p.text !== t.text || p.note !== t.note;
+		})
+		.map((t) => t.id);
+}
+
+/**
+ * One transcript line for a todo call: progress, then what changed. The card
+ * holds the full list, so the row never repeats it. Only the task in progress
+ * keeps its text. Undefined when the result predates recorded changes.
+ */
+export function todoDeltaLine(after: readonly Todo[], changed: readonly string[] | undefined): CardRow | undefined {
+	if (!changed) return undefined;
+	const visible = after.filter((t) => t.status !== "dropped");
+	const done = visible.filter((t) => t.status === "done").length;
+	const ids = new Set(changed);
+	const parts = after.filter((t) => ids.has(t.id)).map((t) => `${TODO_GLYPH[t.status]} ${t.id}${t.status === "in_progress" ? ` ${t.text}` : ""}`);
+	return { text: [`Todo ${done}/${visible.length}`, ...parts].join(" · "), tone: "accent" };
+}

@@ -17,11 +17,13 @@ import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { panelState } from "../lib/panel-state.ts";
 import { isChildSession } from "../lib/runtime.ts";
-import { isOpen, TODO_GLYPH as GLYPH, TODO_STATUSES as STATUSES, todoCard, type Todo, type TodoStatus as Status } from "../lib/todo-card.ts";
+import { changedIds, isOpen, TODO_GLYPH as GLYPH, TODO_STATUSES as STATUSES, todoCard, todoDeltaLine, type Todo, type TodoStatus as Status } from "../lib/todo-card.ts";
 
 interface TodoDetails {
 	todos: Todo[];
 	error?: string;
+	/** Ids this call added or changed; absent in results stored before deltas were recorded. */
+	changed?: string[];
 }
 
 const WIDGET_KEY = "brigadev-todo";
@@ -138,6 +140,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Params,
 
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const before = todos.map((t) => ({ ...t }));
 			const reply = (text: string, error?: string) => {
 				listInContext = true;
 				if (!error && params.action !== "list") {
@@ -145,7 +148,7 @@ export default function (pi: ExtensionAPI) {
 					staleRuns = 0;
 				}
 				refreshWidget(ctx);
-				return { content: [{ type: "text" as const, text }], details: { todos: todos.map((t) => ({ ...t })), error } as TodoDetails };
+				return { content: [{ type: "text" as const, text }], details: { todos: todos.map((t) => ({ ...t })), error, changed: changedIds(before, todos) } as TodoDetails };
 			};
 			switch (params.action) {
 				case "set": {
@@ -182,11 +185,14 @@ export default function (pi: ExtensionAPI) {
 			return new Text(text, 0, 0);
 		},
 
-		renderResult(result, _options, theme) {
+		renderResult(result, { expanded }, theme) {
 			const details = result.details as TodoDetails | undefined;
 			if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
 			const list = details?.todos ?? [];
 			if (list.length === 0) return new Text(theme.fg("dim", "No todos"), 0, 0);
+			// Collapsed rows show only what changed; the card above the editor is the full view.
+			const delta = expanded ? undefined : todoDeltaLine(list, details?.changed);
+			if (delta) return new Text(theme.fg(delta.tone, delta.text), 0, 0);
 			const color = (s: Status) => (s === "done" ? "success" : s === "blocked" ? "warning" : s === "dropped" ? "dim" : s === "in_progress" ? "accent" : "muted");
 			return new Text(list.map((t) => theme.fg(color(t.status), `${GLYPH[t.status]} ${t.id} ${t.text}`)).join("\n"), 0, 0);
 		},
