@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Structured subagent results: an agent definition may declare `output: <file>.schema.json`. Its child process gets a `structured_output` tool whose parameters are that schema; an accepted call ends the run, a run that settles without one gets a single reminder, and the parent validates the payload and fails the run when it is missing or does not match. A schema that cannot be read rejects the launch. Agents without `output` keep their prose results.
+- The review lenses (`review-*`), the Judgment Day judges (`jd-judge-a`, `jd-judge-b`), and `brigadev-verify` now return their existing contracts as schema-checked JSON (`assets/agents/*.schema.json`): review findings plus a required `reviewed` line, judge `findings` or `resolutions`, and verifier verdicts per `S#`, blockers, advisories, regression tests, scratch directories, and unverified checks. A lens or judge run that fails validation is never read as clean: `brigadev-review` and Judgment Day relaunch it once, then report it. An agent override without `output` keeps the prose contract.
 
 ## [0.13.0] - 2026-11-07
 

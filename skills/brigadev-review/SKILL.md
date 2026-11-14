@@ -40,7 +40,7 @@ git diff --stat <base>...HEAD
 ```
 
 2. **Launch** the selected lenses in ONE parallel `subagent` call. Each task names the patch path, the base, the touched files, and the feature document if one exists. `reason`: "review: <lens> because <what the candidate touches>".
-3. **Ledger**: merge the findings, dedupe by location and claim, and keep IDs. Classify:
+3. **Ledger**: each lens returns schema-checked JSON (`findings`, `reviewed`). A failed lens run is never clean: relaunch it once, then report it as not reviewed. Merge the findings, dedupe by location and claim, and keep IDs. Classify:
    - **blocker**: `introduced` or `worsened` BLOCKER/CRITICAL with concrete evidence;
    - **follow-up**: `pre-existing` findings;
    - **advisory**: WARNING and SUGGESTION.
