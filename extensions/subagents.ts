@@ -23,7 +23,8 @@ import { queuedFields, runState, settleQueued, subagentRow, syncRowTimer, type R
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { listWidth, maxScroll, renderTwoPane, type Row } from "../lib/two-pane.ts";
 import type { AgentDefinition } from "../lib/agents.ts";
-import { addUsage, emptyTally, formatCost, formatTokens, priceBridgeMessage, type CostCalculator, type Tally } from "../lib/cost.ts";
+import { emptyTally, formatCost, formatTokens, priceBridgeMessage, type CostCalculator, type Tally } from "../lib/cost.ts";
+import { foldChildEvent, parseChildLine } from "../lib/child-events.ts";
 import { createStallWatchdog, resolveStallTimeouts, stallMessage } from "../lib/stall-watchdog.ts";
 import { admitLaunch, buildChildTask, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
 import { classifyFailure, cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
@@ -208,39 +209,14 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 			});
 			watchdog.start();
 
-			const trackActivity = (event: any) => {
-				const msg = event.type === "message_end" ? event.message : undefined;
-				if (msg?.role === "assistant" && Array.isArray(msg.content)) {
-					const calls = msg.content.filter((p: any) => p?.type === "toolCall");
-					for (const call of calls) watchdog.toolStarted(String(call.id), `tool ${call.name}`);
-					if (!calls.length) watchdog.activity("assistant message");
-				} else if (msg?.role === "toolResult") {
-					watchdog.toolFinished(String(msg.toolCallId), `result of ${msg.toolName ?? "tool"}`);
-				} else {
-					watchdog.activity(String(event.type ?? "event"));
-				}
-			};
-
 			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-				trackActivity(event);
-				if (event.type === "message_end" && event.message) {
+				for (const event of parseChildLine(line)) {
+					if (event.type === "tool_start") watchdog.toolStarted(event.id, `tool ${event.name}`);
+					else if (event.type === "tool_end") watchdog.toolFinished(event.id, `result of ${event.name}`);
+					else if (event.type === "activity") watchdog.activity(event.label);
 					// Bridge turns report $0; price them at list price (see lib/cost.ts).
-					const msg = (priceBridgeMessage(event.message, options.price) ?? event.message) as Message;
-					result.messages.push(msg);
-					if (msg.role === "assistant") {
-						addUsage(result.usage, msg.usage);
-						if (msg.model) result.model = msg.provider ? `${msg.provider}/${msg.model}` : msg.model;
-						if (msg.stopReason) result.stopReason = msg.stopReason;
-						if (msg.errorMessage) result.errorMessage = msg.errorMessage;
-					}
-					options.onUpdate(result);
+					else event.message = (priceBridgeMessage(event.message, options.price) ?? event.message) as Message;
+					if (foldChildEvent(result, event)) options.onUpdate(result);
 				}
 			};
 
