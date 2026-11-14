@@ -109,6 +109,7 @@ function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.Proc
 				const at = args.indexOf("--append-system-prompt");
 				h.spawned = { command, args, options, promptFile: at >= 0 ? fs.readFileSync(args[at + 1], "utf8") : undefined };
 				h.proc = new FakeChild();
+				onSpawn?.();
 				return h.proc;
 			};
 			const options: RunOptions = {
@@ -144,13 +145,23 @@ function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.Proc
 			return promise;
 		},
 		ready: async () => {
-			for (let i = 0; i < 50 && !h.proc; i++) await tick();
+			// The run spawns after real async temp-dir I/O, which can take any number of ticks under load: wait for the spawn itself.
+			if (!h.proc) {
+				await new Promise<void>((resolve) => {
+					const ceiling = setTimeout(resolve, 5000);
+					onSpawn = () => {
+						clearTimeout(ceiling);
+						resolve();
+					};
+				});
+			}
 			assert.ok(h.proc, "child was spawned");
 			return h.proc;
 		},
 		savedRuns: () => fs.readdirSync(path.join(docs, "runs")),
 		saved: (result: RunResult, file: string) => fs.readFileSync(path.join(result.artifactsDir!, file), "utf8"),
 	};
+	let onSpawn: (() => void) | undefined;
 	return h;
 }
 
@@ -1149,7 +1160,8 @@ describe("createChildTracker: every live child in one place, with a bounded forc
 		(await a.ready()).pid = 11;
 		(await b.ready()).pid = 12;
 		tracker.killAll("SIGKILL");
-		assert.deepEqual(groupKills, [[11, "SIGKILL"], [12, "SIGKILL"]]);
+		// Each run spawns after its own async temp-dir setup, so the two register in either order.
+		assert.deepEqual(groupKills.sort(([x], [y]) => x - y), [[11, "SIGKILL"], [12, "SIGKILL"]]);
 		a.proc!.close(null);
 		b.proc!.close(null);
 		await Promise.all([pa, pb]);
@@ -1224,7 +1236,8 @@ describe("createChildTracker: every live child in one place, with a bounded forc
 		(await a.ready()).pid = 21;
 		(await b.ready()).pid = 22;
 		tracker.killAllNow();
-		assert.deepEqual(groupKills, [[21, "SIGKILL"], [22, "SIGKILL"]]);
+		// Each run spawns after its own async temp-dir setup, so the two register in either order.
+		assert.deepEqual(groupKills.sort(([x], [y]) => x - y), [[21, "SIGKILL"], [22, "SIGKILL"]]);
 		a.proc!.close(null);
 		b.proc!.close(null);
 		await Promise.all([pa, pb]);
