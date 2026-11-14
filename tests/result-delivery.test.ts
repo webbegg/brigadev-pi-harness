@@ -211,6 +211,46 @@ describe("result delivery: a delivery that throws is retried, then reported", ()
 		assert.deepEqual(h.log.failed, []);
 	});
 
+	it("R3-101: unrelated settles while idle do not burn the attempt budget; idle signals do", () => {
+		const failing = new Set(["L1"]);
+		const h = flaky(failing);
+		h.delivery.settled({ launch: summary("L1"), result: "a" });
+		// Three unrelated launches settle while the parent is idle: each triggers a flush that may try L1 again.
+		for (const id of ["L2", "L3", "L4"]) h.delivery.settled({ launch: summary(id), result: id });
+		assert.deepEqual(h.log.failed, [], "settle-triggered flushes do not spend L1's budget");
+		assert.deepEqual(h.delivery.held(), ["L1"]);
+		assert.deepEqual(h.log.delivered, ["L2", "L3", "L4"], "the others still flow");
+		// Only idle signals (flush) count: the settle-time attempt was the first, so two more give up.
+		for (let i = 1; i < DELIVERY_ATTEMPTS; i++) {
+			assert.deepEqual(h.log.failed, [], `still retrying before idle signal ${i}`);
+			h.delivery.flush();
+		}
+		assert.deepEqual(h.log.failed, ["L1"], "the idle signals exhausted the budget");
+		assert.equal(h.delivery.isHeld("L1"), false);
+	});
+
+	it("R3-101: a settle-triggered flush still retries an earlier failure, so it can succeed without an idle signal", () => {
+		const failing = new Set(["L1"]);
+		const h = flaky(failing);
+		h.delivery.settled({ launch: summary("L1"), result: "a" });
+		failing.clear();
+		h.delivery.settled({ launch: summary("L2"), result: "b" });
+		assert.deepEqual(h.log.delivered, ["L1", "L2"], "earlier failure first, then the new one");
+		assert.deepEqual(h.delivery.held(), []);
+	});
+
+	it("R3-101: settles between idle signals never add attempts beyond one per signal", () => {
+		const h = flaky(new Set(["L1"]));
+		h.delivery.settled({ launch: summary("L1"), result: "a" });
+		h.delivery.settled({ launch: summary("L2"), result: "b" });
+		h.delivery.flush(); // idle signal 1: attempt 2
+		h.delivery.settled({ launch: summary("L3"), result: "c" });
+		h.delivery.settled({ launch: summary("L4"), result: "d" });
+		assert.deepEqual(h.log.failed, [], "two attempts counted so far");
+		h.delivery.flush(); // idle signal 2: attempt 3 = the bound
+		assert.deepEqual(h.log.failed, ["L1"]);
+	});
+
 	it("a retried item that was collected by wait meanwhile is dropped without a report", () => {
 		const h = flaky(new Set(["L1"]));
 		h.delivery.settled({ launch: summary("L1"), result: "a" });

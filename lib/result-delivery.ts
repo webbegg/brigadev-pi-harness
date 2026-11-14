@@ -18,6 +18,12 @@
 // registry's prune keeps it) and is tried again on the next idle flush, up to DELIVERY_ATTEMPTS
 // attempts in all. After the last one it is released unconsumed, so `subagent_wait` can still
 // collect it, and `onDeliveryFailed` tells the user.
+//
+// What counts as an attempt (R3-101): a failure spends an item's budget at most once per idle signal.
+// The public `flush()` is the idle signal (the host calls it on `agent_settled`); each call starts a new
+// idle epoch. A flush that a settle triggers also tries earlier-failed items (so one can still get through
+// without waiting), but if that item already failed in the current epoch, the failure is not counted again.
+// So unrelated settles cannot burn the budget; only distinct idle signals (and the item's first failure) do.
 
 import type { WaitOutcome } from "./subagent-registry.ts";
 
@@ -61,10 +67,12 @@ export function createResultDelivery<R>(deps: ResultDeliveryDeps<R>): ResultDeli
 	let queue: Delivered<R>[] = [];
 	let enabled = true;
 	let flushing = false;
-	// Attempts that threw, per launch id.
-	let failures = new Map<string, number>();
+	// Attempts that threw, per launch id, and the idle epoch of the last one that was counted.
+	let failures = new Map<string, { attempts: number; epoch: number }>();
+	// Incremented by each idle signal (public `flush`).
+	let epoch = 0;
 
-	const flush = () => {
+	const flushPass = () => {
 		// A delivery may synchronously start a turn that flushes again; the outer loop keeps going.
 		if (flushing || queue.length === 0 || !deps.isIdle()) return;
 		flushing = true;
@@ -80,9 +88,11 @@ export function createResultDelivery<R>(deps: ResultDeliveryDeps<R>): ResultDeli
 				try {
 					deps.deliver(item);
 				} catch (error) {
-					const attempts = (failures.get(item.id) ?? 0) + 1;
+					const previous = failures.get(item.id);
+					// Already counted in this idle epoch (a settle-triggered retry): tried, but the budget is not spent again.
+					const attempts = previous === undefined ? 1 : previous.epoch === epoch ? previous.attempts : previous.attempts + 1;
 					if (attempts < DELIVERY_ATTEMPTS) {
-						failures.set(item.id, attempts);
+						failures.set(item.id, { attempts, epoch });
 						retry.push(item);
 					} else {
 						// Released unconsumed (so `subagent_wait` still has it) and unheld (so the registry may prune it).
@@ -109,9 +119,13 @@ export function createResultDelivery<R>(deps: ResultDeliveryDeps<R>): ResultDeli
 		settled({ launch, result }) {
 			if (!enabled || launch.consumed || deps.isConsumed(launch.id) || queue.some((q) => q.id === launch.id)) return;
 			queue.push({ id: launch.id, launch, ...(launch.error === undefined ? { result } : {}) });
-			flush();
+			flushPass();
 		},
-		flush,
+		flush() {
+			// A flush re-entered from a delivery is the same idle signal, not a new one.
+			if (!flushing) epoch++;
+			flushPass();
+		},
 		held: () => queue.map((q) => q.id),
 		isHeld: (id) => queue.some((q) => q.id === id),
 		reset() {

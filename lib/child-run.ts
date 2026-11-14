@@ -117,6 +117,8 @@ export interface ChildTracker {
 	size(): number;
 	/** Signals every tracked child now; one that throws does not stop the rest. */
 	killAll(signal: NodeJS.Signals): void;
+	/** SIGKILL every tracked child's group now, synchronously (for a process 'exit' handler); never throws, never waits. */
+	killAllNow(): void;
 	/** SIGTERM everything, resolve when none is left or after `graceMs` (then SIGKILL the survivors); never waits longer. */
 	shutdown(options: { graceMs: number; setTimer: (fn: () => void, ms: number) => unknown; clearTimer: (handle: unknown) => void }): Promise<void>;
 }
@@ -143,6 +145,14 @@ export function createChildTracker(): ChildTracker {
 		},
 		size: () => live.size,
 		killAll,
+		killAllNow() {
+			// Each registered kill is the run's group-kill-with-fallback (the one terminate uses).
+			try {
+				killAll("SIGKILL");
+			} catch {
+				// An exit handler must not throw.
+			}
+		},
 		shutdown({ graceMs, setTimer, clearTimer }) {
 			if (live.size === 0) return Promise.resolve();
 			killAll("SIGTERM");
@@ -168,6 +178,68 @@ export function createChildTracker(): ChildTracker {
 
 /** The process-wide tracker the extension shuts down; tests inject their own through `ChildRunDeps.tracker`. */
 export const liveChildren: ChildTracker = createChildTracker();
+
+/** The part of `process` the exit guard uses; tests pass a fake. */
+export interface ParentProcessLike {
+	on(event: string, listener: () => void): unknown;
+	listenerCount(event: string): number;
+	exit(code?: number): unknown;
+}
+
+// Children run in their own process group (`detached`), so a signal sent to the parent's group (terminal hangup, a
+// group kill) no longer reaches them; closing their stdin is the only other stop, and a child in the middle of a tool
+// call may not act on it. The guard SIGKILLs every tracked child group when the parent process exits and, when asked,
+// on the listed signals. It cannot help when the parent itself is SIGKILLed or the machine dies: no handler runs then.
+const GUARD_KEY = Symbol.for("brigadev.parentExitGuard");
+interface GuardState {
+	trackers: Set<ChildTracker>;
+	signals: Set<string>;
+}
+
+/**
+ * Installs, once per process, a `process.on("exit")` handler that calls `killAllNow` on every tracker given so far.
+ * The extension may be loaded again (`/reload`, possibly as a fresh module with a fresh tracker), so the once-only state
+ * lives on the process object under a global symbol: a later call adds its tracker and no second listener.
+ *
+ * `signals` (none by default) adds a listener per signal that kills the children, then keeps Node's default: adding a
+ * listener disables the default exit, so when no other listener exists it exits with 128+signo (SIGHUP 129, SIGTERM 143);
+ * when another one exists it leaves the decision to that one. Pi 1.5 handles SIGTERM and SIGHUP itself in interactive,
+ * print and rpc mode (graceful shutdown, `session_shutdown`, then `process.exit`, which fires the exit handler), so the
+ * extension passes none. No SIGINT: the TUI uses Ctrl+C.
+ */
+export function installParentExitGuard(tracker: ChildTracker, options: { processLike?: ParentProcessLike; signals?: readonly NodeJS.Signals[] } = {}): void {
+	const proc = options.processLike ?? (process as unknown as ParentProcessLike);
+	const holder = proc as unknown as { [GUARD_KEY]?: GuardState };
+	let state = holder[GUARD_KEY];
+	if (!state) {
+		const fresh: GuardState = { trackers: new Set(), signals: new Set() };
+		state = fresh;
+		holder[GUARD_KEY] = fresh;
+		proc.on("exit", () => killEvery(fresh));
+	}
+	const guard = state;
+	guard.trackers.add(tracker);
+	for (const signal of options.signals ?? []) {
+		if (guard.signals.has(signal)) continue;
+		guard.signals.add(signal);
+		proc.on(signal, () => {
+			killEvery(guard);
+			// Ours is one of the listeners; any more means someone else handles the signal.
+			if (proc.listenerCount(signal) > 1) return;
+			proc.exit(128 + (os.constants.signals[signal] ?? 0));
+		});
+	}
+}
+
+function killEvery(state: GuardState): void {
+	for (const tracker of state.trackers) {
+		try {
+			tracker.killAllNow();
+		} catch {
+			// Nothing to do at exit.
+		}
+	}
+}
 
 export interface ChildRunDeps {
 	/** Defaults to node:child_process spawn. */

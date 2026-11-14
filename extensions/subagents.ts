@@ -23,7 +23,7 @@ import { queuedFields, runState, subagentRow, syncRowTimer, type RowInput, type 
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { listWidth, renderTwoPane } from "../lib/two-pane.ts";
 import { emptyTally, formatCost, formatTokens } from "../lib/cost.ts";
-import { failed, KILL_GRACE_MS, liveChildren, output, runChild, type RunResult } from "../lib/child-run.ts";
+import { failed, installParentExitGuard, KILL_GRACE_MS, liveChildren, output, runChild, type RunResult } from "../lib/child-run.ts";
 import { newRunId } from "../lib/run-artifacts.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
 import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
@@ -142,6 +142,11 @@ function routeLabel(route: ResolvedRoute, profileName: string | undefined): stri
 
 export default function (pi: ExtensionAPI) {
 	if (isChildSession()) return;
+
+	// Children run in their own process group, so a parent that dies without `session_shutdown` would leave them running:
+	// SIGKILL their groups when the process exits (once per process, whatever the number of /reloads). SIGTERM/SIGHUP are
+	// Pi's to handle (graceful shutdown then process.exit), so no signal listeners here.
+	installParentExitGuard(liveChildren);
 
 	let skills: SkillRef[] = [];
 	const activeWriters: ActiveWriter[] = [];

@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { ChildControl } from "../lib/child-rpc.ts";
-import { CLOSE_DRAIN_MS, createChildTracker, failed, KILL_GRACE_MS, output, runChild, type ChildProcessLike, type ChildRunDeps, type RunOptions, type RunResult, type SpawnFn } from "../lib/child-run.ts";
+import { CLOSE_DRAIN_MS, createChildTracker, failed, installParentExitGuard, KILL_GRACE_MS, output, runChild, type ParentProcessLike, type ChildProcessLike, type ChildRunDeps, type RunOptions, type RunResult, type SpawnFn } from "../lib/child-run.ts";
 import { CHILD_ENV, STRUCTURED_OUTPUT_EXTENSION_PATH } from "../lib/runtime.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -1210,5 +1210,137 @@ describe("createChildTracker: every live child in one place, with a bounded forc
 		time.advance(10);
 		await shutdown;
 		assert.deepEqual(seen, ["SIGTERM", "SIGKILL"]);
+	});
+
+	it("R4-101 killAllNow SIGKILLs every tracked child group synchronously and never throws", async () => {
+		const tracker = createChildTracker();
+		tracker.killAllNow(); // nothing tracked
+		const groupKills: Array<[number, string]> = [];
+		const deps: Partial<ChildRunDeps> = { tracker, platform: "linux", killGroup: (pid, signal) => void groupKills.push([pid, signal]) };
+		const a = harness({ deps });
+		const b = harness({ deps });
+		const pa = a.start();
+		const pb = b.start();
+		(await a.ready()).pid = 21;
+		(await b.ready()).pid = 22;
+		tracker.killAllNow();
+		assert.deepEqual(groupKills, [[21, "SIGKILL"], [22, "SIGKILL"]]);
+		a.proc!.close(null);
+		b.proc!.close(null);
+		await Promise.all([pa, pb]);
+	});
+
+	it("R4-101 killAllNow with a throwing kill function does not throw and still reaches the others", () => {
+		const tracker = createChildTracker();
+		const seen: string[] = [];
+		tracker.add(() => {
+			throw new Error("gone");
+		});
+		tracker.add((signal) => void seen.push(signal));
+		assert.doesNotThrow(() => tracker.killAllNow());
+		assert.deepEqual(seen, ["SIGKILL"]);
+	});
+
+	it("R4-101 killAllNow falls back to the child itself when the group kill throws (the same path as terminate)", async () => {
+		const tracker = createChildTracker();
+		const h = harness({ deps: { tracker, platform: "linux", killGroup: () => { throw new Error("ESRCH"); } } });
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.pid = 31;
+		tracker.killAllNow();
+		assert.deepEqual(proc.kills, ["SIGKILL"]);
+		proc.close(null);
+		await promise;
+	});
+});
+
+/** A stand-in for `process`: records listeners, lets a test fire them, and records exit codes. */
+function fakeProcess(others: Record<string, number> = {}) {
+	const listeners = new Map<string, Array<() => void>>();
+	const exits: Array<number | undefined> = [];
+	const proc = {
+		on(event: string, listener: () => void) {
+			listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+			return proc;
+		},
+		listenerCount: (event: string) => (listeners.get(event)?.length ?? 0) + (others[event] ?? 0),
+		exit: (code?: number) => void exits.push(code),
+	};
+	return { proc: proc as unknown as ParentProcessLike, listeners, exits, fire: (event: string) => (listeners.get(event) ?? []).forEach((l) => l()) };
+}
+
+describe("installParentExitGuard: children do not outlive a parent that exits without session_shutdown (R4-101)", () => {
+	/** A tracker with two children whose kills are recorded. */
+	function tracked() {
+		const tracker = createChildTracker();
+		const kills: string[] = [];
+		tracker.add((s) => void kills.push(`a:${s}`));
+		tracker.add((s) => void kills.push(`b:${s}`));
+		return { tracker, kills };
+	}
+
+	it("the process 'exit' event SIGKILLs every tracked child, synchronously", () => {
+		const { tracker, kills } = tracked();
+		const p = fakeProcess();
+		installParentExitGuard(tracker, { processLike: p.proc });
+		assert.equal(p.listeners.get("exit")?.length, 1);
+		p.fire("exit");
+		assert.deepEqual(kills, ["a:SIGKILL", "b:SIGKILL"]);
+	});
+
+	it("installing again (extension reloaded) adds no second listener, and the new tracker is covered too", () => {
+		const first = tracked();
+		const second = tracked();
+		const p = fakeProcess();
+		installParentExitGuard(first.tracker, { processLike: p.proc, signals: ["SIGHUP"] });
+		installParentExitGuard(second.tracker, { processLike: p.proc, signals: ["SIGHUP"] });
+		installParentExitGuard(second.tracker, { processLike: p.proc, signals: ["SIGHUP"] });
+		assert.equal(p.listeners.get("exit")?.length, 1);
+		assert.equal(p.listeners.get("SIGHUP")?.length, 1);
+		p.fire("exit");
+		assert.deepEqual(first.kills, ["a:SIGKILL", "b:SIGKILL"]);
+		assert.deepEqual(second.kills, ["a:SIGKILL", "b:SIGKILL"]);
+	});
+
+	it("no signal listener is installed unless asked (Pi handles SIGTERM/SIGHUP itself)", () => {
+		const p = fakeProcess();
+		installParentExitGuard(createChildTracker(), { processLike: p.proc });
+		assert.deepEqual([...p.listeners.keys()], ["exit"]);
+	});
+
+	it("a signal nobody else handles: kill the children, then exit with 128+signo", () => {
+		const { tracker, kills } = tracked();
+		const p = fakeProcess();
+		installParentExitGuard(tracker, { processLike: p.proc, signals: ["SIGHUP", "SIGTERM"] });
+		p.fire("SIGHUP");
+		assert.deepEqual(kills, ["a:SIGKILL", "b:SIGKILL"]);
+		assert.deepEqual(p.exits, [129]);
+		p.fire("SIGTERM");
+		assert.deepEqual(p.exits, [129, 143]);
+	});
+
+	it("a signal someone else handles: kill the children, do not exit (the other handler decides)", () => {
+		const { tracker, kills } = tracked();
+		const p = fakeProcess({ SIGTERM: 1 });
+		installParentExitGuard(tracker, { processLike: p.proc, signals: ["SIGTERM"] });
+		p.fire("SIGTERM");
+		assert.deepEqual(kills, ["a:SIGKILL", "b:SIGKILL"]);
+		assert.deepEqual(p.exits, []);
+	});
+
+	it("with nothing tracked, or a kill that throws, the handlers are safe", () => {
+		const empty = fakeProcess();
+		installParentExitGuard(createChildTracker(), { processLike: empty.proc, signals: ["SIGHUP"] });
+		assert.doesNotThrow(() => empty.fire("exit"));
+		assert.doesNotThrow(() => empty.fire("SIGHUP"));
+		const tracker = createChildTracker();
+		tracker.add(() => {
+			throw new Error("gone");
+		});
+		const p = fakeProcess();
+		installParentExitGuard(tracker, { processLike: p.proc, signals: ["SIGTERM"] });
+		assert.doesNotThrow(() => p.fire("exit"));
+		assert.doesNotThrow(() => p.fire("SIGTERM"));
+		assert.deepEqual(p.exits, [143], "still exits after a kill that threw");
 	});
 });
