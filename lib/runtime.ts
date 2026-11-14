@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { compactToolsMode, tidyActive } from "./tidy-detect.ts";
 
 /** Package root, resolved from this file so it works from any install location. */
 export const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -59,7 +60,16 @@ export interface BrigadevSettings {
 	/** Price zero-cost claude-bridge turns at the Anthropic list price (default true). */
 	bridgePricing?: boolean;
 	/** UI features, each on by default. */
-	ui?: { footer?: boolean; phase?: boolean; dashboard?: boolean };
+	ui?: {
+		footer?: boolean;
+		phase?: boolean;
+		dashboard?: boolean;
+		/**
+		 * Our one-line rows for built-in tools. "auto" (default) steps aside when pi-tidy is
+		 * active, true = always ours, false = never ours.
+		 */
+		compactTools?: "auto" | boolean;
+	};
 }
 
 export function agentDir(): string {
@@ -68,6 +78,24 @@ export function agentDir(): string {
 
 export function settingsPath(): string {
 	return join(agentDir(), "brigadev.json");
+}
+
+/**
+ * Effective compact-tools mode from public data only: Pi `packages` (pass `pi.getSettings().packages`,
+ * which is unavailable while an extension loads), the agent dir `extensions/` listing and the raw
+ * global Pi settings.json. Unreadable inputs count as "no extension / default config".
+ */
+export function resolveCompactTools(packages: readonly unknown[] | undefined): { ours: boolean; reason: string } {
+	let extensionEntries: string[] = [];
+	try {
+		extensionEntries = readdirSync(join(agentDir(), "extensions"));
+	} catch {}
+	let piSettings: unknown;
+	try {
+		piSettings = JSON.parse(readFileSync(join(agentDir(), "settings.json"), "utf8"));
+	} catch {}
+	const active = tidyActive({ packages, extensionEntries, piSettings });
+	return compactToolsMode(readSettings().ui?.compactTools, active);
 }
 
 export function readSettings(): BrigadevSettings {
