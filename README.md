@@ -110,7 +110,7 @@ Each profile route can list fallback models. When a run fails on quota, auth, a 
 ```
 
 - **Orchestrator:** switches the session's model and continues the same conversation, with a note quoting your latest request.
-- **Subagents:** the run is retried on the next model from the start (`-p` children cannot switch mid-conversation).
+- **Subagents:** the run is retried on the next model from the start (a subagent child is a separate `pi --mode rpc` process whose model is fixed at start, so the retry restarts the run from the start).
 - **Cooldowns:** a model that failed is skipped by every agent of the session for 30 minutes after a limit or auth error, 2 minutes after a transient one; a launch whose primary is cooling starts on the first usable fallback.
 - **Usage windows:** `/brigadev:usage` and the status bar (`◷ week 56%`) show your Claude 5-hour and weekly windows from each response's rate-limit headers. When a provider's limit is reached (and Extra Usage is off), chains skip that provider until its reset.
 - All `claude-bridge` models share one subscription: within the bridge, a chain helps with model-specific failures (overload, a per-model limit); for a spent subscription, add a model from another provider.
@@ -287,7 +287,7 @@ Pure logic lives in `lib/` and is covered by `tests/`. Extensions are thin adapt
 ## Known limits (MVP)
 
 - Edit surfaces and `bash`: `write` and `edit` are blocked outside a writer's surfaces. For `bash`, the guard blocks calls that write a literal project path outside the surfaces (`>`, `>>`, `&>`, `tee`, `sed -i`, `cp`/`mv`/`install`/`ln` destinations, `touch`, `mkdir`, `truncate`). This is best effort: variables, globs, substitutions, and scripts run by an interpreter (`python3 - <<EOF`) are not parsed. In a git repository the guard also compares the working tree before and after each writer `bash` call and flags any file changed outside the surfaces, after the fact: it reports the paths and marks the result as an error, and never reverts anything. Ignored files and repositories without git are not covered by that check. After a launch with writers, the `subagent` result also lists files changed outside the writers' surfaces. Writes outside the project root (such as the system temp dir) are not restricted by these checks.
-- Subagents run in the foreground (parallel within one call). No background jobs, agent dashboard, or model fallback chains yet.
+- Async subagent launches live in the running Pi process: results do not survive a reload or restart (children are stopped at session shutdown), and a finished run cannot be resumed or continued, only read from its saved folder. Run folders under `~/.brigadev/<repo>/runs/` are not pruned.
 - Profiles have no per-repository pin and are not frozen at session start: a session without its own profile follows the default as it changes.
 - No "auto" permission mode (classifier-based approvals).
 - Memory mirroring of feature documents is used only when a memory tool such as `mem_save` is available.

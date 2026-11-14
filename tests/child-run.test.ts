@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { ChildControl } from "../lib/child-rpc.ts";
-import { failed, output, runChild, type ChildProcessLike, type RunOptions, type RunResult, type SpawnFn } from "../lib/child-run.ts";
+import { CLOSE_DRAIN_MS, createChildTracker, failed, KILL_GRACE_MS, output, runChild, type ChildProcessLike, type ChildRunDeps, type RunOptions, type RunResult, type SpawnFn } from "../lib/child-run.ts";
 import { CHILD_ENV, STRUCTURED_OUTPUT_EXTENSION_PATH } from "../lib/runtime.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -63,6 +63,8 @@ class FakeChild extends EventEmitter implements ChildProcessLike {
 	stdout = new EventEmitter();
 	stderr = new EventEmitter();
 	kills: string[] = [];
+	/** Set by a test that exercises process-group signalling; a fake without one is signalled through `kill`. */
+	pid: number | undefined;
 	kill(signal?: NodeJS.Signals) {
 		this.kills.push(String(signal));
 		return true;
@@ -83,7 +85,7 @@ const assistant = (text: string, extra: Record<string, unknown> = {}) => ({
 	message: { role: "assistant", content: [{ type: "text", text }], provider: "anthropic", model: "claude-x", stopReason: "stop", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.25 } }, ...extra },
 });
 
-function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.ProcessEnv; signal?: AbortSignal; schema?: RunOptions["schema"]; price?: RunOptions["price"]; onControl?: RunOptions["onControl"] } = {}) {
+function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.ProcessEnv; signal?: AbortSignal; schema?: RunOptions["schema"]; price?: RunOptions["price"]; onControl?: RunOptions["onControl"]; onUpdate?: RunOptions["onUpdate"]; deps?: Partial<ChildRunDeps> } = {}) {
 	const time = fakeTime();
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "brigadev-child-run-"));
 	const tmpRoot = path.join(root, "tmp");
@@ -123,6 +125,7 @@ function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.Proc
 				onUpdate: (r) => {
 					h.updates++;
 					h.last = r;
+					over.onUpdate?.(r);
 				},
 			};
 			const promise = runChild(options, {
@@ -134,6 +137,7 @@ function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.Proc
 				now: () => h.clock,
 				tmpRoot,
 				docsDir: () => docs,
+				...over.deps,
 			});
 			// Surface a rejection to the test only when it awaits `promise`.
 			promise.catch(() => undefined);
@@ -856,5 +860,355 @@ describe("runChild: artifacts", () => {
 		const result = await promise;
 		assert.equal(result.exitCode, 0);
 		assert.equal(result.artifactsDir, undefined);
+	});
+});
+
+/** Resolves true when the promise settled within a real 300 ms, false when it is still pending (a hang). */
+const settlesSoon = (promise: Promise<unknown>) =>
+	Promise.race([promise.then(() => true, () => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 300).unref())]);
+
+describe("runChild: a throwing caller hook never stops the run from settling (R4-001)", () => {
+	it("onUpdate throwing in a data chunk does not escape the stream handler; the run still settles with its output", async () => {
+		const h = harness({
+			onUpdate: () => {
+				throw new Error("ui hook bug");
+			},
+		});
+		const promise = h.start();
+		const proc = await h.ready();
+		assert.doesNotThrow(() => proc.line(assistant("first")));
+		assert.doesNotThrow(() => proc.line(assistant("second")), "every line is folded even though the hook threw on the one before");
+		assert.doesNotThrow(() => proc.line(settled()));
+		assert.doesNotThrow(() => proc.close(0));
+		assert.equal(await settlesSoon(promise), true, "settled");
+		const result = await promise;
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.messages.length, 2);
+		assert.equal(output(result), "second");
+		assert.equal(h.time.pending(), 0, "no timer is left armed");
+	});
+
+	it("onUpdate throwing on the last line (flushed by close) still reaches settlement", async () => {
+		const h = harness({
+			onUpdate: () => {
+				throw new Error("ui hook bug");
+			},
+		});
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.say(JSON.stringify(assistant("tail without newline")));
+		assert.doesNotThrow(() => proc.close(0));
+		assert.equal(await settlesSoon(promise), true, "the close handler reached settlement");
+		const result = await promise;
+		assert.equal(output(result), "tail without newline");
+		assert.equal(h.time.pending(), 0);
+		assert.deepEqual(fs.readdirSync(h.tmpRoot), [], "the temp folder is removed");
+	});
+
+	it("onControl throwing (the handle, and its withdrawal) does not break the run", async () => {
+		let calls = 0;
+		const h = harness({
+			onControl: () => {
+				calls++;
+				throw new Error("control hook bug");
+			},
+		});
+		const promise = h.start();
+		const proc = await h.ready();
+		assert.equal(calls, 1, "the handle was offered");
+		proc.line(assistant("ok"));
+		assert.doesNotThrow(() => proc.line(settled()));
+		assert.doesNotThrow(() => proc.close(0));
+		assert.equal(await settlesSoon(promise), true);
+		assert.equal(calls, 2, "the withdrawal was attempted too");
+		assert.equal((await promise).exitCode, 0);
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("a hook that throws on every call cannot stop a user abort or a stall from settling the run", async () => {
+		const h = harness({
+			env: { BRIGADEV_STALL_TIMEOUT_MS: "1000" },
+			onUpdate: () => {
+				throw new Error("ui hook bug");
+			},
+		});
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line(delta("working"));
+		assert.doesNotThrow(() => h.time.advance(5000), "the watchdog's termination is not blocked by the hook");
+		assert.ok(proc.kills.includes("SIGTERM"));
+		proc.close(null);
+		assert.equal(await settlesSoon(promise), true);
+		assert.equal((await promise).stopReason, "error");
+	});
+});
+
+describe("runChild: the run settles when the child exits even if `close` never comes (R4-003a)", () => {
+	it("settles CLOSE_DRAIN_MS after `exit` without `close`, keeping the output it already read", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		let done = false;
+		void promise.then(() => (done = true));
+		proc.line(assistant("answer"));
+		proc.say(JSON.stringify(assistant("last line, no newline")));
+		proc.emit("exit", 0, null); // a grandchild holds the pipes: `close` never follows
+		h.time.advance(CLOSE_DRAIN_MS - 1);
+		await tick();
+		assert.equal(done, false, "still draining output");
+		h.time.advance(1);
+		assert.equal(await settlesSoon(promise), true);
+		const result = await promise;
+		assert.equal(result.exitCode, 0);
+		assert.equal(output(result), "last line, no newline");
+		assert.equal(h.time.pending(), 0);
+		assert.deepEqual(fs.readdirSync(h.tmpRoot), []);
+	});
+
+	it("a `close` that follows `exit` in time settles at once with the output that arrived in between", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.emit("exit", 3, null);
+		proc.line(assistant("flushed after exit"));
+		proc.close(3);
+		const result = await promise;
+		assert.equal(result.exitCode, 3);
+		assert.equal(output(result), "flushed after exit");
+		assert.equal(h.time.pending(), 0, "the drain timer was cleared by close");
+	});
+
+	it("output arriving after the run settled does not change its result", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line(assistant("before"));
+		proc.emit("exit", 0, null);
+		h.time.advance(CLOSE_DRAIN_MS);
+		const result = await promise;
+		assert.doesNotThrow(() => proc.line(assistant("too late")));
+		proc.stderr.emit("data", Buffer.from("too late"));
+		proc.close(0);
+		assert.equal(output(result), "before");
+		assert.equal(result.stderr, "");
+	});
+
+	it("a user abort whose child exits but never closes still settles (the cancel case)", async () => {
+		const controller = new AbortController();
+		const h = harness({ signal: controller.signal });
+		const promise = h.start();
+		const proc = await h.ready();
+		controller.abort();
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		proc.emit("exit", null, "SIGTERM");
+		h.time.advance(CLOSE_DRAIN_MS);
+		assert.equal(await settlesSoon(promise), true);
+		await assert.rejects(promise, /aborted/);
+		assert.equal(h.time.pending(), 0, "the SIGKILL timer is gone");
+	});
+});
+
+describe("runChild: the child runs in its own process group and signals reach the group (R4-003b)", () => {
+	const groupHarness = (over: Parameters<typeof harness>[0] = {}) => {
+		const groupKills: Array<[number, string]> = [];
+		const h = harness({
+			...over,
+			deps: {
+				platform: "linux",
+				killGroup: (pid, signal) => void groupKills.push([pid, signal]),
+				...over.deps,
+			},
+		});
+		return { h, groupKills };
+	};
+
+	it("spawns detached (a new group) off Windows, and not on win32", async () => {
+		const linux = groupHarness();
+		const p1 = linux.h.start();
+		const c1 = await linux.h.ready();
+		assert.equal(linux.h.spawned!.options.detached, true);
+		c1.close(0);
+		await p1;
+		const win = groupHarness({ deps: { platform: "win32" } });
+		const p2 = win.h.start();
+		const c2 = await win.h.ready();
+		assert.equal(win.h.spawned!.options.detached, false);
+		c2.close(0);
+		await p2;
+	});
+
+	it("abort signals the group with SIGTERM, then SIGKILL after the grace, instead of the lone child", async () => {
+		const controller = new AbortController();
+		const { h, groupKills } = groupHarness({ signal: controller.signal });
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.pid = 4242;
+		controller.abort();
+		assert.deepEqual(groupKills, [[4242, "SIGTERM"]]);
+		h.time.advance(KILL_GRACE_MS);
+		assert.deepEqual(groupKills, [[4242, "SIGTERM"], [4242, "SIGKILL"]]);
+		assert.deepEqual(proc.kills, [], "the group signal covers the child");
+		proc.close(null);
+		await assert.rejects(promise, /aborted/);
+	});
+
+	it("falls back to the child itself when signalling the group throws", async () => {
+		const controller = new AbortController();
+		const attempts: string[] = [];
+		const { h } = groupHarness({
+			signal: controller.signal,
+			deps: {
+				killGroup: (pid, signal) => {
+					attempts.push(`${pid}:${signal}`);
+					throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+				},
+			},
+		});
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.pid = 77;
+		controller.abort();
+		assert.deepEqual(attempts, ["77:SIGTERM"]);
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		h.time.advance(KILL_GRACE_MS);
+		assert.deepEqual(proc.kills, ["SIGTERM", "SIGKILL"]);
+		proc.close(null);
+		await assert.rejects(promise, /aborted/);
+	});
+
+	it("signals the child alone when it has no pid, and on win32 even with one", async () => {
+		for (const [platform, pid] of [["linux", undefined], ["win32", 99]] as const) {
+			const controller = new AbortController();
+			const { h, groupKills } = groupHarness({ signal: controller.signal, deps: { platform } });
+			const promise = h.start();
+			const proc = await h.ready();
+			proc.pid = pid;
+			controller.abort();
+			assert.deepEqual(groupKills, [], platform);
+			assert.deepEqual(proc.kills, ["SIGTERM"], platform);
+			proc.close(null);
+			await assert.rejects(promise, /aborted/);
+		}
+	});
+
+	it("a child that exited but left the pipes held is cleaned up: the group gets SIGKILL when the drain gives up", async () => {
+		const { h, groupKills } = groupHarness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.pid = 555;
+		proc.emit("exit", 0, null);
+		assert.deepEqual(groupKills, [], "nothing is killed while output may still drain");
+		h.time.advance(CLOSE_DRAIN_MS);
+		await promise;
+		assert.deepEqual(groupKills, [[555, "SIGKILL"]]);
+	});
+
+	it("a normal exit and close never signal anything", async () => {
+		const { h, groupKills } = groupHarness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.pid = 556;
+		proc.emit("exit", 0, null);
+		proc.close(0);
+		await promise;
+		assert.deepEqual(groupKills, []);
+		assert.deepEqual(proc.kills, []);
+	});
+});
+
+describe("createChildTracker: every live child in one place, with a bounded forced shutdown (R4-002)", () => {
+	it("tracks a running child from spawn until the run settles, sync or async alike", async () => {
+		const tracker = createChildTracker();
+		const h = harness({ deps: { tracker } });
+		const promise = h.start();
+		const proc = await h.ready();
+		assert.equal(tracker.size(), 1);
+		proc.close(0);
+		await promise;
+		assert.equal(tracker.size(), 0);
+	});
+
+	it("a spawn error releases the child too", async () => {
+		const tracker = createChildTracker();
+		const h = harness({ deps: { tracker } });
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.emit("error", new Error("ENOENT"));
+		await promise;
+		assert.equal(tracker.size(), 0);
+	});
+
+	it("killAll signals every tracked child's group now", async () => {
+		const tracker = createChildTracker();
+		const groupKills: Array<[number, string]> = [];
+		const deps: Partial<ChildRunDeps> = { tracker, platform: "linux", killGroup: (pid, signal) => void groupKills.push([pid, signal]) };
+		const a = harness({ deps });
+		const b = harness({ deps });
+		const pa = a.start();
+		const pb = b.start();
+		(await a.ready()).pid = 11;
+		(await b.ready()).pid = 12;
+		tracker.killAll("SIGKILL");
+		assert.deepEqual(groupKills, [[11, "SIGKILL"], [12, "SIGKILL"]]);
+		a.proc!.close(null);
+		b.proc!.close(null);
+		await Promise.all([pa, pb]);
+	});
+
+	it("shutdown: SIGTERM, resolves as soon as every child settled, no SIGKILL", async () => {
+		const tracker = createChildTracker();
+		const time = fakeTime();
+		const h = harness({ deps: { tracker } });
+		const promise = h.start();
+		const proc = await h.ready();
+		let shut = false;
+		const shutdown = tracker.shutdown({ graceMs: 6000, setTimer: time.setTimer, clearTimer: time.clearTimer }).then(() => (shut = true));
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		await tick();
+		assert.equal(shut, false);
+		proc.close(null);
+		await promise.catch(() => undefined);
+		await shutdown;
+		assert.deepEqual(proc.kills, ["SIGTERM"], "no SIGKILL for a child that stopped");
+		assert.equal(time.pending(), 0, "the grace timer is cleared");
+	});
+
+	it("shutdown: a child that ignores SIGTERM is SIGKILLed after the grace and shutdown still returns", async () => {
+		const tracker = createChildTracker();
+		const time = fakeTime();
+		const h = harness({ deps: { tracker } });
+		const promise = h.start();
+		const proc = await h.ready();
+		let shut = false;
+		const shutdown = tracker.shutdown({ graceMs: 6000, setTimer: time.setTimer, clearTimer: time.clearTimer }).then(() => (shut = true));
+		time.advance(5999);
+		await tick();
+		assert.equal(shut, false);
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		time.advance(1);
+		await shutdown;
+		assert.deepEqual(proc.kills, ["SIGTERM", "SIGKILL"], "survivors are killed before shutdown returns");
+		proc.close(null);
+		await promise.catch(() => undefined);
+	});
+
+	it("shutdown with no live child resolves at once and arms nothing", async () => {
+		const time = fakeTime();
+		await createChildTracker().shutdown({ graceMs: 6000, setTimer: time.setTimer, clearTimer: time.clearTimer });
+		assert.equal(time.pending(), 0);
+	});
+
+	it("a kill function that throws does not stop the others or the shutdown", async () => {
+		const tracker = createChildTracker();
+		const seen: string[] = [];
+		tracker.add(() => {
+			throw new Error("gone");
+		});
+		tracker.add((signal) => void seen.push(signal));
+		const time = fakeTime();
+		const shutdown = tracker.shutdown({ graceMs: 10, setTimer: time.setTimer, clearTimer: time.clearTimer });
+		time.advance(10);
+		await shutdown;
+		assert.deepEqual(seen, ["SIGTERM", "SIGKILL"]);
 	});
 });

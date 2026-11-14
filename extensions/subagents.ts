@@ -23,11 +23,11 @@ import { queuedFields, runState, subagentRow, syncRowTimer, type RowInput, type 
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { listWidth, renderTwoPane } from "../lib/two-pane.ts";
 import { emptyTally, formatCost, formatTokens } from "../lib/cost.ts";
-import { failed, output, runChild, type RunResult } from "../lib/child-run.ts";
+import { failed, KILL_GRACE_MS, liveChildren, output, runChild, type RunResult } from "../lib/child-run.ts";
 import { newRunId } from "../lib/run-artifacts.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
 import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
-import { alreadyDeliveredText, createResultDelivery, resultCard, resultMessage, RESULT_MESSAGE_TYPE, type ResultMessageDetails } from "../lib/result-delivery.ts";
+import { createResultDelivery, deliveredNote, resultCard, resultMessage, RESULT_MESSAGE_TYPE, type ResultMessageDetails } from "../lib/result-delivery.ts";
 import { createSubagentRegistry, type WaitOutcome } from "../lib/subagent-registry.ts";
 import { admitLaunch, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
 import { cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
@@ -45,6 +45,8 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const WAIT_DEFAULT_SECONDS = 60;
 const WAIT_MAX_SECONDS = 300;
+/** Extra time on top of the SIGTERM->SIGKILL grace that session shutdown waits for children to settle. */
+const SHUTDOWN_SLACK_MS = 1000;
 const STATUS_KEY = "brigadev-agents";
 const CARD_KEY = "brigadev-agents-card";
 const CARD_COLLAPSE_KEY = "ctrl+shift+a";
@@ -190,6 +192,14 @@ export default function (pi: ExtensionAPI) {
 			const text = collectedResult.content.map((c) => c.text).join("\n");
 			pi.sendMessage(resultMessage(id, text, collectedResult.isError === true || launch.error !== undefined), { triggerTurn: true, deliverAs: "steer" });
 		},
+		// Retried at each idle flush; when the bound is spent the result is still collectable with subagent_wait.
+		onDeliveryFailed: ({ id }) => {
+			try {
+				if (parentCtx?.hasUI) parentCtx.ui.notify(`brigadev: could not deliver the result of async subagent launch ${id}; collect it with subagent_wait {"runId":"${id}"}`, "warning");
+			} catch {
+				// A stale context: nobody to tell.
+			}
+		},
 	});
 	registry.subscribe((event) => {
 		if (event.type === "settle") delivery.settled(event);
@@ -276,12 +286,14 @@ export default function (pi: ExtensionAPI) {
 		epoch++;
 		showCard(ctx);
 	});
-	// Children of running async launches get the usual SIGTERM, then SIGKILL after 5 s.
+	// Children (async and sync) get SIGTERM, and are given KILL_GRACE_MS + 1 s to settle; a group still alive then is
+	// SIGKILLed before this returns, so no child or grandchild outlives the parent. The wait is bounded: shutdown cannot hang.
 	pi.on("session_shutdown", async () => {
 		// Aborted children settle after this; their results must not be sent to a session that is going away.
 		delivery.stop();
 		registry.abortAll();
 		stopTimers();
+		await liveChildren.shutdown({ graceMs: KILL_GRACE_MS + SHUTDOWN_SLACK_MS, setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout) });
 	});
 
 	pi.registerShortcut(CARD_COLLAPSE_KEY, {
@@ -551,6 +563,12 @@ export default function (pi: ExtensionAPI) {
 		return { ...outcome.result, details: { ...outcome.result.details, launchId: id } };
 	};
 
+	/** The idle delivery already put this result in the session: point at the saved folders instead of repeating it (wait and cancel alike). */
+	const deliveredResult = (id: string, outcome: WaitOutcome<LaunchResult>): LaunchResult | undefined => {
+		const note = deliveredNote(id, outcome);
+		return note === undefined ? undefined : ({ content: [{ type: "text", text: note }], details: { mode: "single", results: [], launchId: id, pending: true } } as LaunchResult);
+	};
+
 	pi.registerTool({
 		name: "subagent_wait",
 		label: "Subagent wait",
@@ -559,12 +577,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, signal) {
 			const seconds = Math.min(WAIT_MAX_SECONDS, Math.max(1, params.timeoutSeconds ?? WAIT_DEFAULT_SECONDS));
 			const outcome = await registry.wait(params.runId, seconds * 1000, signal);
-			// The idle delivery already put this result in the session: point at the saved folders instead of repeating it.
-			if (outcome.status === "settled" && outcome.launch.consumedBy === "delivered") {
-				const tasks = (outcome.result?.details.results ?? []).map((r) => ({ agent: r.agent, artifactsDir: r.artifactsDir }));
-				return { content: [{ type: "text", text: alreadyDeliveredText(params.runId, tasks) }], details: { mode: "single", results: [], launchId: params.runId, pending: true } } as LaunchResult;
-			}
-			return collected(params.runId, outcome, seconds);
+			return deliveredResult(params.runId, outcome) ?? collected(params.runId, outcome, seconds);
 		},
 	});
 
@@ -574,7 +587,8 @@ export default function (pi: ExtensionAPI) {
 		description: "Cancel an async subagent launch; returns the partial results.",
 		parameters: CancelParams,
 		async execute(_id, params) {
-			return collected(params.runId, await registry.cancel(params.runId));
+			const outcome = await registry.cancel(params.runId);
+			return deliveredResult(params.runId, outcome) ?? collected(params.runId, outcome);
 		},
 	});
 
