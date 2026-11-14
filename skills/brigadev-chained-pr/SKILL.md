@@ -15,6 +15,7 @@ A planned PR may exceed ~400 changed lines (additions + deletions, generated fil
 - Recommend slicing above ~400 changed lines; follow the user's choice and the target repository's size policy.
 - The budget shapes the slicing, never the code. Never delete comments, docs, or tests, or compress code, to fit.
 - One honest slicing pass. If no cohesive split fits, keep the best one and report the count and why.
+- A wide refactor that disjoint surfaces cannot split (one mechanical change across many callers) is sliced as expand–contract: add the new form, migrate callers in batches that stay green, then delete the old form. See `references/chaining-details.md`.
 - Each PR is reviewable in about 60 minutes and holds one deliverable unit with its tests and docs.
 - Verify the default branch before creating branches; never assume `main`.
 - A polluted diff (changes from another slice) is a base bug: retarget or rebase until only this slice shows.

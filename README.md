@@ -57,6 +57,7 @@ Check it loaded: `/brigadev:status`.
 | `alt+a` or `/brigadev:runs` | Agents viewer: subagent runs with their threads |
 | `alt+o` or `/brigadev:panel` | Side panel: todos, agents, changes, and session at a glance. Needs a terminal at least 140 columns wide. It draws over the right 44 columns of the transcript while open; a docked rail would need private Pi internals. (`alt+p` is Pi's own "previous model" key on Windows and WSL, so the panel uses `alt+o`.) |
 | `/brigadev:mode [normal\|yolo\|default <mode>]` | Permission mode for this session, or the default for new sessions |
+| `/brigadev:force-commit` | One-shot: the next `git commit` of the current working tree skips the evidence gate (see below). Only you can run it |
 | `/brigadev:agents` | Effective agent list (package, user, trusted project) |
 | `/brigadev:harness on\|off` | Toggle the orchestrator prompt for this session (A/B testing) |
 | `/review [base or focus]` | 4R review |
@@ -133,6 +134,22 @@ Each profile route can list fallback models. When a run fails on quota, auth, a 
 A commit runs without asking only when it targets the session's repository on a branch other than the default branch (the one `origin/HEAD` points to, else a lone local `main` or `master`). `main` and `master` stay protected whenever they exist, even if `origin/HEAD` is repointed. It still asks after a `cd`, a branch switch, or `git -C`/`--git-dir`/`--work-tree` earlier in the same command (inside `{ }`, `then`, and `do` blocks too), and a chained `git push` keeps its own prompt. If git cannot answer, it asks. Commands after `then`, `do`, `else`, `{`, `!`, and similar words are classified like their plain forms.
 
 Without a UI (print mode), "ask" means block. The guard recognizes executable forms; it is not a sandbox.
+
+## Evidence gate
+
+Every check command (tests, lint, typecheck, build) run through bash, by you or by any subagent, is recorded with its command, exit code, time, directory, agent, and output tail in `~/.brigadev/<repo>/evidence/<branch>.jsonl`, an append-only log keyed to the content of the working tree it ran on. Outside git nothing is recorded. The log stores commands and output tails in plaintext (file mode 0600), so treat it as sensitive.
+
+A `git commit` with source changes anywhere in the repository (not only the session's folder) is blocked unless a passing test run is recorded for the current working tree. Any edit after the last passing run changes the tree and blocks the commit until the tests run again; committing without new edits does not. Only the `test` kind counts (`npm test`, `node --test`, `pytest`, `go test`, ...), not lint or build. A commit that runs in another directory or on another branch cannot be checked, so it is blocked too. The gate fails closed: if the working tree cannot be computed (git takes longer than 10 seconds, or fails), the commit is blocked with that reason, and only the guard dialog can force it (`/brigadev:force-commit` needs a computable tree). Outside git nothing is gated.
+
+The exit-code rule: a run counts only when its exit code is the test's. The test must be the command itself (`npm test`, `CI=1 npx vitest`), in its own bash command or an `&&` chain; naming it as an argument (`echo npm test`, `grep "node --test" package.json`) does not count. A `||`, `;`, `&`, `!`, `#` comment, subshell, `$(...)`, backtick, or a `|` after the test hands the exit code to something else, and so does an `exit`, `exec`, `eval`, or `source` before it, so the run is recorded as unknown and does not pass the gate. The one exception is a leading `set -o pipefail;`, which allows a pipe after the test. A `cd` before the test must stay inside the repository.
+
+A run is also keyed to the tree only if the tree was the same before and after it. An edit made while the tests ran (a parallel tool call, `tests && edit`) is not vouched for: that run is recorded as unknown with a `note`.
+
+Only you can force it. With a UI, the guard shows why the commit is blocked and asks whether to commit anyway. Without one, run `/brigadev:force-commit` before the commit: it applies once and only to the working tree as it is now, so editing a file first cancels it. Each force is logged in the evidence file, and only when the commit then goes ahead (a later guard rule that declines it spends nothing). There is no flag or environment variable that forces the gate, and subagents never reach it (they cannot commit).
+
+This is a best-effort guard, not a sandbox. It recognises commits the way the command classifier does, so commit forms it does not recognise (shell aliases, plumbing such as `git commit-tree`, wrappers, scripts) are not gated. Deliberate tricks with runner options or environment can still fake a pass, so a package-manager test run (`npm`, `pnpm`, `yarn`, `bun`) counts only as plain `npm test` (optionally `-s`/`--silent`, with arguments after `--`) and without `npm_config_*` variables; run workspace or filtered tests through the runner directly or as `npm test -- <args>` in that package's directory. To keep a model from forging a pass, `write`/`edit` calls into the evidence folder and bash commands that name it together with a write (redirection, `tee`, `cp`, `mv`, `rm`, `sed`, an interpreter, ...) are blocked, while reading stays allowed; a deliberately obfuscated command (a path built from variables, `cd` then a relative write) is not prevented.
+
+Changes that touch only prose (`.md`, `.markdown`, `.rst`, `.adoc`, `LICENSE`, `NOTICE`, `COPYING`, `AUTHORS`) pass without a test run; `.txt` and `.mdx` count as source (`requirements.txt`, `CMakeLists.txt`). The gate applies in every permission mode, including yolo.
 
 ## Repo docs folder
 
@@ -248,7 +265,7 @@ An authorized change on the default branch starts a `type/description` branch, a
 
 ## Customize
 
-- **Agents**: override any package agent by name in `~/.pi/agent/agents/<name>.md` or `.pi/agents/<name>.md` (trusted projects). Frontmatter: `name`, `description`, `tools`, `model`, `thinking`, `writer: true`, `admission: risk`.
+- **Agents**: override any package agent by name in `~/.pi/agent/agents/<name>.md` or `.pi/agents/<name>.md` (trusted projects). Frontmatter: `name`, `description`, `tools`, `model`, `thinking`, `writer: true`, `admission: risk`, `output: <file>.schema.json` (a JSON Schema next to the agent file: the agent must return its result through a `structured_output` tool, the parent validates it, and a run without a valid result fails after one reminder).
 - **Orchestrator rules**: edit `assets/orchestrator.md` and the lazy files next to it.
 - **Skills**: edit `skills/*/SKILL.md`, then `/reload`.
 - **Default mode**: `/brigadev:mode default yolo` writes `~/.pi/agent/brigadev.json`.

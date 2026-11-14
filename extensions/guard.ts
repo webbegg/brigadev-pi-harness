@@ -6,16 +6,19 @@
  * Subagents load this file explicitly (`-e`), so it must work standalone.
  */
 
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
+import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
-import { decideBashCommand, decideFileAccess, type PathVerdict } from "../lib/guard-rules.ts";
+import { appendEvidence, commitGateWithForce, evidenceFile, forceRecord, gateDialog, readEvidence, type ForceRecord } from "../lib/evidence.ts";
+import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { appendSystemPromptOnce, CHILD_ENV, childAllowedSurfaces, isChildSession, readSettings, writeSettings } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
+import { worktreeTreeResult } from "../lib/worktree-tree.ts";
 
 const MODE_ENTRY = "brigadev-mode";
 const STATUS_KEY = "brigadev-mode";
@@ -26,6 +29,8 @@ export default function (pi: ExtensionAPI) {
 	let mode: PermissionMode = PERMISSION_MODE.NORMAL;
 	// Per-session grants for directories outside the project root.
 	const outsideGrants = new Set<string>();
+	// Worktree tree the user granted a one-shot commit force for (/brigadev:force-commit). Only that command sets it.
+	let forcedTree: string | undefined;
 
 	const projectRoot = (ctx: ExtensionContext) => canonicalPath(process.env[CHILD_ENV.PROJECT_ROOT] ?? ctx.cwd);
 
@@ -65,6 +70,60 @@ export default function (pi: ExtensionAPI) {
 		return ctx.ui.confirm(title, body);
 	};
 
+	/**
+	 * Evidence gate for `git commit` (parent only, every permission mode): blocks a commit with source
+	 * changes unless a passing test is recorded for the current tree. Only the user can force it.
+	 * Returns a block reason, or a `settle` to call once the remaining rules let the commit run: the
+	 * user's force (one-shot or dialog) is spent and logged then, not when a later rule declines.
+	 */
+	const evidenceGate = async (command: string, ctx: ExtensionContext): Promise<{ reason?: string; settle: () => void }> => {
+		const nothing = { settle: () => {} };
+		const commits = classifyCommand(command).filter((match) => match.commit);
+		if (commits.length === 0) return nothing;
+		// The whole repository, not the session folder: a session in a subdirectory commits files elsewhere too.
+		const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: projectRoot(ctx), timeout: 15_000 }).catch(() => undefined);
+		const root = top?.code === 0 && top.stdout.trim() ? canonicalPath(top.stdout.trim()) : projectRoot(ctx);
+		const treeResult = await worktreeTreeResult(root);
+		const tree = treeResult.kind === "tree" ? treeResult.tree : undefined;
+		const treeError = treeResult.kind === "error" ? treeResult.reason : undefined;
+		const snapshot = tree === undefined ? undefined : await takeSnapshot(exec, root);
+		const branch = (await readBranchFacts(exec, ctx.cwd)).currentBranch;
+		const file = evidenceFile(repoDocsDir(ctx.cwd), branch);
+		const log = (via: ForceRecord["via"]) => {
+			try {
+				appendEvidence(file, forceRecord({ ts: new Date().toISOString(), branch, tree, via, command }));
+			} catch {
+				// The force is the user's decision; a failed log write does not undo it.
+			}
+		};
+
+		const { decision, consumedForce } = commitGateWithForce({
+			// Unknown dirty paths count as source: a gate that cannot see the change must not pass it.
+			dirtyPaths: snapshot ? [...snapshot.keys()] : ["(unknown)"],
+			tree,
+			treeError,
+			elsewhere: commits.some((match) => match.elsewhere),
+			records: readEvidence(file),
+			forcedTree,
+		});
+		if (decision.action === "allow") {
+			return consumedForce
+				? {
+						settle: () => {
+							forcedTree = undefined;
+							log("command");
+						},
+					}
+				: nothing;
+		}
+
+		if (!isChild && ctx.hasUI) {
+			const dialog = gateDialog(decision.reason, command);
+			if (await ctx.ui.confirm(dialog.title, dialog.body)) return { settle: () => log("dialog") };
+		}
+		return { reason: decision.reason, settle: () => {} };
+	};
+
 	pi.on("session_start", async (_event, ctx) => restoreMode(ctx));
 	pi.on("session_tree", async (_event, ctx) => restoreMode(ctx));
 
@@ -75,6 +134,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (isToolCallEventType("bash", event)) {
+			// Nobody forges a recorded test result: the evidence log is written only by the recorder. (Textual rule; reading stays allowed.)
+			if (event.input.command.includes("evidence") && bashWritesEvidence(event.input.command, [join(repoDocsDir(ctx.cwd), "evidence")])) return { block: true, reason: EVIDENCE_BLOCK };
 			const surfaces = writerSurfaces();
 			if (surfaces) {
 				const outside = writesOutsideSurfaces(event.input.command, ctx.cwd, projectRoot(ctx), surfaces);
@@ -88,10 +149,14 @@ export default function (pi: ExtensionAPI) {
 
 			const decision = await decideBashCommand({ command: event.input.command, mode, isChild, cwd: ctx.cwd, readFacts: (cwd) => readBranchFacts(exec, cwd) });
 			if (decision.action === "block") return { block: true, reason: decision.reason };
+			const gated = isChild ? undefined : await evidenceGate(event.input.command, ctx);
+			if (gated?.reason) return { block: true, reason: gated.reason };
 			if (decision.action === "confirm") {
 				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(event.input.command)}\n\nRun it?`);
 				if (!ok) return { block: true, reason: `User declined: ${decision.reason}` };
 			}
+			// Every rule allowed the commit: only now is the user's force spent and logged.
+			gated?.settle();
 
 			// The command will run: remember the tree so tool_result can see what it changed.
 			if (surfaces) {
@@ -155,6 +220,19 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	if (isChild) return;
+
+	pi.registerCommand("brigadev:force-commit", {
+		description: "Let the next git commit on the current working tree pass the evidence gate (one-shot; edits cancel it)",
+		handler: async (_args, ctx) => {
+			const result = await worktreeTreeResult(projectRoot(ctx));
+			if (result.kind === "no-git") return ctx.ui.notify("brigadev: not a git working tree, so the evidence gate does not apply", "error");
+			if (result.kind === "error") {
+				return ctx.ui.notify(`brigadev: the working tree could not be computed (${result.reason}), so a force cannot be bound to it. Use the dialog the guard shows when the commit is blocked, or fix git and try again.`, "error");
+			}
+			forcedTree = result.tree;
+			ctx.ui.notify("brigadev: the next commit of the current working tree skips the evidence gate. Editing any file first cancels this.", "info");
+		},
+	});
 
 	pi.registerCommand("brigadev:mode", {
 		description: "Permission mode: normal | yolo | default <normal|yolo> | status",

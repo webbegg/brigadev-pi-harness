@@ -1,0 +1,25 @@
+{
+	"type": "object",
+	"required": ["findings", "reviewed"],
+	"additionalProperties": false,
+	"properties": {
+		"findings": {
+			"type": "array",
+			"description": "Every finding with evidence; [] when clean.",
+			"items": {
+				"type": "object",
+				"required": ["id", "severity", "location", "claim", "evidence", "cause"],
+				"additionalProperties": false,
+				"properties": {
+					"id": { "type": "string", "minLength": 1, "description": "<LENS>-001, <LENS>-002, ..." },
+					"severity": { "type": "string", "enum": ["BLOCKER", "CRITICAL", "WARNING", "SUGGESTION"] },
+					"location": { "type": "string", "minLength": 1, "description": "path/to/file.ts:LINE" },
+					"claim": { "type": "string", "minLength": 1, "description": "Concrete user or maintainer impact." },
+					"evidence": { "type": "string", "minLength": 1, "description": "The changed hunk or reproduction that proves it." },
+					"cause": { "type": "string", "enum": ["introduced", "worsened", "pre-existing"] }
+				}
+			}
+		},
+		"reviewed": { "type": "string", "minLength": 1, "description": "One line of concrete evidence of what you reviewed (patch, files, checks)." }
+	}
+}

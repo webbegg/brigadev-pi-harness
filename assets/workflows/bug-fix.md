@@ -37,4 +37,6 @@ Bug fix request, started from the workflow menu. Follow the normal ODD flow: rep
 - Actual (errors or logs): {{actual}}
 - Ticket or link: {{ticket}}
 
+Run the diagnosis loop in `diagnosis.md` in the assets root named in the orchestrator prompt: a command that fails because of the bug comes before any hypothesis.
+
 If the problem cannot be reproduced from the details above, report what was tried instead of guessing at a fix.

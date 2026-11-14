@@ -1,0 +1,52 @@
+{
+	"type": "object",
+	"required": ["verdicts", "blockers", "advisories", "regressionTests", "scratch", "unverified"],
+	"additionalProperties": false,
+	"properties": {
+		"verdicts": {
+			"type": "array",
+			"minItems": 1,
+			"description": "One verdict per S# in the feature document.",
+			"items": {
+				"type": "object",
+				"required": ["spec", "verdict", "evidence"],
+				"additionalProperties": false,
+				"properties": {
+					"spec": { "type": "string", "minLength": 1, "description": "S1, S2, ..." },
+					"verdict": { "type": "string", "enum": ["met", "unmet", "not implemented", "out of scope", "unverified"], "description": "unverified counts as unmet; give the reason and the missing command." },
+					"evidence": { "type": "string", "minLength": 1, "description": "Probe and observed result, or the scope reason." }
+				}
+			}
+		},
+		"blockers": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"required": ["summary", "reproduction"],
+				"additionalProperties": false,
+				"properties": { "summary": { "type": "string", "minLength": 1 }, "reproduction": { "type": "string", "minLength": 1 }, "spec": { "type": "string" } }
+			}
+		},
+		"advisories": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"required": ["summary", "reproduction"],
+				"additionalProperties": false,
+				"properties": { "summary": { "type": "string", "minLength": 1 }, "reproduction": { "type": "string", "minLength": 1 } }
+			}
+		},
+		"regressionTests": {
+			"type": "array",
+			"description": "Ready-to-commit tests for the parent to hand to a writer.",
+			"items": {
+				"type": "object",
+				"required": ["path", "content", "covers"],
+				"additionalProperties": false,
+				"properties": { "path": { "type": "string", "minLength": 1 }, "content": { "type": "string", "minLength": 1 }, "covers": { "type": "string", "minLength": 1, "description": "S# covered." } }
+			}
+		},
+		"scratch": { "type": "array", "items": { "type": "string" }, "description": "Exact scratch directories you created." },
+		"unverified": { "type": "array", "items": { "type": "string" }, "description": "Checks left unverified, each with the reason and the missing command." }
+	}
+}

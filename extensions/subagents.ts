@@ -32,7 +32,8 @@ import { costCalculator, currentModelRef, listPrice, loadAgents, modelCatalog } 
 import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
 import { panelState } from "../lib/panel-state.ts";
 import { canonicalPath } from "../lib/paths.ts";
-import { CHILD_ENV, GUARD_EXTENSION_PATH, isChildSession } from "../lib/runtime.ts";
+import { CHILD_ENV, EVIDENCE_EXTENSION_PATH, GUARD_EXTENSION_PATH, isChildSession, STRUCTURED_OUTPUT_EXTENSION_PATH } from "../lib/runtime.ts";
+import { checkStructuredRun, formatStructured, loadOutputSchema, STRUCTURED_OUTPUT_TOOL, type JsonSchema } from "../lib/structured-output.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot } from "../lib/worktree-snapshot.ts";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -59,6 +60,8 @@ interface RunResult {
 	fallbacks?: string[];
 	stopReason?: string;
 	errorMessage?: string;
+	/** Validated structured_output payload, for agents that declare an output schema. */
+	structured?: unknown;
 }
 
 interface Details {
@@ -79,7 +82,11 @@ function finalText(messages: Message[]): string {
 }
 
 const failed = (r: RunResult) => r.exitCode > 0 || r.stopReason === "error" || r.stopReason === "aborted";
-const output = (r: RunResult) => (failed(r) ? r.errorMessage || r.stderr.trim() || finalText(r.messages) : finalText(r.messages)) || "(no output)";
+const output = (r: RunResult) =>
+	(failed(r) ? r.errorMessage || r.stderr.trim() || finalText(r.messages) : r.structured !== undefined ? formatStructured(r.structured) : finalText(r.messages)) || "(no output)";
+
+/** One parallel section's body: a structured result is never cut (compact JSON above the cap); prose is capped. */
+const sectionOutput = (r: RunResult): string => (!failed(r) && r.structured !== undefined ? formatStructured(r.structured, PER_TASK_OUTPUT_CAP) : capOutput(output(r)));
 
 function capOutput(text: string): string {
 	if (Buffer.byteLength(text, "utf8") <= PER_TASK_OUTPUT_CAP) return text;
@@ -115,6 +122,8 @@ interface RunOptions {
 	taskText: string;
 	route: ResolvedRoute;
 	routeLabel: string;
+	/** The agent's output schema, loaded and checked before launch. */
+	schema?: JsonSchema;
 	price: CostCalculator;
 	signal?: AbortSignal;
 	onUpdate: (result: RunResult) => void;
@@ -124,11 +133,13 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 	const { agent, request } = options;
 	const result: RunResult = { agent: agent.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally() };
 
-	const args = ["--mode", "json", "-p", "--no-session", "-e", GUARD_EXTENSION_PATH];
+	const args = ["--mode", "json", "-p", "--no-session", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
+	const structured = Boolean(options.schema && agent.outputSchema);
+	if (structured) args.push("-e", STRUCTURED_OUTPUT_EXTENSION_PATH);
 	const { model, thinking } = options.route;
 	if (model) args.push("--model", model);
 	if (thinking) args.push("--thinking", thinking);
-	if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
+	if (agent.tools?.length) args.push("--tools", [...agent.tools, ...(structured ? [STRUCTURED_OUTPUT_TOOL] : [])].join(","));
 	Object.assign(result, { model, thinking, route: options.routeLabel });
 
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "brigadev-agent-"));
@@ -154,6 +165,8 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 		};
 		if (agent.writer && request.allowedEditSurfaces) env[CHILD_ENV.ALLOWED_SURFACES] = JSON.stringify(request.allowedEditSurfaces);
 		else delete env[CHILD_ENV.ALLOWED_SURFACES];
+		if (structured) env[CHILD_ENV.OUTPUT_SCHEMA] = agent.outputSchema;
+		else delete env[CHILD_ENV.OUTPUT_SCHEMA];
 
 		let aborted = false;
 		let stalled = false;
@@ -257,6 +270,11 @@ async function runAgent(options: RunOptions): Promise<RunResult> {
 			}
 		});
 		if (aborted) throw new Error("Subagent was aborted");
+		if (structured && !failed(result)) {
+			const check = checkStructuredRun(result.messages, options.schema!);
+			if (check.ok) result.structured = check.value;
+			else Object.assign(result, { stopReason: "error", errorMessage: check.error });
+		}
 		return result;
 	} finally {
 		await fs.promises.rm(tmpDir, { recursive: true, force: true });
@@ -426,6 +444,14 @@ export default function (pi: ExtensionAPI) {
 					problems.push(`${requests.length > 1 ? `task ${i + 1}: ` : ""}${resolved[i].request.agent} routes to unknown model "${route.model}" (${routeLabel(route, profile.name)}); fix it with /brigadev:profile set`);
 				}
 			});
+			// Output schemas are read once here; a broken one rejects the launch instead of failing the child.
+			const schemas = resolved.map(({ agent }, i) => {
+				if (!agent?.outputSchema) return undefined;
+				const loaded = loadOutputSchema(agent.outputSchema);
+				if ("schema" in loaded) return loaded.schema;
+				problems.push(`${requests.length > 1 ? `task ${i + 1}: ` : ""}${agent.name}: ${loaded.error}`);
+				return undefined;
+			});
 			if (problems.length > 0) return reject(`Launch rejected by brigadev delegation rules:\n- ${problems.join("\n- ")}`);
 
 			const results: RunResult[] = resolved.map(({ request }) => ({ agent: request.agent, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally() }));
@@ -491,6 +517,7 @@ export default function (pi: ExtensionAPI) {
 							taskText: text,
 							route: stepRoute,
 							routeLabel: `${routeLabel(route, profile.name)}${attempt.model !== route.model ? " ↪ fallback" : ""}`,
+							schema: schemas[index],
 							price,
 							signal,
 							onUpdate: (partial) => {
@@ -538,7 +565,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: (failed(r) ? `Agent ${r.stopReason ?? "failed"}: ` : "") + output(r) + warningText }], details, isError: failed(r) };
 			}
 			const ok = results.filter((r) => !failed(r)).length;
-			const sections = results.map((r) => `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${capOutput(output(r))}`);
+			const sections = results.map((r) => `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${sectionOutput(r)}`);
 			return { content: [{ type: "text", text: `Parallel: ${ok}/${results.length} succeeded\n\n${sections.join("\n\n---\n\n")}${warningText}` }], details };
 		},
 

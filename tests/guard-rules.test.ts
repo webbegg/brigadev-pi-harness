@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import type { BranchFacts } from "../lib/commit-branch.ts";
 import { canonicalPath } from "../lib/paths.ts";
-import { decideBashCommand, decideFileAccess, type FileAccessInput } from "../lib/guard-rules.ts";
+import { bashWritesEvidence, decideBashCommand, decideFileAccess, type FileAccessInput } from "../lib/guard-rules.ts";
 import { PERMISSION_MODE } from "../lib/permission-policy.ts";
 
 describe("file access decision", () => {
@@ -163,5 +163,65 @@ describe("bash decision", () => {
 		assert.deepEqual(await decide("git commit -m x", { isChild: true }), { action: "block", cwds: [] });
 		assert.deepEqual(await decide("git commit -m x", { mode: "yolo" }), { action: "allow", cwds: [] });
 		assert.deepEqual(await decide("git push", { mode: "normal" }), { action: "confirm", cwds: [] });
+	});
+});
+
+describe("evidence log protection", () => {
+	const docs = "/h/.brigadev/repo";
+	const evidence = `${docs}/evidence`;
+	const input = (overrides: Partial<FileAccessInput> & { absolutePath: string }): FileAccessInput => ({ isChild: false, projectRoot: "/work/project", docsDir: docs, sensitive: false, readOnly: false, surfaces: undefined, ...overrides });
+
+	it("blocks write and edit tool calls into the evidence folder and its children", () => {
+		for (const absolutePath of [evidence, `${evidence}/feat-x.jsonl`, `${evidence}/sub/new.jsonl`]) {
+			const decision = decideFileAccess(input({ absolutePath }));
+			assert.equal(decision.action, "block", absolutePath);
+			assert.match("reason" in decision ? decision.reason : "", /evidence/);
+		}
+	});
+
+	it("blocks it for a subagent and for a sensitive-looking name too", () => {
+		assert.equal(decideFileAccess(input({ absolutePath: `${evidence}/x.jsonl`, isChild: true })).action, "block");
+		assert.equal(decideFileAccess(input({ absolutePath: `${evidence}/.env`, sensitive: true })).action, "block");
+	});
+
+	it("still lets the parent read the evidence and write the other harness documents", () => {
+		assert.deepEqual(decideFileAccess(input({ absolutePath: `${evidence}/feat-x.jsonl`, isWrite: false })), { action: "allow" });
+		assert.deepEqual(decideFileAccess(input({ absolutePath: `${docs}/tasks/x.md` })), { action: "allow" });
+		assert.deepEqual(decideFileAccess(input({ absolutePath: `${docs}/reviews/evidence-notes.md` })), { action: "allow" });
+	});
+
+	it("does not treat a sibling folder or a project folder named evidence as the log", () => {
+		assert.equal(decideFileAccess(input({ absolutePath: `${docs}/evidence-old/x.jsonl` })).action, "allow");
+		assert.deepEqual(decideFileAccess(input({ absolutePath: "/work/project/evidence/a.ts" })), { action: "allow" });
+	});
+
+	const dirs = [evidence];
+
+	it("blocks a bash command that writes to the evidence path", () => {
+		for (const command of [
+			`echo '{}' >> ${evidence}/feat-x.jsonl`,
+			`echo '{}' > ~/.brigadev/repo/evidence/feat-x.jsonl`,
+			`echo x >> $HOME/.brigadev/repo/evidence/b.jsonl`,
+			`printf x | tee ${evidence}/b.jsonl`,
+			`cp /tmp/forged.jsonl ${evidence}/b.jsonl`,
+			`rm ${evidence}/b.jsonl`,
+			`sed -i '' s/fail/pass/ ${evidence}/b.jsonl`,
+			`node -e "require('fs').appendFileSync('${evidence}/b.jsonl','x')"`,
+			`: > "${evidence}/b.jsonl"`,
+		]) {
+			assert.equal(bashWritesEvidence(command, dirs), true, command);
+		}
+	});
+
+	it("lets bash read the evidence", () => {
+		for (const command of [`cat ${evidence}/b.jsonl`, `grep fail ${evidence}/b.jsonl | tail -3`, `ls -la ~/.brigadev/repo/evidence`, `jq . ${evidence}/b.jsonl 2>&1`, `tail -n 5 ${evidence}/b.jsonl 2>/dev/null`, `wc -l $HOME/.brigadev/repo/evidence/b.jsonl`]) {
+			assert.equal(bashWritesEvidence(command, dirs), false, command);
+		}
+	});
+
+	it("ignores writes that do not mention the evidence path", () => {
+		for (const command of ["echo x > /tmp/a", "npm test > out.txt", "rm -rf build", `cat ${docs}/tasks/x.md > /tmp/y`]) {
+			assert.equal(bashWritesEvidence(command, dirs), false, command);
+		}
 	});
 });

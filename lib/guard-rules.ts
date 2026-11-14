@@ -2,11 +2,12 @@
 // tests without the Pi packages that extensions/guard.ts imports. The
 // extension reads the facts (paths, environment, git) and acts on the answer.
 
-import { dirname, relative, sep } from "node:path";
-import { classifyCommand } from "./command-classifier.ts";
+import { homedir } from "node:os";
+import { dirname, join, relative, sep } from "node:path";
+import { basename as executableName, blankHeredocs, classifyCommand, tokenize } from "./command-classifier.ts";
 import { type BranchFacts, decideWithBranchRule } from "./commit-branch.ts";
 import { isWithinSurfaces } from "./edit-surfaces.ts";
-import { isInside } from "./paths.ts";
+import { canonicalPath, isInside } from "./paths.ts";
 import { type Decision, type PermissionMode } from "./permission-policy.ts";
 import { isRepoDocsPath } from "./repo-docs.ts";
 
@@ -40,6 +41,16 @@ export type FileAccessDecision = PathVerdict | { action: "ask"; kind: "sensitive
 const ALLOW: PathVerdict = { action: "allow" };
 const block = (reason: string): PathVerdict => ({ action: "block", reason });
 
+export const EVIDENCE_BLOCK =
+	"Blocked by brigadev guard: the evidence log is written only by the recorder, so a recorded test result cannot be forged. Read it if you need it; run the tests to add to it.";
+
+/** A write or edit that lands in `<docs>/evidence/` (the folder itself or anything under it). */
+function writesEvidence(input: FileAccessInput): boolean {
+	if (input.isWrite === false || !/(^|[\\/])evidence([\\/]|$)/.test(input.absolutePath)) return false;
+	const docsDir = typeof input.docsDir === "function" ? input.docsDir() : input.docsDir;
+	return isInside(canonicalPath(join(docsDir, "evidence")), input.absolutePath);
+}
+
 function decideAfterSensitive(input: FileAccessInput): PathVerdict {
 	const { isChild, absolutePath, projectRoot } = input;
 	if (input.isWrite === false) return ALLOW;
@@ -65,16 +76,54 @@ function decideAfterSensitive(input: FileAccessInput): PathVerdict {
 }
 
 /**
- * Order: a sensitive path first (subagents blocked, the parent asked), then,
- * for writes, the parent-only docs exemption, the outside-project rule, and
- * for a subagent inside the project its read-only flag and edit surfaces.
+ * Order: a write into the evidence log is blocked for everyone; then a
+ * sensitive path (subagents blocked, the parent asked); then, for writes, the
+ * parent-only docs exemption, the outside-project rule, and for a subagent
+ * inside the project its read-only flag and edit surfaces.
  */
 export function decideFileAccess(input: FileAccessInput): FileAccessDecision {
+	// The docs folder is only resolved for a path with an `evidence` segment: resolving it runs git.
+	if (writesEvidence(input)) return block(EVIDENCE_BLOCK);
 	if (input.sensitive) {
 		if (input.isChild) return block(`Blocked by brigadev guard: ${input.rawPath ?? input.absolutePath} may hold secrets; subagents never read or write it.`);
 		return { action: "ask", kind: "sensitive", then: decideAfterSensitive(input) };
 	}
 	return decideAfterSensitive(input);
+}
+
+// Commands that create, change, or remove files; one of them next to an evidence path is a write.
+const WRITE_COMMANDS = new Set(["tee", "cp", "mv", "rm", "ln", "dd", "truncate", "install", "touch", "sed", "awk", "gawk", "perl", "python", "python3", "node", "ruby", "rsync", "unlink", "shred", "chmod", "mkdir", "rmdir", "patch"]);
+
+/** Spellings of an evidence directory a command can use: absolute, `~/`, `$HOME/`, `${HOME}/`, and any `.brigadev/<repo>/evidence` path. */
+function evidenceReferences(evidenceDirs: readonly string[], home: string): { literals: string[]; pattern: RegExp } {
+	const literals: string[] = [];
+	for (const dir of evidenceDirs) {
+		for (const form of [dir, canonicalPath(dir)]) {
+			literals.push(form);
+			if (isInside(home, form) && form !== home) {
+				const rest = relative(home, form).split(sep).join("/");
+				literals.push(`~/${rest}`, `$HOME/${rest}`, `\${HOME}/${rest}`);
+			}
+		}
+	}
+	return { literals, pattern: /\.brigadev\/[^\s'"]*\/?evidence(?![\w-])/ };
+}
+
+/**
+ * True when a command both names an evidence directory and writes: an output
+ * redirection, or a file-changing command or interpreter. Reading stays
+ * allowed (`cat`, `grep`, `ls`, `2>&1`). A best-effort textual rule, like the
+ * rest of the command classifier: a deliberately obfuscated command (a path
+ * built from variables, `cd` then a relative write) is not caught.
+ */
+export function bashWritesEvidence(command: string, evidenceDirs: readonly string[], home: string = homedir()): boolean {
+	const references = evidenceReferences(evidenceDirs, home);
+	if (!references.literals.some((literal) => command.includes(literal)) && !references.pattern.test(command)) return false;
+	const text = blankHeredocs(command);
+	// File-descriptor duplication (`2>&1`) and `/dev/null` are not writes to a file.
+	const redirected = text.replace(/\d*>&[\d-]*/g, " ").replace(/\d*>>?\s*\/dev\/null/g, " ");
+	if (/&?>/.test(redirected)) return true;
+	return tokenize(text).some((segment) => segment.argv.some((word) => WRITE_COMMANDS.has(executableName(word))));
 }
 
 export interface BashDecisionInput {

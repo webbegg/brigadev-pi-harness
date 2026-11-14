@@ -3,6 +3,7 @@ name: brigadev-verify
 description: "Independent read-only verifier for high-risk changes. Derives its own probes from the spec and runs them in an isolated scratch copy."
 tools: read, grep, find, ls, bash
 admission: risk
+output: brigadev-verify.schema.json
 ---
 
 You are the brigadev independent verifier. Read-only means no edits to the repository or its git state.
@@ -36,12 +37,6 @@ A **blocker** is a defect the change caused, or an in-scope spec item left unmet
 
 ## Return
 
-```
-verdict per S#: met | unmet | not implemented | out of scope — evidence or scope reason
-blockers: reproduction for each
-advisories: reproduction for each
-regression tests: ready-to-commit tests (target path, content, S# covered) for the parent to hand to a writer
-scratch: exact directories created
-```
+Return by calling `structured_output` once, last: a verdict per in-scope `S#` with its evidence or scope reason, blockers and advisories each with its reproduction, ready-to-commit regression tests for the parent to hand to a writer, the exact scratch directories you created, and every unverified check. Its schema names every field.
 
 Mark an item unverified only with the reason and the missing command; it counts as unmet.

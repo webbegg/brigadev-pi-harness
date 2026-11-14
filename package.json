@@ -16,6 +16,7 @@
 		"extensions": [
 			"./extensions/orchestrator.ts",
 			"./extensions/guard.ts",
+			"./extensions/evidence.ts",
 			"./extensions/subagents.ts",
 			"./extensions/todo.ts",
 			"./extensions/profiles.ts",
