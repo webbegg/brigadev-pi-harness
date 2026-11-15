@@ -1,294 +1,66 @@
 /**
  * brigadev subagents: focused agents with isolated context, each in its own
- * `pi --mode json -p` process. Adapted from Pi's official subagent example.
+ * `pi --mode rpc` process (the task is sent as an RPC prompt, so a running child can
+ * be steered or aborted from the Agents viewer). Adapted from Pi's official subagent example.
  *
  * Adds the brigadev delegation contract on top: every launch names its
  * reason, the verifier needs a named risk item, writers need disjoint
  * allowed edit surfaces, and requirements travel by reference.
  */
 
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Message } from "@earendil-works/pi-ai";
 import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { agentsCard, FINISHED_TTL_MS, formatElapsed, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
-import { threadRows } from "../lib/agent-thread.ts";
-import { queuedFields, runState, settleQueued, subagentRow, syncRowTimer, type RowInput, type RowTimerState } from "../lib/subagent-row.ts";
+import { agentsCard, FINISHED_TTL_MS, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
+import { ABORT_PROMPT, abortArmFor, autoScroll, buildEntries, canTakeOver, entryDetail, listRow, moveSelection, openTakeover, pressAbort, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, takeoverNotice, viewerFooter, viewerTitle, type AbortArm, type RecordedRun, type Selection, type TakeoverKey, type TakeoverState, type TrackedRun } from "../lib/subagent-viewer.ts";
+import type { ChildControl } from "../lib/child-rpc.ts";
+import { formatStatus, statusCounts } from "../lib/subagent-status.ts";
+import { queuedFields, runState, subagentRow, syncRowTimer, type RowInput, type RowTimerState } from "../lib/subagent-row.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
-import { listWidth, maxScroll, renderTwoPane, type Row } from "../lib/two-pane.ts";
-import type { AgentDefinition } from "../lib/agents.ts";
-import { addUsage, emptyTally, formatCost, formatTokens, priceBridgeMessage, type CostCalculator, type Tally } from "../lib/cost.ts";
-import { createStallWatchdog, resolveStallTimeouts, stallMessage } from "../lib/stall-watchdog.ts";
-import { admitLaunch, buildChildTask, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
-import { classifyFailure, cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
+import { listWidth, renderTwoPane } from "../lib/two-pane.ts";
+import { emptyTally, formatCost, formatTokens } from "../lib/cost.ts";
+import { failed, installParentExitGuard, KILL_GRACE_MS, liveChildren, output, runChild, type RunResult } from "../lib/child-run.ts";
+import { newRunId } from "../lib/run-artifacts.ts";
+import { createSemaphore } from "../lib/semaphore.ts";
+import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
+import { createResultDelivery, deliveredNote, omittedResultText, resultBatchMessage, resultCard, RESULT_MESSAGE_TYPE, type BatchEntry, type ResultMessageDetails } from "../lib/result-delivery.ts";
+import { createSubagentRegistry, type WaitOutcome } from "../lib/subagent-registry.ts";
+import { admitLaunch, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
+import { cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
 import { blockedReason, fallbackState } from "../lib/fallback-state.ts";
 import { resolveAgentRoute, resolveModelRef, routeFor, type ResolvedRoute } from "../lib/model-routing.ts";
 import { costCalculator, currentModelRef, listPrice, loadAgents, modelCatalog } from "../lib/pi-adapters.ts";
 import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
 import { panelState } from "../lib/panel-state.ts";
 import { canonicalPath } from "../lib/paths.ts";
-import { CHILD_ENV, EVIDENCE_EXTENSION_PATH, GUARD_EXTENSION_PATH, isChildSession, STRUCTURED_OUTPUT_EXTENSION_PATH } from "../lib/runtime.ts";
-import { checkStructuredRun, formatStructured, loadOutputSchema, STRUCTURED_OUTPUT_TOOL, type JsonSchema } from "../lib/structured-output.ts";
-import { diffSnapshots, outsideSurfaces, takeSnapshot } from "../lib/worktree-snapshot.ts";
+import { isChildSession } from "../lib/runtime.ts";
+import { loadOutputSchema } from "../lib/structured-output.ts";
+import { takeSnapshot } from "../lib/worktree-snapshot.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const WAIT_DEFAULT_SECONDS = 60;
+const WAIT_MAX_SECONDS = 300;
+/** Extra time on top of the SIGTERM->SIGKILL grace that session shutdown waits for children to settle. */
+const SHUTDOWN_SLACK_MS = 1000;
 const STATUS_KEY = "brigadev-agents";
 const CARD_KEY = "brigadev-agents-card";
 const CARD_COLLAPSE_KEY = "ctrl+shift+a";
 const VIEWER_KEY = "alt+a";
-
-interface RunResult {
-	agent: string;
-	task: string;
-	exitCode: number; // -1 while running
-	messages: Message[];
-	stderr: string;
-	usage: Tally;
-	model?: string;
-	thinking?: string;
-	/** Where the model came from: "profile:<name>/<key>", "definition", or "parent". */
-	route?: string;
-	/** True when the model came from the parent session (resolved route source), for the row's `↑`. */
-	inherited?: boolean;
-	/** Placeholder of a task that is waiting for a concurrency slot. */
-	queued?: boolean;
-	/** Settled without ever starting (aborted while queued). */
-	cancelled?: boolean;
-	/** Models that failed before this one, with the failure category. */
-	fallbacks?: string[];
-	/** Epoch ms when the run was launched (first attempt); drives the row's elapsed time. */
-	startedAt?: number;
-	/** Epoch ms when the run settled; set for aborted placeholders too. */
-	endedAt?: number;
-	stopReason?: string;
-	errorMessage?: string;
-	/** Validated structured_output payload, for agents that declare an output schema. */
-	structured?: unknown;
-}
-
-interface Details {
-	mode: "single" | "parallel";
-	results: RunResult[];
-	/** Files the batch changed outside every writer's surfaces (set when writers ran in a git repo). */
-	outsideSurfaces?: string[];
-}
-
-
-function finalText(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role !== "assistant") continue;
-		for (const part of msg.content) if (part.type === "text") return part.text;
-	}
-	return "";
-}
-
-const failed = (r: RunResult) => r.exitCode > 0 || r.stopReason === "error" || r.stopReason === "aborted";
-const output = (r: RunResult) =>
-	(failed(r) ? r.errorMessage || r.stderr.trim() || finalText(r.messages) : r.structured !== undefined ? formatStructured(r.structured) : finalText(r.messages)) || "(no output)";
-
-/** One parallel section's body: a structured result is never cut (compact JSON above the cap); prose is capped. */
-const sectionOutput = (r: RunResult): string => (!failed(r) && r.structured !== undefined ? formatStructured(r.structured, PER_TASK_OUTPUT_CAP) : capOutput(output(r)));
-
-function capOutput(text: string): string {
-	if (Buffer.byteLength(text, "utf8") <= PER_TASK_OUTPUT_CAP) return text;
-	let cut = text.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(cut, "utf8") > PER_TASK_OUTPUT_CAP) cut = cut.slice(0, -1);
-	return `${cut}\n\n[Output truncated. Full output is in the tool details.]`;
-}
+/** Settled runs this process remembers for the viewer (older ones are still on the session branch when collected). */
+const MAX_SETTLED_VIEW_RUNS = 100;
+/** Tool results that carry finished runs: a sync call, or an async launch collected by wait/cancel. */
+const VIEWER_TOOLS = new Set(["subagent", "subagent_wait", "subagent_cancel"]);
 
 function piInvocation(args: string[]): { command: string; args: string[] } {
 	const script = process.argv[1];
 	if (script && !script.startsWith("/$bunfs/root/") && fs.existsSync(script)) return { command: process.execPath, args: [script, ...args] };
 	const exec = path.basename(process.execPath).toLowerCase();
 	return /^(node|bun)(\.exe)?$/.test(exec) ? { command: "pi", args } : { command: process.execPath, args };
-}
-
-async function mapLimited<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
-	const results: R[] = new Array(items.length);
-	let next = 0;
-	const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
-		while (next < items.length) {
-			const index = next++;
-			results[index] = await fn(items[index], index);
-		}
-	});
-	await Promise.all(workers);
-	return results;
-}
-
-interface RunOptions {
-	cwd: string;
-	agent: AgentDefinition;
-	request: LaunchRequest;
-	taskText: string;
-	route: ResolvedRoute;
-	routeLabel: string;
-	/** The agent's output schema, loaded and checked before launch. */
-	schema?: JsonSchema;
-	price: CostCalculator;
-	signal?: AbortSignal;
-	onUpdate: (result: RunResult) => void;
-}
-
-async function runAgent(options: RunOptions): Promise<RunResult> {
-	const { agent, request } = options;
-	const result: RunResult = { agent: agent.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally() };
-
-	const args = ["--mode", "json", "-p", "--no-session", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
-	const structured = Boolean(options.schema && agent.outputSchema);
-	if (structured) args.push("-e", STRUCTURED_OUTPUT_EXTENSION_PATH);
-	const { model, thinking } = options.route;
-	if (model) args.push("--model", model);
-	if (thinking) args.push("--thinking", thinking);
-	if (agent.tools?.length) args.push("--tools", [...agent.tools, ...(structured ? [STRUCTURED_OUTPUT_TOOL] : [])].join(","));
-	Object.assign(result, { model, thinking, route: options.routeLabel, inherited: options.route.modelSource === "parent" });
-
-	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "brigadev-agent-"));
-	try {
-		if (agent.systemPrompt.trim()) {
-			const promptPath = path.join(tmpDir, "system.md");
-			await fs.promises.writeFile(promptPath, agent.systemPrompt, { encoding: "utf8", mode: 0o600 });
-			args.push("--append-system-prompt", promptPath);
-		}
-		args.push(options.taskText);
-
-		// One spelling of the working directory: an inherited PWD that differs
-		// from the real cwd (macOS /tmp -> /private/tmp, a symlinked checkout)
-		// shows the child two directories, and it then runs every lookup twice.
-		const cwd = canonicalPath(options.cwd);
-		const env: NodeJS.ProcessEnv = {
-			...process.env,
-			PWD: cwd,
-			[CHILD_ENV.CHILD]: "1",
-			[CHILD_ENV.AGENT]: agent.name,
-			[CHILD_ENV.PROJECT_ROOT]: cwd,
-			[CHILD_ENV.READ_ONLY]: agent.writer ? "0" : "1",
-		};
-		if (agent.writer && request.allowedEditSurfaces) env[CHILD_ENV.ALLOWED_SURFACES] = JSON.stringify(request.allowedEditSurfaces);
-		else delete env[CHILD_ENV.ALLOWED_SURFACES];
-		if (structured) env[CHILD_ENV.OUTPUT_SCHEMA] = agent.outputSchema;
-		else delete env[CHILD_ENV.OUTPUT_SCHEMA];
-
-		let aborted = false;
-		let stalled = false;
-		result.exitCode = await new Promise<number>((resolveExit) => {
-			const invocation = piInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, { cwd, env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
-			let buffer = "";
-			let exited = false;
-			let stallError = "";
-			let killTimer: NodeJS.Timeout | undefined;
-
-			// SIGTERM now, SIGKILL after 5 s if the child has not exited by then.
-			const terminate = () => {
-				proc.kill("SIGTERM");
-				killTimer ??= setTimeout(() => !exited && proc.kill("SIGKILL"), 5000);
-			};
-
-			const watchdog = createStallWatchdog({
-				...resolveStallTimeouts(process.env),
-				setTimer: (fn, ms) => setTimeout(fn, ms),
-				clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
-				onStall: (info) => {
-					stalled = true;
-					result.stopReason = "error";
-					stallError = stallMessage(info);
-					result.errorMessage = stallError;
-					terminate();
-				},
-			});
-			watchdog.start();
-
-			const trackActivity = (event: any) => {
-				const msg = event.type === "message_end" ? event.message : undefined;
-				if (msg?.role === "assistant" && Array.isArray(msg.content)) {
-					const calls = msg.content.filter((p: any) => p?.type === "toolCall");
-					for (const call of calls) watchdog.toolStarted(String(call.id), `tool ${call.name}`);
-					if (!calls.length) watchdog.activity("assistant message");
-				} else if (msg?.role === "toolResult") {
-					watchdog.toolFinished(String(msg.toolCallId), `result of ${msg.toolName ?? "tool"}`);
-				} else {
-					watchdog.activity(String(event.type ?? "event"));
-				}
-			};
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-				trackActivity(event);
-				if (event.type === "message_end" && event.message) {
-					// Bridge turns report $0; price them at list price (see lib/cost.ts).
-					const msg = (priceBridgeMessage(event.message, options.price) ?? event.message) as Message;
-					result.messages.push(msg);
-					if (msg.role === "assistant") {
-						addUsage(result.usage, msg.usage);
-						if (msg.model) result.model = msg.provider ? `${msg.provider}/${msg.model}` : msg.model;
-						if (msg.stopReason) result.stopReason = msg.stopReason;
-						if (msg.errorMessage) result.errorMessage = msg.errorMessage;
-					}
-					options.onUpdate(result);
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() ?? "";
-				for (const line of lines) processLine(line);
-			});
-			proc.stderr.on("data", (data) => {
-				result.stderr += data.toString();
-			});
-			proc.on("close", (code) => {
-				exited = true;
-				watchdog.stop();
-				clearTimeout(killTimer);
-				if (buffer.trim()) processLine(buffer);
-				// The child may report its own "aborted" on SIGTERM; the stall is the real cause.
-				if (stalled) Object.assign(result, { stopReason: "error", errorMessage: stallError });
-				resolveExit(stalled ? 1 : (code ?? 0));
-			});
-			proc.on("error", (error) => {
-				exited = true;
-				watchdog.stop();
-				clearTimeout(killTimer);
-				result.stderr += String(error);
-				resolveExit(1);
-			});
-
-			if (options.signal) {
-				const kill = () => {
-					aborted = true;
-					terminate();
-				};
-				if (options.signal.aborted) kill();
-				else options.signal.addEventListener("abort", kill, { once: true });
-			}
-		});
-		if (aborted) throw new Error("Subagent was aborted");
-		if (structured && !failed(result)) {
-			const check = checkStructuredRun(result.messages, options.schema!);
-			if (check.ok) result.structured = check.value;
-			else Object.assign(result, { stopReason: "error", errorMessage: check.error });
-		}
-		return result;
-	} finally {
-		await fs.promises.rm(tmpDir, { recursive: true, force: true });
-	}
 }
 
 // Field descriptions live on the top-level fields only; parallel items reuse
@@ -314,7 +86,14 @@ const Params = Type.Object({
 	featureDoc: described.featureDoc,
 	skills: described.skills,
 	tasks: Type.Optional(Type.Array(Type.Object(launchFields(false)), { description: `Parallel independent units (max ${MAX_PARALLEL_TASKS}), same fields` })),
+	async: Type.Optional(Type.Boolean({ description: "Return a launch id now; collect it with subagent_wait" })),
 });
+
+const WaitParams = Type.Object({
+	runId: Type.String({ description: "Launch id from an async subagent call" }),
+	timeoutSeconds: Type.Optional(Type.Number({ description: `Default ${WAIT_DEFAULT_SECONDS}, max ${WAIT_MAX_SECONDS}` })),
+});
+const CancelParams = Type.Object({ runId: Type.String({ description: "Launch id from an async subagent call" }) });
 
 function formatUsage(r: RunResult): string {
 	const u = r.usage;
@@ -364,17 +143,79 @@ function routeLabel(route: ResolvedRoute, profileName: string | undefined): stri
 export default function (pi: ExtensionAPI) {
 	if (isChildSession()) return;
 
+	// Children run in their own process group, so a parent that dies without `session_shutdown` would leave them running:
+	// SIGKILL their groups when the process exits (once per process, whatever the number of /reloads). SIGTERM/SIGHUP are
+	// Pi's to handle (graceful shutdown then process.exit), so no signal listeners here.
+	installParentExitGuard(liveChildren);
+
 	let skills: SkillRef[] = [];
 	const activeWriters: ActiveWriter[] = [];
-	let running = 0;
+	// Async launches record the writers other launches register while they run (the A1 backstop exclusion).
+	const writerListeners = new Set<(writers: readonly ActiveWriter[]) => void>();
+	// Launches in flight, sync or async, by id: their result placeholders are the one source of the footer's running count
+	// and of the viewer's live rows, so nothing is counted by hand and no exit path can leave a count behind.
+	const launches = new Map<RunResult[], number>();
+	let launchSeq = 0;
+	// Steering handles of the running children, by viewer entry key (`<launch>:<task>`). A finished run has none.
+	const controls = new Map<string, ChildControl>();
+	// Runs of launches that ended in this session, for the viewer (async launches stay visible before they are collected).
+	let settled: TrackedRun[] = [];
+	// Bumped on session start: a launch left from the previous session must not add to the new one.
+	let epoch = 0;
+	// Repaint hook of the open Agents viewer.
+	let repaintViewer: (() => void) | undefined;
+
+	// One concurrency cap for every launch in this process, sync or async.
+	const slots = createSemaphore(MAX_CONCURRENCY);
+	// Async launches: each runs under its own AbortController, collected by subagent_wait / subagent_cancel.
+	const registry = createSubagentRegistry<LaunchResult>({
+		setTimer: (fn, ms) => setTimeout(fn, ms),
+		clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
+		newId: () => newRunId("launch"),
+		// A result held for the idle parent is never pruned before it is delivered or collected.
+		isPinned: (id) => delivery.isHeld(id),
+	});
+
+	// Idle delivery of async results the model did not collect: injected as a custom message that starts a parent turn.
+	// Pi API (docs/extensions.md in the installed pi-coding-agent): `pi.sendMessage(..., { triggerTurn: true, deliverAs: "steer" })`
+	// starts a turn when idle and joins the run when busy (L1627-1649); `ctx.isIdle()` (L1255-1257); `agent_settled` is the
+	// final-idle signal, `agent_end` is not (L336, L661-693); a renderer is registered per customType (L1805, L3165-3200).
+	let parentCtx: ExtensionContext | undefined;
+	const delivery = createResultDelivery<LaunchResult>({
+		isIdle: () => {
+			try {
+				return parentCtx?.isIdle() ?? false;
+			} catch {
+				return false; // a stale context (session replaced): treat as busy; session_start resets the buffer
+			}
+		},
+		isConsumed: (id) => registry.get(id)?.consumed ?? true,
+		markConsumed: (id) => void registry.markConsumed(id),
+		// One message per flush (D1): every ready launch in one combined message, so one parent turn starts and its model sees all of them.
+		deliver: (batch) => {
+			const entries = batch.map(({ id, launch, result }): BatchEntry => {
+				const collectedResult = collected(id, launch.error === undefined ? { status: "settled", launch, result } : { status: "settled", launch, error: launch.error });
+				const tasks = (result?.details.results ?? []).map((r) => ({ agent: r.agent, artifactsDir: r.artifactsDir }));
+				return { id, text: collectedResult.content.map((c) => c.text).join("\n"), failed: collectedResult.isError === true || launch.error !== undefined, pointer: omittedResultText(id, tasks) };
+			});
+			pi.sendMessage(resultBatchMessage(entries), { triggerTurn: true, deliverAs: "steer" });
+		},
+		// Retried at each idle flush; when the bound is spent the result is still collectable with subagent_wait.
+		onDeliveryFailed: ({ id }) => {
+			try {
+				if (parentCtx?.hasUI) parentCtx.ui.notify(`brigadev: could not deliver the result of async subagent launch ${id}; collect it with subagent_wait {"runId":"${id}"}`, "warning");
+			} catch {
+				// A stale context: nobody to tell.
+			}
+		},
+	});
+	registry.subscribe((event) => {
+		if (event.type === "settle") delivery.settled(event);
+	});
 
 	// Agents card: live rows above the editor while subagents run.
 	let runs: AgentRun[] = [];
-	// Live results by card run id, for the Agents viewer while a run is in flight.
-	const liveResults = new Map<string, RunResult>();
 	let cardCollapsed = false;
-	// True while the agents card widget is installed (collapsed or not).
-	let widgetShown = false;
 	let renderCard: (() => void) | undefined;
 	let ticker: ReturnType<typeof setInterval> | undefined;
 	let expiry: ReturnType<typeof setTimeout> | undefined;
@@ -385,9 +226,14 @@ export default function (pi: ExtensionAPI) {
 		ticker = expiry = undefined;
 	};
 
-	// The footer count duplicates the card, so it only shows while the card does not.
+	// Footer: `agents: 2 running · 3 done · alt+a`, counted across sync and async launches. Done follows the card's lifetime.
 	const syncStatus = (ctx: ExtensionContext) => {
-		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, running > 0 && !widgetShown ? `◐ ${running} agent${running === 1 ? "" : "s"}` : undefined);
+		if (!ctx.hasUI) return;
+		try {
+			ctx.ui.setStatus(STATUS_KEY, formatStatus(statusCounts(launches.keys(), runs, Date.now()), VIEWER_KEY));
+		} catch {
+			// A stale context (session replaced): the new session sets its own status.
+		}
 	};
 
 	const showCard = (ctx: ExtensionContext) => {
@@ -397,14 +243,11 @@ export default function (pi: ExtensionAPI) {
 		if (visibleRuns(runs, Date.now()).length === 0) {
 			stopTimers();
 			renderCard = undefined;
-			widgetShown = false;
 			ctx.ui.setWidget(CARD_KEY, undefined);
 			syncStatus(ctx);
 			return;
 		}
 		if (!renderCard) {
-			widgetShown = true;
-			syncStatus(ctx);
 			ctx.ui.setWidget(CARD_KEY, (tui, theme) => {
 				renderCard = () => tui.requestRender();
 				return {
@@ -422,9 +265,15 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 		renderCard?.();
-		// Tick the elapsed column while work runs; drop finished rows after their TTL.
+		syncStatus(ctx);
+		// Tick the elapsed column while work runs; drop finished rows after their TTL (the footer's done count expires with them).
 		const anyRunning = runs.some((r) => r.state === "running");
-		if (anyRunning && !ticker) ticker = setInterval(() => renderCard?.(), 1000);
+		if (anyRunning && !ticker) {
+			ticker = setInterval(() => {
+				renderCard?.();
+				syncStatus(ctx);
+			}, 1000);
+		}
 		if (!anyRunning) {
 			if (ticker) clearInterval(ticker);
 			ticker = undefined;
@@ -434,10 +283,26 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		parentCtx = ctx;
+		// Launches left from a previous session in this process are stopped and forgotten, with any result held for them.
+		delivery.reset();
+		registry.clear();
 		runs = [];
+		launches.clear();
+		controls.clear();
+		settled = [];
+		epoch++;
 		showCard(ctx);
 	});
-	pi.on("session_shutdown", async () => stopTimers());
+	// Children (async and sync) get SIGTERM, and are given KILL_GRACE_MS + 1 s to settle; a group still alive then is
+	// SIGKILLed before this returns, so no child or grandchild outlives the parent. The wait is bounded: shutdown cannot hang.
+	pi.on("session_shutdown", async () => {
+		// Aborted children settle after this; their results must not be sent to a session that is going away.
+		delivery.stop();
+		registry.abortAll();
+		stopTimers();
+		await liveChildren.shutdown({ graceMs: KILL_GRACE_MS + SHUTDOWN_SLACK_MS, setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout) });
+	});
 
 	pi.registerShortcut(CARD_COLLAPSE_KEY, {
 		description: "Collapse or expand the brigadev agents card",
@@ -447,10 +312,23 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	const setRunning = (ctx: ExtensionContext, delta: number) => {
-		running += delta;
-		syncStatus(ctx);
-	};
+	// The parent is idle for good (not between retries or queued continuations): deliver what settled meanwhile.
+	pi.on("agent_settled", async (_event, ctx) => {
+		parentCtx = ctx;
+		delivery.flush();
+	});
+
+	pi.registerMessageRenderer<ResultMessageDetails>(RESULT_MESSAGE_TYPE, (message, { expanded, outputPad, keyHint }, theme) => {
+		const content = typeof message.content === "string" ? message.content : message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
+		const card = resultCard(content, message.details, expanded);
+		const box = new Box(outputPad, 1, (t) => theme.bg("customMessageBg", t));
+		card.lines.forEach((line, i) => {
+			box.addChild({ render: (width: number) => [theme.fg(line.tone, i === 0 ? theme.bold(truncateToWidth(line.text, Math.max(1, width), "…")) : truncateToWidth(line.text, Math.max(1, width), "…"))], invalidate: () => {} });
+		});
+		if (expanded) box.addChild(new Markdown(card.body, 0, 0, getMarkdownTheme()));
+		else if (card.hidden > 0) box.addChild(new Text(theme.fg("muted", `  (${keyHint("app.tools.expand", "to expand")})`), 0, 0));
+		return box;
+	});
 
 	pi.on("before_agent_start", async (event) => {
 		skills = (event.systemPromptOptions.skills ?? []).map((s) => ({ name: s.name, filePath: s.filePath }));
@@ -463,6 +341,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Params,
 
 		async execute(_id, params, signal, onUpdate, ctx) {
+			parentCtx = ctx;
 			const agents = loadAgents(ctx);
 			const requests: LaunchRequest[] = params.tasks?.length
 				? params.tasks
@@ -510,143 +389,131 @@ export default function (pi: ExtensionAPI) {
 				usage: emptyTally(),
 				...(routes[i] ? queuedFields(routes[i]!, routeLabel(routes[i]!, profile.name)) : { queued: true }),
 			}));
-			const emit = () => {
-				const done = results.filter((r) => r.exitCode !== -1).length;
-				onUpdate?.({
-					content: [{ type: "text", text: mode === "parallel" ? `${done}/${results.length} done` : finalText(results[0].messages) || "(running...)" }],
-					details: { mode, results: [...results] },
-				} as AgentToolResult<Details>);
-			};
+			// The launch body, shared by both modes: validation is done, so everything from here on runs the children.
+			const tasks: LaunchTask[] = resolved.map(({ request, agent }, i) => ({ request, agent: agent!, route: routes[i]!, routeLabel: routeLabel(routes[i]!, profile.name) }));
+			const launch = (signal: AbortSignal | undefined, hooks: LaunchHooks) => {
+				const price = costCalculator(ctx);
+				const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);
 
-			const price = costCalculator(ctx);
-			const warnings: string[] = [];
-
-			// Backstop for writers: the parent is idle during the call, so any change
-			// outside the union of the writers' surfaces came from a child.
-			const writerSurfaces = resolved.flatMap(({ request, agent }) => (agent?.writer ? (request.allowedEditSurfaces ?? []) : []));
-			const watchTree = resolved.some(({ agent }) => agent?.writer);
-			const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);
-			const treeBefore = watchTree ? await takeSnapshot(exec, canonicalPath(ctx.cwd)) : undefined;
-
-			// A placeholder that never started (aborted while queued) settles as cancelled instead of staying "running".
-			const settleCancelled = () => {
-				if (settleQueued(results, Date.now()) > 0) emit();
-			};
-			signal?.addEventListener("abort", settleCancelled, { once: true });
-			const pool = mapLimited(resolved, MAX_CONCURRENCY, async ({ request, agent }, index) => {
-				const { text, missingSkills } = buildChildTask(request, agent!, skills);
-				if (missingSkills.length) warnings.push(`${agent!.name}: unknown skills ${missingSkills.join(", ")}`);
-				const writer: ActiveWriter | undefined = agent!.writer ? { id: randomUUID().slice(0, 8), agent: agent!.name, surfaces: request.allowedEditSurfaces ?? [] } : undefined;
-				if (writer) activeWriters.push(writer);
-				setRunning(ctx, 1);
-				const cardRun: AgentRun = {
-					id: randomUUID().slice(0, 8),
-					agent: agent!.name,
-					task: request.task.split("\n")[0],
-					state: "running",
-					model: routes[index]!.model,
-					thinking: routes[index]!.thinking,
-					tokens: 0,
-					cost: 0,
-					startedAt: Date.now(),
-				};
-				runs.push(cardRun);
-				showCard(ctx);
-				liveResults.set(cardRun.id, results[index]);
-				const syncCard = (r: RunResult) => {
+				// Agents card rows, one per task that got a slot.
+				const cards = new Map<number, AgentRun>();
+				const id = launchSeq++;
+				const syncCard = (cardRun: AgentRun, r: RunResult) => {
 					cardRun.tokens = r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output;
 					cardRun.cost = r.usage.cost;
 					if (r.model) cardRun.model = r.model;
 				};
-				// Fallback chain: the primary, then the profile's fallbacks, with cooling
-				// or out-of-quota models moved behind usable ones.
-				const route = routes[index]!;
-				const chain = route.model
-					? launchOrder({ model: route.model, thinking: route.thinking }, routeFor(profile.profile, agent!.name)?.entry.fallbacks ?? [], (m) => blockedReason(m, Date.now()) !== undefined)
-					: [{ model: route.model, thinking: route.thinking }];
-				const failedModels: string[] = [];
-				try {
-					for (let step = 0; step < chain.length; step++) {
-						const attempt = chain[step];
-						const stepRoute: ResolvedRoute = { ...route, model: attempt.model, thinking: attempt.thinking ?? route.thinking };
-						Object.assign(cardRun, { model: stepRoute.model, thinking: stepRoute.thinking });
-						const label = `${routeLabel(route, profile.name)}${attempt.model !== route.model ? " ↪ fallback" : ""}`;
-						// Live row data from the first moment: the attempt's model and the trail so far.
-						const trail = () => (failedModels.length ? { fallbacks: [...failedModels] } : {});
-						results[index] = { agent: agent!.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), model: stepRoute.model, thinking: stepRoute.thinking, route: label, inherited: stepRoute.modelSource === "parent", startedAt: cardRun.startedAt, ...trail() };
-						liveResults.set(cardRun.id, results[index]);
-						emit();
-						results[index] = await runAgent({
-							cwd: ctx.cwd,
-							agent: agent!,
-							request,
-							taskText: text,
-							route: stepRoute,
-							routeLabel: label,
-							schema: schemas[index],
-							price,
-							signal,
-							onUpdate: (partial) => {
-								Object.assign(partial, { startedAt: cardRun.startedAt, ...trail() });
-								results[index] = partial;
-								liveResults.set(cardRun.id, partial);
-								syncCard(partial);
-								emit();
-							},
-						});
-						const r = results[index];
-						Object.assign(r, { startedAt: cardRun.startedAt, endedAt: Date.now(), ...trail() });
-						if (!failed(r) || !attempt.model) break;
-						const category = classifyFailure(r.stopReason ?? "error", r.errorMessage || r.stderr);
-						if (!category) break;
-						fallbackState().cooldowns.cool(attempt.model, Date.now() + cooldownMs(category));
-						failedModels.push(`${attempt.model} (${category})`);
-						const next = chain[step + 1];
-						if (!next?.model) break;
-						pi.appendEntry("brigadev-fallback", { agent: agent!.name, from: attempt.model, to: next.model, category });
-						if (ctx.hasUI) {
-							ctx.ui.notify(`brigadev: ${agent!.name} hit ${category} on ${attempt.model} → retrying on ${next.model}${priceNote(listPrice(ctx, attempt.model), listPrice(ctx, next.model))}`, "warning");
-						}
-					}
-					if (failedModels.length) results[index].fallbacks = failedModels;
-				} finally {
-					results[index].endedAt ??= Date.now();
-					syncCard(results[index]);
-					cardRun.state = failed(results[index]) || results[index].exitCode === -1 ? "failed" : "done";
-					cardRun.endedAt = Date.now();
-					liveResults.delete(cardRun.id);
-					showCard(ctx);
-					setRunning(ctx, -1);
-					if (writer) activeWriters.splice(activeWriters.indexOf(writer), 1);
-				}
-				emit();
-			});
-			try {
-				await pool;
-			} finally {
-				signal?.removeEventListener("abort", settleCancelled);
-				settleQueued(results, Date.now());
-			}
+				const view: TaskView = {
+					start(index, info) {
+						const cardRun: AgentRun = { id: randomUUID().slice(0, 8), agent: info.agent, task: info.task, state: "running", model: info.model, thinking: info.thinking, tokens: 0, cost: 0, startedAt: info.startedAt };
+						cards.set(index, cardRun);
+						runs.push(cardRun);
+						showCard(ctx);
+						repaintViewer?.();
+					},
+					attempt(index, result) {
+						const cardRun = cards.get(index)!;
+						Object.assign(cardRun, { model: result.model, thinking: result.thinking });
+						repaintViewer?.();
+					},
+					update(index, partial) {
+						const cardRun = cards.get(index)!;
+						syncCard(cardRun, partial);
+						repaintViewer?.();
+					},
+					finish(index, result) {
+						const cardRun = cards.get(index)!;
+						syncCard(cardRun, result);
+						cardRun.state = failed(result) || result.exitCode === -1 ? "failed" : "done";
+						cardRun.endedAt = Date.now();
+						showCard(ctx);
+						repaintViewer?.();
+					},
+					control(index, control) {
+						const key = `${id}:${index}`;
+						if (control) controls.set(key, control);
+						else controls.delete(key);
+						repaintViewer?.();
+					},
+				};
 
-			const details: Details = { mode, results };
-			const treeAfter = treeBefore ? await takeSnapshot(exec, canonicalPath(ctx.cwd)) : undefined;
-			if (treeBefore && treeAfter) {
-				details.outsideSurfaces = outsideSurfaces(diffSnapshots(treeBefore, treeAfter), writerSurfaces);
-				if (details.outsideSurfaces.length > 0) warnings.push(`files changed outside the writers' allowed edit surfaces: ${details.outsideSurfaces.join(", ")}`);
-			}
-			const warningText = warnings.length ? `\n\nWarnings: ${warnings.join("; ")}` : "";
-			if (mode === "single") {
-				const r = results[0];
-				return { content: [{ type: "text", text: (failed(r) ? `Agent ${r.stopReason ?? "failed"}: ` : "") + output(r) + warningText }], details, isError: failed(r) };
-			}
-			const ok = results.filter((r) => !failed(r)).length;
-			const sections = results.map((r) => `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${sectionOutput(r)}`);
-			return { content: [{ type: "text", text: `Parallel: ${ok}/${results.length} succeeded\n\n${sections.join("\n\n---\n\n")}${warningText}` }], details };
+				const launchEpoch = epoch;
+				launches.set(results, id);
+				syncStatus(ctx);
+				repaintViewer?.();
+
+				return runLaunch(
+					{ mode, tasks, results, signal, hooks },
+					{
+						slots,
+						runAgent: (call) =>
+							runChild(
+								{ cwd: ctx.cwd, agent: tasks[call.index].agent, request: tasks[call.index].request, taskText: call.taskText, route: call.route, routeLabel: call.routeLabel, schema: schemas[call.index], price, signal: call.signal, onUpdate: call.onUpdate, onControl: call.onControl },
+								{ piInvocation },
+							),
+						skills: () => skills,
+						// The primary, then the profile's fallbacks, with cooling or out-of-quota models moved behind usable ones.
+						chain: (index): FallbackStep[] => {
+							const { route, agent } = tasks[index];
+							return route.model
+								? launchOrder({ model: route.model, thinking: route.thinking }, routeFor(profile.profile, agent.name)?.entry.fallbacks ?? [], (m) => blockedReason(m, Date.now()) !== undefined)
+								: [{ model: route.model, thinking: route.thinking }];
+						},
+						coolModel: (model, category) => fallbackState().cooldowns.cool(model, Date.now() + cooldownMs(category)),
+						fallbackNotice: ({ agent, from, to, category }) => {
+							pi.appendEntry("brigadev-fallback", { agent, from, to, category });
+							if (ctx.hasUI) ctx.ui.notify(`brigadev: ${agent} hit ${category} on ${from} → retrying on ${to}${priceNote(listPrice(ctx, from), listPrice(ctx, to))}`, "warning");
+						},
+						writers: {
+							list: () => activeWriters,
+							onAdd: (listener) => (writerListeners.add(listener), () => void writerListeners.delete(listener)),
+							add: (writers) => {
+								activeWriters.push(...writers);
+								writerListeners.forEach((listener) => listener(writers));
+							},
+							remove: (writer) => {
+								const at = activeWriters.indexOf(writer);
+								if (at >= 0) activeWriters.splice(at, 1);
+							},
+						},
+						view,
+						snapshot: () => takeSnapshot(exec, canonicalPath(ctx.cwd)),
+					},
+				).finally(() => {
+					// Whatever way the launch ended: no child of it can be steered any more.
+					results.forEach((_, i) => controls.delete(`${id}:${i}`));
+					// It no longer counts as running, its rows settle, and its runs stay viewable.
+					if (launchEpoch !== epoch) return;
+					launches.delete(results);
+					for (const cardRun of cards.values()) if (cardRun.state === "running") Object.assign(cardRun, { state: "failed", endedAt: Date.now() });
+					results.forEach((result, i) => {
+						if (result.exitCode !== -1 || result.endedAt !== undefined) settled.push({ id: `${id}:${i}`, result });
+					});
+					settled = settled.slice(-MAX_SETTLED_VIEW_RUNS);
+					try {
+						showCard(ctx);
+					} catch {
+						// A stale context: the launch's outcome matters more than its card.
+					}
+					repaintViewer?.();
+				});
+			};
+
+			if (!params.async) return toResult(mode, await launch(signal, { onUpdate: onUpdate as LaunchHooks["onUpdate"], tolerateAbort: false }));
+
+			// Async: the launch runs under the registry's own AbortController (the tool call's signal ends with the call).
+			// Admission errors were already returned above, before anything started.
+			const id = registry.start({ total: results.length, run: async (runSignal, control) => toResult(mode, await launch(runSignal, { onProgress: control.progress, tolerateAbort: true, async: true })) });
+			const names = [...new Set(requests.map((r) => r.agent))].join(", ");
+			return {
+				content: [{ type: "text", text: `Started async launch ${id} (${results.length} task${results.length === 1 ? "" : "s"}: ${names}). Collect it with subagent_wait {"runId":"${id}"}; stop it with subagent_cancel.` }],
+				details: { mode, results: results.map((r) => ({ ...r })), launchId: id, pending: true } as Details,
+			};
 		},
 
 		renderCall(args, theme) {
 			const launches = args.tasks?.length ? args.tasks : [{ agent: args.agent ?? "...", task: args.task ?? "", reason: args.reason ?? "" }];
-			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", launches.length > 1 ? `parallel (${launches.length})` : launches[0].agent);
+			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", launches.length > 1 ? `parallel (${launches.length})` : launches[0].agent) + (args.async ? theme.fg("muted", " async") : "");
 			for (const l of launches.slice(0, 4)) {
 				const preview = l.task.length > 60 ? `${l.task.slice(0, 60)}…` : l.task;
 				text += `\n  ${launches.length > 1 ? `${theme.fg("accent", l.agent)} ` : ""}${theme.fg("dim", preview)}`;
@@ -657,7 +524,8 @@ export default function (pi: ExtensionAPI) {
 
 		renderResult(result, { expanded }, theme, context) {
 			const details = result.details as Details | undefined;
-			if (!details?.results.length) {
+			// An async launch's immediate return shows its text (launch id, how to collect), not rows that would never update.
+			if (!details?.results.length || details.pending) {
 				const first = result.content[0];
 				return new Text(first?.type === "text" ? first.text : "(no output)", 0, 0);
 			}
@@ -691,98 +559,181 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	interface ViewerRun {
-		result: RunResult;
-		state: "running" | "done" | "failed";
-		startedAt?: number;
-		elapsed?: string;
-	}
-
-	/** Runs in flight plus every finished run recorded on this branch, newest first. */
-	const viewerRuns = (ctx: ExtensionContext): ViewerRun[] => {
-		const finished: ViewerRun[] = [];
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type !== "message" || entry.message.role !== "toolResult" || entry.message.toolName !== "subagent") continue;
-			const details = entry.message.details as Details | undefined;
-			const at = Date.parse(entry.timestamp);
-			for (const result of details?.results ?? []) finished.push({ result, state: failed(result) ? "failed" : "done", startedAt: at });
+	/** What `subagent_wait` / `subagent_cancel` answer for each registry outcome. */
+	const collected = (id: string, outcome: WaitOutcome<LaunchResult>, waitedSeconds?: number): LaunchResult => {
+		const text = (t: string, isError?: boolean): LaunchResult => ({ content: [{ type: "text", text: t }], details: { mode: "single", results: [], launchId: id, pending: true }, ...(isError ? { isError } : {}) });
+		if (outcome.status === "unknown") return text(`Unknown launch id "${id}" (not started in this session, or pruned).`, true);
+		if (outcome.status === "running") {
+			const { done, total } = outcome.launch;
+			return text(`Launch ${id} still running: ${done}/${total} done${waitedSeconds === undefined ? "" : ` after ${waitedSeconds}s`}. Call subagent_wait again, or subagent_cancel.`);
 		}
-		const live: ViewerRun[] = runs
-			.filter((r) => r.state === "running" && liveResults.has(r.id))
-			.map((r) => ({ result: liveResults.get(r.id)!, state: "running", startedAt: r.startedAt, elapsed: formatElapsed(Date.now() - r.startedAt) }));
-		return [...live, ...finished.reverse()];
+		if (outcome.error !== undefined || !outcome.result) return text(`Launch ${id} failed: ${outcome.error ?? "no result"}`, true);
+		return { ...outcome.result, details: { ...outcome.result.details, launchId: id } };
+	};
+
+	/** The idle delivery already put this result in the session: point at the saved folders instead of repeating it (wait and cancel alike). */
+	const deliveredResult = (id: string, outcome: WaitOutcome<LaunchResult>): LaunchResult | undefined => {
+		const note = deliveredNote(id, outcome);
+		return note === undefined ? undefined : ({ content: [{ type: "text", text: note }], details: { mode: "single", results: [], launchId: id, pending: true } } as LaunchResult);
+	};
+
+	pi.registerTool({
+		name: "subagent_wait",
+		label: "Subagent wait",
+		description: `Wait for an async subagent launch (default ${WAIT_DEFAULT_SECONDS}s, max ${WAIT_MAX_SECONDS}s). Returns its result, or its progress if still running.`,
+		parameters: WaitParams,
+		async execute(_id, params, signal) {
+			const seconds = Math.min(WAIT_MAX_SECONDS, Math.max(1, params.timeoutSeconds ?? WAIT_DEFAULT_SECONDS));
+			const outcome = await registry.wait(params.runId, seconds * 1000, signal);
+			return deliveredResult(params.runId, outcome) ?? collected(params.runId, outcome, seconds);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_cancel",
+		label: "Subagent cancel",
+		description: "Cancel an async subagent launch; returns the partial results.",
+		parameters: CancelParams,
+		async execute(_id, params) {
+			const outcome = await registry.cancel(params.runId);
+			return deliveredResult(params.runId, outcome) ?? collected(params.runId, outcome);
+		},
+	});
+
+	/** Every run: those this process tracks (queued, running, and settled since the session started, async ones included) plus the finished ones recorded on this branch. */
+	const viewerEntries = (ctx: ExtensionContext) => {
+		const tracked: TrackedRun[] = [...settled];
+		for (const [results, id] of launches) results.forEach((result, i) => tracked.push({ id: `${id}:${i}`, result }));
+		const recorded: RecordedRun[] = [];
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type !== "message" || entry.message.role !== "toolResult" || !VIEWER_TOOLS.has(entry.message.toolName)) continue;
+			const details = entry.message.details as Details | undefined;
+			// An async launch's immediate return (and a timed-out wait) holds placeholders, not final results.
+			if (details?.pending) continue;
+			const at = Date.parse(entry.timestamp);
+			for (const result of details?.results ?? []) recorded.push({ result, at });
+		}
+		return buildEntries({ tracked, recorded, now: Date.now() });
 	};
 
 	const openViewer = async (ctx: ExtensionContext) => {
 		if (ctx.mode !== "tui") return ctx.ui.notify("The Agents viewer needs the interactive UI", "error");
 		await ctx.ui.custom<void>((tui, theme, _kb, done) => {
 			const painter = themePainter(theme);
-			let selected = 0;
-			let scroll = 0;
+			let selection: Selection = { key: undefined, index: 0 };
+			let view = scrollView.initial();
 			let detailOnly = false;
-			let follow = true;
-			// Live runs stream new messages; repaint while the viewer is open.
+			// Takeover: the open input line (steer / follow up), and a one-line result shown in the footer until the next key.
+			let takeover: TakeoverState | undefined;
+			let notice: string | undefined;
+			// `x` pressed once on a run: a second one within 3 s aborts it (pure state in lib/subagent-viewer.ts).
+			let armed: AbortArm | undefined;
+			let closed = false;
+			// What the user typed goes to the child as an RPC steer while it is streaming, as a follow_up between turns.
+			const sendTakeover = (key: string, text: string): string => {
+				const control = controls.get(key);
+				if (!control) return "Not sent: the run has finished";
+				const kind = takeoverKind(control.isStreaming());
+				// The notice reports Pi's answer to this command (matched by id), not that the write succeeded.
+				const answer = kind === "steer" ? control.steer(text) : control.followUp(text);
+				void answer.then((outcome) => {
+					if (closed) return;
+					notice = takeoverNotice(kind, outcome);
+					tui.requestRender();
+				});
+				return kind === "steer" ? "Steering message sent, waiting for Pi…" : "Follow-up sent, waiting for Pi…";
+			};
+			// The list changes while the viewer is open: repaint on every progress update, and once a second so elapsed times tick.
+			repaintViewer = () => tui.requestRender();
 			const timer = setInterval(() => tui.requestRender(), 1000);
 			const close = () => {
+				closed = true;
 				clearInterval(timer);
+				repaintViewer = undefined;
 				done();
 			};
-			const glyph = { running: "◐", done: "✓", failed: "✗" } as const;
-			const tone = { running: "accent", done: "success", failed: "error" } as const;
-
-			const detailFor = (run: ViewerRun | undefined, width: number): Row[] => {
-				if (!run) return [];
-				const r = run.result;
-				const u = r.usage;
-				const header = [
-					`${r.agent} · ${run.state}${run.elapsed ? ` · ${run.elapsed}` : ""}`,
-					`${r.model ?? "?"}${r.thinking ? ` · ${r.thinking}` : ""}${r.route ? ` · ${r.route}` : ""}`,
-					`${u.turns} turns · ↑${formatTokens(u.input + u.cacheRead + u.cacheWrite)} ↓${formatTokens(u.output)} · ${formatCost(u.cost)}`,
-					`task: ${r.task.split("\n")[0]}`,
-				];
-				const rows = threadRows(header, r.messages, width);
-				if (run.state === "failed" && (r.errorMessage || r.stderr)) rows.push({ text: `error: ${(r.errorMessage || r.stderr).split("\n")[0]}`, tone: "error" });
-				return rows;
-			};
+			const detailWidth = (width: number) => (detailOnly ? width - 2 : width - listWidth(width) - 4);
+			const home = os.homedir();
 
 			return {
 				invalidate() {},
 				handleInput(data: string) {
-					const list = viewerRuns(ctx);
+					const entries = viewerEntries(ctx);
+					selection = resolveSelection(entries, selection);
+					const entry = entries[selection.index];
+					notice = undefined;
+					if (takeover && !controls.has(takeover.key)) [takeover, notice] = [undefined, "The run finished"];
+					// Only an `x` on the same run, within the timeout, completes an abort; any other key disarms it.
+					armed = takeover || data !== "x" ? undefined : abortArmFor(armed, entry?.key, Date.now());
+					if (takeover) {
+						// The input line owns every key until Enter or Esc, so j/k/q/x are typed, not commands.
+						const typed = printableText(data);
+						const key: TakeoverKey | undefined = matchesKey(data, Key.enter)
+							? { kind: "submit" }
+							: matchesKey(data, Key.escape)
+								? { kind: "cancel" }
+								: matchesKey(data, Key.backspace)
+									? { kind: "backspace" }
+									: matchesKey(data, "ctrl+u")
+										? { kind: "clear" }
+										: typed !== undefined
+											? { kind: "text", text: typed }
+											: undefined;
+						if (key) {
+							const open = takeover;
+							const step = takeoverKey(open, key);
+							takeover = step.state;
+							if (step.submit !== undefined) notice = sendTakeover(open.key, step.submit);
+						}
+						return tui.requestRender();
+					}
 					const bodyHeight = Math.max(1, tui.terminal.rows - 3);
-					const width = tui.terminal.columns;
-					const detail = detailFor(list[selected], detailOnly ? width - 2 : width - listWidth(width) - 4);
+					const total = entryDetail(entry, detailWidth(tui.terminal.columns), home).length;
+					// Scroll keys act on what is on screen (a pinned thread is at its end).
+					const shown = { scroll: autoScroll(view, total, bodyHeight, entry?.active ?? false), follow: view.follow };
 					if (matchesKey(data, Key.escape) || data === "q") return close();
-					if (matchesKey(data, Key.down) || data === "j") [selected, scroll, follow] = [Math.min(list.length - 1, selected + 1), 0, true];
-					else if (matchesKey(data, Key.up) || data === "k") [selected, scroll, follow] = [Math.max(0, selected - 1), 0, true];
-					else if (matchesKey(data, Key.pageDown) || data === " " || data === "J") [scroll, follow] = [Math.min(maxScroll(detail.length, bodyHeight), scroll + 10), false];
-					else if (matchesKey(data, Key.pageUp) || data === "K") [scroll, follow] = [Math.max(0, scroll - 10), false];
-					else if (data === "g") [scroll, follow] = [0, false];
-					else if (data === "G") [scroll, follow] = [maxScroll(detail.length, bodyHeight), true];
+					if (matchesKey(data, Key.down) || data === "j") [selection, view] = [moveSelection(entries, selection, 1), scrollView.initial()];
+					else if (matchesKey(data, Key.up) || data === "k") [selection, view] = [moveSelection(entries, selection, -1), scrollView.initial()];
+					else if (matchesKey(data, Key.pageDown) || data === " " || data === "J") view = scrollView.by(shown, 10, total, bodyHeight);
+					else if (matchesKey(data, Key.pageUp) || data === "K") view = scrollView.by(shown, -10, total, bodyHeight);
+					else if (data === "g") view = scrollView.to(shown, "top", total, bodyHeight);
+					else if (data === "G") view = scrollView.to(shown, "bottom", total, bodyHeight);
 					else if (data === "F") detailOnly = !detailOnly;
+					else if (matchesKey(data, Key.enter)) {
+						takeover = openTakeover(entry, entry !== undefined && controls.has(entry.key));
+						if (!takeover) notice = "Only a running agent can be steered";
+					} else if (data === "x") {
+						const control = entry && controls.get(entry.key);
+						if (!canTakeOver(entry, control !== undefined)) notice = "Only a running agent can be aborted";
+						else {
+							const press = pressAbort(armed, entry.key, Date.now());
+							armed = press.armed;
+							if (press.abort) notice = control?.abort() ? "Abort sent" : "Only a running agent can be aborted";
+						}
+					}
 					tui.requestRender();
 				},
 				render(width: number): string[] {
-					const list = viewerRuns(ctx);
-					selected = Math.min(selected, Math.max(0, list.length - 1));
-					const run = list[selected];
-					const detail = detailFor(run, detailOnly ? width - 2 : width - listWidth(width) - 4);
+					const entries = viewerEntries(ctx);
+					selection = resolveSelection(entries, selection);
+					const entry = entries[selection.index];
+					const detail = entryDetail(entry, detailWidth(width), home);
+					if (takeover && !controls.has(takeover.key)) [takeover, notice] = [undefined, "The run finished"];
 					const bodyHeight = Math.max(1, tui.terminal.rows - 3);
-					// A running thread follows its newest lines until the user scrolls.
-					if (follow && run?.state === "running") scroll = maxScroll(detail.length, bodyHeight);
-					const running = list.filter((r) => r.state === "running").length;
+					// A queued or running thread follows its newest lines until the user scrolls up.
+					view = { scroll: autoScroll(view, detail.length, bodyHeight, entry?.active ?? false), follow: view.follow };
 					return renderTwoPane(
 						{
 							width,
 							height: tui.terminal.rows,
-							title: `Agents · ${running} running · ${list.length - running} finished`,
-							list: list.map((r) => ({ text: `${glyph[r.state]} ${r.result.agent} · ${r.result.task.split("\n")[0]}`, tone: tone[r.state] })),
-							selected,
+							title: viewerTitle(entries),
+							list: entries.map(listRow),
+							selected: selection.index,
 							detail,
-							detailScroll: scroll,
+							detailScroll: view.scroll,
 							detailOnly,
 							empty: "No subagent runs in this session yet",
-							footer: "j/k run · space/J/K scroll · g/G top/end · F thread only · q close",
+							footer: takeover ? takeoverFooter(takeover, takeoverKind(controls.get(takeover.key)?.isStreaming() ?? false), width) : (notice ?? (abortArmFor(armed, entry?.key, Date.now()) ? ABORT_PROMPT : viewerFooter(canTakeOver(entry, entry !== undefined && controls.has(entry.key))))),
 						},
 						painter,
 					);
