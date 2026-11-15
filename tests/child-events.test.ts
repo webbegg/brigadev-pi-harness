@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { emptySnapshot, foldChildEvent, parseChildLine, type ChildEvent } from "../lib/child-events.ts";
+import { emptySnapshot, foldChildEvent, MAX_PARTIAL_CHARS, parseChildLine, type ChildEvent } from "../lib/child-events.ts";
 
 const line = (event: unknown) => JSON.stringify(event);
 const assistant = (content: unknown[], extra: Record<string, unknown> = {}) => ({
@@ -54,6 +54,100 @@ describe("parseChildLine: one shared event format for a child's JSON stream", ()
 
 	it("message_end without a message is plain activity", () => {
 		assert.deepEqual(parseChildLine(line({ type: "message_end" })), [{ type: "activity", label: "message_end" }]);
+	});
+});
+
+describe("parseChildLine: streaming events (Pi json.md: message_update, text_delta)", () => {
+	const update = (assistantMessageEvent: unknown) => line({ type: "message_update", usage: {}, assistantMessageEvent });
+
+	it("a text delta is a sign of life and a partial", () => {
+		assert.deepEqual(parseChildLine(update({ type: "text_delta", contentIndex: 0, delta: "Hel" })), [
+			{ type: "activity", label: "message_update" },
+			{ type: "partial", delta: "Hel" },
+		]);
+	});
+
+	it("thinking, tool-call, and other updates are plain activity", () => {
+		for (const type of ["thinking_delta", "toolcall_delta", "text_start", "text_end", "start"]) {
+			assert.deepEqual(parseChildLine(update({ type, contentIndex: 0, delta: "x" })), [{ type: "activity", label: "message_update" }], type);
+		}
+		assert.deepEqual(parseChildLine(line({ type: "message_update" })), [{ type: "activity", label: "message_update" }]);
+	});
+
+	it("an empty or non-string delta adds nothing", () => {
+		assert.deepEqual(parseChildLine(update({ type: "text_delta", contentIndex: 0, delta: "" })), [{ type: "activity", label: "message_update" }]);
+		assert.deepEqual(parseChildLine(update({ type: "text_delta", contentIndex: 0, delta: 5 })), [{ type: "activity", label: "message_update" }]);
+	});
+
+	it("an assistant message_start resets the live text; other roles do not", () => {
+		assert.deepEqual(parseChildLine(line({ type: "message_start", message: { role: "assistant", content: [] } })), [
+			{ type: "activity", label: "message_start" },
+			{ type: "partial", delta: "", reset: true },
+		]);
+		assert.deepEqual(parseChildLine(line({ type: "message_start", message: { role: "user", content: "hi" } })), [{ type: "activity", label: "message_start" }]);
+	});
+});
+
+describe("foldChildEvent: live partial text", () => {
+	const partial = (delta: string, reset?: boolean): ChildEvent => ({ type: "partial", delta, ...(reset ? { reset } : {}) });
+
+	it("deltas accumulate in snapshot.partial and report a change", () => {
+		const snap = emptySnapshot();
+		assert.equal(foldChildEvent(snap, partial("Hel")), true);
+		assert.equal(foldChildEvent(snap, partial("lo")), true);
+		assert.equal(snap.partial, "Hello");
+		assert.deepEqual(snap.messages, [], "a partial is not a message");
+	});
+
+	it("the matching assistant message_end clears it and the final message replaces it", () => {
+		const snap = emptySnapshot();
+		foldChildEvent(snap, partial("Hello wor"));
+		const final = assistant([{ type: "text", text: "Hello world" }]);
+		assert.equal(foldChildEvent(snap, { type: "message", message: final as any }), true);
+		assert.equal(snap.partial, undefined);
+		assert.equal(snap.messages.length, 1);
+	});
+
+	it("a reset clears it; resetting an empty buffer changes nothing", () => {
+		const snap = emptySnapshot();
+		assert.equal(foldChildEvent(snap, partial("", true)), false);
+		foldChildEvent(snap, partial("old"));
+		assert.equal(foldChildEvent(snap, partial("", true)), true);
+		assert.equal(snap.partial, undefined);
+	});
+
+	it("a tool result message does not clear the next message's live text", () => {
+		const snap = emptySnapshot();
+		foldChildEvent(snap, partial("next"));
+		foldChildEvent(snap, { type: "message", message: { role: "toolResult", toolCallId: "c1", content: [] } as any });
+		assert.equal(snap.partial, "next");
+	});
+
+	it("is bounded: past the cap only the newest text is kept, marked with a leading ellipsis", () => {
+		const snap = emptySnapshot();
+		foldChildEvent(snap, partial("a".repeat(MAX_PARTIAL_CHARS)));
+		assert.equal(snap.partial!.length, MAX_PARTIAL_CHARS);
+		foldChildEvent(snap, partial("END"));
+		assert.equal(snap.partial!.length, MAX_PARTIAL_CHARS + 1);
+		assert.ok(snap.partial!.startsWith("…") && snap.partial!.endsWith("aaaEND"));
+		for (let i = 0; i < 5; i++) foldChildEvent(snap, partial("b".repeat(MAX_PARTIAL_CHARS)));
+		assert.ok(snap.partial!.length <= MAX_PARTIAL_CHARS + 1, "stays bounded however much streams");
+		foldChildEvent(snap, { type: "message", message: assistant([]) as any });
+		assert.equal(snap.partial, undefined, "the cap does not outlive the message");
+	});
+
+	it("parse then fold reproduces a streamed message", () => {
+		const stream = [
+			line({ type: "message_start", message: { role: "assistant", content: [] } }),
+			line({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Hel" } }),
+			line({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "lo" } }),
+		];
+		const snap = emptySnapshot();
+		for (const raw of stream) for (const event of parseChildLine(raw)) foldChildEvent(snap, event);
+		assert.equal(snap.partial, "Hello");
+		for (const event of parseChildLine(line({ type: "message_end", message: assistant([{ type: "text", text: "Hello" }]) }))) foldChildEvent(snap, event);
+		assert.equal(snap.partial, undefined);
+		assert.equal(snap.messages.length, 1);
 	});
 });
 

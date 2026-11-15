@@ -35,7 +35,8 @@ function textOf(content: MessageLike["content"]): string {
 	return (content ?? []).filter((p) => p.type === "text").map((p) => p.text ?? "").join("\n");
 }
 
-export function threadRows(header: string[], messages: readonly MessageLike[], width: number): Row[] {
+/** `partial` is the in-progress assistant text (not yet a message); it shows last, with a cursor on its final line. */
+export function threadRows(header: string[], messages: readonly MessageLike[], width: number, partial?: string): Row[] {
 	const rows: Row[] = header.map((text, i) => ({ text, tone: i === 0 ? "accent" : "muted" }));
 	rows.push({ text: "" });
 	for (const message of messages) {
@@ -55,6 +56,10 @@ export function threadRows(header: string[], messages: readonly MessageLike[], w
 			const hidden = lines.length - shown.length;
 			if (hidden > 0) rows.push({ text: `  … ${hidden} more line${hidden === 1 ? "" : "s"}`, tone: "dim" });
 		}
+	}
+	if (partial?.trim()) {
+		const lines = wrapText(partial.trimEnd(), width);
+		lines.forEach((line, i) => rows.push({ text: i === lines.length - 1 ? `${line} ▍` : line, tone: "text" }));
 	}
 	return rows;
 }

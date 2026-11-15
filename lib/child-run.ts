@@ -25,6 +25,9 @@ import { checkStructuredRun, formatStructured, type JsonSchema } from "./structu
 /** Grace between SIGTERM and SIGKILL when a child ignores the terminate request. */
 export const KILL_GRACE_MS = 5000;
 
+/** Streaming text updates reach `onUpdate` at most this often; the snapshot itself is always current. */
+export const PARTIAL_UPDATE_MS = 100;
+
 export interface RunResult {
 	agent: string;
 	task: string;
@@ -50,6 +53,8 @@ export interface RunResult {
 	endedAt?: number;
 	stopReason?: string;
 	errorMessage?: string;
+	/** Live text of the assistant message in progress (see lib/child-events.ts); never set on a settled run. */
+	partial?: string;
 	/** Validated structured_output payload, for agents that declare an output schema. */
 	structured?: unknown;
 	/** Id of this child attempt; names its saved folder (lib/run-artifacts.ts). */
@@ -149,6 +154,8 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			parentEnv: env,
 		});
 
+		const now = deps.now ?? Date.now;
+		let lastPartialUpdate = Number.NEGATIVE_INFINITY;
 		let aborted = false;
 		let stalled = false;
 		result.exitCode = await new Promise<number>((resolveExit) => {
@@ -185,8 +192,15 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					else if (event.type === "tool_end") watchdog.toolFinished(event.id, `result of ${event.name}`);
 					else if (event.type === "activity") watchdog.activity(event.label);
 					// Bridge turns report $0; price them at list price (see lib/cost.ts).
-					else event.message = (priceBridgeMessage(event.message, options.price) ?? event.message) as Message;
-					if (foldChildEvent(result, event)) options.onUpdate(result);
+					else if (event.type === "message") event.message = (priceBridgeMessage(event.message, options.price) ?? event.message) as Message;
+					if (!foldChildEvent(result, event)) continue;
+					// Streaming text can arrive for every token: the snapshot is current, but listeners hear of it at a bounded rate.
+					if (event.type === "partial") {
+						const at = now();
+						if (at - lastPartialUpdate < PARTIAL_UPDATE_MS) continue;
+						lastPartialUpdate = at;
+					}
+					options.onUpdate(result);
 				}
 			};
 
@@ -225,6 +239,10 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				else options.signal.addEventListener("abort", kill, { once: true });
 			}
 		});
+		// A child that ended mid-message leaves no live text behind.
+		// A child that ended mid-message leaves no live text behind.
+		// A child that ended mid-message leaves no live text behind.
+		delete result.partial;
 		if (aborted) throw new Error("Subagent was aborted");
 		if (structured && !failed(result)) {
 			const check = checkStructuredRun(result.messages, options.schema!);
