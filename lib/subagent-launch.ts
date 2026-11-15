@@ -7,7 +7,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentDefinition } from "./agents.ts";
 import type { ChildControl } from "./child-rpc.ts";
-import { failed, finalText, isUnfinished, output, runStatus, type RunResult } from "./child-run.ts";
+import { failed, finalText, isUnfinished, output, runStatus, type RunResult } from "./run-status.ts";
 import { emptyTally } from "./cost.ts";
 import { buildChildTask, type ActiveWriter, type LaunchRequest, type SkillRef } from "./delegation.ts";
 import { classifyFailure, type FailureCategory } from "./fallback.ts";

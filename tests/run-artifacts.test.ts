@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { newRunId, pruneRunFolders, runsDir, writeRunArtifacts, type RunRecord } from "../lib/run-artifacts.ts";
+import { newRunId, pruneRunFolders, pruneWarning, runsDir, writeRunArtifacts, type RunRecord } from "../lib/run-artifacts.ts";
 import { emptyTally } from "../lib/cost.ts";
 
 const record = (over: Partial<RunRecord> = {}): RunRecord => ({
@@ -32,6 +32,20 @@ describe("newRunId", () => {
 
 	it("replaces characters that are unsafe in a path", () => {
 		assert.equal(newRunId("../evil name", 0, () => "zzzzzz"), "19700101T000000Z-evil-name-zzzzzz");
+	});
+});
+
+describe("pruneWarning", () => {
+	it("is undefined when nothing failed", () => {
+		assert.equal(pruneWarning({ removed: ["x"], errors: [] }), undefined);
+	});
+
+	it("gives the count and the first error, once", () => {
+		assert.equal(pruneWarning({ removed: [], errors: ["a: EACCES", "b: EBUSY", "c: EIO"] }), "brigadev: 3 problems while pruning old run folders; first: a: EACCES");
+	});
+
+	it("says problem, not problems, for one error", () => {
+		assert.equal(pruneWarning({ removed: ["x"], errors: ["a: EACCES"] }), "brigadev: 1 problem while pruning old run folders; first: a: EACCES");
 	});
 });
 
@@ -93,6 +107,49 @@ describe("pruneRunFolders: retention of saved run folders", () => {
 		fs.mkdirSync(path.join(runs, id));
 		fs.writeFileSync(path.join(runs, id, "result.json"), "{}");
 	};
+
+	it("S8: a folder named more than 1 day in the future takes its age from its mtime: an old mtime is pruned by the age rule", () => {
+		withDocs((docs, runs) => {
+			const future = idAt(-5, "fut", "000001");
+			const fresh = idAt(1, "a", "000002");
+			mk(runs, future);
+			mk(runs, fresh);
+			const old = new Date(NOW - 30 * DAY);
+			fs.utimesSync(path.join(runs, future), old, old);
+			const out = pruneRunFolders(docs, { now: () => NOW });
+			assert.deepEqual(out, { removed: [future], errors: [] });
+			assert.deepEqual(fs.readdirSync(runs), [fresh]);
+		});
+	});
+
+	it("S8: a far-future folder with a recent mtime counts by that mtime in the maxFolders rule", () => {
+		withDocs((docs, runs) => {
+			const future = idAt(-5, "fut", "000001");
+			const a = idAt(1, "a", "000002");
+			const b = idAt(2, "b", "000003");
+			for (const id of [future, a, b]) mk(runs, id);
+			// Touched 3 days ago: older than a and b by mtime, though its name says it is the newest.
+			const touched = new Date(NOW - 3 * DAY);
+			fs.utimesSync(path.join(runs, future), touched, touched);
+			const out = pruneRunFolders(docs, { now: () => NOW, maxFolders: 2 });
+			assert.deepEqual(out, { removed: [future], errors: [] });
+			assert.deepEqual(fs.readdirSync(runs).sort(), [a, b].sort());
+		});
+	});
+
+	it("S8: a folder dated within 1 day in the future keeps the time in its name, whatever its mtime", () => {
+		withDocs((docs, runs) => {
+			const slightly = idAt(-0.5, "fut", "000001");
+			const a = idAt(1, "a", "000002");
+			const b = idAt(2, "b", "000003");
+			for (const id of [slightly, a, b]) mk(runs, id);
+			const old = new Date(NOW - 30 * DAY);
+			fs.utimesSync(path.join(runs, slightly), old, old);
+			const out = pruneRunFolders(docs, { now: () => NOW, maxFolders: 2 });
+			assert.deepEqual(out, { removed: [b], errors: [] }, "by name it is the newest, so the oldest one goes");
+			assert.deepEqual(fs.readdirSync(runs).sort(), [slightly, a].sort());
+		});
+	});
 
 	it("removes at most maxRemovals folders per call (50 by default), oldest first, and the next call continues", () => {
 		withDocs((docs, runs) => {

@@ -5,7 +5,7 @@
 // while it is still on the card.
 
 import { visibleRuns, type AgentRun } from "./agents-card.ts";
-import { isUnfinished, runStatus, type RunResult } from "./child-run.ts";
+import { isUnfinished, runStatus, type RunResult } from "./run-status.ts";
 
 /** The part of a task's result the count reads (see `runStatus`): an unfinished placeholder has exit code -1 and no end time. */
 export type StatusTask = Pick<RunResult, "exitCode" | "endedAt" | "queued" | "cancelled" | "stopReason">;
