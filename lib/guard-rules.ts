@@ -3,11 +3,11 @@
 // extension reads the facts (paths, environment, git) and acts on the answer.
 
 import { homedir } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { basename as executableName, blankHeredocs, classifyCommand, tokenize } from "./command-classifier.ts";
 import { type BranchFacts, decideWithBranchRule } from "./commit-branch.ts";
 import { isWithinSurfaces } from "./edit-surfaces.ts";
-import { canonicalPath, isInside } from "./paths.ts";
+import { canonicalPath, expandHome, isInside } from "./paths.ts";
 import { type Decision, type PermissionMode } from "./permission-policy.ts";
 import { isRepoDocsPath } from "./repo-docs.ts";
 
@@ -109,17 +109,32 @@ function evidenceReferences(evidenceDirs: readonly string[], home: string): { li
 	return { literals, pattern: /\.brigadev\/[^\s'"]*\/?evidence(?![\w-])/ };
 }
 
+/** A command that starts in `cwd` (a bg_start working directory) reaches the evidence folder by a relative word, or starts inside it. */
+function reachesEvidenceFromCwd(text: string, evidenceDirs: readonly string[], cwd: string): boolean {
+	const dirs = evidenceDirs.map((dir) => canonicalPath(dir));
+	const inEvidence = (path: string) => dirs.some((dir) => isInside(dir, path));
+	if (inEvidence(canonicalPath(cwd))) return true;
+	for (const segment of tokenize(text, { redirections: true })) {
+		for (const word of [...segment.argv, ...segment.redirects.map((redirect) => redirect.target)]) {
+			if (word !== "" && inEvidence(canonicalPath(resolve(cwd, expandHome(word))))) return true;
+		}
+	}
+	return false;
+}
+
 /**
  * True when a command both names an evidence directory and writes: an output
  * redirection, or a file-changing command or interpreter. Reading stays
  * allowed (`cat`, `grep`, `ls`, `2>&1`). A best-effort textual rule, like the
  * rest of the command classifier: a deliberately obfuscated command (a path
- * built from variables, `cd` then a relative write) is not caught.
+ * built from variables, `cd` then a relative write) is not caught. With `cwd`
+ * (where a background process starts), relative words resolve against it.
  */
-export function bashWritesEvidence(command: string, evidenceDirs: readonly string[], home: string = homedir()): boolean {
+export function bashWritesEvidence(command: string, evidenceDirs: readonly string[], home: string = homedir(), cwd?: string): boolean {
 	const references = evidenceReferences(evidenceDirs, home);
-	if (!references.literals.some((literal) => command.includes(literal)) && !references.pattern.test(command)) return false;
 	const text = blankHeredocs(command);
+	const named = references.literals.some((literal) => command.includes(literal)) || references.pattern.test(command);
+	if (!named && !(cwd !== undefined && reachesEvidenceFromCwd(text, evidenceDirs, cwd))) return false;
 	// File-descriptor duplication (`2>&1`) and `/dev/null` are not writes to a file.
 	const redirected = text.replace(/\d*>&[\d-]*/g, " ").replace(/\d*>>?\s*\/dev\/null/g, " ");
 	if (/&?>/.test(redirected)) return true;
@@ -149,9 +164,13 @@ export interface BashDecisionInput {
 	cwd: string;
 	/** Reads branch facts of the repository at a directory; called only for a plain `git commit`. */
 	readFacts: (cwd: string) => Promise<BranchFacts>;
+	/** `cwd` is in another repository than the session's: a commit counts as run elsewhere, like `cd <cwd> && git commit`. */
+	elsewhere?: boolean;
 }
 
 /** Classifies the command and applies the permission rules, with the feature-branch commit rule reading facts at the session cwd. */
 export function decideBashCommand(input: BashDecisionInput): Promise<Decision> {
-	return decideWithBranchRule(classifyCommand(input.command), input.mode, input.isChild, () => input.readFacts(input.cwd));
+	const matches = classifyCommand(input.command);
+	if (input.elsewhere) for (const match of matches) if (match.commit) match.elsewhere = true;
+	return decideWithBranchRule(matches, input.mode, input.isChild, () => input.readFacts(input.cwd));
 }

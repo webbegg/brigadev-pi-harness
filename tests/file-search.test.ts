@@ -13,12 +13,11 @@ import {
 	filterRgLines,
 	resolveOnPath,
 	runBounded,
-	SENSITIVE_GLOBS,
 	type RunResult,
 	type SearchContext,
 	type SearchRunner,
 } from "../lib/file-search.ts";
-import { isSensitivePath } from "../lib/permission-policy.ts";
+import { isSensitivePath, SENSITIVE_GLOBS } from "../lib/permission-policy.ts";
 import { createFakeCtx, createFakePi } from "./helpers/fake-pi.ts";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
 
@@ -74,7 +73,7 @@ describe("argument building", () => {
 		assert.deepEqual(args.slice(-3), ["--", "-rf; echo hi", "src"]);
 		const globs = args.flatMap((arg, i) => (args[i - 1] === "--glob" ? [arg] : []));
 		assert.equal(globs[0], "*.ts");
-		assert.ok(globs.includes("!**/.env*"));
+		assert.ok(globs.includes("!**/.env"));
 		assert.deepEqual(globs.slice(1), SENSITIVE_GLOBS.map((glob) => `!${glob}`));
 	});
 
@@ -144,6 +143,25 @@ describe("output filtering", () => {
 
 	it("passes lines without a NUL through", () => {
 		assert.deepEqual(filterRgLines("plain line\n", false).lines, ["plain line"]);
+	});
+
+	it("decides on the canonical path too: a symlinked directory, and a cwd inside a credentials folder", () => {
+		const home = path.join(root, "canon-home");
+		const aws = path.join(home, ".aws");
+		const proj = path.join(root, "canon-proj");
+		fs.mkdirSync(aws, { recursive: true });
+		fs.mkdirSync(proj, { recursive: true });
+		fs.symlinkSync(aws, path.join(proj, "awsdir"));
+		const rgOut = ["a.ts\x001:x", "awsdir/credentials\x001:SECRET", "awsdir/credentials\x002-ctx", "--"].join("\n");
+		const fromProject = filterRgLines(rgOut, false, proj);
+		assert.deepEqual(fromProject.lines, ["a.ts:1:x", "--"]);
+		assert.equal(fromProject.omitted, 2);
+		assert.deepEqual(filterRgLines("credentials\x001:SECRET\nconfig\x001:ok\n", false, aws).lines, ["config:1:ok"]);
+		const fd = filterFdLines(["a.ts", "awsdir/credentials", "awsdir/config"], false, proj);
+		assert.deepEqual(fd.lines, ["a.ts", "awsdir/config"]);
+		assert.equal(fd.omitted, 1);
+		assert.deepEqual(filterFdLines(["credentials"], false, aws), { lines: [], omitted: 1 });
+		assert.deepEqual(filterFdLines(["awsdir/credentials"], true, proj), { lines: ["awsdir/credentials"], omitted: 0 });
 	});
 });
 
@@ -278,6 +296,21 @@ describe("executeSearch with an injected runner", () => {
 		assert.equal(ran, false);
 	});
 
+	it("counts lines dropped by the canonical filter as omitted in the note", async () => {
+		const home = path.join(root, "canon-home2", ".aws");
+		fs.mkdirSync(home, { recursive: true });
+		const out = await executeSearch("rg", "rg", { pattern: "x" }, context({ cwd: home, projectRoot: home }), async () => done("credentials\x001:x\nconfig\x001:x\n"));
+		assert.equal(out.text.split("\n")[0], "config:1:x");
+		assert.match(out.text, /1 result from sensitive files omitted/);
+		assert.equal(out.omittedSensitive, 1);
+	});
+
+	it("reports rg's `No files were searched` error as no matches", async () => {
+		const out = await executeSearch("rg", "rg", { pattern: "x", path: "src" }, context(), async () => done("", { code: 2, stderr: "rg: No files were searched, which means ripgrep probably applied a filter you didn't expect." }));
+		assert.equal(out.text, "No matches found");
+		await assert.rejects(executeSearch("rg", "rg", { pattern: "(" }, context(), async () => done("", { code: 2, stderr: "regex parse error" })), /rg failed/);
+	});
+
 	it("surfaces failures", async () => {
 		await assert.rejects(executeSearch("rg", "rg", { pattern: "(" }, context(), async () => done("", { code: 2, stderr: "regex parse error" })), /rg failed: regex parse error/);
 		await assert.rejects(executeSearch("fd", "fd", {}, context(), async () => done("", { code: null, stderr: "spawn fd ENOENT" })), /fd failed/);
@@ -347,6 +380,19 @@ describe("real fd and rg binaries", () => {
 		assert.match(out.text, /src\/a\.ts:1:/);
 		assert.ok(!/SECRET|server\.pem|id_rsa|\.env:/.test(out.text), out.text);
 		assert.equal((await executeSearch("rg", "rg", { pattern: "absent-token-xyz" }, context({ cwd: dir, projectRoot: dir }))).text, "No matches found");
+	});
+
+	it("env templates stay visible while real env files stay hidden (rg and fd)", { skip: (!onPath("rg") || !onPath("fd")) && "rg or fd is not on PATH" }, async () => {
+		const dir = path.join(root, "real-env");
+		fs.mkdirSync(dir, { recursive: true });
+		for (const name of [".env", ".env.local", ".env.staging", ".env.test", ".env.production", ".env.example", ".env.sample", ".env.template"]) fs.writeFileSync(path.join(dir, name), "needle=1\n");
+		const ctx = context({ cwd: dir, projectRoot: dir });
+		const rg = (await executeSearch("rg", "rg", { pattern: "needle", hidden: true }, ctx)).text;
+		const fd = (await executeSearch("fd", "fd", { hidden: true }, ctx)).text;
+		for (const text of [rg, fd]) {
+			for (const shown of [".env.example", ".env.sample", ".env.template"]) assert.match(text, new RegExp(shown.replace(".", "\\.")), `${shown} in ${text}`);
+			assert.ok(!/\.env(\.local|\.staging|\.test|\.production)?(:|\n|$)/m.test(text.replace(/\[[^\]]*\]/g, "")), text);
+		}
 	});
 
 	it("fd lists files and never returns sensitive ones, even with hidden on", { skip: !onPath("fd") && "fd is not on PATH" }, async () => {

@@ -66,9 +66,9 @@ export function registerFileSearchTools(pi: ExtensionAPI, deps: FileSearchDeps =
 		pi.registerTool({
 			name: "fd",
 			label: "Find Files",
-			description: `Find files and directories by name with fd. Respects .gitignore. Results are limited to ${FD_DEFAULT_LIMIT} entries by default; output is capped and says when it was cut. Files that commonly hold secrets are never listed.`,
-			promptSnippet: "Find files and directories by name with fd (fast, gitignore-aware).",
-			promptGuidelines: ["Use fd to discover files and directories by name, extension, or glob instead of bash with find or ls -R.", "Use rg instead of fd when searching file contents."],
+			description: `Find files and directories by name with fd. Respects .gitignore. At most ${FD_DEFAULT_LIMIT} entries by default; output is capped and says when it was cut. Files that commonly hold secrets are never listed.`,
+			promptSnippet: "Find files and directories by name with fd",
+			promptGuidelines: ["Use fd instead of bash find or ls -R to discover files by name, extension, or glob; use rg to search file contents."],
 			parameters: FD_PARAMETERS,
 			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 				const output = await executeSearch("fd", fd, params as FdParams, searchContext(ctx, signal));
@@ -82,8 +82,8 @@ export function registerFileSearchTools(pi: ExtensionAPI, deps: FileSearchDeps =
 			name: "rg",
 			label: "Search Content",
 			description: `Search file contents with ripgrep. Smart-case, respects .gitignore, at most ${RG_DEFAULT_COUNT} matches per file by default; output is capped and says when it was cut. Files that commonly hold secrets are never searched.`,
-			promptSnippet: "Search file contents with ripgrep (fast regex content search).",
-			promptGuidelines: ["Use rg to search file contents instead of bash with grep.", "Set fixed_strings on rg when searching for literal code containing regex metacharacters.", "Use fd instead of rg when looking for files by name."],
+			promptSnippet: "Search file contents with ripgrep",
+			promptGuidelines: ["Use rg instead of bash grep to search file contents; use fd to find files by name.", "Set fixed_strings when searching for literal code containing regex metacharacters."],
 			parameters: RG_PARAMETERS,
 			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 				const output = await executeSearch("rg", rg, params as RgParams, searchContext(ctx, signal));

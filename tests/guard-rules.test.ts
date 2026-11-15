@@ -161,6 +161,13 @@ describe("bash decision", () => {
 		assert.deepEqual(await decide("{ cd /x; git commit -m y; }"), { action: "confirm", cwds: [] });
 	});
 
+	it("a commit that runs in another repository (bg_start cwd) is not a branch-rule candidate, as `cd x && git commit`", async () => {
+		const elsewhere = await decideBashCommand({ command: "git commit -m x", mode: PERMISSION_MODE.NORMAL, isChild: false, cwd: "/work/other", elsewhere: true, readFacts: async () => FEATURE });
+		assert.equal(elsewhere.action, "confirm");
+		const here = await decideBashCommand({ command: "git commit -m x", mode: PERMISSION_MODE.NORMAL, isChild: false, cwd: "/work/session", elsewhere: false, readFacts: async () => FEATURE });
+		assert.equal(here.action, "allow");
+	});
+
 	it("keeps the subagent and yolo rules", async () => {
 		assert.deepEqual(await decide("git commit -m x", { isChild: true }), { action: "block", cwds: [] });
 		assert.deepEqual(await decide("git commit -m x", { mode: "yolo" }), { action: "allow", cwds: [] });
@@ -219,6 +226,17 @@ describe("evidence log protection", () => {
 		for (const command of [`cat ${evidence}/b.jsonl`, `grep fail ${evidence}/b.jsonl | tail -3`, `ls -la ~/.brigadev/repo/evidence`, `jq . ${evidence}/b.jsonl 2>&1`, `tail -n 5 ${evidence}/b.jsonl 2>/dev/null`, `wc -l $HOME/.brigadev/repo/evidence/b.jsonl`]) {
 			assert.equal(bashWritesEvidence(command, dirs), false, command);
 		}
+	});
+
+	it("resolves relative paths against the bg_start cwd (docs folder or the evidence folder itself)", () => {
+		for (const command of ["echo x >> evidence/f.jsonl", "printf x | tee evidence/f.jsonl", "rm ./evidence/f.jsonl"]) {
+			assert.equal(bashWritesEvidence(command, dirs, "/h", docs), true, command);
+		}
+		assert.equal(bashWritesEvidence("echo x >> f.jsonl", dirs, "/h", evidence), true);
+		assert.equal(bashWritesEvidence("echo x >> ../evidence/f.jsonl", dirs, "/h", `${docs}/tasks`), true);
+		assert.equal(bashWritesEvidence("cat evidence/f.jsonl", dirs, "/h", docs), false);
+		assert.equal(bashWritesEvidence("echo x >> evidence/f.jsonl", dirs, "/h", "/work/project"), false);
+		assert.equal(bashWritesEvidence("echo x >> evidence/f.jsonl", dirs, "/h"), false);
 	});
 
 	it("ignores writes that do not mention the evidence path", () => {
@@ -379,6 +397,16 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 
 	it("a command that reads the evidence log is not blocked", async () => {
 		assert.equal((await outcome("bg_start", { command: `tail -f ${evidenceLog()}` }, { hasUI: false })).reason, undefined);
+	});
+
+	it("a relative write into the evidence log is blocked like the absolute form when the working directory is the docs folder", async () => {
+		const docs = join(home, "repo");
+		mkdirSync(join(docs, "evidence"), { recursive: true });
+		for (const [command, cwd] of [["echo x >> evidence/feat-x.jsonl", docs], ["printf x | tee ./evidence/feat-x.jsonl", docs], ["echo x >> feat-x.jsonl", join(docs, "evidence")]] as const) {
+			const result = await outcome("bg_start", { command, cwd }, { hasUI: false });
+			assert.match(String(result.reason), /evidence log/, `${command} in ${cwd}`);
+		}
+		assert.equal((await outcome("bg_start", { command: "cat evidence/feat-x.jsonl", cwd: docs }, { hasUI: false })).reason, undefined);
 	});
 
 	it("the commit gate reads the repository at the working directory the process runs in", async () => {

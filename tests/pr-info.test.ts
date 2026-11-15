@@ -182,6 +182,37 @@ describe("createPrTracker", () => {
 		assert.deepEqual(texts, ["PR #42", undefined]);
 	});
 
+	it("keeps the last known PR when a lookup is unavailable, and clears it only on `none`", async () => {
+		const texts: Array<string | undefined> = [];
+		let answer: Awaited<ReturnType<PrExec>> = ok(view());
+		const tracker = createPrTracker({ exec: async () => answer, onChange: (text) => texts.push(text) });
+		await tracker.refresh("/r");
+		for (const transient of [fail("gh: command not found", 127), fail("error connecting to api.github.com"), ok("not json"), { stdout: "", stderr: "", code: null, killed: true }]) {
+			answer = transient;
+			assert.equal((await tracker.refresh("/r")).status, "unavailable");
+			assert.equal(tracker.current()?.number, 42);
+		}
+		assert.deepEqual(texts, ["PR #42"]);
+		answer = fail('no pull requests found for branch "x"');
+		assert.equal((await tracker.refresh("/r")).status, "none");
+		assert.equal(tracker.current(), undefined);
+		assert.deepEqual(texts, ["PR #42", undefined]);
+		// with nothing known, an unavailable lookup shows nothing
+		answer = fail("gh: command not found", 127);
+		await tracker.refresh("/r");
+		assert.equal(tracker.current(), undefined);
+	});
+
+	it("a reset forgets the PR even when the next lookup is unavailable", async () => {
+		let answer = ok(view());
+		const tracker = createPrTracker({ exec: async () => answer, onChange: () => {} });
+		await tracker.refresh("/r");
+		tracker.reset();
+		answer = fail("gh: command not found", 127);
+		await tracker.refresh("/r");
+		assert.equal(tracker.current(), undefined);
+	});
+
 	it("does not republish an unchanged footer text", async () => {
 		const texts: Array<string | undefined> = [];
 		const tracker = createPrTracker({ exec: async () => ok(view()), onChange: (text) => texts.push(text) });

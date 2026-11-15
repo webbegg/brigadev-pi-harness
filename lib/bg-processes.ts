@@ -4,9 +4,11 @@
 //
 // A process gets no stdin, runs in its own process group (not on win32), and keeps its output (stdout and stderr
 // merged, in arrival order) as a capped in-memory tail. It settles exactly once: `done` (exit 0), `failed` (non-zero
-// exit, a signal nobody sent, or it could not start) or `killed` (we signalled it). Stopping follows lib/child-run.ts:
-// SIGTERM to the group, SIGKILL after KILL_GRACE_MS (which also takes the descendants that left the group), and every
-// live process is registered with a ChildTracker so the parent-exit guard can end them if the session dies.
+// exit, a signal nobody sent, or it could not start) or `killed` (we signalled it, or the drain after the shell's exit
+// ended work it left running). Stopping uses the signaller shared with lib/child-run.ts: SIGTERM to the group, SIGKILL
+// after KILL_GRACE_MS; the descendants that left the group are listed before the first signal and SIGKILLed when the
+// shell exits early or the grace ends. Every live process is registered with a ChildTracker so the parent-exit guard
+// can end them if the session dies.
 //
 // "Seen": the model has seen an exit when it asked `bg_status` of a settled process or waited for its own `bg_kill`.
 // The settle hook reports it, so the exit notice (lib/bg-delivery.ts) is not sent for what the model already knows.
@@ -15,7 +17,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { CLOSE_DRAIN_MS, createChildTracker, descendantTargets, KILL_GRACE_MS, listProcessesWithPs, type ChildTracker, type DescendantTargets, type ProcessEntry } from "./child-run.ts";
+import { CLOSE_DRAIN_MS, createChildTracker, createProcessSignaller, KILL_GRACE_MS, listProcessesWithPs, mergeDescendantTargets, type ChildTracker, type DescendantTargets, type ProcessEntry, type ProcessSignaller } from "./child-run.ts";
 
 /** The most processes that may run at once. */
 export const MAX_RUNNING = 8;
@@ -30,6 +32,8 @@ export const BG_KILL_GRACE_MS = KILL_GRACE_MS;
 /** Extra time, after SIGKILL and the pipe drain, before a process that never reported its exit is settled by force. */
 const FORCE_SETTLE_SLACK_MS = 1000;
 const NAME_MAX = 60;
+/** The note on a process whose shell exited while work it started was still running (`cmd &`). */
+export const LEFTOVER_NOTE = "Work left running after the shell exited was stopped.";
 
 export type BgState = "running" | "done" | "failed" | "killed";
 
@@ -243,6 +247,10 @@ interface Entry {
 	tail: TailBuffer;
 	decoders: StringDecoder[];
 	release: () => void;
+	/** The one signaller shared with lib/child-run.ts. */
+	signaller: ProcessSignaller;
+	/** Descendants listed while the shell was alive, before the first stop signal: they outlive a shell that dies on SIGTERM. */
+	descendants?: DescendantTargets;
 	/** The process reported its exit (not necessarily its output closing). */
 	exited: boolean;
 	/** What its `exit` event said, for a settle that happens without `close`. */
@@ -335,58 +343,16 @@ export function createBgProcesses(deps: BgProcessDeps = {}): BgProcesses {
 		e.closeTimer = e.killTimer = e.forceTimer = undefined;
 	};
 
-	const hasGroup = (e: Entry) => e.pid !== undefined && platform !== "win32";
-
-	// The descendants a forced kill must also reach: a command the process ran may sit in a process group of its own,
-	// which the group kill misses. Listed while the process is alive (afterwards the parent links are gone).
-	const descendantsOf = (e: Entry, shared?: readonly ProcessEntry[]): DescendantTargets | undefined => {
-		if (!hasGroup(e)) return undefined;
-		try {
-			return descendantTargets(e.pid!, shared ?? listProcesses(), selfPid);
-		} catch {
-			return undefined;
-		}
-	};
-
-	const killDescendants = (e: Entry, targets: DescendantTargets | undefined, ownGroupDone: boolean) => {
-		if (!targets) return;
-		const one = (pid: number) => {
-			try {
-				killPid(pid, "SIGKILL");
-			} catch {
-				// Already gone.
-			}
-		};
-		for (const { pgid, pids } of targets.groups) {
-			if (ownGroupDone && pgid === e.pid) continue;
-			try {
-				killGroup(pgid, "SIGKILL");
-			} catch {
-				pids.forEach(one);
-			}
-		}
-		targets.pids.forEach(one);
-	};
-
-	// To the whole group; to the process alone when it has no pid, on win32, or when the group signal throws.
-	// SIGKILL is the forced path: it takes the descendants' own groups too. SIGTERM stays graceful.
+	// A command the shell ran may sit in a process group of its own, which a group signal misses, and which outlives a
+	// shell that dies on SIGTERM (the parent links are gone by then). So the descendants are listed on every signal while
+	// the shell is alive and remembered: they get SIGKILL on the forced pass, and at once when the shell exits after a stop
+	// was requested (the `exit` handler). Never throws.
 	const signalEntry = (e: Entry, signal: NodeJS.Signals, processes?: readonly ProcessEntry[]) => {
-		if (!e.exited) e.killRequested = true;
-		const descendants = signal === "SIGKILL" ? descendantsOf(e, processes) : undefined;
-		let groupDone = false;
-		try {
-			if (hasGroup(e)) {
-				try {
-					killGroup(e.pid!, signal);
-					groupDone = true;
-				} catch {
-					// No such group (or not ours): signal the process itself.
-				}
-			}
-			if (!groupDone) e.child.kill(signal);
-		} finally {
-			killDescendants(e, descendants, groupDone);
+		if (!e.exited) {
+			e.killRequested = true;
+			e.descendants = mergeDescendantTargets(e.descendants, e.signaller.descendants(processes));
 		}
+		e.signaller.signal(signal, signal === "SIGKILL" ? e.descendants : undefined);
 	};
 
 	const prune = () => {
@@ -471,6 +437,7 @@ export function createBgProcesses(deps: BgProcessDeps = {}): BgProcesses {
 				tail: new TailBuffer(tailBytes),
 				decoders: [new StringDecoder("utf8"), new StringDecoder("utf8")],
 				release: () => {},
+				signaller: createProcessSignaller({ pid: () => child.pid, killSelf: (signal) => void child.kill(signal), killGroup, killPid, listProcesses, selfPid, platform }),
 				exited: false,
 				killRequested: false,
 				seenByKill: false,
@@ -495,18 +462,24 @@ export function createBgProcesses(deps: BgProcessDeps = {}): BgProcesses {
 				if (e.state !== "running") return;
 				e.exited = true;
 				e.exitInfo = { code, signal };
+				// A stop was requested and the shell is gone: the descendants that sit in groups of their own would outlive it.
+				// (Its own group is left to the drain below, so what shares it keeps the time it had to handle SIGTERM.)
+				if (e.killRequested) e.signaller.killDescendants(e.descendants, true);
 				// Output normally follows in `close`, but a descendant that holds the pipes keeps `close` from ever firing:
 				// the wait is bounded, then the process's group is ended and it settles without `close`. The process is gone,
-				// so its descendants were reparented (a walk would find none): no process listing here.
+				// so its descendants were reparented (a walk would find none): no process listing here. A group that still had
+				// members (`cmd &`) means work was left running: the process settles as killed, with a note.
 				e.closeTimer ??= setTimer(() => {
-					if (hasGroup(e)) {
+					let leftover = false;
+					if (e.signaller.hasGroup()) {
 						try {
 							killGroup(e.pid!, "SIGKILL");
+							leftover = true;
 						} catch {
 							// The group is already gone.
 						}
 					}
-					settle(e, e.exitInfo);
+					settle(e, leftover && !e.killRequested ? { ...e.exitInfo, forced: true, error: LEFTOVER_NOTE } : e.exitInfo);
 				}, CLOSE_DRAIN_MS);
 			});
 			child.on("close", (code: number | null, signal: string | null) => settle(e, { code, signal }));
