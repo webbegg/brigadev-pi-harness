@@ -94,6 +94,45 @@ describe("pruneRunFolders: retention of saved run folders", () => {
 		fs.writeFileSync(path.join(runs, id, "result.json"), "{}");
 	};
 
+	it("removes at most maxRemovals folders per call (50 by default), oldest first, and the next call continues", () => {
+		withDocs((docs, runs) => {
+			// 60 expired folders, 20 to 79 days old; the hex part keeps every id distinct.
+			const ids = Array.from({ length: 60 }, (_, i) => idAt(20 + i, "a", i.toString(16).padStart(6, "0")));
+			for (const id of ids) mk(runs, id);
+			const first = pruneRunFolders(docs, { now: () => NOW });
+			assert.equal(first.removed.length, 50);
+			assert.deepEqual(first.removed, [...ids].reverse().slice(0, 50), "the oldest 50, oldest first");
+			assert.equal(fs.readdirSync(runs).length, 10);
+			const second = pruneRunFolders(docs, { now: () => NOW });
+			assert.deepEqual(second.removed, [...ids].reverse().slice(50));
+			assert.deepEqual(fs.readdirSync(runs), []);
+		});
+	});
+
+	it("maxRemovals caps the age rule, so the count rule waits for a later call", () => {
+		withDocs((docs, runs) => {
+			const expired = [30, 31, 32].map((d, i) => idAt(d, "e", `00000${i}`));
+			const fresh = [1, 2, 3, 4].map((d, i) => idAt(d, "f", `00001${i}`));
+			for (const id of [...expired, ...fresh]) mk(runs, id);
+			const out = pruneRunFolders(docs, { now: () => NOW, maxFolders: 2, maxRemovals: 2 });
+			assert.deepEqual(out.removed, [expired[2], expired[1]], "oldest expired first; nothing left of the cap for the count rule");
+			assert.equal(fs.readdirSync(runs).length, 5);
+		});
+	});
+
+	it("the count rule uses what the age rule left of the cap, oldest first", () => {
+		withDocs((docs, runs) => {
+			const expired = idAt(30, "e", "000000");
+			const fresh = [1, 2, 3, 4].map((d, i) => idAt(d, "f", `00001${i}`));
+			for (const id of [expired, ...fresh]) mk(runs, id);
+			const first = pruneRunFolders(docs, { now: () => NOW, maxFolders: 2, maxRemovals: 2 });
+			assert.deepEqual(first.removed, [expired, fresh[3]]);
+			const second = pruneRunFolders(docs, { now: () => NOW, maxFolders: 2, maxRemovals: 2 });
+			assert.deepEqual(second.removed, [fresh[2]]);
+			assert.deepEqual(fs.readdirSync(runs).sort(), [fresh[0], fresh[1]].sort());
+		});
+	});
+
 	it("removes folders older than maxAgeDays (14 by default), by the timestamp in the name", () => {
 		withDocs((docs, runs) => {
 			const old = idAt(15);

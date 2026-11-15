@@ -183,8 +183,9 @@ export default function (pi: ExtensionAPI) {
 
 	// Idle delivery of async results the model did not collect: injected as a custom message that starts a parent turn.
 	// Pi API (docs/extensions.md in the installed pi-coding-agent): `pi.sendMessage(..., { triggerTurn: true, deliverAs: "steer" })`
-	// starts a turn when idle and joins the run when busy (sections on custom messages); `ctx.isIdle()` (context API);
-	// `agent_settled` is the final-idle signal, `agent_end` is not (agent events); a renderer is registered per customType.
+	// starts a turn when idle and joins the run when busy ("pi.sendMessage(message, options?)"); `ctx.isIdle()` ("ExtensionContext");
+	// `agent_settled` is the final-idle signal, `agent_end` is not ("agent_start / agent_end / agent_before_settle / agent_settled");
+	// a renderer is registered per customType ("pi.registerMessageRenderer(customType, renderer)").
 	let parentCtx: ExtensionContext | undefined;
 	// Launches the last delivery left as a pointer (size guard): recorded as such when the delivery succeeds.
 	let omittedInDelivery = new Set<string>();

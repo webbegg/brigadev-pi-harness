@@ -202,8 +202,11 @@ export type SpawnFn = (command: string, args: string[], options: { cwd: string; 
  * run settles. `shutdown` is the bounded stop for session end: terminate all, wait up to the grace, kill survivors.
  */
 export interface ChildTracker {
-	/** Registers a live child by the function that signals it (and its group); returns the release function. */
-	add(kill: (signal: NodeJS.Signals) => void): () => void;
+	/**
+	 * Registers a live child by the function that signals it (and its group); returns the release function.
+	 * On a forced (SIGKILL) pass the tracker passes the pass's one process listing as the second argument.
+	 */
+	add(kill: (signal: NodeJS.Signals, processes?: readonly ProcessEntry[]) => void): () => void;
 	size(): number;
 	/** Signals every tracked child now; one that throws does not stop the rest. */
 	killAll(signal: NodeJS.Signals): void;
@@ -213,13 +216,26 @@ export interface ChildTracker {
 	shutdown(options: { graceMs: number; setTimer: (fn: () => void, ms: number) => unknown; clearTimer: (handle: unknown) => void }): Promise<void>;
 }
 
-export function createChildTracker(): ChildTracker {
-	const live = new Set<(signal: NodeJS.Signals) => void>();
+/**
+ * `listProcesses` (default `ps`) is read once per forced pass and shared by every child of the pass, so N children cost
+ * one listing (at most its 2 s bound), not N. A failed listing is an empty one: each child's own group is still killed.
+ */
+export function createChildTracker(options: { listProcesses?: () => ProcessEntry[] } = {}): ChildTracker {
+	const listProcesses = options.listProcesses ?? listProcessesWithPs;
+	const live = new Set<(signal: NodeJS.Signals, processes?: readonly ProcessEntry[]) => void>();
 	const waiters = new Set<() => void>();
+	const listOnce = (): ProcessEntry[] => {
+		try {
+			return listProcesses();
+		} catch {
+			return [];
+		}
+	};
 	const killAll = (signal: NodeJS.Signals) => {
+		const processes = signal === "SIGKILL" && live.size > 0 ? listOnce() : undefined;
 		for (const kill of [...live]) {
 			try {
-				kill(signal);
+				kill(signal, processes);
 			} catch {
 				// One child that cannot be signalled must not spare the others.
 			}
@@ -351,7 +367,7 @@ export interface ChildRunDeps {
 	killGroup?: (pid: number, signal: NodeJS.Signals) => void;
 	/** Defaults to process.platform; process groups do not apply on win32. */
 	platform?: NodeJS.Platform;
-	/** The process table, read synchronously on a forced kill to find the child's descendants; defaults to `ps`. */
+	/** The process table, read synchronously when this child alone is force-killed (a tracker pass lists once for all children); defaults to `ps`. */
 	listProcesses?: () => ProcessEntry[];
 	/** Signals one process; defaults to process.kill. Used when a descendant's group cannot be signalled. */
 	killPid?: (pid: number, signal: NodeJS.Signals) => void;
@@ -445,11 +461,12 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			const proc = spawn(invocation.command, invocation.args, { cwd, env: launch.env, shell: false, stdio: launch.stdio, detached: platform !== "win32" });
 			const hasGroup = () => proc.pid !== undefined && platform !== "win32";
 			// A command the child's bash tool runs has a process group of its own, so the child's group kill misses it.
-			// Listed before the child dies (afterwards the chain of parents is gone); a failed listing means no extra kills.
-			const descendantsOfChild = (): DescendantTargets | undefined => {
+			// Listed before the child dies (afterwards the chain of parents is gone: only a live child is walked); a failed listing means no extra kills.
+			// `shared` is the listing a tracker pass already took for every child.
+			const descendantsOfChild = (shared?: readonly ProcessEntry[]): DescendantTargets | undefined => {
 				if (!hasGroup()) return undefined;
 				try {
-					return descendantTargets(proc.pid!, listProcesses(), selfPid);
+					return descendantTargets(proc.pid!, shared ?? listProcesses(), selfPid);
 				} catch {
 					return undefined;
 				}
@@ -478,8 +495,8 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			// To the whole group; to the child alone when it has no pid, on win32, or when the group signal throws.
 			// SIGKILL is the forced path (grace over, shutdown survivors, exit guard): it takes the descendants' groups too.
 			// SIGTERM stays graceful so the child can clean up its own tool processes.
-			const signalChild = (signal: NodeJS.Signals) => {
-				const descendants = signal === "SIGKILL" ? descendantsOfChild() : undefined;
+			const signalChild = (signal: NodeJS.Signals, processes?: readonly ProcessEntry[]) => {
+				const descendants = signal === "SIGKILL" ? descendantsOfChild(processes) : undefined;
 				let groupDone = false;
 				try {
 					if (hasGroup()) {
@@ -513,7 +530,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			// steer/follow_up commands wait here for Pi's response (matched by id); nothing is left waiting once input ends.
 			const commands = createCommandTracker();
 
-			// Commands and UI answers go to the child as one JSON record per line (rpc.md, framing); false once the pipe is closed.
+			// Commands and UI answers go to the child as one JSON record per line (rpc.md, "Framing"); false once the pipe is closed.
 			const send = (record: RpcCommand | UiResponse): boolean => {
 				if (!inputOpen) return false;
 				try {
@@ -523,7 +540,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					return false;
 				}
 			};
-			// Closing stdin asks the child to shut down in order (rpc.md, shutdown); a finished run takes no more input, so it has no handle.
+			// Closing stdin asks the child to shut down in order (rpc.md, "Shutdown"); a finished run takes no more input, so it has no handle.
 			const endInput = () => {
 				if (!inputOpen) return;
 				inputOpen = false;
@@ -598,12 +615,12 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					else if (event.type === "activity") watchdog.activity(event.label);
 					else if (event.type === "run") {
 						streaming = event.phase === "start";
-						// `agent_end` can be followed by retries, compaction, or queued messages; `agent_settled` is the end (rpc.md, commands).
+						// `agent_end` can be followed by retries, compaction, or queued messages; `agent_settled` is the end (rpc.md, "Run lifecycle").
 						if (event.phase === "settled") finishInput();
 					} else if (event.type === "response") {
-						// The answer to a steer/follow_up settles that command's outcome (rpc.md, command ids).
+						// The answer to a steer/follow_up settles that command's outcome (rpc.md, "Correlate commands and responses").
 						commands.respond(event);
-						// A rejected prompt starts no run, and a handled one starts none either (rpc.md, commands): neither will ever settle.
+						// A rejected prompt starts no run, and a handled one starts none either (rpc.md, "Run lifecycle"): neither will ever settle.
 						if (event.command === "prompt" && !event.success) {
 							Object.assign(result, { stopReason: "error", errorMessage: `Pi rejected the task: ${event.error ?? "unknown error"}` });
 							finishInput();
@@ -684,17 +701,15 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				if (done) return;
 				exited = true;
 				closeTimer ??= setTimer(() => {
-					// Whatever still holds the pipes belongs to this child's group or a descendant's: end them, then settle without `close`.
+					// Whatever still holds the pipes belongs to this child's group: end it, then settle without `close`. The child is
+					// gone, so its descendants were reparented (a walk would find none) and its pid may already belong to someone else:
+					// no process listing here.
 					if (hasGroup()) {
-						const descendants = descendantsOfChild();
-						let groupDone = false;
 						try {
 							killGroup(proc.pid!, "SIGKILL");
-							groupDone = true;
 						} catch {
 							// The group is already gone.
 						}
-						killDescendants(descendants, groupDone);
 					}
 					settle(code);
 				}, CLOSE_DRAIN_MS);

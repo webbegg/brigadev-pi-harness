@@ -527,6 +527,30 @@ describe("alreadyDeliveredText: what subagent_wait says about a launch whose res
 		const text = alreadyDeliveredText("L1", [{ agent: "scout", artifactsDir: "/d/r" }]);
 		assert.ok(text.split("\n").length <= 4);
 	});
+
+	it("omitted with no saved folders does not point at folders below: it says a pointer was delivered and no folder is available", () => {
+		const text = alreadyDeliveredText("L3", [], { omitted: true });
+		assert.match(text, /L3/);
+		assert.match(text, /delivered to this session as a pointer/);
+		assert.match(text, /no saved folder is available/);
+		assert.ok(!text.includes("below"), "no promise of folders that are not listed");
+		assert.ok(!text.includes("result.json"));
+		assert.ok(!text.includes("too large"), "no size claim when nothing says it was size");
+	});
+
+	it("omitted with an error (a failed launch) gives the error instead of 'too large'", () => {
+		const text = alreadyDeliveredText("L4", [], { omitted: true, error: "spawn pi ENOENT" });
+		assert.match(text, /spawn pi ENOENT/);
+		assert.match(text, /no saved folder is available/);
+		assert.ok(!text.includes("too large"));
+		assert.ok(!text.includes("below"));
+	});
+
+	it("omitted with folders keeps the 'saved folders below' wording, even when an error is passed", () => {
+		const tasks = [{ agent: "scout", artifactsDir: "/d/r" }];
+		assert.match(alreadyDeliveredText("L1", tasks, { omitted: true }), /too large to include in the delivered message: read it from the saved folders below \(result\.json\)/);
+		assert.equal(alreadyDeliveredText("L1", tasks, { omitted: true, error: "x" }), alreadyDeliveredText("L1", tasks, { omitted: true }));
+	});
 });
 
 type R0 = { details: { results: { agent: string; artifactsDir?: string }[] } };
@@ -554,6 +578,16 @@ describe("deliveredNote: the one decision both subagent_wait and subagent_cancel
 	it("a delivered launch with no result still gets the note, naming no folders", () => {
 		const note = deliveredNote("L1", { status: "settled", launch: summary("L1", { consumed: true, consumedBy: "delivered" }), error: "boom" });
 		assert.equal(note, alreadyDeliveredText("L1", []));
+	});
+
+	it("a launch delivered as a pointer with no result (a failed launch) gets its error and no folder promise", () => {
+		const note = deliveredNote("L1", { status: "settled", launch: summary("L1", { consumed: true, consumedBy: "delivered-omitted" }), error: "spawn pi ENOENT" }) ?? "";
+		assert.equal(note, alreadyDeliveredText("L1", [], { omitted: true, error: "spawn pi ENOENT" }));
+		assert.match(note, /spawn pi ENOENT/);
+		assert.ok(!note.includes("too large") && !note.includes("below"));
+		const bare = deliveredNote("L1", { status: "settled", launch: summary("L1", { consumed: true, consumedBy: "delivered-omitted" }) }) ?? "";
+		assert.match(bare, /no saved folder is available/);
+		assert.ok(!bare.includes("below"));
 	});
 
 	it("a launch delivered as a pointer gets a note that says its result was too large to include and points to result.json", () => {

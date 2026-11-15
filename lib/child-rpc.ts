@@ -3,15 +3,15 @@
 // steering handle a running task exposes. Pure: no Pi imports, no I/O.
 //
 // Pi docs (installed 1.5.2, docs/):
-// - rpc.md, record families and strict JSONL framing (LF only)
-// - rpc.md, commands: `prompt` is acknowledged, not completed; `agent_settled` says Pi will not continue by itself;
+// - rpc.md, "Protocol records" and "Framing" (strict JSONL, LF only)
+// - rpc.md, "Run lifecycle": `prompt` is acknowledged, not completed; `agent_settled` says Pi will not continue by itself;
 //   disposition "handled" means no run started (don't wait for `agent_settled`)
-// - rpc.md, shutdown: closing stdin requests an orderly shutdown
+// - rpc.md, "Shutdown": closing stdin requests an orderly shutdown
 // - rpc-commands.md: `prompt`, `steer`, `follow_up`, `abort`
 // - rpc-extension-ui.md: dialog methods (select, confirm, input, editor) block until answered;
 //   fire-and-forget methods (notify, setStatus, setWidget, setTitle, set_editor_text) expect nothing;
 //   the cancellation response `{"type":"extension_ui_response","id":...,"cancelled":true}` dismisses any dialog
-// - rpc.md, command ids: every command accepts an optional string `id`; the response repeats it; "command handling is asynchronous,
+// - rpc.md, "Correlate commands and responses": every command accepts an optional string `id`; the response repeats it; "command handling is asynchronous,
 //   so clients should correlate by ID rather than response order"
 // - rpc-commands.md, `steer` and `follow_up`: success response `data.disposition` is "queued" or "handled"
 
@@ -48,7 +48,7 @@ export const UI_DIALOG_METHODS: readonly string[] = ["select", "confirm", "input
 /** Methods that expect no answer (rpc-extension-ui.md). */
 export const FIRE_AND_FORGET_METHODS: readonly string[] = ["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"];
 
-/** One record, LF-terminated (rpc.md, framing). JSON escapes newlines inside strings, so the terminator is the only raw LF. */
+/** One record, LF-terminated (rpc.md, "Framing"). JSON escapes newlines inside strings, so the terminator is the only raw LF. */
 export const encodeCommand = (record: RpcCommand | UiResponse): string => `${JSON.stringify(record)}\n`;
 
 /** Decodes one stdout line; blank or broken lines (and a CR from CRLF) decode to nothing or are tolerated. */

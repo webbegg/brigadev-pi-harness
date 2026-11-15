@@ -21,9 +21,9 @@ export type ChildEvent =
 	| { type: "tool_end"; id: string; name: string }
 	/** Streaming text of the assistant message in progress (Pi json.md `message_update` / `text_delta`); `reset` starts a new message. */
 	| { type: "partial"; delta: string; reset?: boolean }
-	/** The agent's run phase (json.md, run events): a low-level run started or ended; `settled` means Pi will not continue by itself (`aborted` when the run was aborted). */
+	/** The agent's run phase (json.md, "Event sequence" and "Agent and turn events"): a low-level run started or ended; `settled` means Pi will not continue by itself (`aborted` when the run was aborted). */
 	| { type: "run"; phase: "start" | "end" | "settled"; aborted?: boolean }
-	/** The answer to one command written to stdin (rpc.md, command ids); `disposition` is the prompt/steer/follow_up outcome. */
+	/** The answer to one command written to stdin (rpc.md, "Correlate commands and responses"); `disposition` is the prompt/steer/follow_up outcome. */
 	| { type: "response"; command: string; success: boolean; id?: string; error?: string; disposition?: string }
 	/** An extension in the child asked its UI something (rpc-extension-ui.md); the run loop answers it per lib/child-rpc.ts. */
 	| { type: "ui_request"; request: UiRequest }

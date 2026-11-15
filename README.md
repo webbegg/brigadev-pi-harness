@@ -155,7 +155,7 @@ Changes that touch only prose (`.md`, `.markdown`, `.rst`, `.adoc`, `LICENSE`, `
 
 ## Repo docs folder
 
-Harness documents live outside the project, in `~/.brigadev/<repo>/` (`BRIGADEV_HOME` overrides `~/.brigadev`): feature documents in `tasks/`, review ledgers in `reviews/`, and one folder per subagent run in `runs/<runId>/` (`task.md`, `transcript.json`, `result.json`, user-only permissions; pruned at session start: folders older than 14 days go, then the oldest beyond 200). `<repo>` is the basename of the main worktree root, so every worktree of a repository shares one folder; outside git it is the directory name. The parent session writes there without asking; subagents still cannot write outside the project. `/brigadev:status` and `/brigadev:doctor` print the resolved folder.
+Harness documents live outside the project, in `~/.brigadev/<repo>/` (`BRIGADEV_HOME` overrides `~/.brigadev`): feature documents in `tasks/`, review ledgers in `reviews/`, and one folder per subagent run in `runs/<runId>/` (`task.md`, `transcript.json`, `result.json`, user-only permissions; pruned at session start: folders older than 14 days go, then the oldest beyond 200, at most 50 per session start; age comes from the folder name, and entries not named like a run id are never touched). `<repo>` is the basename of the main worktree root, so every worktree of a repository shares one folder; outside git it is the directory name. The parent session writes there without asking; subagents still cannot write outside the project. `/brigadev:status` and `/brigadev:doctor` print the resolved folder.
 
 ## Workflows
 

@@ -244,8 +244,14 @@ export function omittedResultText(id: string, tasks: ReadonlyArray<{ agent: stri
 /**
  * What `subagent_wait` answers for a launch whose result the idle delivery already put in the session: the launch id,
  * that it was delivered, and each task's saved folder (run-artifacts.ts), so the full text can still be read. Not the result.
+ * `omitted`: only a pointer was delivered. With no folders to list (a launch that failed before it saved any), the note
+ * says so and gives the launch's `error` when there is one, instead of promising folders or a size problem.
  */
-export function alreadyDeliveredText(id: string, tasks: ReadonlyArray<{ agent: string; artifactsDir?: string }>, options: { omitted?: boolean } = {}): string {
+export function alreadyDeliveredText(id: string, tasks: ReadonlyArray<{ agent: string; artifactsDir?: string }>, options: { omitted?: boolean; error?: string } = {}): string {
+	if (options.omitted && tasks.length === 0) {
+		const why = options.error ? `the launch failed (${options.error}) and ` : "";
+		return `Launch ${id} was delivered to this session as a pointer instead of its result; ${why}no saved folder is available.`;
+	}
 	const lead = options.omitted
 		? `Launch ${id} was delivered to this session, but its result was too large to include in the delivered message: read it from the saved folders below (result.json).`
 		: `Launch ${id} was already delivered to this session: its result is in the conversation above, so it is not repeated here.`;
@@ -263,7 +269,7 @@ export function deliveredNote<R extends { details: { results: ReadonlyArray<{ ag
 	return alreadyDeliveredText(
 		id,
 		(outcome.result?.details.results ?? []).map((r) => ({ agent: r.agent, artifactsDir: r.artifactsDir })),
-		{ omitted: by === "delivered-omitted" },
+		{ omitted: by === "delivered-omitted", error: outcome.error },
 	);
 }
 
