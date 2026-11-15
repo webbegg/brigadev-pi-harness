@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { COLLAPSED_CALLS, modelSegment, queuedFields, rowHeader, runState, settleQueued, subagentRow, syncRowTimer, type RowInput } from "../lib/subagent-row.ts";
+import { isUnfinished, runStatus, toRunState } from "../lib/child-run.ts";
+import { COLLAPSED_CALLS, modelSegment, queuedFields, rowHeader, settleQueued, subagentRow, syncRowTimer, type RowInput } from "../lib/subagent-row.ts";
 
-const sr = { queuedFields, runState, settleQueued, syncRowTimer };
+const sr = { queuedFields, settleQueued, syncRowTimer };
+const runState = (r: Parameters<typeof runStatus>[0]) => toRunState(runStatus(r));
 
 describe("subagent row", () => {
 	const now = 100_000;
@@ -78,13 +80,13 @@ describe("subagent row", () => {
 		const placeholder = { exitCode: -1, queued: true as boolean | undefined, cancelled: undefined as boolean | undefined, endedAt: undefined as number | undefined };
 		const started = { exitCode: -1, endedAt: undefined as number | undefined };
 		const done = { exitCode: 0, endedAt: 5 };
-		assert.equal(sr.runState(placeholder, false), "running");
+		assert.equal(runState(placeholder), "running");
 		assert.equal(sr.settleQueued([placeholder, started, done], 9_000), 1);
 		assert.equal(placeholder.endedAt, 9_000);
 		assert.equal(placeholder.cancelled, true);
 		assert.equal(started.endedAt, undefined);
 		assert.equal(done.endedAt, 5);
-		assert.equal(sr.runState(placeholder, false), "failed");
+		assert.equal(runState(placeholder), "failed");
 		const header = rowHeader(input({ state: "failed", cancelled: true, startedAt: undefined, calls: [], cost: 0 }), now);
 		assert.equal(header, "✗ brigadev-worker · claude-sonnet-5-5 · high · cancelled");
 	});
@@ -181,4 +183,26 @@ describe("subagent row", () => {
 		assert.equal(subagentRow(input({ state: "done" }), { now, expanded: false })[0].tone, "success");
 		assert.equal(subagentRow(input({ state: "failed" }), { now, expanded: false })[0].tone, "error");
 	});
+});
+
+describe("runStatus: the one run-state rule", () => {
+	const cases: Array<[string, Parameters<typeof runStatus>[0], string, string]> = [
+		// [what, run, status, three-state view]
+		["exit -1, no end, not queued", { exitCode: -1 }, "running", "running"],
+		["exit -1, no end, queued", { exitCode: -1, queued: true }, "queued", "running"],
+		["exit -1 with an end time", { exitCode: -1, endedAt: 5 }, "failed", "failed"],
+		["exit -1 with an end time, aborted while queued", { exitCode: -1, queued: true, cancelled: true, endedAt: 5 }, "cancelled", "failed"],
+		["exit 0", { exitCode: 0, stopReason: "stop" }, "done", "done"],
+		["exit 0 without a stop reason", { exitCode: 0 }, "done", "done"],
+		["exit 1", { exitCode: 1 }, "failed", "failed"],
+		["exit 0, stop reason error", { exitCode: 0, stopReason: "error" }, "failed", "failed"],
+		["exit 0, stop reason aborted", { exitCode: 0, stopReason: "aborted" }, "failed", "failed"],
+	];
+	for (const [what, run, status, view] of cases) {
+		it(`${what}: ${status}`, () => {
+			assert.equal(runStatus(run), status);
+			assert.equal(toRunState(runStatus(run)), view);
+			assert.equal(isUnfinished(runStatus(run)), status === "running" || status === "queued");
+		});
+	}
 });

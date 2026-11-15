@@ -350,6 +350,26 @@ describe("subagent registry: lifecycle", () => {
 		assert.equal(registry.get(c)?.consumedBy, "delivered");
 	});
 
+	it("markConsumed can record a delivery as a pointer (`delivered-omitted`); the first consumer is still kept", async () => {
+		const { registry } = setup();
+		const a = manualRun();
+		const b = manualRun();
+		const omitted = registry.start({ total: 1, run: a.run });
+		const waited = registry.start({ total: 1, run: b.run });
+		a.resolve("a");
+		b.resolve("b");
+		await tick();
+		assert.equal(registry.markConsumed(omitted, "delivered-omitted"), true);
+		assert.equal(registry.markConsumed(omitted), false);
+		const w = await registry.wait(omitted, 1000);
+		assert.equal(w.status === "settled" && w.launch.consumedBy, "delivered-omitted");
+		const c = await registry.cancel(omitted);
+		assert.equal(c.status === "settled" && c.launch.consumedBy, "delivered-omitted");
+		await registry.wait(waited, 1000);
+		assert.equal(registry.markConsumed(waited, "delivered-omitted"), false);
+		assert.equal(registry.get(waited)?.consumedBy, "wait");
+	});
+
 	it("the first consumer is kept: a later wait or cancel never rewrites it, and the outcome shows it", async () => {
 		const { registry } = setup();
 		const m = manualRun();

@@ -40,6 +40,103 @@ export function newRunId(agent: string, now: number = Date.now(), random: () => 
 	return `${stamp}-${name}-${random().replace(/-/g, "").slice(0, 6)}`;
 }
 
+/** The id format `newRunId` produces: `<yyyymmddThhmmssZ>-<name>-<6 hex>`. */
+const GENERATED_RUN_ID = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z-[A-Za-z0-9_-]+-[0-9a-f]{6}$/;
+
+/** Launch time from a generated run id, or undefined when the name is not one (or is not a real date). */
+function runIdTime(name: string): number | undefined {
+	if (!RUN_ID.test(name)) return undefined;
+	const m = GENERATED_RUN_ID.exec(name);
+	if (!m) return undefined;
+	const [y, mo, d, h, mi, s] = m.slice(1, 7).map(Number);
+	const time = Date.UTC(y, mo - 1, d, h, mi, s);
+	const back = new Date(time);
+	const real = back.getUTCFullYear() === y && back.getUTCMonth() === mo - 1 && back.getUTCDate() === d && back.getUTCHours() === h && back.getUTCMinutes() === mi && back.getUTCSeconds() === s;
+	return real ? time : undefined;
+}
+
+export interface PruneOptions {
+	/** Remove run folders launched more than this many days ago. Default 14. */
+	maxAgeDays?: number;
+	/** After the age rule, keep at most this many of the newest folders. Default 200. */
+	maxFolders?: number;
+	/** Remove at most this many folders per call, so a large backlog (the first prune after an upgrade) does not stall a session start; the rest waits for the next call. Default 50. */
+	maxRemovals?: number;
+	/** Clock, injectable for tests. */
+	now?: () => number;
+	/** Removes one folder; injectable for tests. Defaults to a recursive `fs.rmSync`. */
+	remove?: (dir: string) => void;
+}
+
+export interface PruneResult {
+	/** Names of the run folders removed. */
+	removed: string[];
+	/** One message per entry that could not be inspected or removed. */
+	errors: string[];
+}
+
+/**
+ * Retention for `<docs>/runs/`: removes run folders older than `maxAgeDays`, then the oldest
+ * beyond `maxFolders`, at most `maxRemovals` per call (oldest first; the count rule only gets what the
+ * age rule left of the cap). Age comes from the timestamp in the folder name, not the mtime, so
+ * copying or touching a folder does not revive it. Only real directories (lstat, never a
+ * symlink) whose name is a generated run id are touched; everything else is left alone.
+ * Never throws; a missing runs folder is a no-op.
+ */
+export function pruneRunFolders(docsDir: string, options: PruneOptions = {}): PruneResult {
+	const result: PruneResult = { removed: [], errors: [] };
+	try {
+		const maxAgeMs = (options.maxAgeDays ?? 14) * 86_400_000;
+		const maxFolders = options.maxFolders ?? 200;
+		let budget = Math.max(0, options.maxRemovals ?? 50);
+		const now = (options.now ?? Date.now)();
+		const remove = options.remove ?? ((dir: string) => fs.rmSync(dir, { recursive: true, force: true }));
+		const root = runsDir(docsDir);
+		try {
+			// A symlinked runs folder is never followed.
+			if (!fs.lstatSync(root).isDirectory()) return result;
+		} catch {
+			return result;
+		}
+		const names = fs.readdirSync(root);
+		const candidates: { name: string; time: number }[] = [];
+		for (const name of names) {
+			const time = runIdTime(name);
+			if (time === undefined) continue;
+			try {
+				if (!fs.lstatSync(path.join(root, name)).isDirectory()) continue;
+			} catch (err) {
+				result.errors.push(`${name}: ${err instanceof Error ? err.message : String(err)}`);
+				continue;
+			}
+			candidates.push({ name, time });
+		}
+		const tryRemove = (name: string): boolean => {
+			// An attempt spends the budget, a failed one too: the work per call stays bounded.
+			budget--;
+			try {
+				remove(path.join(root, name));
+				result.removed.push(name);
+				return true;
+			} catch (err) {
+				result.errors.push(`${name}: ${err instanceof Error ? err.message : String(err)}`);
+				return false;
+			}
+		};
+		// Oldest first; the name breaks ties so the order is stable.
+		candidates.sort((a, b) => a.time - b.time || (a.name < b.name ? -1 : 1));
+		const remaining = candidates.filter((c) => (now - c.time > maxAgeMs && budget > 0 ? !tryRemove(c.name) : true));
+		const excess = remaining.length - Math.max(0, maxFolders);
+		for (const c of remaining.slice(0, Math.max(0, excess))) {
+			if (budget <= 0) break;
+			tryRemove(c.name);
+		}
+	} catch (err) {
+		result.errors.push(err instanceof Error ? err.message : String(err));
+	}
+	return result;
+}
+
 /** Writes `task.md`, `transcript.json`, and `result.json` to `<docs>/runs/<runId>/`; returns the folder. */
 export function writeRunArtifacts(docsDir: string, record: RunRecord): string {
 	if (!RUN_ID.test(record.runId)) throw new Error(`invalid run id: ${record.runId}`);

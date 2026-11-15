@@ -7,12 +7,12 @@
 import { threadRows } from "./agent-thread.ts";
 import { formatElapsed } from "./agents-card.ts";
 import type { CommandOutcome } from "./child-rpc.ts";
-import { failed, type RunResult } from "./child-run.ts";
+import { isUnfinished, runStatus, type RunResult, type RunStatus } from "./child-run.ts";
 import { formatCost, formatTokens } from "./cost.ts";
 import type { Tone } from "./shell-bar.ts";
 import { maxScroll, type Row } from "./two-pane.ts";
 
-export type EntryState = "queued" | "running" | "done" | "failed" | "cancelled";
+export type EntryState = RunStatus;
 
 /** A run this process is tracking (in a launch in flight, or settled since the session started). `id` is stable across updates. */
 export interface TrackedRun {
@@ -41,15 +41,6 @@ const GLYPH: Record<EntryState, string> = { queued: "○", running: "◐", done:
 const TONE: Record<EntryState, Tone> = { queued: "muted", running: "accent", done: "success", failed: "error", cancelled: "muted" };
 const RANK: Record<EntryState, number> = { running: 0, queued: 1, done: 2, failed: 2, cancelled: 2 };
 
-/** Exit -1 with no end time is unfinished (queued until it gets a slot); with an end time it settled without finishing. */
-export function entryState(r: RunResult): EntryState {
-	if (r.exitCode === -1) {
-		if (r.endedAt === undefined) return r.queued ? "queued" : "running";
-		return r.cancelled ? "cancelled" : "failed";
-	}
-	return failed(r) ? "failed" : "done";
-}
-
 /** Identity of a result across its in-process and recorded copies. */
 const sameRunKey = (r: RunResult): string => (r.runId ? `id:${r.runId}` : ["", r.agent, r.task, r.startedAt ?? "", r.endedAt ?? ""].join("\u0000"));
 
@@ -71,8 +62,8 @@ export function buildEntries(input: { tracked: readonly TrackedRun[]; recorded: 
 	}
 	return items
 		.map(({ key, result, sortAt }) => {
-			const state = entryState(result);
-			const active = state === "running" || state === "queued";
+			const state = runStatus(result);
+			const active = isUnfinished(state);
 			const elapsed = state === "queued" || result.startedAt === undefined ? "" : formatElapsed((result.endedAt ?? input.now) - result.startedAt);
 			return { entry: { key, result, state, active, elapsed } as ViewerEntry, sortAt, startedAt: result.startedAt ?? 0 };
 		})

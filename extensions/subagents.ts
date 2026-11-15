@@ -19,16 +19,18 @@ import { agentsCard, FINISHED_TTL_MS, visibleRuns, type AgentRun, type RunState 
 import { ABORT_PROMPT, abortArmFor, autoScroll, buildEntries, canTakeOver, entryDetail, listRow, moveSelection, openTakeover, pressAbort, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, takeoverNotice, viewerFooter, viewerTitle, type AbortArm, type RecordedRun, type Selection, type TakeoverKey, type TakeoverState, type TrackedRun } from "../lib/subagent-viewer.ts";
 import type { ChildControl } from "../lib/child-rpc.ts";
 import { formatStatus, statusCounts } from "../lib/subagent-status.ts";
-import { queuedFields, runState, subagentRow, syncRowTimer, type RowInput, type RowTimerState } from "../lib/subagent-row.ts";
+import { queuedFields, subagentRow, syncRowTimer, type RowInput, type RowTimerState } from "../lib/subagent-row.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { listWidth, renderTwoPane } from "../lib/two-pane.ts";
 import { emptyTally, formatCost, formatTokens } from "../lib/cost.ts";
-import { failed, installParentExitGuard, KILL_GRACE_MS, liveChildren, output, runChild, type RunResult } from "../lib/child-run.ts";
-import { newRunId } from "../lib/run-artifacts.ts";
+import { installParentExitGuard, KILL_GRACE_MS, liveChildren, output, runChild, runStatus, toRunState, type RunResult } from "../lib/child-run.ts";
+import { newRunId, pruneRunFolders } from "../lib/run-artifacts.ts";
+import { repoDocsDir } from "../lib/repo-docs.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
 import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
-import { createResultDelivery, deliveredNote, omittedResultText, resultBatchMessage, resultCard, RESULT_MESSAGE_TYPE, type BatchEntry, type ResultMessageDetails } from "../lib/result-delivery.ts";
-import { createSubagentRegistry, type WaitOutcome } from "../lib/subagent-registry.ts";
+import { createResultDelivery, omittedLaunchIds, omittedResultText, resultBatchMessage, resultCard, RESULT_MESSAGE_TYPE, type BatchEntry, type ResultMessageDetails } from "../lib/result-delivery.ts";
+import { createSubagentRegistry } from "../lib/subagent-registry.ts";
+import { cancelLaunch, collectedResult, collectHint, startedText, waitForLaunch, WAIT_DEFAULT_SECONDS, WAIT_MAX_SECONDS } from "../lib/subagent-tools.ts";
 import { admitLaunch, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
 import { cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
 import { blockedReason, fallbackState } from "../lib/fallback-state.ts";
@@ -43,8 +45,6 @@ import { takeSnapshot } from "../lib/worktree-snapshot.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
-const WAIT_DEFAULT_SECONDS = 60;
-const WAIT_MAX_SECONDS = 300;
 /** Extra time on top of the SIGTERM->SIGKILL grace that session shutdown waits for children to settle. */
 const SHUTDOWN_SLACK_MS = 1000;
 const STATUS_KEY = "brigadev-agents";
@@ -89,11 +89,16 @@ const Params = Type.Object({
 	async: Type.Optional(Type.Boolean({ description: "Return a launch id now; collect it with subagent_wait" })),
 });
 
+// `runId` is the old name of `launchId` (it collides with the per-attempt run id): still accepted, exactly one is required (lib/subagent-tools.ts).
+const launchRef = {
+	launchId: Type.Optional(Type.String({ description: "Launch id from an async subagent call" })),
+	runId: Type.Optional(Type.String({ description: "Deprecated alias of launchId" })),
+};
 const WaitParams = Type.Object({
-	runId: Type.String({ description: "Launch id from an async subagent call" }),
+	...launchRef,
 	timeoutSeconds: Type.Optional(Type.Number({ description: `Default ${WAIT_DEFAULT_SECONDS}, max ${WAIT_MAX_SECONDS}` })),
 });
-const CancelParams = Type.Object({ runId: Type.String({ description: "Launch id from an async subagent call" }) });
+const CancelParams = Type.Object(launchRef);
 
 function formatUsage(r: RunResult): string {
 	const u = r.usage;
@@ -110,9 +115,9 @@ function formatUsage(r: RunResult): string {
 		.join(" · ");
 }
 
-/** Row state: an aborted placeholder (exitCode -1 with an end time) counts as failed. */
+/** Row state: queued counts as running, an aborted placeholder (exitCode -1 with an end time) as failed. */
 function rowState(r: RunResult): RunState {
-	return runState(r, failed(r));
+	return toRunState(runStatus(r));
 }
 
 function rowInput(r: RunResult): RowInput {
@@ -150,7 +155,7 @@ export default function (pi: ExtensionAPI) {
 
 	let skills: SkillRef[] = [];
 	const activeWriters: ActiveWriter[] = [];
-	// Async launches record the writers other launches register while they run (the A1 backstop exclusion).
+	// Async launches record the writers other launches register while they run (the writer backstop's exclusion of other launches' writers).
 	const writerListeners = new Set<(writers: readonly ActiveWriter[]) => void>();
 	// Launches in flight, sync or async, by id: their result placeholders are the one source of the footer's running count
 	// and of the viewer's live rows, so nothing is counted by hand and no exit path can leave a count behind.
@@ -178,9 +183,12 @@ export default function (pi: ExtensionAPI) {
 
 	// Idle delivery of async results the model did not collect: injected as a custom message that starts a parent turn.
 	// Pi API (docs/extensions.md in the installed pi-coding-agent): `pi.sendMessage(..., { triggerTurn: true, deliverAs: "steer" })`
-	// starts a turn when idle and joins the run when busy (L1627-1649); `ctx.isIdle()` (L1255-1257); `agent_settled` is the
-	// final-idle signal, `agent_end` is not (L336, L661-693); a renderer is registered per customType (L1805, L3165-3200).
+	// starts a turn when idle and joins the run when busy ("pi.sendMessage(message, options?)"); `ctx.isIdle()` ("ExtensionContext");
+	// `agent_settled` is the final-idle signal, `agent_end` is not ("agent_start / agent_end / agent_before_settle / agent_settled");
+	// a renderer is registered per customType ("pi.registerMessageRenderer(customType, renderer)").
 	let parentCtx: ExtensionContext | undefined;
+	// Launches the last delivery left as a pointer (size guard): recorded as such when the delivery succeeds.
+	let omittedInDelivery = new Set<string>();
 	const delivery = createResultDelivery<LaunchResult>({
 		isIdle: () => {
 			try {
@@ -190,20 +198,22 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 		isConsumed: (id) => registry.get(id)?.consumed ?? true,
-		markConsumed: (id) => void registry.markConsumed(id),
-		// One message per flush (D1): every ready launch in one combined message, so one parent turn starts and its model sees all of them.
+		markConsumed: (id) => void registry.markConsumed(id, omittedInDelivery.has(id) ? "delivered-omitted" : "delivered"),
+		// One message per flush: every ready launch in one combined message, so one parent turn starts and its model sees all of them.
 		deliver: (batch) => {
 			const entries = batch.map(({ id, launch, result }): BatchEntry => {
-				const collectedResult = collected(id, launch.error === undefined ? { status: "settled", launch, result } : { status: "settled", launch, error: launch.error });
+				const collected = collectedResult(id, launch.error === undefined ? { status: "settled", launch, result } : { status: "settled", launch, error: launch.error });
 				const tasks = (result?.details.results ?? []).map((r) => ({ agent: r.agent, artifactsDir: r.artifactsDir }));
-				return { id, text: collectedResult.content.map((c) => c.text).join("\n"), failed: collectedResult.isError === true || launch.error !== undefined, pointer: omittedResultText(id, tasks) };
+				return { id, text: collected.content.map((c) => c.text).join("\n"), failed: collected.isError === true || launch.error !== undefined, pointer: omittedResultText(id, tasks) };
 			});
-			pi.sendMessage(resultBatchMessage(entries), { triggerTurn: true, deliverAs: "steer" });
+			const message = resultBatchMessage(entries);
+			omittedInDelivery = new Set(omittedLaunchIds(entries));
+			pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
 		},
 		// Retried at each idle flush; when the bound is spent the result is still collectable with subagent_wait.
 		onDeliveryFailed: ({ id }) => {
 			try {
-				if (parentCtx?.hasUI) parentCtx.ui.notify(`brigadev: could not deliver the result of async subagent launch ${id}; collect it with subagent_wait {"runId":"${id}"}`, "warning");
+				if (parentCtx?.hasUI) parentCtx.ui.notify(`brigadev: could not deliver the result of async subagent launch ${id}; collect it with ${collectHint(id)}`, "warning");
 			} catch {
 				// A stale context: nobody to tell.
 			}
@@ -293,6 +303,12 @@ export default function (pi: ExtensionAPI) {
 		settled = [];
 		epoch++;
 		showCard(ctx);
+		// Run folders hold full transcripts: keep 14 days and at most 200 (lib/run-artifacts.ts). Never fails the session.
+		try {
+			pruneRunFolders(repoDocsDir(ctx.cwd));
+		} catch {
+			// Retention is housekeeping, not part of starting a session.
+		}
 	});
 	// Children (async and sync) get SIGTERM, and are given KILL_GRACE_MS + 1 s to settle; a group still alive then is
 	// SIGKILLed before this returns, so no child or grandchild outlives the parent. The wait is bounded: shutdown cannot hang.
@@ -424,7 +440,7 @@ export default function (pi: ExtensionAPI) {
 					finish(index, result) {
 						const cardRun = cards.get(index)!;
 						syncCard(cardRun, result);
-						cardRun.state = failed(result) || result.exitCode === -1 ? "failed" : "done";
+						cardRun.state = runStatus(result) === "done" ? "done" : "failed";
 						cardRun.endedAt = Date.now();
 						showCard(ctx);
 						repaintViewer?.();
@@ -504,19 +520,18 @@ export default function (pi: ExtensionAPI) {
 			// Async: the launch runs under the registry's own AbortController (the tool call's signal ends with the call).
 			// Admission errors were already returned above, before anything started.
 			const id = registry.start({ total: results.length, run: async (runSignal, control) => toResult(mode, await launch(runSignal, { onProgress: control.progress, tolerateAbort: true, async: true })) });
-			const names = [...new Set(requests.map((r) => r.agent))].join(", ");
 			return {
-				content: [{ type: "text", text: `Started async launch ${id} (${results.length} task${results.length === 1 ? "" : "s"}: ${names}). Collect it with subagent_wait {"runId":"${id}"}; stop it with subagent_cancel.` }],
+				content: [{ type: "text", text: startedText(id, results.length, [...new Set(requests.map((r) => r.agent))]) }],
 				details: { mode, results: results.map((r) => ({ ...r })), launchId: id, pending: true } as Details,
 			};
 		},
 
 		renderCall(args, theme) {
-			const launches = args.tasks?.length ? args.tasks : [{ agent: args.agent ?? "...", task: args.task ?? "", reason: args.reason ?? "" }];
-			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", launches.length > 1 ? `parallel (${launches.length})` : launches[0].agent) + (args.async ? theme.fg("muted", " async") : "");
-			for (const l of launches.slice(0, 4)) {
+			const shown = args.tasks?.length ? args.tasks : [{ agent: args.agent ?? "...", task: args.task ?? "", reason: args.reason ?? "" }];
+			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", shown.length > 1 ? `parallel (${shown.length})` : shown[0].agent) + (args.async ? theme.fg("muted", " async") : "");
+			for (const l of shown.slice(0, 4)) {
 				const preview = l.task.length > 60 ? `${l.task.slice(0, 60)}…` : l.task;
-				text += `\n  ${launches.length > 1 ? `${theme.fg("accent", l.agent)} ` : ""}${theme.fg("dim", preview)}`;
+				text += `\n  ${shown.length > 1 ? `${theme.fg("accent", l.agent)} ` : ""}${theme.fg("dim", preview)}`;
 				if (l.reason) text += theme.fg("muted", ` — ${l.reason}`);
 			}
 			return new Text(text, 0, 0);
@@ -559,34 +574,12 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/** What `subagent_wait` / `subagent_cancel` answer for each registry outcome. */
-	const collected = (id: string, outcome: WaitOutcome<LaunchResult>, waitedSeconds?: number): LaunchResult => {
-		const text = (t: string, isError?: boolean): LaunchResult => ({ content: [{ type: "text", text: t }], details: { mode: "single", results: [], launchId: id, pending: true }, ...(isError ? { isError } : {}) });
-		if (outcome.status === "unknown") return text(`Unknown launch id "${id}" (not started in this session, or pruned).`, true);
-		if (outcome.status === "running") {
-			const { done, total } = outcome.launch;
-			return text(`Launch ${id} still running: ${done}/${total} done${waitedSeconds === undefined ? "" : ` after ${waitedSeconds}s`}. Call subagent_wait again, or subagent_cancel.`);
-		}
-		if (outcome.error !== undefined || !outcome.result) return text(`Launch ${id} failed: ${outcome.error ?? "no result"}`, true);
-		return { ...outcome.result, details: { ...outcome.result.details, launchId: id } };
-	};
-
-	/** The idle delivery already put this result in the session: point at the saved folders instead of repeating it (wait and cancel alike). */
-	const deliveredResult = (id: string, outcome: WaitOutcome<LaunchResult>): LaunchResult | undefined => {
-		const note = deliveredNote(id, outcome);
-		return note === undefined ? undefined : ({ content: [{ type: "text", text: note }], details: { mode: "single", results: [], launchId: id, pending: true } } as LaunchResult);
-	};
-
 	pi.registerTool({
 		name: "subagent_wait",
 		label: "Subagent wait",
 		description: `Wait for an async subagent launch (default ${WAIT_DEFAULT_SECONDS}s, max ${WAIT_MAX_SECONDS}s). Returns its result, or its progress if still running.`,
 		parameters: WaitParams,
-		async execute(_id, params, signal) {
-			const seconds = Math.min(WAIT_MAX_SECONDS, Math.max(1, params.timeoutSeconds ?? WAIT_DEFAULT_SECONDS));
-			const outcome = await registry.wait(params.runId, seconds * 1000, signal);
-			return deliveredResult(params.runId, outcome) ?? collected(params.runId, outcome, seconds);
-		},
+		execute: async (_id, params, signal) => waitForLaunch(registry, params, signal),
 	});
 
 	pi.registerTool({
@@ -594,10 +587,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent cancel",
 		description: "Cancel an async subagent launch; returns the partial results.",
 		parameters: CancelParams,
-		async execute(_id, params) {
-			const outcome = await registry.cancel(params.runId);
-			return deliveredResult(params.runId, outcome) ?? collected(params.runId, outcome);
-		},
+		execute: async (_id, params) => cancelLaunch(registry, params),
 	});
 
 	/** Every run: those this process tracks (queued, running, and settled since the session started, async ones included) plus the finished ones recorded on this branch. */

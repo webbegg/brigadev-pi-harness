@@ -5,12 +5,10 @@
 // while it is still on the card.
 
 import { visibleRuns, type AgentRun } from "./agents-card.ts";
+import { isUnfinished, runStatus, type RunResult } from "./child-run.ts";
 
-/** The part of a task's result the count reads: an unfinished placeholder has exit code -1 and no end time. */
-export interface StatusTask {
-	exitCode: number;
-	endedAt?: number;
-}
+/** The part of a task's result the count reads (see `runStatus`): an unfinished placeholder has exit code -1 and no end time. */
+export type StatusTask = Pick<RunResult, "exitCode" | "endedAt" | "queued" | "cancelled" | "stopReason">;
 
 export interface StatusCounts {
 	running: number;
@@ -20,7 +18,7 @@ export interface StatusCounts {
 /** Tasks that are queued or running across the launches in flight. */
 export function activeTasks(launches: Iterable<readonly StatusTask[]>): number {
 	let n = 0;
-	for (const results of launches) for (const r of results) if (r.exitCode === -1 && r.endedAt === undefined) n++;
+	for (const results of launches) for (const r of results) if (isUnfinished(runStatus(r))) n++;
 	return n;
 }
 

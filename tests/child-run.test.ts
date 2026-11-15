@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { ChildControl } from "../lib/child-rpc.ts";
-import { CLOSE_DRAIN_MS, createChildTracker, failed, installParentExitGuard, KILL_GRACE_MS, output, runChild, type ParentProcessLike, type ChildProcessLike, type ChildRunDeps, type RunOptions, type RunResult, type SpawnFn } from "../lib/child-run.ts";
+import { CLOSE_DRAIN_MS, createChildTracker, descendantTargets, failed, listProcessesWithPs, parseProcessList, installParentExitGuard, KILL_GRACE_MS, output, runChild, type ParentProcessLike, type ChildProcessLike, type ChildRunDeps, type RunOptions, type RunResult, type SpawnFn } from "../lib/child-run.ts";
 import { CHILD_ENV, STRUCTURED_OUTPUT_EXTENSION_PATH } from "../lib/runtime.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -138,6 +138,10 @@ function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.Proc
 				now: () => h.clock,
 				tmpRoot,
 				docsDir: () => docs,
+				// A fake child has a made-up pid: never list or signal real processes unless a test injects its own.
+				listProcesses: () => [],
+				killPid: () => undefined,
+				selfPid: 100,
 				...over.deps,
 			});
 			// Surface a rejection to the test only when it awaits `promise`.
@@ -1150,7 +1154,7 @@ describe("createChildTracker: every live child in one place, with a bounded forc
 	});
 
 	it("killAll signals every tracked child's group now", async () => {
-		const tracker = createChildTracker();
+		const tracker = createChildTracker({ listProcesses: () => [] });
 		const groupKills: Array<[number, string]> = [];
 		const deps: Partial<ChildRunDeps> = { tracker, platform: "linux", killGroup: (pid, signal) => void groupKills.push([pid, signal]) };
 		const a = harness({ deps });
@@ -1225,7 +1229,7 @@ describe("createChildTracker: every live child in one place, with a bounded forc
 	});
 
 	it("R4-101 killAllNow SIGKILLs every tracked child group synchronously and never throws", async () => {
-		const tracker = createChildTracker();
+		const tracker = createChildTracker({ listProcesses: () => [] });
 		tracker.killAllNow(); // nothing tracked
 		const groupKills: Array<[number, string]> = [];
 		const deps: Partial<ChildRunDeps> = { tracker, platform: "linux", killGroup: (pid, signal) => void groupKills.push([pid, signal]) };
@@ -1255,7 +1259,7 @@ describe("createChildTracker: every live child in one place, with a bounded forc
 	});
 
 	it("R4-101 killAllNow falls back to the child itself when the group kill throws (the same path as terminate)", async () => {
-		const tracker = createChildTracker();
+		const tracker = createChildTracker({ listProcesses: () => [] });
 		const h = harness({ deps: { tracker, platform: "linux", killGroup: () => { throw new Error("ESRCH"); } } });
 		const promise = h.start();
 		const proc = await h.ready();
@@ -1355,5 +1359,226 @@ describe("installParentExitGuard: children do not outlive a parent that exits wi
 		assert.doesNotThrow(() => p.fire("exit"));
 		assert.doesNotThrow(() => p.fire("SIGTERM"));
 		assert.deepEqual(p.exits, [143], "still exits after a kill that threw");
+	});
+});
+
+// A child's bash tool runs its commands in their own process group, so the child's group kill misses them (D2).
+// Pids: 100 is this (parent) process in group 100; 4242 is the child (its own group); 4300 -> 4301 and 4400 are descendants in other groups.
+const PS = [
+	{ pid: 100, ppid: 1, pgid: 100 },
+	{ pid: 4242, ppid: 100, pgid: 4242 },
+	{ pid: 4300, ppid: 4242, pgid: 4300 }, // the bash tool's command, its own group
+	{ pid: 4301, ppid: 4300, pgid: 4300 }, // its helper, same group
+	{ pid: 4400, ppid: 4301, pgid: 4400 }, // a grandchild that started yet another group
+	{ pid: 4500, ppid: 4242, pgid: 4242 }, // a plain child in the child's own group
+	{ pid: 9000, ppid: 1, pgid: 9000 }, // unrelated
+];
+
+describe("process table helpers (D2, S5)", () => {
+	it("parseProcessList reads `pid ppid pgid` rows and skips anything else", () => {
+		assert.deepEqual(parseProcessList("  1     0     1\n 20  1  20\nnot a row\n\n"), [{ pid: 1, ppid: 0, pgid: 1 }, { pid: 20, ppid: 1, pgid: 20 }]);
+	});
+
+	it("descendantTargets is bounded and cycle-safe, and refuses a root of 0, 1 or the parent itself", () => {
+		const cycle = [{ pid: 100, ppid: 1, pgid: 100 }, { pid: 5, ppid: 6, pgid: 5 }, { pid: 6, ppid: 5, pgid: 6 }];
+		assert.deepEqual(descendantTargets(5, cycle, 100).groups.map((g) => g.pgid), [6]);
+		for (const root of [0, 1, 100, Number.NaN]) assert.deepEqual(descendantTargets(root, PS, 100), { groups: [], pids: [] });
+		const wide = [{ pid: 100, ppid: 1, pgid: 100 }, ...Array.from({ length: 5000 }, (_, i) => ({ pid: 1000 + i, ppid: 50, pgid: 1000 + i }))];
+		assert.ok(descendantTargets(50, wide, 100).groups.length <= 1001);
+	});
+
+	it("with the parent's group unknown, no group is trusted: descendants are signalled by pid", () => {
+		assert.deepEqual(descendantTargets(4242, PS.filter((e) => e.pid !== 100), 100), { groups: [], pids: [4300, 4500, 4301, 4400] });
+	});
+
+	it("the default listing is the real process table: it holds this process, with its parent and group", () => {
+		const me = listProcessesWithPs().find((e) => e.pid === process.pid);
+		assert.equal(me?.ppid, process.ppid);
+		assert.ok((me?.pgid ?? 0) > 1);
+	});
+});
+
+describe("forced kills also reach the child's descendant process groups (D2, S5)", () => {
+	const forcedHarness = (over: Parameters<typeof harness>[0] = {}, list: () => Array<{ pid: number; ppid: number; pgid: number }> = () => PS) => {
+		const groupKills: Array<[number, string]> = [];
+		const pidKills: Array<[number, string]> = [];
+		let listed = 0;
+		const h = harness({
+			...over,
+			deps: {
+				platform: "linux",
+				killGroup: (pid, signal) => void groupKills.push([pid, signal]),
+				killPid: (pid, signal) => void pidKills.push([pid, signal]),
+				listProcesses: () => {
+					listed++;
+					return list();
+				},
+				...over.deps,
+			},
+		});
+		return { h, groupKills, pidKills, listed: () => listed };
+	};
+	const sorted = (kills: Array<[number, string]>) => [...kills].sort(([a], [b]) => a - b);
+
+	it("the SIGKILL after the grace also kills descendants' groups; the SIGTERM before it does not list or signal them", async () => {
+		const controller = new AbortController();
+		const { h, groupKills, pidKills, listed } = forcedHarness({ signal: controller.signal });
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.pid = 4242;
+		controller.abort();
+		assert.deepEqual(groupKills, [[4242, "SIGTERM"]], "graceful: the child's group only, so it can clean up");
+		assert.equal(listed(), 0, "the graceful path does not even list processes");
+		h.time.advance(KILL_GRACE_MS);
+		assert.equal(listed(), 1, "a single child's own forced kill lists once, for itself");
+		assert.deepEqual(groupKills[1], [4242, "SIGKILL"], "the child's own group first");
+		assert.deepEqual(sorted(groupKills.slice(2)), [[4300, "SIGKILL"], [4400, "SIGKILL"]]);
+		assert.equal(groupKills.length, 4, "nothing unrelated, no duplicate of the child's group");
+		assert.deepEqual(pidKills, []);
+		proc.close(null);
+		await assert.rejects(promise, /aborted/);
+	});
+
+	it("the close-drain SIGKILL ends the child's own group only and lists no processes (the child is gone: its descendants are reparented and its pid may be reused)", async () => {
+		const { h, groupKills, pidKills, listed } = forcedHarness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.pid = 4242;
+		proc.emit("exit", 0, null);
+		h.time.advance(CLOSE_DRAIN_MS);
+		await promise;
+		assert.deepEqual(groupKills, [[4242, "SIGKILL"]]);
+		assert.deepEqual(pidKills, []);
+		assert.equal(listed(), 0, "no process listing after the child exited");
+	});
+
+	it("never signals pid/group 0 or 1, the parent's pid, or the parent's own group; a descendant in the parent's group is killed by pid", async () => {
+		const hostile = [
+			{ pid: 4242, ppid: 100, pgid: 4242 },
+			{ pid: 100, ppid: 4242, pgid: 100 }, // the parent itself listed as a descendant (a bogus cycle)
+			{ pid: 1, ppid: 4242, pgid: 1 },
+			{ pid: 0, ppid: 4242, pgid: 0 },
+			{ pid: 4600, ppid: 4242, pgid: 1 }, // group 1
+			{ pid: 4601, ppid: 4242, pgid: 0 }, // group 0
+			{ pid: 4602, ppid: 4242, pgid: 100 }, // in the parent's own group
+			{ pid: 4700, ppid: 4242, pgid: 4700 }, // fine
+		];
+		const self = { pid: 100, ppid: 1, pgid: 100 };
+		const controller = new AbortController();
+		const { h, groupKills, pidKills } = forcedHarness({ signal: controller.signal }, () => [self, ...hostile]);
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.pid = 4242;
+		controller.abort();
+		h.time.advance(KILL_GRACE_MS);
+		proc.close(null);
+		await assert.rejects(promise, /aborted/);
+		assert.deepEqual(groupKills, [[4242, "SIGTERM"], [4242, "SIGKILL"], [4700, "SIGKILL"]]);
+		assert.deepEqual(pidKills, [[4602, "SIGKILL"]], "only a pid, never the parent's group");
+	});
+
+	it("a process list that fails (throws, or is empty) falls back to the existing behavior and never throws", async () => {
+		for (const list of [() => { throw new Error("ps: not found"); }, () => []]) {
+			const controller = new AbortController();
+			const { h, groupKills, pidKills } = forcedHarness({ signal: controller.signal }, list);
+			const promise = h.start();
+			const proc = await h.ready();
+			proc.pid = 4242;
+			controller.abort();
+			h.time.advance(KILL_GRACE_MS);
+			assert.deepEqual(groupKills, [[4242, "SIGTERM"], [4242, "SIGKILL"]]);
+			assert.deepEqual(pidKills, []);
+			proc.close(null);
+			await assert.rejects(promise, /aborted/);
+		}
+	});
+
+	it("a descendant group that cannot be signalled falls back to its pids", async () => {
+		const controller = new AbortController();
+		const { h, pidKills } = forcedHarness({ signal: controller.signal, deps: { killGroup: (pid) => { if (pid !== 4242) throw new Error("EPERM"); } } });
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.pid = 4242;
+		controller.abort();
+		h.time.advance(KILL_GRACE_MS);
+		assert.deepEqual(sorted(pidKills), [[4300, "SIGKILL"], [4301, "SIGKILL"], [4400, "SIGKILL"]]);
+		proc.close(null);
+		await assert.rejects(promise, /aborted/);
+	});
+
+	it("win32 and a child without a pid skip the listing", async () => {
+		for (const [platform, pid] of [["win32", 4242], ["linux", undefined]] as const) {
+			const controller = new AbortController();
+			const { h, listed } = forcedHarness({ signal: controller.signal, deps: { platform } });
+			const promise = h.start();
+			const proc = await h.ready();
+			proc.pid = pid;
+			controller.abort();
+			h.time.advance(KILL_GRACE_MS);
+			assert.equal(listed(), 0, platform);
+			assert.deepEqual(proc.kills, ["SIGTERM", "SIGKILL"], platform);
+			proc.close(null);
+			await assert.rejects(promise, /aborted/);
+		}
+	});
+
+	it("tracker killAllNow and shutdown survivors kill the descendants' groups; shutdown's SIGTERM does not", async () => {
+		const tracker = createChildTracker({ listProcesses: () => PS });
+		const { h, groupKills, listed } = forcedHarness({ deps: { tracker } });
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.pid = 4242;
+		const time = h.time;
+		const down = tracker.shutdown({ graceMs: 6000, setTimer: time.setTimer, clearTimer: time.clearTimer });
+		assert.deepEqual(groupKills, [[4242, "SIGTERM"]]);
+		assert.equal(listed(), 0);
+		time.advance(6000);
+		await down;
+		assert.deepEqual(sorted(groupKills.slice(1)), [[4242, "SIGKILL"], [4300, "SIGKILL"], [4400, "SIGKILL"]]);
+		groupKills.length = 0;
+		tracker.killAllNow();
+		assert.deepEqual(sorted(groupKills), [[4242, "SIGKILL"], [4300, "SIGKILL"], [4400, "SIGKILL"]], "synchronously, in the exit handler");
+		proc.close(null);
+		await promise;
+	});
+
+	// Three tracked children: one forced pass takes ONE process listing (not one synchronous `ps` of up to 2 s per child) and hands it to each.
+	const trackedThree = async (list: () => Array<{ pid: number; ppid: number; pgid: number }>) => {
+		let trackerListed = 0;
+		const tracker = createChildTracker({ listProcesses: () => (trackerListed++, list()) });
+		const groupKills: Array<[number, string]> = [];
+		let ownListed = 0;
+		const deps: Partial<ChildRunDeps> = { tracker, platform: "linux", killGroup: (pid, signal) => void groupKills.push([pid, signal]), listProcesses: () => (ownListed++, PS) };
+		const runs = [harness({ deps }), harness({ deps }), harness({ deps })];
+		const promises = runs.map((r) => r.start());
+		const pids = [4242, 5000, 5100];
+		for (const [i, r] of runs.entries()) (await r.ready()).pid = pids[i];
+		return { tracker, groupKills, trackerListed: () => trackerListed, ownListed: () => ownListed, finish: () => Promise.all(runs.map((r, i) => (r.proc!.close(null), promises[i]))) };
+	};
+
+	it("a forced pass over three tracked children takes one process listing and hands it to each", async () => {
+		const t = await trackedThree(() => [...PS, { pid: 5000, ppid: 100, pgid: 5000 }, { pid: 5100, ppid: 100, pgid: 5100 }]);
+		t.tracker.killAllNow();
+		assert.equal(t.trackerListed(), 1);
+		assert.equal(t.ownListed(), 0, "no child lists for itself during a tracker pass");
+		assert.deepEqual(sorted(t.groupKills), [[4242, "SIGKILL"], [4300, "SIGKILL"], [4400, "SIGKILL"], [5000, "SIGKILL"], [5100, "SIGKILL"]]);
+		t.groupKills.length = 0;
+		t.tracker.killAll("SIGTERM");
+		assert.equal(t.trackerListed(), 1, "a graceful pass lists nothing");
+		t.tracker.killAll("SIGKILL");
+		assert.equal(t.trackerListed(), 2, "one listing per forced pass");
+		assert.equal(t.ownListed(), 0);
+		await t.finish();
+	});
+
+	it("a failed listing in a tracker pass still kills each child's own group, and never throws", async () => {
+		for (const list of [() => { throw new Error("ps: timed out"); }, () => []]) {
+			const t = await trackedThree(list);
+			assert.doesNotThrow(() => t.tracker.killAllNow());
+			assert.equal(t.trackerListed(), 1);
+			assert.equal(t.ownListed(), 0, "a failed shared listing is not retried per child");
+			assert.deepEqual(sorted(t.groupKills), [[4242, "SIGKILL"], [5000, "SIGKILL"], [5100, "SIGKILL"]]);
+			await t.finish();
+		}
 	});
 });

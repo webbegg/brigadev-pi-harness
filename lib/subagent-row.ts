@@ -4,6 +4,7 @@
 
 import { argPreview } from "./agent-thread.ts";
 import { formatElapsed, shortModel, type RunState } from "./agents-card.ts";
+import { runStatus, type RunResult } from "./child-run.ts";
 import { drawnTicker, type DrawnTicker, type TickerDeps } from "./compact-tools.ts";
 import { formatCost } from "./cost.ts";
 import type { Tone } from "./shell-bar.ts";
@@ -88,17 +89,11 @@ export function queuedFields(route: { model?: string; thinking?: string; modelSo
 	return { model: route.model, thinking: route.thinking, route: label, inherited: route.modelSource === "parent", queued: true };
 }
 
-/** Row state of a run: exit -1 with an end time is a placeholder that settled without finishing. */
-export function runState(r: { exitCode: number; endedAt?: number; stopReason?: string }, failed: boolean): RunState {
-	if (r.exitCode === -1) return r.endedAt === undefined ? "running" : "failed";
-	return failed ? "failed" : "done";
-}
-
 /** Settle placeholders that never started (aborted while queued); returns how many. */
-export function settleQueued(results: Array<{ exitCode: number; queued?: boolean; cancelled?: boolean; endedAt?: number }>, at: number): number {
+export function settleQueued(results: Array<Pick<RunResult, "exitCode" | "queued" | "cancelled" | "endedAt" | "stopReason">>, at: number): number {
 	let n = 0;
 	for (const r of results) {
-		if (r.exitCode !== -1 || !r.queued || r.endedAt !== undefined) continue;
+		if (runStatus(r) !== "queued") continue;
 		r.endedAt = at;
 		r.cancelled = true;
 		n++;

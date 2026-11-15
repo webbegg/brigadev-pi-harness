@@ -7,7 +7,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentDefinition } from "./agents.ts";
 import type { ChildControl } from "./child-rpc.ts";
-import { failed, finalText, output, type RunResult } from "./child-run.ts";
+import { failed, finalText, isUnfinished, output, runStatus, type RunResult } from "./child-run.ts";
 import { emptyTally } from "./cost.ts";
 import { buildChildTask, type ActiveWriter, type LaunchRequest, type SkillRef } from "./delegation.ts";
 import { classifyFailure, type FailureCategory } from "./fallback.ts";
@@ -21,7 +21,7 @@ const OUTSIDE_WARNING = "files changed outside the writers' allowed edit surface
 const CANCELLED_TEXT = "Cancelled before it started.";
 
 /** A placeholder that never started (aborted while queued): neither a success nor a child failure. */
-const cancelled = (r: RunResult) => r.cancelled === true && r.exitCode === -1;
+const cancelled = (r: RunResult) => runStatus(r) === "cancelled";
 
 export const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
@@ -303,7 +303,7 @@ export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<L
 				// A task that threw before it could settle (e.g. its view hook failed) must not stay counted as running
 				// while its siblings finish: the footer count is derived from these placeholders.
 				const r = results[index];
-				if (r.exitCode === -1 && r.endedAt === undefined) Object.assign(r, { endedAt: now(), stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error) });
+				if (isUnfinished(runStatus(r))) Object.assign(r, { endedAt: now(), stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error) });
 			} finally {
 				removeWriter(writers[index]);
 			}

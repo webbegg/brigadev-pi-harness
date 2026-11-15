@@ -21,9 +21,9 @@ export type ChildEvent =
 	| { type: "tool_end"; id: string; name: string }
 	/** Streaming text of the assistant message in progress (Pi json.md `message_update` / `text_delta`); `reset` starts a new message. */
 	| { type: "partial"; delta: string; reset?: boolean }
-	/** The agent's run phase (json.md:31-48): a low-level run started or ended; `settled` means Pi will not continue by itself (`aborted` when the run was aborted). */
+	/** The agent's run phase (json.md, "Event sequence" and "Agent and turn events"): a low-level run started or ended; `settled` means Pi will not continue by itself (`aborted` when the run was aborted). */
 	| { type: "run"; phase: "start" | "end" | "settled"; aborted?: boolean }
-	/** The answer to one command written to stdin (rpc.md:35-48); `disposition` is the prompt/steer/follow_up outcome. */
+	/** The answer to one command written to stdin (rpc.md, "Correlate commands and responses"); `disposition` is the prompt/steer/follow_up outcome. */
 	| { type: "response"; command: string; success: boolean; id?: string; error?: string; disposition?: string }
 	/** An extension in the child asked its UI something (rpc-extension-ui.md); the run loop answers it per lib/child-rpc.ts. */
 	| { type: "ui_request"; request: UiRequest }
@@ -41,6 +41,7 @@ export interface ChildSnapshot {
 	partial?: string;
 }
 
+/** A fresh snapshot (no production caller: the run loop folds into its own RunResult; tests start from this). */
 export const emptySnapshot = (): ChildSnapshot => ({ messages: [], usage: emptyTally() });
 
 const RUN_PHASES = { agent_start: "start", agent_end: "end", agent_settled: "settled" } as const;

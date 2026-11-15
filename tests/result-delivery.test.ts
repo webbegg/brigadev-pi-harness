@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { alreadyDeliveredText, BATCH_TEXT_CAP, createResultDelivery, DELIVERY_ATTEMPTS, deliveredNote, omittedResultText, RESULT_MESSAGE_TYPE, resultBatchMessage, resultCard, resultMessage } from "../lib/result-delivery.ts";
+import { alreadyDeliveredText, BATCH_TEXT_CAP, createResultDelivery, DELIVERY_ATTEMPTS, deliveredNote, omittedLaunchIds, omittedResultText, RESULT_MESSAGE_TYPE, resultBatchMessage, resultCard, resultMessage } from "../lib/result-delivery.ts";
 import { PER_TASK_OUTPUT_CAP } from "../lib/subagent-launch.ts";
 import { createSubagentRegistry, type LaunchSummary } from "../lib/subagent-registry.ts";
 
@@ -527,10 +527,36 @@ describe("alreadyDeliveredText: what subagent_wait says about a launch whose res
 		const text = alreadyDeliveredText("L1", [{ agent: "scout", artifactsDir: "/d/r" }]);
 		assert.ok(text.split("\n").length <= 4);
 	});
+
+	it("omitted with no saved folders does not point at folders below: it says a pointer was delivered and no folder is available", () => {
+		const text = alreadyDeliveredText("L3", [], { omitted: true });
+		assert.match(text, /L3/);
+		assert.match(text, /delivered to this session as a pointer/);
+		assert.match(text, /no saved folder is available/);
+		assert.ok(!text.includes("below"), "no promise of folders that are not listed");
+		assert.ok(!text.includes("result.json"));
+		assert.ok(!text.includes("too large"), "no size claim when nothing says it was size");
+	});
+
+	it("omitted with an error (a failed launch) gives the error instead of 'too large'", () => {
+		const text = alreadyDeliveredText("L4", [], { omitted: true, error: "spawn pi ENOENT" });
+		assert.match(text, /spawn pi ENOENT/);
+		assert.match(text, /no saved folder is available/);
+		assert.ok(!text.includes("too large"));
+		assert.ok(!text.includes("below"));
+	});
+
+	it("omitted with folders keeps the 'saved folders below' wording, even when an error is passed", () => {
+		const tasks = [{ agent: "scout", artifactsDir: "/d/r" }];
+		assert.match(alreadyDeliveredText("L1", tasks, { omitted: true }), /too large to include in the delivered message: read it from the saved folders below \(result\.json\)/);
+		assert.equal(alreadyDeliveredText("L1", tasks, { omitted: true, error: "x" }), alreadyDeliveredText("L1", tasks, { omitted: true }));
+	});
 });
 
+type R0 = { details: { results: { agent: string; artifactsDir?: string }[] } };
+
 describe("deliveredNote: the one decision both subagent_wait and subagent_cancel use", () => {
-	const outcome = (consumedBy: "wait" | "cancel" | "delivered" | undefined) => ({
+	const outcome = (consumedBy: "wait" | "cancel" | "delivered" | "delivered-omitted" | undefined) => ({
 		status: "settled" as const,
 		launch: summary("L1", consumedBy ? { consumed: true, consumedBy } : {}),
 		result: { details: { results: [{ agent: "scout", artifactsDir: "/d/runs/scout-1" }, { agent: "reviewer" }] } },
@@ -552,6 +578,65 @@ describe("deliveredNote: the one decision both subagent_wait and subagent_cancel
 	it("a delivered launch with no result still gets the note, naming no folders", () => {
 		const note = deliveredNote("L1", { status: "settled", launch: summary("L1", { consumed: true, consumedBy: "delivered" }), error: "boom" });
 		assert.equal(note, alreadyDeliveredText("L1", []));
+	});
+
+	it("a launch delivered as a pointer with no result (a failed launch) gets its error and no folder promise", () => {
+		const note = deliveredNote("L1", { status: "settled", launch: summary("L1", { consumed: true, consumedBy: "delivered-omitted" }), error: "spawn pi ENOENT" }) ?? "";
+		assert.equal(note, alreadyDeliveredText("L1", [], { omitted: true, error: "spawn pi ENOENT" }));
+		assert.match(note, /spawn pi ENOENT/);
+		assert.ok(!note.includes("too large") && !note.includes("below"));
+		const bare = deliveredNote("L1", { status: "settled", launch: summary("L1", { consumed: true, consumedBy: "delivered-omitted" }) }) ?? "";
+		assert.match(bare, /no saved folder is available/);
+		assert.ok(!bare.includes("below"));
+	});
+
+	it("a launch delivered as a pointer gets a note that says its result was too large to include and points to result.json", () => {
+		const note = deliveredNote("L1", outcome("delivered-omitted")) ?? "";
+		assert.equal(note, alreadyDeliveredText("L1", [{ agent: "scout", artifactsDir: "/d/runs/scout-1" }, { agent: "reviewer", artifactsDir: undefined }], { omitted: true }));
+		assert.match(note, /too large to include in the delivered message/);
+		assert.match(note, /result\.json/);
+		assert.ok(note.includes("scout: /d/runs/scout-1"));
+		assert.ok(!note.includes("in the conversation above"), "the false claim is gone");
+		assert.notEqual(note, deliveredNote("L1", outcome("delivered")));
+	});
+
+	it("a full-text delivery keeps today's note exactly", () => {
+		const note = deliveredNote("L1", outcome("delivered")) ?? "";
+		assert.ok(note.startsWith("Launch L1 was already delivered to this session: its result is in the conversation above, so it is not repeated here."));
+		assert.equal(note, alreadyDeliveredText("L1", [{ agent: "scout", artifactsDir: "/d/runs/scout-1" }, { agent: "reviewer", artifactsDir: undefined }]));
+	});
+
+	it("through the real registry: an omitted launch gets the pointer note via wait and cancel; a full-text one the unchanged note; the first consumer wins", async () => {
+		type R = { details: { results: { agent: string; artifactsDir?: string }[] } };
+		let n = 0;
+		const registry = createSubagentRegistry<R>({ setTimer: setTimeout, clearTimer: (h) => clearTimeout(h as NodeJS.Timeout), newId: () => `L${++n}` });
+		const ids = ["full", "cut"].map(() => registry.start({ total: 1, run: async () => ({ details: { results: [{ agent: "scout", artifactsDir: `/d/runs/${n}` }] } }) }));
+		await new Promise((resolve) => setImmediate(resolve));
+		// What the extension does after a delivery: the ids the size guard replaced are marked as delivered-omitted.
+		const omitted = new Set(omittedLaunchIds([{ id: ids[0], text: "a".repeat(100), failed: false, pointer: "" }, { id: ids[1], text: "b".repeat(150), failed: false, pointer: "" }], 200));
+		for (const id of ids) assert.equal(registry.markConsumed(id, omitted.has(id) ? "delivered-omitted" : "delivered"), true);
+		assert.equal(registry.markConsumed(ids[1]), false);
+
+		const waitedCut = await registry.wait(ids[1], 1000);
+		const cancelledCut = await registry.cancel(ids[1]);
+		for (const o of [waitedCut, cancelledCut]) {
+			assert.match(deliveredNote(ids[1], o) ?? "", /too large to include in the delivered message/);
+			assert.ok(!(deliveredNote(ids[1], o) ?? "").includes("in the conversation above"));
+		}
+		const waitedFull = await registry.wait(ids[0], 1000);
+		const cancelledFull = await registry.cancel(ids[0]);
+		for (const o of [waitedFull, cancelledFull]) assert.match(deliveredNote(ids[0], o) ?? "", /its result is in the conversation above/);
+	});
+
+	it("first consumer wins: an omitted delivery after a wait stays `wait` and gets no note", async () => {
+		const registry = createSubagentRegistry<R0>({ setTimer: setTimeout, clearTimer: (h) => clearTimeout(h as NodeJS.Timeout), newId: () => "L9" });
+		registry.start({ total: 1, run: async () => ({ details: { results: [] } }) });
+		await new Promise((resolve) => setImmediate(resolve));
+		await registry.wait("L9", 1000);
+		assert.equal(registry.markConsumed("L9", "delivered-omitted"), false);
+		const again = await registry.wait("L9", 1000);
+		assert.equal(again.status === "settled" && again.launch.consumedBy, "wait");
+		assert.equal(deliveredNote("L9", again), undefined);
 	});
 
 	it("cancel after delivery through the registry reports the note, not the result", async () => {
@@ -644,6 +729,15 @@ describe("D1: the combined message of a batch and its card", () => {
 		assert.ok(!m.content.includes("bbbb"));
 		assert.ok(!m.content.includes("cccc"), "L3 would fit, but the order of results is kept");
 		assert.ok(m.content.includes("/docs/runs/L3"));
+	});
+
+	it("omittedLaunchIds: the ids whose text the size guard replaces, the same rule resultBatchMessage applies", () => {
+		const e = (id: string, n: number) => entry(id, "x".repeat(n));
+		assert.deepEqual(omittedLaunchIds([e("L1", 100), e("L2", 150), e("L3", 10)], 200), ["L2", "L3"]);
+		assert.deepEqual(omittedLaunchIds([e("L1", 100), e("L2", 50)], 200), []);
+		assert.deepEqual(omittedLaunchIds([e("L1", BATCH_TEXT_CAP + 10), e("L2", 1)]), ["L2"], "the first is never omitted");
+		assert.deepEqual(omittedLaunchIds([e("L1", BATCH_TEXT_CAP + 10)]), []);
+		assert.deepEqual(omittedLaunchIds([]), []);
 	});
 
 	it("omittedResultText: names the launch, says the text was left out, lists each task's saved folder", () => {
