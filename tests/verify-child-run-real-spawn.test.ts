@@ -9,7 +9,9 @@ import { output, runChild, type RunOptions } from "../lib/child-run.ts";
 //  - ok:      answers the prompt, then settles (the parent must close stdin for the child to exit)
 //  - hang:    accepts the prompt and never finishes (abort test)
 //  - confirm: sends an extension UI confirm request and blocks until it is answered; the answer is logged to FAKE_LOG
+//  - stubborn: like hang, but ignores SIGTERM and starts a `sleep` in a process group of its own (as a bash tool does); its pid goes to FAKE_LOG
 const FAKE_PI = `import * as fs from "node:fs";
+import { spawn } from "node:child_process";
 const line = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
 const mode = process.env.FAKE_MODE;
 const finish = (text) => {
@@ -22,6 +24,13 @@ const onCommand = (command) => {
 	if (command.type === "prompt") {
 		line({ type: "response", command: "prompt", success: true, data: { disposition: "started" } });
 		if (mode === "hang") return setInterval(() => {}, 1000);
+		if (mode === "stubborn") {
+			process.on("SIGTERM", () => {});
+			const tool = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+			tool.unref();
+			fs.writeFileSync(process.env.FAKE_LOG, String(tool.pid));
+			return setInterval(() => {}, 1000);
+		}
 		if (mode === "confirm") return line({ type: "extension_ui_request", id: "ui-1", method: "confirm", title: "Allow rm -rf?", message: "really" });
 		return finish("real child answer");
 	}
@@ -90,6 +99,41 @@ it("default node spawn: aborting a running child rejects after SIGTERM and still
 	assert.equal(fs.readdirSync(path.join(docs, "runs")).length, 1);
 	assert.deepEqual(fs.readdirSync(tmpRoot), []);
 	fs.rmSync(root, { recursive: true, force: true });
+});
+
+it("S5, default node spawn: a child that ignores SIGTERM is SIGKILLed after the grace and so is its tool command in another process group", { timeout: 20_000, skip: process.platform === "win32" }, async () => {
+	const ac = new AbortController();
+	const { p, root } = setup("stubborn", ac.signal);
+	const pidFile = path.join(root, "ui-response.json");
+	let toolPid = 0;
+	try {
+		for (let i = 0; i < 100 && !toolPid; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			toolPid = Number(fs.existsSync(pidFile) ? fs.readFileSync(pidFile, "utf8") : 0);
+		}
+		assert.ok(toolPid > 1, "the child started its tool command");
+		ac.abort();
+		await assert.rejects(p, /Subagent was aborted/);
+		const alive = () => {
+			try {
+				process.kill(toolPid, 0);
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		for (let i = 0; i < 40 && alive(); i++) await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.equal(alive(), false, "the tool command died with the forced kill");
+	} finally {
+		if (toolPid > 1) {
+			try {
+				process.kill(toolPid, "SIGKILL");
+			} catch {
+				// Already gone.
+			}
+		}
+		fs.rmSync(root, { recursive: true, force: true });
+	}
 });
 
 it("S0, default node spawn: a child that blocks on an extension UI confirm is answered with a cancellation and the run completes", { timeout: 15_000 }, async () => {

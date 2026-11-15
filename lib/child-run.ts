@@ -3,7 +3,7 @@
 // into a run snapshot, answer its extension UI requests with a cancellation (S0: nothing
 // waits for a person), close its stdin when the agent settles so it exits, expose a
 // steering handle while it runs, capture stderr, watch for stalls, terminate on abort
-// (SIGTERM, then SIGKILL after 5 s), check structured output, and save the attempt's
+// (SIGTERM, then SIGKILL after 5 s, which also reaches the descendants' own process groups), check structured output, and save the attempt's
 // folder. No Pi runtime imports: the spawn function, timers, Pi invocation, and cost calculator are injected, so a
 // test drives it with a fake child.
 //
@@ -13,7 +13,7 @@
 // Caller hooks (`onUpdate`, `onControl`) are isolated: a throwing hook is swallowed, because a UI bug
 // is not the child's outcome and must never skip settlement or crash a stream handler.
 
-import { spawn as nodeSpawn } from "node:child_process";
+import { execFileSync, spawn as nodeSpawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -42,6 +42,72 @@ export const CLOSE_DRAIN_MS = 1000;
 
 /** Streaming text updates reach `onUpdate` at most this often; the snapshot itself is always current. */
 export const PARTIAL_UPDATE_MS = 100;
+
+/** One row of the process table. */
+export interface ProcessEntry {
+	pid: number;
+	ppid: number;
+	pgid: number;
+}
+
+/** The longest the process listing may take, and the most descendants one forced kill follows. */
+const PROCESS_LIST_TIMEOUT_MS = 2000;
+const MAX_DESCENDANTS = 1000;
+
+export function parseProcessList(text: string): ProcessEntry[] {
+	const entries: ProcessEntry[] = [];
+	for (const line of text.split("\n")) {
+		const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s*$/.exec(line);
+		if (match) entries.push({ pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]) });
+	}
+	return entries;
+}
+
+/** The process table, synchronously (a process 'exit' handler may use it); throws when `ps` fails or takes too long. */
+export function listProcessesWithPs(): ProcessEntry[] {
+	const text = execFileSync("ps", ["-axo", "pid=,ppid=,pgid="], { encoding: "utf8", timeout: PROCESS_LIST_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+	return parseProcessList(text);
+}
+
+/** What a forced kill adds to the child's own group kill: descendants grouped by process group, and single pids. */
+export interface DescendantTargets {
+	groups: Array<{ pgid: number; pids: number[] }>;
+	/** Descendants that sit in the parent's own group (or an unknown one): signalled alone, never through the group. */
+	pids: number[];
+}
+
+/**
+ * The processes below `rootPid` (found by parent links, bounded, cycle-safe) grouped by process group. Never lists pid 0/1,
+ * the parent itself (`selfPid`), a group 0/1, or the parent's own group as a group target: a descendant that shares the
+ * parent's group is listed by pid only, and when the parent's group is unknown no group is trusted.
+ */
+export function descendantTargets(rootPid: number, table: readonly ProcessEntry[], selfPid: number): DescendantTargets {
+	const targets: DescendantTargets = { groups: [], pids: [] };
+	if (!(rootPid > 1) || rootPid === selfPid) return targets;
+	const childrenOf = new Map<number, ProcessEntry[]>();
+	for (const entry of table) {
+		const siblings = childrenOf.get(entry.ppid);
+		if (siblings) siblings.push(entry);
+		else childrenOf.set(entry.ppid, [entry]);
+	}
+	const selfGroup = table.find((entry) => entry.pid === selfPid)?.pgid;
+	const groups = new Map<number, number[]>();
+	const seen = new Set<number>([rootPid]);
+	const queue = [rootPid];
+	while (queue.length > 0 && seen.size <= MAX_DESCENDANTS) {
+		for (const entry of childrenOf.get(queue.shift()!) ?? []) {
+			if (seen.size > MAX_DESCENDANTS) break;
+			if (seen.has(entry.pid) || entry.pid <= 1 || entry.pid === selfPid) continue;
+			seen.add(entry.pid);
+			queue.push(entry.pid);
+			if (!(entry.pgid > 1)) continue;
+			if (selfGroup === undefined || entry.pgid === selfGroup) targets.pids.push(entry.pid);
+			else groups.set(entry.pgid, [...(groups.get(entry.pgid) ?? []), entry.pid]);
+		}
+	}
+	targets.groups = [...groups].map(([pgid, pids]) => ({ pgid, pids }));
+	return targets;
+}
 
 export interface RunResult {
 	agent: string;
@@ -261,6 +327,12 @@ export interface ChildRunDeps {
 	killGroup?: (pid: number, signal: NodeJS.Signals) => void;
 	/** Defaults to process.platform; process groups do not apply on win32. */
 	platform?: NodeJS.Platform;
+	/** The process table, read synchronously on a forced kill to find the child's descendants; defaults to `ps`. */
+	listProcesses?: () => ProcessEntry[];
+	/** Signals one process; defaults to process.kill. Used when a descendant's group cannot be signalled. */
+	killPid?: (pid: number, signal: NodeJS.Signals) => void;
+	/** The parent's own pid, never signalled; defaults to process.pid. */
+	selfPid?: number;
 }
 
 export interface RunOptions {
@@ -291,6 +363,9 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 	const platform = deps.platform ?? process.platform;
 	const killGroup = deps.killGroup ?? ((pid: number, signal: NodeJS.Signals) => void process.kill(-pid, signal));
 	const tracker = deps.tracker ?? liveChildren;
+	const listProcesses = deps.listProcesses ?? listProcessesWithPs;
+	const killPid = deps.killPid ?? ((pid: number, signal: NodeJS.Signals) => void process.kill(pid, signal));
+	const selfPid = deps.selfPid ?? process.pid;
 	// Caller hooks never break the run: a throw is swallowed (not recorded on the result, which is the child's outcome).
 	const hook = (fn: () => void) => {
 		try {
@@ -344,17 +419,57 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			const invocation = deps.piInvocation(launch.args);
 			// Own process group (not on win32, where groups do not apply): a signal to the group reaches grandchildren too.
 			const proc = spawn(invocation.command, invocation.args, { cwd, env: launch.env, shell: false, stdio: launch.stdio, detached: platform !== "win32" });
-			// To the whole group; to the child alone when it has no pid, on win32, or when the group signal throws.
-			const signalChild = (signal: NodeJS.Signals) => {
-				if (proc.pid !== undefined && platform !== "win32") {
+			const hasGroup = () => proc.pid !== undefined && platform !== "win32";
+			// A command the child's bash tool runs has a process group of its own, so the child's group kill misses it.
+			// Listed before the child dies (afterwards the chain of parents is gone); a failed listing means no extra kills.
+			const descendantsOfChild = (): DescendantTargets | undefined => {
+				if (!hasGroup()) return undefined;
+				try {
+					return descendantTargets(proc.pid!, listProcesses(), selfPid);
+				} catch {
+					return undefined;
+				}
+			};
+			// SIGKILL to each descendant group (the child's own group is skipped when its kill went through); a group that
+			// cannot be signalled falls back to its pids. Never throws.
+			const killDescendants = (targets: DescendantTargets | undefined, childGroupDone: boolean) => {
+				if (!targets) return;
+				const one = (pid: number) => {
 					try {
-						killGroup(proc.pid, signal);
-						return;
+						killPid(pid, "SIGKILL");
 					} catch {
-						// No such group (or not ours): signal the child itself.
+						// Already gone.
+					}
+				};
+				for (const { pgid, pids } of targets.groups) {
+					if (childGroupDone && pgid === proc.pid) continue;
+					try {
+						killGroup(pgid, "SIGKILL");
+					} catch {
+						pids.forEach(one);
 					}
 				}
-				proc.kill(signal);
+				targets.pids.forEach(one);
+			};
+			// To the whole group; to the child alone when it has no pid, on win32, or when the group signal throws.
+			// SIGKILL is the forced path (grace over, shutdown survivors, exit guard): it takes the descendants' groups too.
+			// SIGTERM stays graceful so the child can clean up its own tool processes.
+			const signalChild = (signal: NodeJS.Signals) => {
+				const descendants = signal === "SIGKILL" ? descendantsOfChild() : undefined;
+				let groupDone = false;
+				try {
+					if (hasGroup()) {
+						try {
+							killGroup(proc.pid!, signal);
+							groupDone = true;
+						} catch {
+							// No such group (or not ours): signal the child itself.
+						}
+					}
+					if (!groupDone) proc.kill(signal);
+				} finally {
+					killDescendants(descendants, groupDone);
+				}
 			};
 			const release = tracker.add(signalChild);
 			let buffer = "";
@@ -545,13 +660,17 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				if (done) return;
 				exited = true;
 				closeTimer ??= setTimer(() => {
-					// Whatever still holds the pipes belongs to this child's group: end it, then settle without `close`.
-					if (proc.pid !== undefined && platform !== "win32") {
+					// Whatever still holds the pipes belongs to this child's group or a descendant's: end them, then settle without `close`.
+					if (hasGroup()) {
+						const descendants = descendantsOfChild();
+						let groupDone = false;
 						try {
-							killGroup(proc.pid, "SIGKILL");
+							killGroup(proc.pid!, "SIGKILL");
+							groupDone = true;
 						} catch {
 							// The group is already gone.
 						}
+						killDescendants(descendants, groupDone);
 					}
 					settle(code);
 				}, CLOSE_DRAIN_MS);
