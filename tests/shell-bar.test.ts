@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { contextGauge, layoutSegments, statusSegment } from "../lib/shell-bar.ts";
+import { contextGauge, KNOWN_STATUS_ORDER, layoutSegments, statusSegment } from "../lib/shell-bar.ts";
 
 describe("shell bar", () => {
 	const segments = [
@@ -25,6 +25,30 @@ describe("shell bar", () => {
 		assert.equal(contextGauge(85).tone, "warning");
 		assert.equal(contextGauge(97).tone, "error");
 		assert.equal(contextGauge(null).text, "ctx ▱▱▱▱▱▱▱▱ ?%");
+	});
+
+	it("keeps the gauge as ?% (with the capacity when known) while occupancy is unknown", () => {
+		for (const unknown of [null, undefined, Number.NaN]) assert.deepEqual(contextGauge(unknown), { text: "ctx ▱▱▱▱▱▱▱▱ ?%", tone: "dim" });
+		assert.equal(contextGauge(null, 8, 200_000).text, "ctx ▱▱▱▱▱▱▱▱ ?%/200k");
+		assert.equal(contextGauge(undefined, 8, 1_000_000).text, "ctx ▱▱▱▱▱▱▱▱ ?%/1.0M");
+		assert.equal(contextGauge(null, 8, 0).text, "ctx ▱▱▱▱▱▱▱▱ ?%");
+		assert.equal(contextGauge(null, 8, null).text, "ctx ▱▱▱▱▱▱▱▱ ?%");
+		// A known occupancy is unchanged by the capacity.
+		assert.equal(contextGauge(45, 8, 200_000).text, "ctx ▰▰▰▰▱▱▱▱ 45%");
+	});
+
+	it("shows the pull request segment, which drops before the repo, gauge, and model", () => {
+		assert.deepEqual(statusSegment("brigadev-pr", "PR #12"), { id: "brigadev-pr", text: "PR #12", tone: "accent", priority: 45 });
+		assert.ok(KNOWN_STATUS_ORDER.includes("brigadev-pr"));
+		const bar = [
+			{ id: "repo", text: "repo main", priority: 50 },
+			{ id: "model", text: "sonnet · medium", priority: 80 },
+			{ id: "ctx", text: "ctx ▰▰▰▱▱▱▱▱ 45%", priority: 70 },
+			statusSegment("brigadev-pr", "PR #12")!,
+		];
+		assert.deepEqual(layoutSegments(bar, 200).map((s) => s.id), ["repo", "model", "ctx", "brigadev-pr"]);
+		assert.ok(!layoutSegments(bar, 50).some((s) => s.id === "brigadev-pr"));
+		assert.deepEqual(layoutSegments(bar, 50).map((s) => s.id), ["repo", "model", "ctx"]);
 	});
 
 	it("compacts brigadev statuses and hides normal mode", () => {
