@@ -295,6 +295,37 @@ describe("subagent registry: lifecycle", () => {
 		assert.ok(registry.get(ids[65]));
 	});
 
+	it("never prunes a pinned settled launch (a held, undelivered result), and prunes it once unpinned", async () => {
+		const pinned = new Set<string>();
+		const time = fakeTime();
+		let n = 0;
+		const registry = createSubagentRegistry<string>({ now: time.now, setTimer: time.setTimer, clearTimer: time.clearTimer, newId: () => `L${++n}`, maxSettled: 2, isPinned: (id) => pinned.has(id) });
+		const first = registry.start({ total: 1, run: async () => "first" });
+		pinned.add(first);
+		await tick();
+		for (let i = 0; i < 5; i++) registry.start({ total: 1, run: async () => `x${i}` });
+		await tick();
+		assert.ok(registry.get(first), "pinned launch kept");
+		assert.equal(registry.list().filter((l) => l.id !== first).length, 2, "the others still obey the cap");
+		pinned.delete(first);
+		registry.start({ total: 1, run: async () => "y" });
+		await tick();
+		assert.equal(registry.get(first), undefined);
+	});
+
+	it("markConsumed consumes a settled launch once and refuses unknown or running ones", async () => {
+		const { registry } = setup();
+		const run = manualRun();
+		const id = registry.start({ total: 1, run: run.run });
+		assert.equal(registry.markConsumed(id), false, "running");
+		assert.equal(registry.markConsumed("nope"), false, "unknown");
+		run.resolve("x");
+		await tick();
+		assert.equal(registry.markConsumed(id), true);
+		assert.equal(registry.get(id)?.consumed, true);
+		assert.equal(registry.markConsumed(id), false, "already consumed");
+	});
+
 	it("counts running and settled launches", async () => {
 		const { registry } = setup();
 		const a = manualRun();
