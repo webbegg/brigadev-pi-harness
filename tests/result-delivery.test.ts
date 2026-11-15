@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { createResultDelivery, RESULT_MESSAGE_TYPE, resultCard, resultMessage } from "../lib/result-delivery.ts";
+import { alreadyDeliveredText, createResultDelivery, DELIVERY_ATTEMPTS, deliveredNote, RESULT_MESSAGE_TYPE, resultCard, resultMessage } from "../lib/result-delivery.ts";
 import { createSubagentRegistry, type LaunchSummary } from "../lib/subagent-registry.ts";
 
 const summary = (id: string, over: Partial<LaunchSummary> = {}): LaunchSummary => ({ id, status: "settled", total: 1, done: 1, startedAt: 0, settledAt: 1, consumed: false, error: undefined, ...over });
@@ -120,7 +120,7 @@ describe("result delivery: idle and busy", () => {
 		assert.deepEqual(seen, ["L1", "L2"]);
 	});
 
-	it("a throwing deliver leaves the launch unconsumed and does not stop later deliveries", () => {
+	it("a throwing deliver keeps the launch held and unconsumed, and does not stop later deliveries", () => {
 		const consumed = new Set<string>();
 		const seen: string[] = [];
 		const delivery = createResultDelivery<string>({
@@ -137,7 +137,162 @@ describe("result delivery: idle and busy", () => {
 		assert.deepEqual(seen, ["L2"]);
 		assert.equal(consumed.has("L1"), false);
 		assert.equal(consumed.has("L2"), true);
+		assert.deepEqual(delivery.held(), ["L1"], "kept (and so pinned) for a retry");
+		assert.equal(delivery.isHeld("L1"), true);
+	});
+});
+
+describe("result delivery: a delivery that throws is retried, then reported", () => {
+	/** `deliver` throws while `failing` holds a launch id; every failure and notice is recorded. */
+	function flaky(failing: Set<string>) {
+		const consumed = new Set<string>();
+		const log = { delivered: [] as string[], attempts: [] as string[], failed: [] as string[], errors: [] as unknown[] };
+		const delivery = createResultDelivery<string>({
+			isIdle: () => true,
+			isConsumed: (id) => consumed.has(id),
+			markConsumed: (id) => void consumed.add(id),
+			deliver: ({ id }) => {
+				log.attempts.push(id);
+				if (failing.has(id)) throw new Error(`stale ${id}`);
+				log.delivered.push(id);
+			},
+			onDeliveryFailed: ({ id }, error) => {
+				log.failed.push(id);
+				log.errors.push(error);
+			},
+		});
+		return { consumed, log, delivery };
+	}
+
+	it("a failed delivery is retried on the next idle flush and succeeds once the parent accepts it", () => {
+		const failing = new Set(["L1"]);
+		const h = flaky(failing);
+		h.delivery.settled({ launch: summary("L1"), result: "a" });
+		assert.deepEqual(h.log.attempts, ["L1"], "one attempt per flush, not a loop");
+		assert.deepEqual(h.delivery.held(), ["L1"]);
+		failing.clear();
+		h.delivery.flush();
+		assert.deepEqual(h.log.delivered, ["L1"]);
+		assert.equal(h.consumed.has("L1"), true);
+		assert.deepEqual(h.delivery.held(), []);
+		assert.deepEqual(h.log.failed, [], "a retry that worked is not a failure");
+	});
+
+	it("gives up after the attempt bound: unconsumed, no longer held, reported once", () => {
+		const h = flaky(new Set(["L1"]));
+		h.delivery.settled({ launch: summary("L1"), result: "a" });
+		for (let i = 1; i < DELIVERY_ATTEMPTS; i++) {
+			assert.deepEqual(h.log.failed, [], `still retrying after ${i} attempts`);
+			assert.equal(h.delivery.isHeld("L1"), true);
+			h.delivery.flush();
+		}
+		assert.equal(h.log.attempts.length, DELIVERY_ATTEMPTS);
+		assert.deepEqual(h.log.failed, ["L1"]);
+		assert.match(String((h.log.errors[0] as Error).message), /stale L1/, "the last error is passed on");
+		assert.equal(h.consumed.has("L1"), false, "left unconsumed so subagent_wait can still collect it");
+		assert.equal(h.delivery.isHeld("L1"), false, "unpinned: the registry may prune it");
+		h.delivery.flush();
+		h.delivery.flush();
+		assert.equal(h.log.attempts.length, DELIVERY_ATTEMPTS, "no attempts after giving up");
+		assert.deepEqual(h.log.failed, ["L1"], "reported exactly once");
+	});
+
+	it("other items keep flowing while one fails, and order is kept on the retry", () => {
+		const failing = new Set(["L1"]);
+		const h = flaky(failing);
+		h.delivery.settled({ launch: summary("L1"), result: "a" });
+		h.delivery.settled({ launch: summary("L2"), result: "b" });
+		// Any flush retries what is held (here the one L2's settle triggers), so L1 has had two attempts by now.
+		assert.deepEqual(h.log.delivered, ["L2"]);
+		assert.deepEqual(h.delivery.held(), ["L1"]);
+		failing.clear();
+		h.delivery.flush();
+		assert.deepEqual(h.log.delivered, ["L2", "L1"]);
+		assert.deepEqual(h.log.failed, []);
+	});
+
+	it("R3-101: unrelated settles while idle do not burn the attempt budget; idle signals do", () => {
+		const failing = new Set(["L1"]);
+		const h = flaky(failing);
+		h.delivery.settled({ launch: summary("L1"), result: "a" });
+		// Three unrelated launches settle while the parent is idle: each triggers a flush that may try L1 again.
+		for (const id of ["L2", "L3", "L4"]) h.delivery.settled({ launch: summary(id), result: id });
+		assert.deepEqual(h.log.failed, [], "settle-triggered flushes do not spend L1's budget");
+		assert.deepEqual(h.delivery.held(), ["L1"]);
+		assert.deepEqual(h.log.delivered, ["L2", "L3", "L4"], "the others still flow");
+		// Only idle signals (flush) count: the settle-time attempt was the first, so two more give up.
+		for (let i = 1; i < DELIVERY_ATTEMPTS; i++) {
+			assert.deepEqual(h.log.failed, [], `still retrying before idle signal ${i}`);
+			h.delivery.flush();
+		}
+		assert.deepEqual(h.log.failed, ["L1"], "the idle signals exhausted the budget");
+		assert.equal(h.delivery.isHeld("L1"), false);
+	});
+
+	it("R3-101: a settle-triggered flush still retries an earlier failure, so it can succeed without an idle signal", () => {
+		const failing = new Set(["L1"]);
+		const h = flaky(failing);
+		h.delivery.settled({ launch: summary("L1"), result: "a" });
+		failing.clear();
+		h.delivery.settled({ launch: summary("L2"), result: "b" });
+		assert.deepEqual(h.log.delivered, ["L1", "L2"], "earlier failure first, then the new one");
+		assert.deepEqual(h.delivery.held(), []);
+	});
+
+	it("R3-101: settles between idle signals never add attempts beyond one per signal", () => {
+		const h = flaky(new Set(["L1"]));
+		h.delivery.settled({ launch: summary("L1"), result: "a" });
+		h.delivery.settled({ launch: summary("L2"), result: "b" });
+		h.delivery.flush(); // idle signal 1: attempt 2
+		h.delivery.settled({ launch: summary("L3"), result: "c" });
+		h.delivery.settled({ launch: summary("L4"), result: "d" });
+		assert.deepEqual(h.log.failed, [], "two attempts counted so far");
+		h.delivery.flush(); // idle signal 2: attempt 3 = the bound
+		assert.deepEqual(h.log.failed, ["L1"]);
+	});
+
+	it("a retried item that was collected by wait meanwhile is dropped without a report", () => {
+		const h = flaky(new Set(["L1"]));
+		h.delivery.settled({ launch: summary("L1"), result: "a" });
+		h.consumed.add("L1");
+		h.delivery.flush();
+		assert.deepEqual(h.delivery.held(), []);
+		assert.deepEqual(h.log.failed, []);
+		assert.equal(h.log.attempts.length, 1);
+	});
+
+	it("a throwing onDeliveryFailed does not break the flush; without one a give-up is silent", () => {
+		const seen: string[] = [];
+		const delivery = createResultDelivery<string>({
+			isIdle: () => true,
+			isConsumed: () => false,
+			markConsumed: () => {},
+			deliver: ({ id }) => {
+				if (id === "L1") throw new Error("x");
+				seen.push(id);
+			},
+			onDeliveryFailed: () => {
+				throw new Error("ui gone");
+			},
+		});
+		delivery.settled({ launch: summary("L1"), result: "a" });
+		for (let i = 1; i < DELIVERY_ATTEMPTS; i++) delivery.flush();
+		delivery.settled({ launch: summary("L2"), result: "b" });
+		assert.deepEqual(seen, ["L2"]);
 		assert.deepEqual(delivery.held(), []);
+	});
+
+	it("stop and reset forget the retry bookkeeping", () => {
+		const failing = new Set(["L1"]);
+		const h = flaky(failing);
+		h.delivery.settled({ launch: summary("L1"), result: "a" });
+		h.delivery.reset();
+		assert.deepEqual(h.delivery.held(), []);
+		// The same id settling again in a new session gets a fresh bound.
+		h.delivery.settled({ launch: summary("L1"), result: "a" });
+		for (let i = 1; i < DELIVERY_ATTEMPTS; i++) h.delivery.flush();
+		assert.equal(h.log.attempts.length, 1 + DELIVERY_ATTEMPTS);
+		assert.deepEqual(h.log.failed, ["L1"]);
 	});
 });
 
@@ -233,6 +388,79 @@ describe("result delivery with the registry", () => {
 		h.delivery.flush();
 		assert.ok(!h.delivered.some((d) => d.startsWith(`${first}:`)));
 		assert.equal(h.delivered.length, 6);
+		assert.equal(h.registry.get(first)?.consumedBy, "wait");
+	});
+
+	it("a wait after delivery sees that the launch was delivered, not collected", async () => {
+		const h = wired(5);
+		h.setIdle(true);
+		const id = h.registry.start({ total: 1, run: async () => "the report" });
+		await tick();
+		assert.deepEqual(h.delivered, [`${id}:the report`]);
+		const outcome = await h.registry.wait(id, 1000);
+		assert.equal(outcome.status === "settled" && outcome.launch.consumedBy, "delivered");
+	});
+});
+
+describe("alreadyDeliveredText: what subagent_wait says about a launch whose result was delivered", () => {
+	it("names the launch, says it was delivered to this session, and lists each task's saved folder", () => {
+		const text = alreadyDeliveredText("launch-7", [
+			{ agent: "scout", artifactsDir: "/docs/runs/scout-1" },
+			{ agent: "reviewer", artifactsDir: "/docs/runs/reviewer-2" },
+		]);
+		assert.match(text, /launch-7/);
+		assert.match(text, /already delivered to this session/);
+		assert.ok(text.includes("scout: /docs/runs/scout-1"));
+		assert.ok(text.includes("reviewer: /docs/runs/reviewer-2"));
+		assert.ok(text.includes("result.json"), "says where the full text is");
+	});
+
+	it("a task without a saved folder says so; no tasks at all still names the launch", () => {
+		assert.ok(alreadyDeliveredText("L1", [{ agent: "scout" }]).includes("scout: (no saved folder)"));
+		const bare = alreadyDeliveredText("L2", []);
+		assert.match(bare, /L2/);
+		assert.match(bare, /already delivered to this session/);
+		assert.ok(!bare.includes("result.json"));
+	});
+
+	it("carries none of the result text", () => {
+		const text = alreadyDeliveredText("L1", [{ agent: "scout", artifactsDir: "/d/r" }]);
+		assert.ok(text.split("\n").length <= 4);
+	});
+});
+
+describe("deliveredNote: the one decision both subagent_wait and subagent_cancel use", () => {
+	const outcome = (consumedBy: "wait" | "cancel" | "delivered" | undefined) => ({
+		status: "settled" as const,
+		launch: summary("L1", consumedBy ? { consumed: true, consumedBy } : {}),
+		result: { details: { results: [{ agent: "scout", artifactsDir: "/d/runs/scout-1" }, { agent: "reviewer" }] } },
+	});
+
+	it("a settled launch the idle delivery already put in the session gets the short note", () => {
+		const note = deliveredNote("L1", outcome("delivered"));
+		assert.equal(note, alreadyDeliveredText("L1", [{ agent: "scout", artifactsDir: "/d/runs/scout-1" }, { agent: "reviewer", artifactsDir: undefined }]));
+	});
+
+	it("anything else is collected normally (undefined)", () => {
+		assert.equal(deliveredNote("L1", outcome("wait")), undefined);
+		assert.equal(deliveredNote("L1", outcome("cancel")), undefined);
+		assert.equal(deliveredNote("L1", outcome(undefined)), undefined);
+		assert.equal(deliveredNote("L1", { status: "unknown" }), undefined);
+		assert.equal(deliveredNote("L1", { status: "running", launch: summary("L1", { status: "running" }) }), undefined);
+	});
+
+	it("a delivered launch with no result still gets the note, naming no folders", () => {
+		const note = deliveredNote("L1", { status: "settled", launch: summary("L1", { consumed: true, consumedBy: "delivered" }), error: "boom" });
+		assert.equal(note, alreadyDeliveredText("L1", []));
+	});
+
+	it("cancel after delivery through the registry reports the note, not the result", async () => {
+		const registry = createSubagentRegistry<{ details: { results: { agent: string }[] } }>({ setTimer: setTimeout, clearTimer: (h) => clearTimeout(h as NodeJS.Timeout), newId: () => "L2" });
+		registry.start({ total: 1, run: async () => ({ details: { results: [{ agent: "scout" }] } }) });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(registry.markConsumed("L2"), true);
+		const cancelled = await registry.cancel("L2");
+		assert.match(deliveredNote("L2", cancelled) ?? "", /already delivered to this session/);
 	});
 });
 

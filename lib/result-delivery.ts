@@ -13,6 +13,22 @@
 // signal, and the later ones join the turn the first one starts (Pi: messages
 // sent while a run is starting go into that run), so several results still cost
 // one parent turn. For that reason idleness is checked once per flush, not per item.
+//
+// A `deliver` that throws (a stale session context) is not final: the item stays held (so the
+// registry's prune keeps it) and is tried again on the next idle flush, up to DELIVERY_ATTEMPTS
+// attempts in all. After the last one it is released unconsumed, so `subagent_wait` can still
+// collect it, and `onDeliveryFailed` tells the user.
+//
+// What counts as an attempt (R3-101): a failure spends an item's budget at most once per idle signal.
+// The public `flush()` is the idle signal (the host calls it on `agent_settled`); each call starts a new
+// idle epoch. A flush that a settle triggers also tries earlier-failed items (so one can still get through
+// without waiting), but if that item already failed in the current epoch, the failure is not counted again.
+// So unrelated settles cannot burn the budget; only distinct idle signals (and the item's first failure) do.
+
+import type { WaitOutcome } from "./subagent-registry.ts";
+
+/** Delivery attempts per result (the first one included) before it is released unconsumed. */
+export const DELIVERY_ATTEMPTS = 3;
 
 export interface Delivered<R> {
 	id: string;
@@ -27,8 +43,10 @@ export interface ResultDeliveryDeps<R> {
 	isConsumed: (id: string) => boolean;
 	/** Records that the result was delivered, so a later `wait` or idle signal cannot repeat it. */
 	markConsumed: (id: string) => void;
-	/** Hands one result to the parent. A throw leaves the launch unconsumed, so `wait` can still collect it. */
+	/** Hands one result to the parent. A throw leaves the launch unconsumed and held for a retry at the next idle flush. */
 	deliver: (item: Delivered<R>) => void;
+	/** Called once with the last error when DELIVERY_ATTEMPTS attempts all threw: the result stays unconsumed for `subagent_wait`. */
+	onDeliveryFailed?: (item: Delivered<R>, error: unknown) => void;
 }
 
 export interface ResultDelivery<R> {
@@ -49,25 +67,51 @@ export function createResultDelivery<R>(deps: ResultDeliveryDeps<R>): ResultDeli
 	let queue: Delivered<R>[] = [];
 	let enabled = true;
 	let flushing = false;
+	// Attempts that threw, per launch id, and the idle epoch of the last one that was counted.
+	let failures = new Map<string, { attempts: number; epoch: number }>();
+	// Incremented by each idle signal (public `flush`).
+	let epoch = 0;
 
-	const flush = () => {
+	const flushPass = () => {
 		// A delivery may synchronously start a turn that flushes again; the outer loop keeps going.
 		if (flushing || queue.length === 0 || !deps.isIdle()) return;
 		flushing = true;
+		// Items whose delivery threw: put back (in order, ahead of newer ones) after the pass, so a flush tries each item once.
+		const retry: Delivered<R>[] = [];
 		try {
 			while (queue.length > 0) {
 				const item = queue.shift()!;
-				if (!enabled || deps.isConsumed(item.id)) continue;
-				try {
-					deps.deliver(item);
-				} catch {
-					// Not delivered (for example a stale session): it stays unconsumed, so `subagent_wait` still has it.
+				if (!enabled || deps.isConsumed(item.id)) {
+					failures.delete(item.id);
 					continue;
 				}
+				try {
+					deps.deliver(item);
+				} catch (error) {
+					const previous = failures.get(item.id);
+					// Already counted in this idle epoch (a settle-triggered retry): tried, but the budget is not spent again.
+					const attempts = previous === undefined ? 1 : previous.epoch === epoch ? previous.attempts : previous.attempts + 1;
+					if (attempts < DELIVERY_ATTEMPTS) {
+						failures.set(item.id, { attempts, epoch });
+						retry.push(item);
+					} else {
+						// Released unconsumed (so `subagent_wait` still has it) and unheld (so the registry may prune it).
+						failures.delete(item.id);
+						try {
+							deps.onDeliveryFailed?.(item, error);
+						} catch {
+							// The notice is best effort; the next item still goes out.
+						}
+					}
+					continue;
+				}
+				failures.delete(item.id);
 				deps.markConsumed(item.id);
 			}
 		} finally {
 			flushing = false;
+			// A reset or stop during the pass must not bring items back.
+			if (enabled && retry.length > 0) queue = [...retry, ...queue];
 		}
 	};
 
@@ -75,17 +119,23 @@ export function createResultDelivery<R>(deps: ResultDeliveryDeps<R>): ResultDeli
 		settled({ launch, result }) {
 			if (!enabled || launch.consumed || deps.isConsumed(launch.id) || queue.some((q) => q.id === launch.id)) return;
 			queue.push({ id: launch.id, launch, ...(launch.error === undefined ? { result } : {}) });
-			flush();
+			flushPass();
 		},
-		flush,
+		flush() {
+			// A flush re-entered from a delivery is the same idle signal, not a new one.
+			if (!flushing) epoch++;
+			flushPass();
+		},
 		held: () => queue.map((q) => q.id),
 		isHeld: (id) => queue.some((q) => q.id === id),
 		reset() {
 			queue = [];
+			failures = new Map();
 			enabled = true;
 		},
 		stop() {
 			queue = [];
+			failures = new Map();
 			enabled = false;
 		},
 	};
@@ -107,6 +157,31 @@ export interface ResultMessageDetails {
 export function resultMessage(id: string, text: string, failed: boolean) {
 	const header = `Async subagent launch ${id} ${failed ? "finished with errors" : "finished"}. Delivered automatically: it is already collected, so do not call subagent_wait for it.`;
 	return { customType: RESULT_MESSAGE_TYPE, content: `${header}\n\n${text}`, display: true, details: { launchId: id, failed } satisfies ResultMessageDetails };
+}
+
+/**
+ * What `subagent_wait` answers for a launch whose result the idle delivery already put in the session: the launch id,
+ * that it was delivered, and each task's saved folder (run-artifacts.ts), so the full text can still be read. Not the result.
+ */
+export function alreadyDeliveredText(id: string, tasks: ReadonlyArray<{ agent: string; artifactsDir?: string }>): string {
+	const lines = [`Launch ${id} was already delivered to this session: its result is in the conversation above, so it is not repeated here.`];
+	if (tasks.length > 0) {
+		lines.push("Saved folders (the full text is in result.json):");
+		lines.push(...tasks.map((t) => `- ${t.agent}: ${t.artifactsDir ?? "(no saved folder)"}`));
+	}
+	return lines.join("\n");
+}
+
+/**
+ * The short note for a launch whose result the idle delivery already put in the session, or `undefined` when the outcome
+ * should be collected normally. One decision for `subagent_wait` and `subagent_cancel`, so neither repeats a delivered result.
+ */
+export function deliveredNote<R extends { details: { results: ReadonlyArray<{ agent: string; artifactsDir?: string }> } }>(id: string, outcome: WaitOutcome<R>): string | undefined {
+	if (outcome.status !== "settled" || outcome.launch.consumedBy !== "delivered") return undefined;
+	return alreadyDeliveredText(
+		id,
+		(outcome.result?.details.results ?? []).map((r) => ({ agent: r.agent, artifactsDir: r.artifactsDir })),
+	);
 }
 
 export interface CardLine {

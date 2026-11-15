@@ -6,6 +6,7 @@
 
 import { threadRows } from "./agent-thread.ts";
 import { formatElapsed } from "./agents-card.ts";
+import type { CommandOutcome } from "./child-rpc.ts";
 import { failed, type RunResult } from "./child-run.ts";
 import { formatCost, formatTokens } from "./cost.ts";
 import type { Tone } from "./shell-bar.ts";
@@ -169,6 +170,33 @@ export const openTakeover = (entry: ViewerEntry | undefined, hasControl: boolean
 
 /** A streaming child is steered (delivered before its next model call); one between turns is followed up. */
 export const takeoverKind = (streaming: boolean): "steer" | "follow_up" => (streaming ? "steer" : "follow_up");
+
+/** What the viewer tells the user once Pi answered (or will not answer) a steer / follow-up. */
+export function takeoverNotice(kind: "steer" | "follow_up", outcome: CommandOutcome): string {
+	const what = kind === "steer" ? "steering message" : "follow-up";
+	if (outcome.status === "accepted") return `${kind === "steer" ? "Steering message" : "Follow-up"} accepted by Pi${outcome.disposition ? ` (${outcome.disposition})` : ""}`;
+	if (outcome.status === "rejected") return `Pi rejected the ${what}: ${outcome.error}`;
+	return "Not delivered: the run ended before Pi answered";
+}
+
+/** `x` aborts only when pressed twice on the same run within this time. */
+export const ABORT_CONFIRM_MS = 3000;
+export const ABORT_PROMPT = "press x again to abort";
+
+/** The run whose abort is waiting for a second `x`, and when the first one was pressed. */
+export interface AbortArm {
+	key: string;
+	at: number;
+}
+
+/** The arm that still holds: for the selected run, and not older than the timeout. Any other key or a selection change clears it by not passing it on. */
+export const abortArmFor = (armed: AbortArm | undefined, selectedKey: string | undefined, now: number): AbortArm | undefined =>
+	armed && selectedKey === armed.key && now - armed.at <= ABORT_CONFIRM_MS ? armed : undefined;
+
+/** One `x` on the selected run: the first arms, a second within the timeout aborts (and disarms). */
+export function pressAbort(armed: AbortArm | undefined, key: string, now: number): { armed?: AbortArm; abort: boolean } {
+	return abortArmFor(armed, key, now) ? { abort: true } : { armed: { key, at: now }, abort: false };
+}
 
 /**
  * One key on the input line. `submit` is the trimmed text to send, and the input closes with it; blank text

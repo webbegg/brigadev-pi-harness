@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { answerUiRequest, createChildControl, decodeRecord, encodeCommand, FIRE_AND_FORGET_METHODS, UI_DIALOG_METHODS, type RpcCommand } from "../lib/child-rpc.ts";
+import { answerUiRequest, createChildControl, createCommandTracker, decodeRecord, encodeCommand, FIRE_AND_FORGET_METHODS, UI_DIALOG_METHODS, type CommandOutcome, type RpcCommand } from "../lib/child-rpc.ts";
 
 describe("encodeCommand: one JSON record per line (Pi rpc.md:50-56)", () => {
 	it("terminates every record with LF and keeps embedded newlines escaped", () => {
@@ -14,6 +14,11 @@ describe("encodeCommand: one JSON record per line (Pi rpc.md:50-56)", () => {
 		assert.equal(encodeCommand({ type: "steer", message: "stop" }), '{"type":"steer","message":"stop"}\n');
 		assert.equal(encodeCommand({ type: "follow_up", message: "then this" }), '{"type":"follow_up","message":"then this"}\n');
 		assert.equal(encodeCommand({ type: "abort" }), '{"type":"abort"}\n');
+	});
+
+	it("steer and follow_up carry an optional id that Pi echoes in the response (rpc.md:37-44)", () => {
+		assert.equal(encodeCommand({ type: "steer", message: "stop", id: "cmd-1" }), '{"type":"steer","message":"stop","id":"cmd-1"}\n');
+		assert.equal(encodeCommand({ type: "follow_up", message: "then", id: "cmd-2" }), '{"type":"follow_up","message":"then","id":"cmd-2"}\n');
 	});
 
 	it("encodes an extension UI response", () => {
@@ -84,33 +89,115 @@ describe("answerUiRequest: S0, a child's dialog is cancelled at once and never f
 	});
 });
 
+describe("createCommandTracker: responses are matched to commands by id, in any order (rpc.md:37-48)", () => {
+	const settledNow = async (promise: Promise<CommandOutcome>) => Promise.race([promise, new Promise<"pending">((resolve) => setImmediate(() => resolve("pending")))]);
+
+	it("hands out unique ids and settles each promise from its own response", async () => {
+		const tracker = createCommandTracker();
+		const a = tracker.expect();
+		const b = tracker.expect();
+		assert.notEqual(a.id, b.id);
+		assert.equal(tracker.pending(), 2);
+		assert.equal(tracker.respond({ id: a.id, success: true, disposition: "queued" }), true);
+		assert.deepEqual(await a.outcome, { status: "accepted", disposition: "queued" });
+		assert.equal(tracker.pending(), 1);
+		assert.equal(tracker.respond({ id: b.id, success: false, error: "Agent is not running" }), true);
+		assert.deepEqual(await b.outcome, { status: "rejected", error: "Agent is not running" });
+		assert.equal(tracker.pending(), 0);
+	});
+
+	it("a response out of order settles the right command", async () => {
+		const tracker = createCommandTracker();
+		const first = tracker.expect();
+		const second = tracker.expect();
+		tracker.respond({ id: second.id, success: true, disposition: "handled" });
+		assert.equal(await settledNow(first.outcome), "pending", "the first is still waiting");
+		assert.deepEqual(await second.outcome, { status: "accepted", disposition: "handled" });
+		tracker.respond({ id: first.id, success: true });
+		assert.deepEqual(await first.outcome, { status: "accepted" });
+	});
+
+	it("a response without a matching id (the prompt's, a parse error, a repeat) settles nothing", async () => {
+		const tracker = createCommandTracker();
+		const a = tracker.expect();
+		assert.equal(tracker.respond({ success: true }), false);
+		assert.equal(tracker.respond({ id: "someone-else", success: false, error: "x" }), false);
+		assert.equal(tracker.pending(), 1);
+		tracker.respond({ id: a.id, success: true });
+		assert.equal(tracker.respond({ id: a.id, success: true }), false, "settles once");
+		assert.deepEqual(await a.outcome, { status: "accepted" });
+	});
+
+	it("settleAll marks everything still waiting as not delivered and leaves nothing pending", async () => {
+		const tracker = createCommandTracker();
+		const a = tracker.expect();
+		const b = tracker.expect();
+		tracker.respond({ id: a.id, success: true });
+		tracker.settleAll();
+		assert.deepEqual(await a.outcome, { status: "accepted" }, "an answered command keeps its outcome");
+		assert.deepEqual(await b.outcome, { status: "not_delivered" });
+		assert.equal(tracker.pending(), 0);
+		assert.equal(tracker.respond({ id: b.id, success: true }), false, "a late response is ignored");
+	});
+
+	it("forget settles one command as not delivered (its write failed)", async () => {
+		const tracker = createCommandTracker();
+		const a = tracker.expect();
+		tracker.forget(a.id);
+		assert.deepEqual(await a.outcome, { status: "not_delivered" });
+		assert.equal(tracker.pending(), 0);
+	});
+});
+
 describe("createChildControl: the handle a running task exposes", () => {
 	function rig(streaming = true, open = true) {
 		const sent: RpcCommand[] = [];
 		const state = { streaming, open, aborts: 0 };
+		const commands = createCommandTracker();
 		const control = createChildControl({
 			send: (command) => (state.open ? (sent.push(command), true) : false),
 			streaming: () => state.streaming,
 			onAbort: () => void state.aborts++,
+			commands,
 		});
-		return { control, sent, state };
+		return { control, sent, state, commands };
 	}
 
-	it("steer and followUp send their RPC commands", () => {
-		const { control, sent } = rig();
-		assert.equal(control.steer("go left"), true);
-		assert.equal(control.followUp("then right"), true);
-		assert.deepEqual(sent, [
+	it("steer and followUp send their RPC commands, each with its own id", () => {
+		const { control, sent, commands } = rig();
+		void control.steer("go left");
+		void control.followUp("then right");
+		assert.equal(sent.length, 2);
+		assert.deepEqual(sent.map(({ type, ...rest }) => ({ type, message: (rest as any).message })), [
 			{ type: "steer", message: "go left" },
 			{ type: "follow_up", message: "then right" },
 		]);
+		const ids = sent.map((c) => (c as { id?: string }).id);
+		assert.ok(ids.every((id) => typeof id === "string" && id.length > 0));
+		assert.notEqual(ids[0], ids[1]);
+		assert.equal(commands.pending(), 2);
 	});
 
-	it("blank text sends nothing", () => {
-		const { control, sent } = rig();
-		assert.equal(control.steer("   "), false);
-		assert.equal(control.followUp(""), false);
+	it("accepted: the promise settles from Pi's response with its disposition", async () => {
+		const { control, sent, commands } = rig();
+		const outcome = control.steer("go left");
+		commands.respond({ id: (sent[0] as { id: string }).id, success: true, disposition: "queued" });
+		assert.deepEqual(await outcome, { status: "accepted", disposition: "queued" });
+	});
+
+	it("rejected: Pi's error comes through", async () => {
+		const { control, sent, commands } = rig();
+		const outcome = control.followUp("later");
+		commands.respond({ id: (sent[0] as { id: string }).id, success: false, error: "Extension commands are not allowed" });
+		assert.deepEqual(await outcome, { status: "rejected", error: "Extension commands are not allowed" });
+	});
+
+	it("blank text sends nothing and is not delivered", async () => {
+		const { control, sent, commands } = rig();
+		assert.deepEqual(await control.steer("   "), { status: "not_delivered" });
+		assert.deepEqual(await control.followUp(""), { status: "not_delivered" });
 		assert.deepEqual(sent, []);
+		assert.equal(commands.pending(), 0);
 	});
 
 	it("abort sends the RPC abort and tells the run loop", () => {
@@ -120,13 +207,14 @@ describe("createChildControl: the handle a running task exposes", () => {
 		assert.equal(state.aborts, 1);
 	});
 
-	it("a closed child accepts nothing and abort does not start an escalation", () => {
-		const { control, sent, state } = rig(true, false);
-		assert.equal(control.steer("x"), false);
-		assert.equal(control.followUp("x"), false);
+	it("a closed child accepts nothing (not delivered, nothing pending) and abort does not start an escalation", async () => {
+		const { control, sent, state, commands } = rig(true, false);
+		assert.deepEqual(await control.steer("x"), { status: "not_delivered" });
+		assert.deepEqual(await control.followUp("x"), { status: "not_delivered" });
 		assert.equal(control.abort(), false);
 		assert.deepEqual(sent, []);
 		assert.equal(state.aborts, 0);
+		assert.equal(commands.pending(), 0);
 	});
 
 	it("reports whether the child is streaming", () => {

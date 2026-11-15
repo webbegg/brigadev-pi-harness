@@ -6,16 +6,23 @@
 // (SIGTERM, then SIGKILL after 5 s), check structured output, and save the attempt's
 // folder. No Pi runtime imports: the spawn function, timers, Pi invocation, and cost calculator are injected, so a
 // test drives it with a fake child.
+//
+// Process lifetime: a child runs in its own process group (so a signal reaches its grandchildren too),
+// the run settles on the child's `exit` even if `close` never comes (a grandchild can hold the pipes),
+// and every live child is registered with a tracker so a shutdown can terminate them all within a bound.
+// Caller hooks (`onUpdate`, `onControl`) are isolated: a throwing hook is swallowed, because a UI bug
+// is not the child's outcome and must never skip settlement or crash a stream handler.
 
 import { spawn as nodeSpawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentDefinition } from "./agents.ts";
 import { foldChildEvent, parseChildLine } from "./child-events.ts";
 import { childLaunch } from "./child-launch.ts";
-import { answerUiRequest, createChildControl, encodeCommand, type ChildControl, type RpcCommand, type UiResponse } from "./child-rpc.ts";
+import { answerUiRequest, createChildControl, createCommandTracker, encodeCommand, type ChildControl, type RpcCommand, type UiResponse } from "./child-rpc.ts";
 import { emptyTally, priceBridgeMessage, type CostCalculator, type Tally } from "./cost.ts";
 import type { LaunchRequest } from "./delegation.ts";
 import type { ResolvedRoute } from "./model-routing.ts";
@@ -29,6 +36,9 @@ import { checkStructuredRun, formatStructured, type JsonSchema } from "./structu
 export const KILL_GRACE_MS = 5000;
 /** Time a child that finished its work (or will never start one) gets to exit on its own after stdin closes. */
 export const EXIT_GRACE_MS = 5000;
+
+/** After the child exits, how long the run waits for `close` (output fully drained) before settling without it. */
+export const CLOSE_DRAIN_MS = 1000;
 
 /** Streaming text updates reach `onUpdate` at most this often; the snapshot itself is always current. */
 export const PARTIAL_UPDATE_MS = 100;
@@ -91,9 +101,145 @@ export interface ChildProcessLike {
 	stderr: { on(event: "data", listener: (data: Buffer | string) => void): unknown };
 	on(event: string, listener: (...args: any[]) => void): unknown;
 	kill(signal?: NodeJS.Signals): unknown;
+	/** Absent when the process failed to start; with `detached` it is also the id of the child's process group. */
+	pid?: number;
 }
 
-export type SpawnFn = (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; shell: false; stdio: ["pipe", "pipe", "pipe"] }) => ChildProcessLike;
+export type SpawnFn = (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; shell: false; stdio: ["pipe", "pipe", "pipe"]; detached: boolean }) => ChildProcessLike;
+
+/**
+ * Every live child process in one place (sync and async launches alike): registered at spawn, released when its
+ * run settles. `shutdown` is the bounded stop for session end: terminate all, wait up to the grace, kill survivors.
+ */
+export interface ChildTracker {
+	/** Registers a live child by the function that signals it (and its group); returns the release function. */
+	add(kill: (signal: NodeJS.Signals) => void): () => void;
+	size(): number;
+	/** Signals every tracked child now; one that throws does not stop the rest. */
+	killAll(signal: NodeJS.Signals): void;
+	/** SIGKILL every tracked child's group now, synchronously (for a process 'exit' handler); never throws, never waits. */
+	killAllNow(): void;
+	/** SIGTERM everything, resolve when none is left or after `graceMs` (then SIGKILL the survivors); never waits longer. */
+	shutdown(options: { graceMs: number; setTimer: (fn: () => void, ms: number) => unknown; clearTimer: (handle: unknown) => void }): Promise<void>;
+}
+
+export function createChildTracker(): ChildTracker {
+	const live = new Set<(signal: NodeJS.Signals) => void>();
+	const waiters = new Set<() => void>();
+	const killAll = (signal: NodeJS.Signals) => {
+		for (const kill of [...live]) {
+			try {
+				kill(signal);
+			} catch {
+				// One child that cannot be signalled must not spare the others.
+			}
+		}
+	};
+	return {
+		add(kill) {
+			live.add(kill);
+			return () => {
+				live.delete(kill);
+				if (live.size === 0) for (const waiter of [...waiters]) waiter();
+			};
+		},
+		size: () => live.size,
+		killAll,
+		killAllNow() {
+			// Each registered kill is the run's group-kill-with-fallback (the one terminate uses).
+			try {
+				killAll("SIGKILL");
+			} catch {
+				// An exit handler must not throw.
+			}
+		},
+		shutdown({ graceMs, setTimer, clearTimer }) {
+			if (live.size === 0) return Promise.resolve();
+			killAll("SIGTERM");
+			return new Promise<void>((resolve) => {
+				let timer: unknown;
+				const finish = () => {
+					waiters.delete(check);
+					clearTimer(timer);
+					resolve();
+				};
+				const check = () => {
+					if (live.size === 0) finish();
+				};
+				waiters.add(check);
+				timer = setTimer(() => {
+					killAll("SIGKILL");
+					finish();
+				}, graceMs);
+			});
+		},
+	};
+}
+
+/** The process-wide tracker the extension shuts down; tests inject their own through `ChildRunDeps.tracker`. */
+export const liveChildren: ChildTracker = createChildTracker();
+
+/** The part of `process` the exit guard uses; tests pass a fake. */
+export interface ParentProcessLike {
+	on(event: string, listener: () => void): unknown;
+	listenerCount(event: string): number;
+	exit(code?: number): unknown;
+}
+
+// Children run in their own process group (`detached`), so a signal sent to the parent's group (terminal hangup, a
+// group kill) no longer reaches them; closing their stdin is the only other stop, and a child in the middle of a tool
+// call may not act on it. The guard SIGKILLs every tracked child group when the parent process exits and, when asked,
+// on the listed signals. It cannot help when the parent itself is SIGKILLed or the machine dies: no handler runs then.
+const GUARD_KEY = Symbol.for("brigadev.parentExitGuard");
+interface GuardState {
+	trackers: Set<ChildTracker>;
+	signals: Set<string>;
+}
+
+/**
+ * Installs, once per process, a `process.on("exit")` handler that calls `killAllNow` on every tracker given so far.
+ * The extension may be loaded again (`/reload`, possibly as a fresh module with a fresh tracker), so the once-only state
+ * lives on the process object under a global symbol: a later call adds its tracker and no second listener.
+ *
+ * `signals` (none by default) adds a listener per signal that kills the children, then keeps Node's default: adding a
+ * listener disables the default exit, so when no other listener exists it exits with 128+signo (SIGHUP 129, SIGTERM 143);
+ * when another one exists it leaves the decision to that one. Pi 1.5 handles SIGTERM and SIGHUP itself in interactive,
+ * print and rpc mode (graceful shutdown, `session_shutdown`, then `process.exit`, which fires the exit handler), so the
+ * extension passes none. No SIGINT: the TUI uses Ctrl+C.
+ */
+export function installParentExitGuard(tracker: ChildTracker, options: { processLike?: ParentProcessLike; signals?: readonly NodeJS.Signals[] } = {}): void {
+	const proc = options.processLike ?? (process as unknown as ParentProcessLike);
+	const holder = proc as unknown as { [GUARD_KEY]?: GuardState };
+	let state = holder[GUARD_KEY];
+	if (!state) {
+		const fresh: GuardState = { trackers: new Set(), signals: new Set() };
+		state = fresh;
+		holder[GUARD_KEY] = fresh;
+		proc.on("exit", () => killEvery(fresh));
+	}
+	const guard = state;
+	guard.trackers.add(tracker);
+	for (const signal of options.signals ?? []) {
+		if (guard.signals.has(signal)) continue;
+		guard.signals.add(signal);
+		proc.on(signal, () => {
+			killEvery(guard);
+			// Ours is one of the listeners; any more means someone else handles the signal.
+			if (proc.listenerCount(signal) > 1) return;
+			proc.exit(128 + (os.constants.signals[signal] ?? 0));
+		});
+	}
+}
+
+function killEvery(state: GuardState): void {
+	for (const tracker of state.trackers) {
+		try {
+			tracker.killAllNow();
+		} catch {
+			// Nothing to do at exit.
+		}
+	}
+}
 
 export interface ChildRunDeps {
 	/** Defaults to node:child_process spawn. */
@@ -109,6 +255,12 @@ export interface ChildRunDeps {
 	tmpRoot?: string;
 	/** Repo docs folder for the saved run folder; defaults to repoDocsDir. */
 	docsDir?: (cwd: string) => string;
+	/** Where live children are registered; defaults to the process-wide `liveChildren`. */
+	tracker?: ChildTracker;
+	/** Signals a whole process group; defaults to `process.kill(-pid, signal)`. */
+	killGroup?: (pid: number, signal: NodeJS.Signals) => void;
+	/** Defaults to process.platform; process groups do not apply on win32. */
+	platform?: NodeJS.Platform;
 }
 
 export interface RunOptions {
@@ -136,6 +288,17 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 	const env = deps.env ?? process.env;
 	const setTimer = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
 	const clearTimer = deps.clearTimer ?? ((handle) => clearTimeout(handle as NodeJS.Timeout));
+	const platform = deps.platform ?? process.platform;
+	const killGroup = deps.killGroup ?? ((pid: number, signal: NodeJS.Signals) => void process.kill(-pid, signal));
+	const tracker = deps.tracker ?? liveChildren;
+	// Caller hooks never break the run: a throw is swallowed (not recorded on the result, which is the child's outcome).
+	const hook = (fn: () => void) => {
+		try {
+			fn();
+		} catch {
+			// A UI or caller bug.
+		}
+	};
 	const result: RunResult = { agent: agent.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), runId: newRunId(agent.name) };
 
 	const structured = Boolean(options.schema && agent.outputSchema);
@@ -175,13 +338,30 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 		const withdraw = () => {
 			if (!controlGiven) return;
 			controlGiven = false;
-			options.onControl?.(undefined);
+			hook(() => options.onControl?.(undefined));
 		};
 		result.exitCode = await new Promise<number>((resolveExit) => {
 			const invocation = deps.piInvocation(launch.args);
-			const proc = spawn(invocation.command, invocation.args, { cwd, env: launch.env, shell: false, stdio: launch.stdio });
+			// Own process group (not on win32, where groups do not apply): a signal to the group reaches grandchildren too.
+			const proc = spawn(invocation.command, invocation.args, { cwd, env: launch.env, shell: false, stdio: launch.stdio, detached: platform !== "win32" });
+			// To the whole group; to the child alone when it has no pid, on win32, or when the group signal throws.
+			const signalChild = (signal: NodeJS.Signals) => {
+				if (proc.pid !== undefined && platform !== "win32") {
+					try {
+						killGroup(proc.pid, signal);
+						return;
+					} catch {
+						// No such group (or not ours): signal the child itself.
+					}
+				}
+				proc.kill(signal);
+			};
+			const release = tracker.add(signalChild);
 			let buffer = "";
 			let exited = false;
+			// Set once the run settled: later output or events change nothing.
+			let done = false;
+			let closeTimer: unknown;
 			let stallError = "";
 			let killTimer: unknown;
 			let abortTimer: unknown;
@@ -191,6 +371,8 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			let forcedExit = false;
 			let streaming = false;
 			let inputOpen = true;
+			// steer/follow_up commands wait here for Pi's response (matched by id); nothing is left waiting once input ends.
+			const commands = createCommandTracker();
 
 			// Commands and UI answers go to the child as one JSON record per line (rpc.md:50-56); false once the pipe is closed.
 			const send = (record: RpcCommand | UiResponse): boolean => {
@@ -207,6 +389,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				if (!inputOpen) return;
 				inputOpen = false;
 				withdraw();
+				commands.settleAll();
 				try {
 					proc.stdin.end();
 				} catch {
@@ -217,12 +400,13 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			proc.stdin.on("error", () => {
 				inputOpen = false;
 				withdraw();
+				commands.settleAll();
 			});
 
 			// SIGTERM now, SIGKILL after the grace period if the child has not exited by then.
 			const terminate = () => {
-				proc.kill("SIGTERM");
-				killTimer ??= setTimer(() => !exited && proc.kill("SIGKILL"), KILL_GRACE_MS);
+				signalChild("SIGTERM");
+				killTimer ??= setTimer(() => !exited && signalChild("SIGKILL"), KILL_GRACE_MS);
 			};
 
 			const watchdog = createStallWatchdog({
@@ -261,11 +445,12 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					// A child that does not stop on its own is terminated like any other.
 					abortTimer ??= setTimer(() => !exited && terminate(), KILL_GRACE_MS);
 				},
+				commands,
 			});
 			// The task is the first command (rpc.md:20; the child has no positional prompt).
 			send({ type: "prompt", message: options.taskText });
 			controlGiven = true;
-			options.onControl?.(control);
+			hook(() => options.onControl?.(control));
 
 			const processLine = (line: string) => {
 				for (const event of parseChildLine(line)) {
@@ -277,6 +462,8 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 						// `agent_end` can be followed by retries, compaction, or queued messages; `agent_settled` is the end (rpc.md:69).
 						if (event.phase === "settled") finishInput();
 					} else if (event.type === "response") {
+						// The answer to a steer/follow_up settles that command's outcome (rpc.md:35-44).
+						commands.respond(event);
 						// A rejected prompt starts no run, and a handled one starts none either (rpc.md:67): neither will ever settle.
 						if (event.command === "prompt" && !event.success) {
 							Object.assign(result, { stopReason: "error", errorMessage: `Pi rejected the task: ${event.error ?? "unknown error"}` });
@@ -296,31 +483,49 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 						if (at - lastPartialUpdate < PARTIAL_UPDATE_MS) continue;
 						lastPartialUpdate = at;
 					}
-					options.onUpdate(result);
+					hook(() => options.onUpdate(result));
 				}
 			};
 
+			// A multi-byte UTF-8 character can be split across chunks: a decoder holds the partial bytes until the rest arrives.
+			// (Not `setEncoding`: the injected child of a test has no such method.)
+			const stdoutDecoder = new StringDecoder("utf8");
+			const stderrDecoder = new StringDecoder("utf8");
 			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
+				if (done) return;
+				buffer += typeof data === "string" ? data : stdoutDecoder.write(data);
 				const lines = buffer.split("\n");
 				buffer = lines.pop() ?? "";
 				for (const line of lines) processLine(line);
 			});
 			proc.stderr.on("data", (data) => {
-				result.stderr += data.toString();
+				if (done) return;
+				result.stderr += typeof data === "string" ? data : stderrDecoder.write(data);
 			});
 			const cleanup = () => {
 				exited = true;
 				inputOpen = false;
+				commands.settleAll();
 				watchdog.stop();
 				if (killTimer !== undefined) clearTimer(killTimer);
 				if (abortTimer !== undefined) clearTimer(abortTimer);
 				if (exitTimer !== undefined) clearTimer(exitTimer);
 				withdraw();
 			};
-			proc.on("close", (code: number | null) => {
+			// The run's one settlement, reached from `close` (all output read) or, if `close` never comes, from the drain timeout.
+			const settle = (code: number | null) => {
+				if (done) return;
+				done = true;
+				if (closeTimer !== undefined) clearTimer(closeTimer);
 				cleanup();
-				if (buffer.trim()) processLine(buffer);
+				try {
+					// Flush what the decoders still hold (a character cut off by the end of the stream).
+					buffer += stdoutDecoder.end();
+					result.stderr += stderrDecoder.end();
+					if (buffer.trim()) processLine(buffer);
+				} catch {
+					// Whatever the last line did, the run still settles below.
+				}
 				// The user's abort is the cause, whatever the child reported on its way out.
 				if (userAborted) Object.assign(result, { stopReason: "aborted", errorMessage: "Aborted by the user" });
 				// The child may report its own "aborted" on SIGTERM; the stall is the real cause.
@@ -330,11 +535,34 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					result.messages.length = finished.messages;
 					Object.assign(result, { stopReason: finished.stopReason, errorMessage: finished.errorMessage });
 				}
+				release();
 				resolveExit(stalled ? 1 : forcedExit ? 0 : (code ?? 0));
+			};
+			proc.on("close", settle);
+			// The child exited: it needs no more signals. Its output normally follows in `close`, but a grandchild that
+			// holds the pipes keeps `close` from ever firing, so the wait for it is bounded.
+			proc.on("exit", (code: number | null) => {
+				if (done) return;
+				exited = true;
+				closeTimer ??= setTimer(() => {
+					// Whatever still holds the pipes belongs to this child's group: end it, then settle without `close`.
+					if (proc.pid !== undefined && platform !== "win32") {
+						try {
+							killGroup(proc.pid, "SIGKILL");
+						} catch {
+							// The group is already gone.
+						}
+					}
+					settle(code);
+				}, CLOSE_DRAIN_MS);
 			});
 			proc.on("error", (error: unknown) => {
+				if (done) return;
+				done = true;
+				if (closeTimer !== undefined) clearTimer(closeTimer);
 				cleanup();
 				result.stderr += String(error);
+				release();
 				resolveExit(1);
 			});
 

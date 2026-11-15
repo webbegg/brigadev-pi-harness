@@ -3,6 +3,8 @@
 // AbortController (not the tool call's signal, which ends with the call) and
 // settles once. `wait` and `cancel` collect a result and mark it `consumed`, so
 // a later delivery (idle notification) can skip what the model already has.
+// `consumedBy` records who took it first (`wait`, `cancel`, or `delivered` by the
+// idle delivery), so a `wait` after delivery can tell the model it already has it.
 // `subscribe` emits start/progress/settle for delivery and the footer count.
 
 export const MAX_SETTLED_LAUNCHES = 64;
@@ -15,11 +17,15 @@ export interface LaunchSummary {
 	done: number;
 	startedAt: number;
 	settledAt: number | undefined;
-	/** Set once `wait` or `cancel` handed the result to the model. */
+	/** Set once `wait` or `cancel` handed the result to the model, or the idle delivery did. */
 	consumed: boolean;
+	/** Who consumed it first; absent until then (the first consumer is kept). */
+	consumedBy?: ConsumedBy;
 	/** Set when the launch body itself threw (not when a child failed: that is in the result). */
 	error: string | undefined;
 }
+
+export type ConsumedBy = "wait" | "cancel" | "delivered";
 
 export type RegistryEvent<R = unknown> =
 	| { type: "start"; launch: LaunchSummary }
@@ -56,7 +62,7 @@ export interface SubagentRegistry<R> {
 	wait(id: string, timeoutMs: number, signal?: AbortSignal): Promise<WaitOutcome<R>>;
 	/** Aborts the launch, waits for its partial result, and consumes it. */
 	cancel(id: string): Promise<WaitOutcome<R>>;
-	/** Marks a settled, unconsumed launch consumed (its result was delivered another way); false when unknown, running, or already consumed. */
+	/** Marks a settled, unconsumed launch consumed as `delivered` (its result went to the session another way); false when unknown, running, or already consumed. */
 	markConsumed(id: string): boolean;
 	/** Aborts every running launch (session shutdown). */
 	abortAll(): void;
@@ -102,8 +108,10 @@ export function createSubagentRegistry<R>(deps: RegistryDeps): SubagentRegistry<
 			? { status: "settled", launch: snapshot(entry), ...(entry.summary.error === undefined ? { result: entry.result } : { error: entry.summary.error }) }
 			: { status: "running", launch: snapshot(entry) };
 
-	const consume = (entry: Entry<R>) => {
+	const consume = (entry: Entry<R>, by: ConsumedBy) => {
+		if (entry.summary.consumed) return;
 		entry.summary.consumed = true;
+		entry.summary.consumedBy = by;
 	};
 
 	const registry: SubagentRegistry<R> = {
@@ -177,7 +185,7 @@ export function createSubagentRegistry<R>(deps: RegistryDeps): SubagentRegistry<
 					else void entry.settled.then(stop);
 				});
 			}
-			if (entry.summary.status === "settled") consume(entry);
+			if (entry.summary.status === "settled") consume(entry, "wait");
 			return outcome(entry);
 		},
 
@@ -186,14 +194,14 @@ export function createSubagentRegistry<R>(deps: RegistryDeps): SubagentRegistry<
 			if (!entry) return { status: "unknown" };
 			entry.controller.abort();
 			await entry.settled;
-			consume(entry);
+			consume(entry, "cancel");
 			return outcome(entry);
 		},
 
 		markConsumed(id) {
 			const entry = entries.get(id);
 			if (!entry || entry.summary.status !== "settled" || entry.summary.consumed) return false;
-			consume(entry);
+			consume(entry, "delivered");
 			return true;
 		},
 

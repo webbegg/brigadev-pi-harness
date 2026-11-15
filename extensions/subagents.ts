@@ -16,18 +16,18 @@ import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@ear
 import { Box, Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { agentsCard, FINISHED_TTL_MS, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
-import { autoScroll, buildEntries, canTakeOver, entryDetail, listRow, moveSelection, openTakeover, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, viewerFooter, viewerTitle, type RecordedRun, type Selection, type TakeoverKey, type TakeoverState, type TrackedRun } from "../lib/subagent-viewer.ts";
+import { ABORT_PROMPT, abortArmFor, autoScroll, buildEntries, canTakeOver, entryDetail, listRow, moveSelection, openTakeover, pressAbort, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, takeoverNotice, viewerFooter, viewerTitle, type AbortArm, type RecordedRun, type Selection, type TakeoverKey, type TakeoverState, type TrackedRun } from "../lib/subagent-viewer.ts";
 import type { ChildControl } from "../lib/child-rpc.ts";
 import { formatStatus, statusCounts } from "../lib/subagent-status.ts";
 import { queuedFields, runState, subagentRow, syncRowTimer, type RowInput, type RowTimerState } from "../lib/subagent-row.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { listWidth, renderTwoPane } from "../lib/two-pane.ts";
 import { emptyTally, formatCost, formatTokens } from "../lib/cost.ts";
-import { failed, output, runChild, type RunResult } from "../lib/child-run.ts";
+import { failed, installParentExitGuard, KILL_GRACE_MS, liveChildren, output, runChild, type RunResult } from "../lib/child-run.ts";
 import { newRunId } from "../lib/run-artifacts.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
 import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
-import { createResultDelivery, resultCard, resultMessage, RESULT_MESSAGE_TYPE, type ResultMessageDetails } from "../lib/result-delivery.ts";
+import { createResultDelivery, deliveredNote, resultCard, resultMessage, RESULT_MESSAGE_TYPE, type ResultMessageDetails } from "../lib/result-delivery.ts";
 import { createSubagentRegistry, type WaitOutcome } from "../lib/subagent-registry.ts";
 import { admitLaunch, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
 import { cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
@@ -45,6 +45,8 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const WAIT_DEFAULT_SECONDS = 60;
 const WAIT_MAX_SECONDS = 300;
+/** Extra time on top of the SIGTERM->SIGKILL grace that session shutdown waits for children to settle. */
+const SHUTDOWN_SLACK_MS = 1000;
 const STATUS_KEY = "brigadev-agents";
 const CARD_KEY = "brigadev-agents-card";
 const CARD_COLLAPSE_KEY = "ctrl+shift+a";
@@ -141,6 +143,11 @@ function routeLabel(route: ResolvedRoute, profileName: string | undefined): stri
 export default function (pi: ExtensionAPI) {
 	if (isChildSession()) return;
 
+	// Children run in their own process group, so a parent that dies without `session_shutdown` would leave them running:
+	// SIGKILL their groups when the process exits (once per process, whatever the number of /reloads). SIGTERM/SIGHUP are
+	// Pi's to handle (graceful shutdown then process.exit), so no signal listeners here.
+	installParentExitGuard(liveChildren);
+
 	let skills: SkillRef[] = [];
 	const activeWriters: ActiveWriter[] = [];
 	// Async launches record the writers other launches register while they run (the A1 backstop exclusion).
@@ -189,6 +196,14 @@ export default function (pi: ExtensionAPI) {
 			const collectedResult = collected(id, launch.error === undefined ? { status: "settled", launch, result } : { status: "settled", launch, error: launch.error });
 			const text = collectedResult.content.map((c) => c.text).join("\n");
 			pi.sendMessage(resultMessage(id, text, collectedResult.isError === true || launch.error !== undefined), { triggerTurn: true, deliverAs: "steer" });
+		},
+		// Retried at each idle flush; when the bound is spent the result is still collectable with subagent_wait.
+		onDeliveryFailed: ({ id }) => {
+			try {
+				if (parentCtx?.hasUI) parentCtx.ui.notify(`brigadev: could not deliver the result of async subagent launch ${id}; collect it with subagent_wait {"runId":"${id}"}`, "warning");
+			} catch {
+				// A stale context: nobody to tell.
+			}
 		},
 	});
 	registry.subscribe((event) => {
@@ -276,12 +291,14 @@ export default function (pi: ExtensionAPI) {
 		epoch++;
 		showCard(ctx);
 	});
-	// Children of running async launches get the usual SIGTERM, then SIGKILL after 5 s.
+	// Children (async and sync) get SIGTERM, and are given KILL_GRACE_MS + 1 s to settle; a group still alive then is
+	// SIGKILLed before this returns, so no child or grandchild outlives the parent. The wait is bounded: shutdown cannot hang.
 	pi.on("session_shutdown", async () => {
 		// Aborted children settle after this; their results must not be sent to a session that is going away.
 		delivery.stop();
 		registry.abortAll();
 		stopTimers();
+		await liveChildren.shutdown({ graceMs: KILL_GRACE_MS + SHUTDOWN_SLACK_MS, setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout) });
 	});
 
 	pi.registerShortcut(CARD_COLLAPSE_KEY, {
@@ -551,6 +568,12 @@ export default function (pi: ExtensionAPI) {
 		return { ...outcome.result, details: { ...outcome.result.details, launchId: id } };
 	};
 
+	/** The idle delivery already put this result in the session: point at the saved folders instead of repeating it (wait and cancel alike). */
+	const deliveredResult = (id: string, outcome: WaitOutcome<LaunchResult>): LaunchResult | undefined => {
+		const note = deliveredNote(id, outcome);
+		return note === undefined ? undefined : ({ content: [{ type: "text", text: note }], details: { mode: "single", results: [], launchId: id, pending: true } } as LaunchResult);
+	};
+
 	pi.registerTool({
 		name: "subagent_wait",
 		label: "Subagent wait",
@@ -558,7 +581,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: WaitParams,
 		async execute(_id, params, signal) {
 			const seconds = Math.min(WAIT_MAX_SECONDS, Math.max(1, params.timeoutSeconds ?? WAIT_DEFAULT_SECONDS));
-			return collected(params.runId, await registry.wait(params.runId, seconds * 1000, signal), seconds);
+			const outcome = await registry.wait(params.runId, seconds * 1000, signal);
+			return deliveredResult(params.runId, outcome) ?? collected(params.runId, outcome, seconds);
 		},
 	});
 
@@ -568,7 +592,8 @@ export default function (pi: ExtensionAPI) {
 		description: "Cancel an async subagent launch; returns the partial results.",
 		parameters: CancelParams,
 		async execute(_id, params) {
-			return collected(params.runId, await registry.cancel(params.runId));
+			const outcome = await registry.cancel(params.runId);
+			return deliveredResult(params.runId, outcome) ?? collected(params.runId, outcome);
 		},
 	});
 
@@ -598,18 +623,28 @@ export default function (pi: ExtensionAPI) {
 			// Takeover: the open input line (steer / follow up), and a one-line result shown in the footer until the next key.
 			let takeover: TakeoverState | undefined;
 			let notice: string | undefined;
+			// `x` pressed once on a run: a second one within 3 s aborts it (pure state in lib/subagent-viewer.ts).
+			let armed: AbortArm | undefined;
+			let closed = false;
 			// What the user typed goes to the child as an RPC steer while it is streaming, as a follow_up between turns.
 			const sendTakeover = (key: string, text: string): string => {
 				const control = controls.get(key);
 				if (!control) return "Not sent: the run has finished";
 				const kind = takeoverKind(control.isStreaming());
-				const sent = kind === "steer" ? control.steer(text) : control.followUp(text);
-				return sent ? (kind === "steer" ? "Steering message sent" : "Follow-up queued") : "Not sent: the run has finished";
+				// The notice reports Pi's answer to this command (matched by id), not that the write succeeded.
+				const answer = kind === "steer" ? control.steer(text) : control.followUp(text);
+				void answer.then((outcome) => {
+					if (closed) return;
+					notice = takeoverNotice(kind, outcome);
+					tui.requestRender();
+				});
+				return kind === "steer" ? "Steering message sent, waiting for Pi…" : "Follow-up sent, waiting for Pi…";
 			};
 			// The list changes while the viewer is open: repaint on every progress update, and once a second so elapsed times tick.
 			repaintViewer = () => tui.requestRender();
 			const timer = setInterval(() => tui.requestRender(), 1000);
 			const close = () => {
+				closed = true;
 				clearInterval(timer);
 				repaintViewer = undefined;
 				done();
@@ -625,6 +660,8 @@ export default function (pi: ExtensionAPI) {
 					const entry = entries[selection.index];
 					notice = undefined;
 					if (takeover && !controls.has(takeover.key)) [takeover, notice] = [undefined, "The run finished"];
+					// Only an `x` on the same run, within the timeout, completes an abort; any other key disarms it.
+					armed = takeover || data !== "x" ? undefined : abortArmFor(armed, entry?.key, Date.now());
 					if (takeover) {
 						// The input line owns every key until Enter or Esc, so j/k/q/x are typed, not commands.
 						const typed = printableText(data);
@@ -664,7 +701,12 @@ export default function (pi: ExtensionAPI) {
 						if (!takeover) notice = "Only a running agent can be steered";
 					} else if (data === "x") {
 						const control = entry && controls.get(entry.key);
-						notice = canTakeOver(entry, control !== undefined) && control?.abort() ? "Abort sent" : "Only a running agent can be aborted";
+						if (!canTakeOver(entry, control !== undefined)) notice = "Only a running agent can be aborted";
+						else {
+							const press = pressAbort(armed, entry.key, Date.now());
+							armed = press.armed;
+							if (press.abort) notice = control?.abort() ? "Abort sent" : "Only a running agent can be aborted";
+						}
 					}
 					tui.requestRender();
 				},
@@ -688,7 +730,7 @@ export default function (pi: ExtensionAPI) {
 							detailScroll: view.scroll,
 							detailOnly,
 							empty: "No subagent runs in this session yet",
-							footer: takeover ? takeoverFooter(takeover, takeoverKind(controls.get(takeover.key)?.isStreaming() ?? false), width) : (notice ?? viewerFooter(canTakeOver(entry, entry !== undefined && controls.has(entry.key)))),
+							footer: takeover ? takeoverFooter(takeover, takeoverKind(controls.get(takeover.key)?.isStreaming() ?? false), width) : (notice ?? (abortArmFor(armed, entry?.key, Date.now()) ? ABORT_PROMPT : viewerFooter(canTakeOver(entry, entry !== undefined && controls.has(entry.key))))),
 						},
 						painter,
 					);
