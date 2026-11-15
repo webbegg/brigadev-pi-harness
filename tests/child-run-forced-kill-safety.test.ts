@@ -84,8 +84,9 @@ const root = fs.mkdtempSync(${JSON.stringify(path.join(os.tmpdir(), "brigadev-ex
 for (const d of ["docs", "tmp", "proj"]) fs.mkdirSync(root + "/" + d);
 runChild({ cwd: root + "/proj", agent: { name: "scout", description: "d", writer: false, systemPrompt: "s", source: "package", filePath: "/a.md" }, request: { agent: "scout", task: "t", reason: "r" }, taskText: "t", route: { model: "p/m", modelSource: "definition", thinkingSource: "definition" }, routeLabel: "definition", price: () => undefined, onUpdate: () => {} },
 	{ piInvocation: (args) => ({ command: process.execPath, args: [${JSON.stringify(fake)}, ...args] }), env: { PATH: process.env.PATH, FAKE_LOG: ${JSON.stringify(log)} }, tmpRoot: root + "/tmp", docsDir: () => root + "/docs" }).catch(() => {});
-for (let i = 0; i < 100 && !fs.existsSync(${JSON.stringify(log)}); i++) await new Promise((r) => setTimeout(r, 100));
-await new Promise((r) => setTimeout(r, 200));
+// Both pid files are written asynchronously by the child and its sh; under load either can lag, so wait for both.
+const nonEmpty = (f) => fs.existsSync(f) && fs.readFileSync(f, "utf8").trim() !== "";
+for (let i = 0; i < 150 && !(nonEmpty(${JSON.stringify(log)}) && nonEmpty(${JSON.stringify(log)} + ".nested")); i++) await new Promise((r) => setTimeout(r, 100));
 const pids = JSON.parse(fs.readFileSync(${JSON.stringify(log)}, "utf8"));
 pids.push(Number(fs.readFileSync(${JSON.stringify(log)} + ".nested", "utf8")));
 fs.writeFileSync(${JSON.stringify(out)}, JSON.stringify(pids));
