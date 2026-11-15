@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.16.0] - 2026-11-15
 
 - Background terminals: `bg_start` runs a long command without blocking the turn; `bg_status`, `bg_list`, and `bg_kill` manage it, and `/brigadev:ps` lists them with their output. At most 8 running, stdin ignored, a 256 KB output tail each. An exit the model has not seen is delivered to the session once, when it is idle. The guard decides `bg_start` exactly like `bash`, including the cwd. Each process runs in its own process group and is stopped on `bg_kill`, at session shutdown, and if Pi exits. Parent session only.
 - `/btw <question>`: a read-only `brigadev-explore` agent answers a side question in the background; the answer is shown to you and never enters the model context or the async result delivery.
