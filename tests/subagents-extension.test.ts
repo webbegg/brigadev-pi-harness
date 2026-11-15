@@ -44,6 +44,11 @@ after(() => {
 
 const load = (options: { hasUI?: boolean; idle?: boolean } = {}): { pi: FakePi; ctx: FakeCtx } => {
 	const pi = createFakePi();
+	// Pi 1.5.2's `registerEntryRenderer`, which the shared fake may not have: recorded on the fake, so a test can read it back.
+	if (!("registerEntryRenderer" in pi)) {
+		const entryRenderers = new Map<string, unknown>();
+		Object.assign(pi, { entryRenderers, registerEntryRenderer: (type: string, renderer: unknown) => void entryRenderers.set(type, renderer) });
+	}
 	extension(pi);
 	return { pi, ctx: createFakeCtx({ cwd, ...options }) };
 };
@@ -282,5 +287,117 @@ describe("async launches: delivered-omitted wiring end to end", () => {
 			await pi.fire("session_shutdown", {}, ctx);
 			process.argv[1] = savedArgv1;
 		}
+	});
+});
+
+describe("/btw: a side question that never enters the model's context", () => {
+	const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+	const UNKNOWN = (id: string) => `Unknown launch id "${id}" (not started in this session, or pruned).`;
+
+	const withFakeChild = async (body: () => Promise<void>) => {
+		savedArgv1 = process.argv[1];
+		process.argv[1] = FAKE_CHILD;
+		try {
+			await body();
+		} finally {
+			process.argv[1] = savedArgv1!;
+		}
+	};
+	const until = async (done: () => boolean, ms = 10_000) => {
+		for (let i = 0; i < ms / 50 && !done(); i++) await sleep(50);
+		assert.ok(done(), "timed out waiting");
+	};
+	const startedId = (ctx: FakeCtx) => /launch (\S+)/.exec(ctx.notifications[0]?.message ?? "")?.[1] as string;
+
+	it("registers /btw and an entry renderer for its answer", () => {
+		const { pi } = load();
+		assert.ok(pi.commands.has("btw"));
+		assert.deepEqual([...(pi as any).entryRenderers.keys()], ["brigadev-btw"]);
+	});
+
+	it("shows the answer as a custom entry (not a message), never sends it to the model, and hides its launch from subagent_wait/cancel", { timeout: 60_000 }, async () => {
+		fs.rmSync(repoDocsDir(cwd), { recursive: true, force: true });
+		await withFakeChild(async () => {
+			const { pi, ctx } = load({ hasUI: true, idle: true });
+			try {
+				await pi.fire("session_start", { reason: "startup" }, ctx);
+				await pi.commands.get("btw").handler("  where is the delivery buffer?  ", ctx);
+				const id = startedId(ctx);
+				assert.ok(id, `the start notice names the launch: ${JSON.stringify(ctx.notifications)}`);
+				assert.equal(ctx.notifications[0].type, "info");
+
+				// While it runs it already answers like an unknown id, and it cannot be cancelled by the model.
+				for (const name of ["subagent_wait", "subagent_cancel"]) {
+					const running = await pi.tool(name).execute("t", { launchId: id, timeoutSeconds: 1 });
+					assert.equal(running.isError, true, name);
+					assert.equal(text(running), UNKNOWN(id));
+				}
+				assert.ok(ctx.statuses.some((s) => /1 running/.test(s.text ?? "")), "it takes a slot and shows in the footer like any launch");
+
+				await until(() => pi.entries.length > 0);
+				assert.equal(pi.entries.length, 1);
+				assert.equal(pi.entries[0].type, "brigadev-btw");
+				const data = pi.entries[0].data as { id: string; status: string; question: string; answer: string };
+				assert.equal(data.id, id);
+				assert.equal(data.status, "answered");
+				assert.equal(data.question, "where is the delivery buffer?");
+				assert.match(data.answer, /small result/);
+				assert.ok(ctx.notifications.some((n) => /answered/.test(n.message) && n.message.includes(id)), "the user is told it answered");
+
+				// The parent is idle and the launch is settled: any idle delivery would have fired by now.
+				await pi.fire("agent_settled", {}, ctx);
+				assert.equal(pi.messages.length, 0, "sendMessage is never called for an aside");
+
+				for (const name of ["subagent_wait", "subagent_cancel"]) {
+					const settled = await pi.tool(name).execute("t", { launchId: id });
+					assert.equal(settled.isError, true, name);
+					assert.equal(text(settled), UNKNOWN(id), `${name} answers exactly like an unknown id`);
+					assert.equal(text(settled), text(await pi.tool(name).execute("t", { launchId: "nope-nope" })).replace("nope-nope", id));
+				}
+				assert.equal(pi.messages.length, 0);
+			} finally {
+				await pi.fire("session_shutdown", {}, ctx);
+			}
+		});
+	});
+
+	it("a model async launch is still delivered while an aside is not", { timeout: 60_000 }, async () => {
+		fs.rmSync(repoDocsDir(cwd), { recursive: true, force: true });
+		await withFakeChild(async () => {
+			const { pi, ctx } = load({ hasUI: true, idle: true });
+			try {
+				await pi.fire("session_start", { reason: "startup" }, ctx);
+				await pi.commands.get("btw").handler("aside question", ctx);
+				const started = await pi.tool("subagent").execute("t", { agent: "brigadev-explore", task: "model task", reason: "independent units", async: true }, undefined, undefined, ctx);
+				assert.notEqual(started.isError, true, text(started));
+				await until(() => pi.entries.length > 0 && pi.messages.length > 0);
+				assert.equal(pi.messages.length, 1);
+				assert.equal(pi.messages[0].message.details.launchId, started.details.launchId, "only the model's launch was delivered");
+				assert.doesNotMatch(pi.messages[0].message.content, /aside question/);
+			} finally {
+				await pi.fire("session_shutdown", {}, ctx);
+			}
+		});
+	});
+
+	it("without a question it says how to use it and starts nothing", async () => {
+		const { pi, ctx } = load({ hasUI: true });
+		await pi.fire("session_start", { reason: "startup" }, ctx);
+		await pi.commands.get("btw").handler("   ", ctx);
+		assert.deepEqual(ctx.notifications, [{ message: "Usage: /btw <question>", type: "info" }]);
+		assert.equal(pi.entries.length, 0);
+	});
+
+	it("an answer that arrives after the session shut down is not recorded", { timeout: 60_000 }, async () => {
+		fs.rmSync(repoDocsDir(cwd), { recursive: true, force: true });
+		await withFakeChild(async () => {
+			const { pi, ctx } = load({ hasUI: true, idle: true });
+			await pi.fire("session_start", { reason: "startup" }, ctx);
+			await pi.commands.get("btw").handler("slow one", ctx);
+			await pi.fire("session_shutdown", {}, ctx);
+			await sleep(500);
+			assert.deepEqual(pi.entries, []);
+			assert.equal(pi.messages.length, 0);
+		});
 	});
 });

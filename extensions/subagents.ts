@@ -14,7 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { agentsCard, FINISHED_TTL_MS, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
 import { ABORT_PROMPT, abortArmFor, autoScroll, buildEntries, canTakeOver, entryDetail, listRow, moveSelection, openTakeover, pressAbort, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, takeoverNotice, viewerFooter, viewerTitle, type AbortArm, type RecordedRun, type Selection, type TakeoverKey, type TakeoverState, type TrackedRun } from "../lib/subagent-viewer.ts";
 import type { ChildControl } from "../lib/child-rpc.ts";
@@ -31,6 +31,7 @@ import { createSemaphore } from "../lib/semaphore.ts";
 import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
 import { createResultDelivery, omittedLaunchIds, omittedResultText, resultBatchMessage, resultCard, RESULT_MESSAGE_TYPE, type BatchEntry, type ResultMessageDetails } from "../lib/result-delivery.ts";
 import { createSubagentRegistry } from "../lib/subagent-registry.ts";
+import { BTW_AGENT, BTW_ENTRY_TYPE, BTW_REASON, btwCard, btwEntry, btwTask, createAsideTracker, hideAsides, type BtwEntryData } from "../lib/btw.ts";
 import { cancelLaunch, collectedResult, collectHint, startedText, waitForLaunch, WAIT_DEFAULT_SECONDS, WAIT_MAX_SECONDS } from "../lib/subagent-tools.ts";
 import { admitLaunch, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
 import { cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
@@ -173,6 +174,10 @@ export default function (pi: ExtensionAPI) {
 
 	// One concurrency cap for every launch in this process, sync or async.
 	const slots = createSemaphore(MAX_CONCURRENCY);
+	// `/btw` asides: launches through the same path as any async one, but never delivered to the model nor reachable from its tools (lib/btw.ts).
+	const asides = createAsideTracker();
+	// False from session shutdown to the next session start: an aside that settles then (aborted) is not recorded into a closing session.
+	let asidesOpen = true;
 	// Async launches: each runs under its own AbortController, collected by subagent_wait / subagent_cancel.
 	const registry = createSubagentRegistry<LaunchResult>({
 		setTimer: (fn, ms) => setTimeout(fn, ms),
@@ -181,6 +186,8 @@ export default function (pi: ExtensionAPI) {
 		// A result held for the idle parent is never pruned before it is delivered or collected.
 		isPinned: (id) => delivery.isHeld(id),
 	});
+	// What the model's subagent_wait / subagent_cancel see: an aside answers like an unknown id.
+	const modelRegistry = hideAsides(registry, asides);
 
 	// Idle delivery of async results the model did not collect: injected as a custom message that starts a parent turn.
 	// Pi API (docs/extensions.md in the installed pi-coding-agent): `pi.sendMessage(..., { triggerTurn: true, deliverAs: "steer" })`
@@ -219,8 +226,23 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 	});
+	// An aside's answer is a custom entry: `pi.appendEntry` (docs/extensions.md, "pi.appendEntry(customType, data?)") "do[es] NOT participate in LLM context",
+	// and is drawn by the entry renderer below ("pi.registerEntryRenderer(customType, renderer)"). Never `sendMessage`, which does reach the model.
+	const recordAside = (id: string, result: LaunchResult | undefined, error: string | undefined) => {
+		if (!asidesOpen) return;
+		const data = btwEntry({ id, question: asides.question(id) ?? "", launch: { error }, result });
+		try {
+			pi.appendEntry(BTW_ENTRY_TYPE, data);
+			registry.markConsumed(id, "delivered");
+			if (parentCtx?.hasUI) parentCtx.ui.notify(`by the way “${data.title}” ${data.status === "failed" ? "failed" : "answered"} (launch ${id})`, data.status === "failed" ? "error" : "info");
+		} catch {
+			// A stale context (session replaced): nobody to show it to.
+		}
+	};
 	registry.subscribe((event) => {
-		if (event.type === "settle") delivery.settled(event);
+		if (event.type !== "settle") return;
+		if (asides.has(event.launch.id)) recordAside(event.launch.id, event.result, event.launch.error);
+		else delivery.settled(event);
 	});
 
 	// Agents card: live rows above the editor while subagents run.
@@ -297,6 +319,8 @@ export default function (pi: ExtensionAPI) {
 		// Launches left from a previous session in this process are stopped and forgotten, with any result held for them.
 		delivery.reset();
 		registry.clear();
+		asides.clear();
+		asidesOpen = true;
 		runs = [];
 		launches.clear();
 		controls.clear();
@@ -316,6 +340,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		// Aborted children settle after this; their results must not be sent to a session that is going away.
 		delivery.stop();
+		asidesOpen = false;
 		registry.abortAll();
 		stopTimers();
 		await liveChildren.shutdown({ graceMs: KILL_GRACE_MS + SHUTDOWN_SLACK_MS, setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout) });
@@ -347,17 +372,25 @@ export default function (pi: ExtensionAPI) {
 		return box;
 	});
 
+	pi.registerEntryRenderer<BtwEntryData>(BTW_ENTRY_TYPE, (entry, { expanded, keyHint }, theme) => {
+		const card = btwCard(entry.data, expanded);
+		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+		card.lines.forEach((line, i) => {
+			box.addChild({ render: (width: number) => [theme.fg(line.tone, i === 0 ? theme.bold(truncateToWidth(line.text, Math.max(1, width), "…")) : truncateToWidth(line.text, Math.max(1, width), "…"))], invalidate: () => {} });
+		});
+		if (expanded) box.addChild(new Markdown(card.body, 0, 0, getMarkdownTheme()));
+		else if (card.hidden > 0) box.addChild(new Text(theme.fg("muted", `  (${keyHint("app.tools.expand", "to expand")})`), 0, 0));
+		return box;
+	});
+
 	pi.on("before_agent_start", async (event) => {
 		skills = (event.systemPromptOptions.skills ?? []).map((s) => ({ name: s.name, filePath: s.filePath }));
 	});
 
-	pi.registerTool({
-		name: "subagent",
-		label: "Subagent",
-		description: "Run a focused brigadev agent in its own context, only for a named delegation trigger. Single: agent, task, reason. Parallel: tasks[]. Writers need allowedEditSurfaces.",
-		parameters: Params,
-
-		async execute(_id, params, signal, onUpdate, ctx) {
+	// The launch behind the `subagent` tool. `/btw` uses it too, with origin "btw": same admission, slots, guard, run folder and viewer row,
+	// but the async launch is recorded as an aside (see `asides`) so the model's tools and the idle delivery never see it.
+	const subagentLauncher = {
+		async launch(params: Static<typeof Params>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: ExtensionContext, origin: "model" | "btw" = "model", question = "") {
 			parentCtx = ctx;
 			const agents = loadAgents(ctx);
 			const requests: LaunchRequest[] = params.tasks?.length
@@ -521,11 +554,22 @@ export default function (pi: ExtensionAPI) {
 			// Async: the launch runs under the registry's own AbortController (the tool call's signal ends with the call).
 			// Admission errors were already returned above, before anything started.
 			const id = registry.start({ total: results.length, run: async (runSignal, control) => toResult(mode, await launch(runSignal, { onProgress: control.progress, tolerateAbort: true, async: true })) });
+			// Marked before the body can settle (it settles on a later tick), so the settle listener already sees it as an aside.
+			if (origin === "btw") asides.mark(id, question);
 			return {
 				content: [{ type: "text", text: startedText(id, results.length, [...new Set(requests.map((r) => r.agent))]) }],
 				details: { mode, results: results.map((r) => ({ ...r })), launchId: id, pending: true } as Details,
 			};
 		},
+	};
+
+	pi.registerTool({
+		name: "subagent",
+		label: "Subagent",
+		description: "Run a focused brigadev agent in its own context, only for a named delegation trigger. Single: agent, task, reason. Parallel: tasks[]. Writers need allowedEditSurfaces.",
+		parameters: Params,
+
+		execute: async (_id, params, signal, onUpdate, ctx) => subagentLauncher.launch(params, signal, onUpdate, ctx),
 
 		renderCall(args, theme) {
 			const shown = args.tasks?.length ? args.tasks : [{ agent: args.agent ?? "...", task: args.task ?? "", reason: args.reason ?? "" }];
@@ -580,7 +624,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent wait",
 		description: `Wait for an async subagent launch (default ${WAIT_DEFAULT_SECONDS}s, max ${WAIT_MAX_SECONDS}s). Returns its result, or its progress if still running.`,
 		parameters: WaitParams,
-		execute: async (_id, params, signal) => waitForLaunch(registry, params, signal),
+		execute: async (_id, params, signal) => waitForLaunch(modelRegistry, params, signal),
 	});
 
 	pi.registerTool({
@@ -588,7 +632,22 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent cancel",
 		description: "Cancel an async subagent launch; returns the partial results.",
 		parameters: CancelParams,
-		execute: async (_id, params) => cancelLaunch(registry, params),
+		execute: async (_id, params) => cancelLaunch(modelRegistry, params),
+	});
+
+	pi.registerCommand("btw", {
+		description: "Ask a side question: a read-only agent answers in the background; the answer is shown to you and never reaches the model",
+		handler: async (args, ctx) => {
+			const tell = (message: string, type: "info" | "error") => {
+				if (ctx.hasUI) ctx.ui.notify(message, type);
+			};
+			const question = args.trim();
+			if (!question) return tell("Usage: /btw <question>", "info");
+			const started = await subagentLauncher.launch({ agent: BTW_AGENT, task: btwTask(question), reason: BTW_REASON, async: true }, undefined, undefined, ctx, "btw", question);
+			const id = started.details.launchId;
+			if (started.isError || !id) return tell(started.content.map((c) => c.text).join("\n"), "error");
+			tell(`by the way: launch ${id} started; its answer will appear in the conversation but never reaches the model`, "info");
+		},
 	});
 
 	/** Every run: those this process tracks (queued, running, and settled since the session started, async ones included) plus the finished ones recorded on this branch. */
