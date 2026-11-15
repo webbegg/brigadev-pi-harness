@@ -24,7 +24,8 @@ import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { listWidth, renderTwoPane } from "../lib/two-pane.ts";
 import { emptyTally, formatCost, formatTokens } from "../lib/cost.ts";
 import { failed, installParentExitGuard, KILL_GRACE_MS, liveChildren, output, runChild, type RunResult } from "../lib/child-run.ts";
-import { newRunId } from "../lib/run-artifacts.ts";
+import { newRunId, pruneRunFolders } from "../lib/run-artifacts.ts";
+import { repoDocsDir } from "../lib/repo-docs.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
 import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
 import { createResultDelivery, deliveredNote, omittedLaunchIds, omittedResultText, resultBatchMessage, resultCard, RESULT_MESSAGE_TYPE, type BatchEntry, type ResultMessageDetails } from "../lib/result-delivery.ts";
@@ -297,6 +298,12 @@ export default function (pi: ExtensionAPI) {
 		settled = [];
 		epoch++;
 		showCard(ctx);
+		// Run folders hold full transcripts: keep 14 days and at most 200 (lib/run-artifacts.ts). Never fails the session.
+		try {
+			pruneRunFolders(repoDocsDir(ctx.cwd));
+		} catch {
+			// Retention is housekeeping, not part of starting a session.
+		}
 	});
 	// Children (async and sync) get SIGTERM, and are given KILL_GRACE_MS + 1 s to settle; a group still alive then is
 	// SIGKILLed before this returns, so no child or grandchild outlives the parent. The wait is bounded: shutdown cannot hang.
