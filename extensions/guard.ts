@@ -12,7 +12,7 @@ import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
 import { appendEvidence, commitGateWithForce, evidenceFile, forceRecord, gateDialog, readEvidence, type ForceRecord } from "../lib/evidence.ts";
-import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, type PathVerdict } from "../lib/guard-rules.ts";
+import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, shellCallOf, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
@@ -124,6 +124,45 @@ export default function (pi: ExtensionAPI) {
 		return { reason: decision.reason, settle: () => {} };
 	};
 
+	/**
+	 * One file-access decision for a path a tool call touches (read, write, edit, or the working directory a background
+	 * process starts in): sensitive-path question, outside-project grant. Returns a block, or undefined to let it run.
+	 * `isDirectory`: the path is a working directory, so a sensitive folder (`.ssh`) counts as sensitive and an outside
+	 * directory is granted as itself, not as its parent (the folder of a file).
+	 */
+	const checkPath = async (toolName: string, rawPath: string, absolute: string, isWrite: boolean, ctx: ExtensionContext, isDirectory = false): Promise<{ block: true; reason: string } | undefined> => {
+		const root = projectRoot(ctx);
+		const decision = decideFileAccess({
+			isChild,
+			isWrite,
+			rawPath,
+			absolutePath: absolute,
+			projectRoot: root,
+			docsDir: () => repoDocsDir(ctx.cwd),
+			sensitive: isSensitivePath(isDirectory ? `${absolute}/` : absolute),
+			readOnly: process.env[CHILD_ENV.READ_ONLY] === "1",
+			surfaces: isChild ? childAllowedSurfaces() : undefined,
+			agent: process.env[CHILD_ENV.AGENT],
+		});
+
+		let verdict: PathVerdict;
+		if (decision.action === "ask" && decision.kind === "sensitive") {
+			const ok = await confirm(ctx, "brigadev: sensitive file", `${toolName} ${rawPath}\n\nThis path commonly holds secrets or credentials. Allow?`);
+			if (!ok) return { block: true, reason: `User declined access to sensitive file ${rawPath}` };
+			verdict = decision.then;
+		} else verdict = decision;
+
+		if (verdict.action === "block") return { block: true, reason: verdict.reason };
+		if (verdict.action === "ask") {
+			if ([...outsideGrants].some((granted) => isInside(granted, absolute))) return undefined;
+			const target = isDirectory ? absolute : verdict.target;
+			const ok = await confirm(ctx, "brigadev: write outside project", `${toolName} ${absolute}\n\nOutside the project root ${root}. Allow writes under ${target} for this session?`);
+			if (!ok) return { block: true, reason: `User declined write outside the project root: ${absolute}` };
+			outsideGrants.add(target);
+		}
+		return undefined;
+	};
+
 	pi.on("session_start", async (_event, ctx) => restoreMode(ctx));
 	pi.on("session_tree", async (_event, ctx) => restoreMode(ctx));
 
@@ -133,12 +172,22 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
-		if (isToolCallEventType("bash", event)) {
+		// `bash` and `bg_start` (a background shell process) are one path: same classification, same permission rules,
+		// same evidence-log and commit-gate rules. `bg_start` adds its working directory, decided like a write into it.
+		const shell = shellCallOf(event.toolName, event.input);
+		if (shell) {
+			const { command } = shell;
 			// Nobody forges a recorded test result: the evidence log is written only by the recorder. (Textual rule; reading stays allowed.)
-			if (event.input.command.includes("evidence") && bashWritesEvidence(event.input.command, [join(repoDocsDir(ctx.cwd), "evidence")])) return { block: true, reason: EVIDENCE_BLOCK };
+			if (command.includes("evidence") && bashWritesEvidence(command, [join(repoDocsDir(ctx.cwd), "evidence")])) return { block: true, reason: EVIDENCE_BLOCK };
+			let commandCwd = ctx.cwd;
+			if (shell.cwd !== undefined) {
+				commandCwd = canonicalPath(resolve(ctx.cwd, expandHome(shell.cwd)));
+				const blocked = await checkPath(event.toolName, shell.cwd, commandCwd, true, ctx, true);
+				if (blocked) return blocked;
+			}
 			const surfaces = writerSurfaces();
 			if (surfaces) {
-				const outside = writesOutsideSurfaces(event.input.command, ctx.cwd, projectRoot(ctx), surfaces);
+				const outside = writesOutsideSurfaces(command, ctx.cwd, projectRoot(ctx), surfaces);
 				if (outside.length > 0) {
 					return {
 						block: true,
@@ -147,12 +196,12 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const decision = await decideBashCommand({ command: event.input.command, mode, isChild, cwd: ctx.cwd, readFacts: (cwd) => readBranchFacts(exec, cwd) });
+			const decision = await decideBashCommand({ command, mode, isChild, cwd: commandCwd, readFacts: (cwd) => readBranchFacts(exec, cwd) });
 			if (decision.action === "block") return { block: true, reason: decision.reason };
-			const gated = isChild ? undefined : await evidenceGate(event.input.command, ctx);
+			const gated = isChild ? undefined : await evidenceGate(command, ctx);
 			if (gated?.reason) return { block: true, reason: gated.reason };
 			if (decision.action === "confirm") {
-				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(event.input.command)}\n\nRun it?`);
+				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(command)}\n\nRun it?`);
 				if (!ok) return { block: true, reason: `User declined: ${decision.reason}` };
 			}
 			// Every rule allowed the commit: only now is the user's force spent and logged.
@@ -173,36 +222,7 @@ export default function (pi: ExtensionAPI) {
 		const rawPath = String((event.input as { path?: unknown }).path ?? "");
 		if (!rawPath) return undefined;
 		const absolute = canonicalPath(resolve(ctx.cwd, expandHome(rawPath)));
-		const root = projectRoot(ctx);
-
-		const decision = decideFileAccess({
-			isChild,
-			isWrite,
-			rawPath,
-			absolutePath: absolute,
-			projectRoot: root,
-			docsDir: () => repoDocsDir(ctx.cwd),
-			sensitive: isSensitivePath(absolute),
-			readOnly: process.env[CHILD_ENV.READ_ONLY] === "1",
-			surfaces: isChild ? childAllowedSurfaces() : undefined,
-			agent: process.env[CHILD_ENV.AGENT],
-		});
-
-		let verdict: PathVerdict;
-		if (decision.action === "ask" && decision.kind === "sensitive") {
-			const ok = await confirm(ctx, "brigadev: sensitive file", `${event.toolName} ${rawPath}\n\nThis path commonly holds secrets or credentials. Allow?`);
-			if (!ok) return { block: true, reason: `User declined access to sensitive file ${rawPath}` };
-			verdict = decision.then;
-		} else verdict = decision;
-
-		if (verdict.action === "block") return { block: true, reason: verdict.reason };
-		if (verdict.action === "ask") {
-			if ([...outsideGrants].some((granted) => isInside(granted, absolute))) return undefined;
-			const ok = await confirm(ctx, "brigadev: write outside project", `${event.toolName} ${absolute}\n\nOutside the project root ${root}. Allow writes under ${verdict.target} for this session?`);
-			if (!ok) return { block: true, reason: `User declined write outside the project root: ${absolute}` };
-			outsideGrants.add(verdict.target);
-		}
-		return undefined;
+		return checkPath(event.toolName, rawPath, absolute, isWrite, ctx);
 	});
 
 	pi.on("tool_result", async (event, ctx) => {

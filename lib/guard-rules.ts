@@ -126,6 +126,21 @@ export function bashWritesEvidence(command: string, evidenceDirs: readonly strin
 	return tokenize(text).some((segment) => segment.argv.some((word) => WRITE_COMMANDS.has(executableName(word))));
 }
 
+/** Tools that run a shell command string: `bash`, and `bg_start` (a background process, extensions/background-terminals.ts). One set of rules decides all of them. */
+export const SHELL_TOOLS: readonly string[] = ["bash", "bg_start"];
+
+/**
+ * The command (and, for `bg_start`, the optional working directory as the model wrote it) a shell tool call runs, or
+ * undefined for any other tool. A command that is not a string counts as empty, so the rules never see a non-string.
+ */
+export function shellCallOf(toolName: string, input: unknown): { command: string; cwd?: string } | undefined {
+	if (!SHELL_TOOLS.includes(toolName)) return undefined;
+	const fields = (input && typeof input === "object" ? input : {}) as { command?: unknown; cwd?: unknown };
+	const command = typeof fields.command === "string" ? fields.command : "";
+	if (toolName !== "bg_start") return { command };
+	return typeof fields.cwd === "string" && fields.cwd.trim() !== "" ? { command, cwd: fields.cwd } : { command };
+}
+
 export interface BashDecisionInput {
 	command: string;
 	mode: PermissionMode;
