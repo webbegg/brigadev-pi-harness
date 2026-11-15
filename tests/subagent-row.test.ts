@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { isUnfinished, runStatus, toRunState } from "../lib/child-run.ts";
+import { runStatus, toRunState } from "../lib/run-status.ts";
 import { COLLAPSED_CALLS, modelSegment, queuedFields, rowHeader, settleQueued, subagentRow, syncRowTimer, type RowInput } from "../lib/subagent-row.ts";
 
 const sr = { queuedFields, settleQueued, syncRowTimer };
@@ -183,26 +183,4 @@ describe("subagent row", () => {
 		assert.equal(subagentRow(input({ state: "done" }), { now, expanded: false })[0].tone, "success");
 		assert.equal(subagentRow(input({ state: "failed" }), { now, expanded: false })[0].tone, "error");
 	});
-});
-
-describe("runStatus: the one run-state rule", () => {
-	const cases: Array<[string, Parameters<typeof runStatus>[0], string, string]> = [
-		// [what, run, status, three-state view]
-		["exit -1, no end, not queued", { exitCode: -1 }, "running", "running"],
-		["exit -1, no end, queued", { exitCode: -1, queued: true }, "queued", "running"],
-		["exit -1 with an end time", { exitCode: -1, endedAt: 5 }, "failed", "failed"],
-		["exit -1 with an end time, aborted while queued", { exitCode: -1, queued: true, cancelled: true, endedAt: 5 }, "cancelled", "failed"],
-		["exit 0", { exitCode: 0, stopReason: "stop" }, "done", "done"],
-		["exit 0 without a stop reason", { exitCode: 0 }, "done", "done"],
-		["exit 1", { exitCode: 1 }, "failed", "failed"],
-		["exit 0, stop reason error", { exitCode: 0, stopReason: "error" }, "failed", "failed"],
-		["exit 0, stop reason aborted", { exitCode: 0, stopReason: "aborted" }, "failed", "failed"],
-	];
-	for (const [what, run, status, view] of cases) {
-		it(`${what}: ${status}`, () => {
-			assert.equal(runStatus(run), status);
-			assert.equal(toRunState(runStatus(run)), view);
-			assert.equal(isUnfinished(runStatus(run)), status === "running" || status === "queued");
-		});
-	}
 });

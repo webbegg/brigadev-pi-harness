@@ -4,7 +4,7 @@
 
 import { argPreview } from "./agent-thread.ts";
 import { formatElapsed, shortModel, type RunState } from "./agents-card.ts";
-import { runStatus, type RunResult } from "./child-run.ts";
+import { runStatus, type RunResult } from "./run-status.ts";
 import { drawnTicker, type DrawnTicker, type TickerDeps } from "./compact-tools.ts";
 import { formatCost } from "./cost.ts";
 import type { Tone } from "./shell-bar.ts";

@@ -40,15 +40,27 @@ export interface Delivered<R> {
 	result?: R;
 }
 
+/** How a delivered launch is recorded: with its text in the message, or only as a pointer to its saved folders. */
+export type DeliveredBy = "delivered" | "delivered-omitted";
+
+/** What `deliver` may return. */
+export interface DeliverResult {
+	/** Ids of the batch whose text was left out of the message. */
+	omitted?: readonly string[];
+}
+
 export interface ResultDeliveryDeps<R> {
 	/** True when the parent agent is not in a run (a delivery would start a turn now). */
 	isIdle: () => boolean;
 	/** True when the model already has this launch's result (collected by wait/cancel), or the launch is gone. */
 	isConsumed: (id: string) => boolean;
-	/** Records that the result was delivered, so a later `wait` or idle signal cannot repeat it. */
-	markConsumed: (id: string) => void;
-	/** Hands the ready results to the parent as one message (settle order). A throw leaves them all unconsumed and held for a retry at the next idle flush. */
-	deliver: (batch: Delivered<R>[]) => void;
+	/** Records that the result was delivered, so a later `wait` or idle signal cannot repeat it. `by` is "delivered-omitted" for a launch `deliver` reported as omitted, else "delivered". */
+	markConsumed: (id: string, by: DeliveredBy) => void;
+	/**
+	 * Hands the ready results to the parent as one message (settle order). A throw leaves them all unconsumed and held for a retry at the next idle flush.
+	 * It may return the ids of launches whose text was left out of the message (size guard): they are marked "delivered-omitted".
+	 */
+	deliver: (batch: Delivered<R>[]) => DeliverResult | void;
 	/** Called once per item, with the last error, when DELIVERY_ATTEMPTS attempts all threw: the results stay unconsumed for `subagent_wait`. */
 	onDeliveryFailed?: (item: Delivered<R>, error: unknown) => void;
 }
@@ -92,8 +104,9 @@ export function createResultDelivery<R>(deps: ResultDeliveryDeps<R>): ResultDeli
 		queue = [];
 		try {
 			if (batch.length === 0) return;
+			let omitted: ReadonlySet<string> = new Set();
 			try {
-				deps.deliver(batch);
+				omitted = new Set(deps.deliver(batch)?.omitted ?? []);
 			} catch (error) {
 				if (generation !== startedIn) return; // reset or stop ran meanwhile: nothing comes back
 				// An item already counted in this idle epoch (a settle-triggered retry) does not spend its budget again.
@@ -122,7 +135,7 @@ export function createResultDelivery<R>(deps: ResultDeliveryDeps<R>): ResultDeli
 			}
 			for (const item of batch) {
 				failures.delete(item.id);
-				deps.markConsumed(item.id);
+				deps.markConsumed(item.id, omitted.has(item.id) ? "delivered-omitted" : "delivered");
 			}
 		} finally {
 			flushing = false;

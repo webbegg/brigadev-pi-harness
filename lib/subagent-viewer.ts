@@ -7,7 +7,7 @@
 import { threadRows } from "./agent-thread.ts";
 import { formatElapsed } from "./agents-card.ts";
 import type { CommandOutcome } from "./child-rpc.ts";
-import { isUnfinished, runStatus, type RunResult, type RunStatus } from "./child-run.ts";
+import { isUnfinished, runStatus, type RunResult, type RunStatus } from "./run-status.ts";
 import { formatCost, formatTokens } from "./cost.ts";
 import type { Tone } from "./shell-bar.ts";
 import { maxScroll, type Row } from "./two-pane.ts";

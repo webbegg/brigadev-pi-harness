@@ -23,8 +23,9 @@ import { queuedFields, subagentRow, syncRowTimer, type RowInput, type RowTimerSt
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { listWidth, renderTwoPane } from "../lib/two-pane.ts";
 import { emptyTally, formatCost, formatTokens } from "../lib/cost.ts";
-import { installParentExitGuard, KILL_GRACE_MS, liveChildren, output, runChild, runStatus, toRunState, type RunResult } from "../lib/child-run.ts";
-import { newRunId, pruneRunFolders } from "../lib/run-artifacts.ts";
+import { installParentExitGuard, KILL_GRACE_MS, liveChildren, runChild } from "../lib/child-run.ts";
+import { output, runStatus, toRunState, type RunResult } from "../lib/run-status.ts";
+import { newRunId, pruneRunFolders, pruneWarning } from "../lib/run-artifacts.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
 import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
@@ -187,8 +188,6 @@ export default function (pi: ExtensionAPI) {
 	// `agent_settled` is the final-idle signal, `agent_end` is not ("agent_start / agent_end / agent_before_settle / agent_settled");
 	// a renderer is registered per customType ("pi.registerMessageRenderer(customType, renderer)").
 	let parentCtx: ExtensionContext | undefined;
-	// Launches the last delivery left as a pointer (size guard): recorded as such when the delivery succeeds.
-	let omittedInDelivery = new Set<string>();
 	const delivery = createResultDelivery<LaunchResult>({
 		isIdle: () => {
 			try {
@@ -198,7 +197,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 		isConsumed: (id) => registry.get(id)?.consumed ?? true,
-		markConsumed: (id) => void registry.markConsumed(id, omittedInDelivery.has(id) ? "delivered-omitted" : "delivered"),
+		markConsumed: (id, by) => void registry.markConsumed(id, by),
 		// One message per flush: every ready launch in one combined message, so one parent turn starts and its model sees all of them.
 		deliver: (batch) => {
 			const entries = batch.map(({ id, launch, result }): BatchEntry => {
@@ -207,8 +206,9 @@ export default function (pi: ExtensionAPI) {
 				return { id, text: collected.content.map((c) => c.text).join("\n"), failed: collected.isError === true || launch.error !== undefined, pointer: omittedResultText(id, tasks) };
 			});
 			const message = resultBatchMessage(entries);
-			omittedInDelivery = new Set(omittedLaunchIds(entries));
 			pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
+			// The launches the size guard left as a pointer: recorded as such once the delivery succeeded.
+			return { omitted: omittedLaunchIds(entries) };
 		},
 		// Retried at each idle flush; when the bound is spent the result is still collectable with subagent_wait.
 		onDeliveryFailed: ({ id }) => {
@@ -305,7 +305,8 @@ export default function (pi: ExtensionAPI) {
 		showCard(ctx);
 		// Run folders hold full transcripts: keep 14 days and at most 200 (lib/run-artifacts.ts). Never fails the session.
 		try {
-			pruneRunFolders(repoDocsDir(ctx.cwd));
+			const warning = pruneWarning(pruneRunFolders(repoDocsDir(ctx.cwd)));
+			if (warning !== undefined && ctx.hasUI) ctx.ui.notify(warning, "warning");
 		} catch {
 			// Retention is housekeeping, not part of starting a session.
 		}

@@ -55,6 +55,9 @@ function runIdTime(name: string): number | undefined {
 	return real ? time : undefined;
 }
 
+/** A run id dated further ahead of the clock than this is not trusted for its age (see `pruneRunFolders`). */
+const FUTURE_SKEW_MS = 86_400_000;
+
 export interface PruneOptions {
 	/** Remove run folders launched more than this many days ago. Default 14. */
 	maxAgeDays?: number;
@@ -75,11 +78,20 @@ export interface PruneResult {
 	errors: string[];
 }
 
+/** The one-line warning for a prune that hit errors (count and the first one), or undefined when there were none. */
+export function pruneWarning(result: Pick<PruneResult, "errors">): string | undefined {
+	const n = result.errors.length;
+	if (n === 0) return undefined;
+	return `brigadev: ${n} ${n === 1 ? "problem" : "problems"} while pruning old run folders; first: ${result.errors[0]}`;
+}
+
 /**
  * Retention for `<docs>/runs/`: removes run folders older than `maxAgeDays`, then the oldest
  * beyond `maxFolders`, at most `maxRemovals` per call (oldest first; the count rule only gets what the
  * age rule left of the cap). Age comes from the timestamp in the folder name, not the mtime, so
- * copying or touching a folder does not revive it. Only real directories (lstat, never a
+ * copying or touching a folder does not revive it. The exception is a name dated more than a day after `now`
+ * (a wrong clock, or a made-up id): by its name it would sort as the newest forever and hold a slot, so its age
+ * comes from its mtime instead and the age and count rules apply to it like any other. Only real directories (lstat, never a
  * symlink) whose name is a generated run id are touched; everything else is left alone.
  * Never throws; a missing runs folder is a no-op.
  */
@@ -101,10 +113,12 @@ export function pruneRunFolders(docsDir: string, options: PruneOptions = {}): Pr
 		const names = fs.readdirSync(root);
 		const candidates: { name: string; time: number }[] = [];
 		for (const name of names) {
-			const time = runIdTime(name);
+			let time = runIdTime(name);
 			if (time === undefined) continue;
 			try {
-				if (!fs.lstatSync(path.join(root, name)).isDirectory()) continue;
+				const stat = fs.lstatSync(path.join(root, name));
+				if (!stat.isDirectory()) continue;
+				if (time - now > FUTURE_SKEW_MS) time = stat.mtimeMs;
 			} catch (err) {
 				result.errors.push(`${name}: ${err instanceof Error ? err.message : String(err)}`);
 				continue;

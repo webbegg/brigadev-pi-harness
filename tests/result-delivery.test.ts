@@ -132,6 +132,52 @@ describe("result delivery: idle and busy", () => {
 		assert.deepEqual(delivery.held(), []);
 	});
 
+	it("S9: an id deliver returns as omitted reaches markConsumed as delivered-omitted", () => {
+		const marks: string[] = [];
+		const delivery = createResultDelivery<string>({
+			isIdle: () => true,
+			isConsumed: () => false,
+			markConsumed: (id, by) => void marks.push(`${id}:${by}`),
+			deliver: () => ({ omitted: ["L2", "L3"] }),
+		});
+		delivery.settled({ launch: summary("L2"), result: "b" });
+		assert.deepEqual(marks, ["L2:delivered-omitted"]);
+	});
+
+	it("S9: a batch marks each item by its own id; a deliver that returns nothing marks all as delivered", () => {
+		const marks: string[] = [];
+		let omitted: string[] | undefined = ["L2"];
+		const state = { idle: false };
+		const delivery = createResultDelivery<string>({
+			isIdle: () => state.idle,
+			isConsumed: () => false,
+			markConsumed: (id, by) => void marks.push(`${id}:${by}`),
+			deliver: () => (omitted ? { omitted } : undefined),
+		});
+		for (const id of ["L1", "L2", "L3"]) delivery.settled({ launch: summary(id), result: id });
+		state.idle = true;
+		delivery.flush();
+		assert.deepEqual(marks, ["L1:delivered", "L2:delivered-omitted", "L3:delivered"]);
+		marks.length = 0;
+		omitted = undefined;
+		delivery.settled({ launch: summary("L4"), result: "d" });
+		assert.deepEqual(marks, ["L4:delivered"]);
+	});
+
+	it("S9: a throwing deliver marks nothing", () => {
+		const marks: string[] = [];
+		const delivery = createResultDelivery<string>({
+			isIdle: () => true,
+			isConsumed: () => false,
+			markConsumed: (id, by) => void marks.push(`${id}:${by}`),
+			deliver: () => {
+				throw new Error("stale");
+			},
+		});
+		delivery.settled({ launch: summary("L1"), result: "a" });
+		assert.deepEqual(marks, []);
+	});
+
 	it("D1: markConsumed runs only after a successful deliver", () => {
 		const events: string[] = [];
 		const delivery = createResultDelivery<string>({
