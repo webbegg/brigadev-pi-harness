@@ -70,19 +70,24 @@ export default function (pi: ExtensionAPI) {
 		return ctx.ui.confirm(title, body);
 	};
 
+	/** Top of the repository that holds `dir` (canonical); `dir` itself when git cannot tell (not a repository, a failure). */
+	const repoRoot = async (dir: string): Promise<string> => {
+		const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: dir, timeout: 15_000 }).catch(() => undefined);
+		return top?.code === 0 && top.stdout.trim() ? canonicalPath(top.stdout.trim()) : dir;
+	};
+
 	/**
 	 * Evidence gate for `git commit` (parent only, every permission mode): blocks a commit with source
 	 * changes unless a passing test is recorded for the current tree. Only the user can force it.
 	 * Returns a block reason, or a `settle` to call once the remaining rules let the commit run: the
 	 * user's force (one-shot or dialog) is spent and logged then, not when a later rule declines.
 	 */
-	const evidenceGate = async (command: string, ctx: ExtensionContext): Promise<{ reason?: string; settle: () => void }> => {
+	const evidenceGate = async (command: string, ctx: ExtensionContext, startsElsewhere: boolean): Promise<{ reason?: string; settle: () => void }> => {
 		const nothing = { settle: () => {} };
 		const commits = classifyCommand(command).filter((match) => match.commit);
 		if (commits.length === 0) return nothing;
 		// The whole repository, not the session folder: a session in a subdirectory commits files elsewhere too.
-		const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: projectRoot(ctx), timeout: 15_000 }).catch(() => undefined);
-		const root = top?.code === 0 && top.stdout.trim() ? canonicalPath(top.stdout.trim()) : projectRoot(ctx);
+		const root = await repoRoot(projectRoot(ctx));
 		const treeResult = await worktreeTreeResult(root);
 		const tree = treeResult.kind === "tree" ? treeResult.tree : undefined;
 		const treeError = treeResult.kind === "error" ? treeResult.reason : undefined;
@@ -102,7 +107,7 @@ export default function (pi: ExtensionAPI) {
 			dirtyPaths: snapshot ? [...snapshot.keys()] : ["(unknown)"],
 			tree,
 			treeError,
-			elsewhere: commits.some((match) => match.elsewhere),
+			elsewhere: startsElsewhere || commits.some((match) => match.elsewhere),
 			records: readEvidence(file),
 			forcedTree,
 		});
@@ -177,17 +182,18 @@ export default function (pi: ExtensionAPI) {
 		const shell = shellCallOf(event.toolName, event.input);
 		if (shell) {
 			const { command } = shell;
+			// Where the command starts: a bg_start `cwd` is the same move as `cd <cwd> && <command>`, so relative paths in the
+			// rules below resolve against it and a commit there is decided like bash decides the `cd` form.
+			const commandCwd = shell.cwd === undefined ? ctx.cwd : canonicalPath(resolve(ctx.cwd, expandHome(shell.cwd)));
 			// Nobody forges a recorded test result: the evidence log is written only by the recorder. (Textual rule; reading stays allowed.)
-			if (command.includes("evidence") && bashWritesEvidence(command, [join(repoDocsDir(ctx.cwd), "evidence")])) return { block: true, reason: EVIDENCE_BLOCK };
-			let commandCwd = ctx.cwd;
+			if ((command.includes("evidence") || commandCwd.includes("evidence")) && bashWritesEvidence(command, [join(repoDocsDir(ctx.cwd), "evidence")], undefined, shell.cwd === undefined ? undefined : commandCwd)) return { block: true, reason: EVIDENCE_BLOCK };
 			if (shell.cwd !== undefined) {
-				commandCwd = canonicalPath(resolve(ctx.cwd, expandHome(shell.cwd)));
 				const blocked = await checkPath(event.toolName, shell.cwd, commandCwd, true, ctx, true);
 				if (blocked) return blocked;
 			}
 			const surfaces = writerSurfaces();
 			if (surfaces) {
-				const outside = writesOutsideSurfaces(command, ctx.cwd, projectRoot(ctx), surfaces);
+				const outside = writesOutsideSurfaces(command, commandCwd, projectRoot(ctx), surfaces);
 				if (outside.length > 0) {
 					return {
 						block: true,
@@ -196,9 +202,11 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const decision = await decideBashCommand({ command, mode, isChild, cwd: commandCwd, readFacts: (cwd) => readBranchFacts(exec, cwd) });
+			// A commit whose directory is in another repository than the session's is "elsewhere" for the branch rule and the gate alike.
+			const startsElsewhere = shell.cwd !== undefined && classifyCommand(command).some((match) => match.commit) && (await repoRoot(commandCwd)) !== (await repoRoot(projectRoot(ctx)));
+			const decision = await decideBashCommand({ command, mode, isChild, cwd: commandCwd, elsewhere: startsElsewhere, readFacts: (cwd) => readBranchFacts(exec, cwd) });
 			if (decision.action === "block") return { block: true, reason: decision.reason };
-			const gated = isChild ? undefined : await evidenceGate(command, ctx);
+			const gated = isChild ? undefined : await evidenceGate(command, ctx, startsElsewhere);
 			if (gated?.reason) return { block: true, reason: gated.reason };
 			if (decision.action === "confirm") {
 				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(command)}\n\nRun it?`);

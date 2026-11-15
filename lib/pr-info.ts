@@ -154,7 +154,7 @@ export async function lookupPr(exec: PrExec, cwd: string, timeoutMs = PR_LOOKUP_
 }
 
 export interface PrTracker {
-	/** Looks the PR up again. The answer is applied only if no later refresh or reset happened meanwhile. Never rejects. */
+	/** Looks the PR up again. The answer is applied only if no later refresh or reset happened meanwhile; an unavailable answer keeps the PR already known. Never rejects. */
 	refresh(cwd: string): Promise<PrLookup>;
 	/** Forgets the cached PR and ignores answers still in flight. */
 	reset(): void;
@@ -182,7 +182,9 @@ export function createPrTracker(options: { exec: PrExec; timeoutMs?: number; onC
 			const mine = ++generation;
 			const lookup = await lookupPr(options.exec, cwd, options.timeoutMs);
 			if (mine === generation) {
-				pr = lookup.status === "found" ? lookup.pr : undefined;
+				// A transient failure (offline, slow, gh missing) keeps the last known PR; only gh's own "no PR" clears it.
+				if (lookup.status === "found") pr = lookup.pr;
+				else if (lookup.status === "none") pr = undefined;
 				publish();
 			}
 			return lookup;

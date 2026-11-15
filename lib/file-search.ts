@@ -7,10 +7,10 @@
 import { spawn } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { decideFileAccess } from "./guard-rules.ts";
 import { canonicalPath, expandHome } from "./paths.ts";
-import { isSensitivePath } from "./permission-policy.ts";
+import { isSensitivePath, SENSITIVE_GLOBS } from "./permission-policy.ts";
 
 export const FD_DEFAULT_LIMIT = 1000;
 export const FD_MAX_LIMIT = 10_000;
@@ -29,29 +29,8 @@ export const OUTPUT_MAX_BYTES = 50 * 1024;
 const STDERR_MAX_BYTES = 16 * 1024;
 const ERROR_NOTE_CHARS = 300;
 
-/**
- * Globs for the files `isSensitivePath` (lib/permission-policy.ts) treats as
- * secret-bearing: passed to rg as `--glob '!…'` and to fd as `--exclude …`.
- * The result lines are filtered with `isSensitivePath` itself as well, so a
- * drift here cannot leak a file; it can only cost a wasted search.
- */
-export const SENSITIVE_GLOBS: readonly string[] = [
-	"**/.env*",
-	"**/.ssh",
-	"**/.aws/credentials",
-	"**/.npmrc",
-	"**/.netrc",
-	"**/id_rsa*",
-	"**/id_ed25519*",
-	"**/id_ecdsa*",
-	"**/id_dsa*",
-	"**/*.pem",
-	"**/*.key",
-	"**/*.p12",
-	"**/*.pfx",
-	"**/credentials.json",
-	"**/.pi/agent/auth.json",
-];
+// The fd/rg exclude globs (SENSITIVE_GLOBS) come from lib/permission-policy.ts, next to the rules they mirror. The result
+// lines are filtered with `isSensitivePath` as well, so a drift there cannot leak a file; it can only cost a wasted search.
 
 // ---------------------------------------------------------------- binaries
 
@@ -177,15 +156,37 @@ export interface Filtered {
 	omitted: number;
 }
 
-/** fd prints one path per line. */
-export function filterFdLines(lines: readonly string[], allowSensitive: boolean): Filtered {
+/**
+ * Decides on a printed result path the way `read` decides on a path: the printed form, and the canonical form (the path
+ * resolved against `cwd`, its directory's symlinks followed), so a symlinked directory or a search that runs inside
+ * `~/.aws` or `~/.pi/agent` is as sensitive as the real location. Without `cwd`, only the printed form is judged.
+ * A file's own last component is not resolved: fd/rg list a symlink's name, they do not read through it.
+ */
+function sensitiveCheck(cwd: string | undefined): (printed: string) => boolean {
+	const directories = new Map<string, string>();
+	return (printed) => {
+		if (isSensitivePath(printed)) return true;
+		if (cwd === undefined || printed === "") return false;
+		const absolute = resolve(cwd, printed);
+		const directory = dirname(absolute);
+		let canonical = directories.get(directory);
+		if (canonical === undefined) directories.set(directory, (canonical = canonicalPath(directory)));
+		const candidate = join(canonical, basename(absolute));
+		return isSensitivePath(printed.endsWith("/") ? `${candidate}/` : candidate);
+	};
+}
+
+/** fd prints one path per line; `cwd` is where it ran (the printed paths are relative to it). */
+export function filterFdLines(lines: readonly string[], allowSensitive: boolean, cwd?: string): Filtered {
 	if (allowSensitive) return { lines: [...lines], omitted: 0 };
-	const kept = lines.filter((line) => !isSensitivePath(line));
+	const sensitive = sensitiveCheck(cwd);
+	const kept = lines.filter((line) => !sensitive(line));
 	return { lines: kept, omitted: lines.length - kept.length };
 }
 
-/** rg `--null` output (`path\0LINE:text`, context `path\0LINE-text`) back to `path:LINE:text`, minus sensitive files. */
-export function filterRgLines(stdout: string, allowSensitive: boolean): Filtered {
+/** rg `--null` output (`path\0LINE:text`, context `path\0LINE-text`) back to `path:LINE:text`, minus sensitive files. `cwd`: as for fd. */
+export function filterRgLines(stdout: string, allowSensitive: boolean, cwd?: string): Filtered {
+	const sensitive = sensitiveCheck(cwd);
 	const raw = stdout.split("\n");
 	if (raw.at(-1) === "") raw.pop();
 	const lines: string[] = [];
@@ -194,7 +195,7 @@ export function filterRgLines(stdout: string, allowSensitive: boolean): Filtered
 		const nul = line.indexOf("\0");
 		const path = nul === -1 ? line : line.slice(0, nul);
 		// A line without a NUL has no file name field; check it whole, in case it is a bare path.
-		if (!allowSensitive && isSensitivePath(path)) {
+		if (!allowSensitive && sensitive(path)) {
 			omitted += 1;
 			continue;
 		}
@@ -395,7 +396,8 @@ export async function executeSearch(tool: "fd" | "rg", binary: string, params: F
 
 	const result = await run(binary, args, { cwd: context.cwd, timeoutMs: SEARCH_TIMEOUT_MS, maxBytes: SEARCH_CAPTURE_BYTES, signal: context.signal });
 	const cut = result.timedOut || result.capped;
-	const noMatchExit = tool === "rg" && result.code === 1;
+	// rg exits 2 with `No files were searched` when its filters (our excludes included) leave nothing to search: no matches.
+	const noMatchExit = tool === "rg" && (result.code === 1 || (result.code === 2 && result.stdout.length === 0 && /No files were searched/.test(result.stderr)));
 	const partialRg = tool === "rg" && result.code === 2 && result.stdout.length > 0;
 	if (result.code !== 0 && !noMatchExit && !partialRg && !cut) {
 		if (context.signal?.aborted) throw new Error(`${tool} search was cancelled.`);
@@ -403,7 +405,7 @@ export async function executeSearch(tool: "fd" | "rg", binary: string, params: F
 	}
 
 	const { lines, omitted } =
-		tool === "rg" ? filterRgLines(result.stdout, decision.allowSensitive) : filterFdLines(result.stdout.split("\n").filter((line) => line !== ""), decision.allowSensitive);
+		tool === "rg" ? filterRgLines(result.stdout, decision.allowSensitive, context.cwd) : filterFdLines(result.stdout.split("\n").filter((line) => line !== ""), decision.allowSensitive, context.cwd);
 	const shown = capLines(lines);
 	const notes: string[] = [];
 	let truncated = false;

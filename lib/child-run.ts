@@ -110,6 +110,97 @@ export function descendantTargets(rootPid: number, table: readonly ProcessEntry[
 	return targets;
 }
 
+/** Two listings as one (a group once, a pid once); undefined when both are. */
+export function mergeDescendantTargets(first: DescendantTargets | undefined, second: DescendantTargets | undefined): DescendantTargets | undefined {
+	if (!first || !second) return first ?? second;
+	const groups = new Map<number, Set<number>>();
+	for (const { pgid, pids } of [...first.groups, ...second.groups]) groups.set(pgid, new Set([...(groups.get(pgid) ?? []), ...pids]));
+	return { groups: [...groups].map(([pgid, pids]) => ({ pgid, pids: [...pids] })), pids: [...new Set([...first.pids, ...second.pids])] };
+}
+
+export interface ProcessSignallerOptions {
+	/** The process's pid, read at each use; started detached it is also its group's id. Undefined when it failed to start. */
+	pid: () => number | undefined;
+	/** Signals the process alone (`child.kill`): the fallback when there is no group to signal. */
+	killSelf: (signal: NodeJS.Signals) => void;
+	killGroup: (pid: number, signal: NodeJS.Signals) => void;
+	killPid: (pid: number, signal: NodeJS.Signals) => void;
+	/** The process table, read when descendants are listed and no shared listing was given. */
+	listProcesses: () => ProcessEntry[];
+	/** The parent's own pid, never signalled. */
+	selfPid: number;
+	platform: NodeJS.Platform;
+}
+
+/**
+ * The one way a child (a subagent run, a background process) is signalled, so both stop alike: its own process group,
+ * then the descendants that left that group (a command that took a process group of its own), whose listing the caller
+ * takes while the child is alive, because once it dies the parent links are gone. Never signals pid/pgid 0/1, the
+ * parent, or the parent's group (`descendantTargets`). No method throws.
+ */
+export interface ProcessSignaller {
+	/** The process has a group of its own to signal. */
+	hasGroup(): boolean;
+	/** The descendants now, from `shared` (a listing a tracker pass already took) or a fresh one; undefined without a group or when listing fails. */
+	descendants(shared?: readonly ProcessEntry[]): DescendantTargets | undefined;
+	/** `signal` to the group (to the process alone when there is no group or the group signal throws), then SIGKILL to `descendants`. */
+	signal(signal: NodeJS.Signals, descendants?: DescendantTargets): void;
+	/** SIGKILL to each descendant group (the process's own group too unless `ownGroupDone`); a group that cannot be signalled falls back to its pids. */
+	killDescendants(targets: DescendantTargets | undefined, ownGroupDone: boolean): void;
+}
+
+export function createProcessSignaller(options: ProcessSignallerOptions): ProcessSignaller {
+	const { killSelf, killGroup, killPid, listProcesses, selfPid, platform } = options;
+	const hasGroup = () => options.pid() !== undefined && platform !== "win32";
+	const one = (target: number) => {
+		try {
+			killPid(target, "SIGKILL");
+		} catch {
+			// Already gone.
+		}
+	};
+	const killDescendants = (targets: DescendantTargets | undefined, ownGroupDone: boolean) => {
+		if (!targets) return;
+		for (const { pgid, pids } of targets.groups) {
+			if (ownGroupDone && pgid === options.pid()) continue;
+			try {
+				killGroup(pgid, "SIGKILL");
+			} catch {
+				pids.forEach(one);
+			}
+		}
+		targets.pids.forEach(one);
+	};
+	return {
+		hasGroup,
+		descendants(shared) {
+			if (!hasGroup()) return undefined;
+			try {
+				return descendantTargets(options.pid()!, shared ?? listProcesses(), selfPid);
+			} catch {
+				return undefined;
+			}
+		},
+		signal(signal, descendants) {
+			let groupDone = false;
+			try {
+				if (hasGroup()) {
+					try {
+						killGroup(options.pid()!, signal);
+						groupDone = true;
+					} catch {
+						// No such group (or not ours): signal the process itself.
+					}
+				}
+				if (!groupDone) killSelf(signal);
+			} finally {
+				killDescendants(descendants, groupDone);
+			}
+		},
+		killDescendants,
+	};
+}
+
 // The run snapshot type and the run-state rule live in lib/run-status.ts (dependency-free, read by the view
 // modules); re-exported here so existing imports keep working.
 export { failed, finalText, isUnfinished, output, runStatus, toRunState, type RunResult, type RunStatus } from "./run-status.ts";
@@ -390,59 +481,12 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			const invocation = deps.piInvocation(launch.args);
 			// Own process group (not on win32, where groups do not apply): a signal to the group reaches grandchildren too.
 			const proc = spawn(invocation.command, invocation.args, { cwd, env: launch.env, shell: false, stdio: launch.stdio, detached: platform !== "win32" });
-			const hasGroup = () => proc.pid !== undefined && platform !== "win32";
+			const signaller = createProcessSignaller({ pid: () => proc.pid, killSelf: (signal) => void proc.kill(signal), killGroup, killPid, listProcesses, selfPid, platform });
 			// A command the child's bash tool runs has a process group of its own, so the child's group kill misses it.
-			// Listed before the child dies (afterwards the chain of parents is gone: only a live child is walked); a failed listing means no extra kills.
-			// `shared` is the listing a tracker pass already took for every child.
-			const descendantsOfChild = (shared?: readonly ProcessEntry[]): DescendantTargets | undefined => {
-				if (!hasGroup()) return undefined;
-				try {
-					return descendantTargets(proc.pid!, shared ?? listProcesses(), selfPid);
-				} catch {
-					return undefined;
-				}
-			};
-			// SIGKILL to each descendant group (the child's own group is skipped when its kill went through); a group that
-			// cannot be signalled falls back to its pids. Never throws.
-			const killDescendants = (targets: DescendantTargets | undefined, childGroupDone: boolean) => {
-				if (!targets) return;
-				const one = (pid: number) => {
-					try {
-						killPid(pid, "SIGKILL");
-					} catch {
-						// Already gone.
-					}
-				};
-				for (const { pgid, pids } of targets.groups) {
-					if (childGroupDone && pgid === proc.pid) continue;
-					try {
-						killGroup(pgid, "SIGKILL");
-					} catch {
-						pids.forEach(one);
-					}
-				}
-				targets.pids.forEach(one);
-			};
-			// To the whole group; to the child alone when it has no pid, on win32, or when the group signal throws.
-			// SIGKILL is the forced path (grace over, shutdown survivors, exit guard): it takes the descendants' groups too.
+			// SIGKILL is the forced path (grace over, shutdown survivors, exit guard): it takes the descendants' groups too,
+			// listed while the child is alive (`processes` is the listing a tracker pass already took for every child).
 			// SIGTERM stays graceful so the child can clean up its own tool processes.
-			const signalChild = (signal: NodeJS.Signals, processes?: readonly ProcessEntry[]) => {
-				const descendants = signal === "SIGKILL" ? descendantsOfChild(processes) : undefined;
-				let groupDone = false;
-				try {
-					if (hasGroup()) {
-						try {
-							killGroup(proc.pid!, signal);
-							groupDone = true;
-						} catch {
-							// No such group (or not ours): signal the child itself.
-						}
-					}
-					if (!groupDone) proc.kill(signal);
-				} finally {
-					killDescendants(descendants, groupDone);
-				}
-			};
+			const signalChild = (signal: NodeJS.Signals, processes?: readonly ProcessEntry[]) => signaller.signal(signal, signal === "SIGKILL" ? signaller.descendants(processes) : undefined);
 			const release = tracker.add(signalChild);
 			let buffer = "";
 			let exited = false;
@@ -635,7 +679,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					// Whatever still holds the pipes belongs to this child's group: end it, then settle without `close`. The child is
 					// gone, so its descendants were reparented (a walk would find none) and its pid may already belong to someone else:
 					// no process listing here.
-					if (hasGroup()) {
+					if (signaller.hasGroup()) {
 						try {
 							killGroup(proc.pid!, "SIGKILL");
 						} catch {

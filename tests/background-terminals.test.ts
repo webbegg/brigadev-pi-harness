@@ -115,6 +115,28 @@ describe("tool schemas", () => {
 		assert.match(schema.properties.cwd.description, /inside the project/i);
 	});
 
+	it("bg_start says in one sentence to run servers in the foreground, not with `&`, and no fact is stated twice", async () => {
+		const tool = (await load()).pi.tool("bg_start");
+		assert.match(tool.description, /run servers in the foreground, not with `&`/i);
+		const guidelines: string[] = tool.promptGuidelines;
+		assert.ok(!guidelines.some((line) => /foreground|`&`/.test(line)));
+		// each fact once: description or guideline, not both
+		for (const fact of [/no stdin|read no stdin|interactive/i, /bg_kill/, /bash/]) {
+			const places = [tool.description, ...guidelines].filter((text) => fact.test(text));
+			assert.equal(places.length, 1, `${fact} appears in ${places.length} places`);
+		}
+	});
+
+	it("keeps the model-facing text of the bg tools short", async () => {
+		const { pi } = await load();
+		const size = (name: string) => {
+			const tool = pi.tool(name);
+			return [tool.description, tool.promptSnippet ?? "", ...(tool.promptGuidelines ?? []), ...Object.values<any>(tool.parameters.properties).map((p) => p.description ?? "")].join("\n").length;
+		};
+		assert.ok(size("bg_start") <= 900, `bg_start ${size("bg_start")}`);
+		for (const name of ["bg_status", "bg_list", "bg_kill"]) assert.ok(size(name) <= 250, `${name} ${size(name)}`);
+	});
+
 	it("bg_status and bg_kill take an id; bg_list takes nothing", async () => {
 		const { pi } = await load();
 		for (const name of ["bg_status", "bg_kill"]) {

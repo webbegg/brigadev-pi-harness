@@ -129,16 +129,16 @@ export default function (pi: ExtensionAPI) {
 		name: "bg_start",
 		label: "Start background process",
 		description:
-			"Start a long-running shell command (dev server, watcher, long build or test run) in the background and return at once. It gets no stdin. At most 8 run at once. You get one message when it exits; use bg_status for its output sooner and bg_kill to stop it. For a quick command use bash.",
+			"Start a long-running shell command (dev server, watcher, long build or test run) in the background and return at once. At most 8 run at once. Run servers in the foreground, not with `&`: work left running after the shell exits is stopped.",
 		promptSnippet: "Start a long-running shell command in the background (bg_start), then bg_status / bg_list / bg_kill",
 		promptGuidelines: [
-			"Use bg_start for commands that keep running (servers, watchers, long builds); use bash for quick ones. Background commands read no stdin, so never start an interactive program.",
-			"After bg_start, keep working instead of polling: a message arrives when the process exits. Check bg_status only when you need its current output, and bg_kill what you no longer need.",
+			"Use bg_start for commands that keep running; use bash for quick ones. There is no stdin, so never start an interactive program.",
+			"After bg_start, keep working instead of polling: one message arrives when it exits. Use bg_status only for its current output, and bg_kill what you no longer need.",
 		],
 		parameters: Type.Object({
-			command: Type.String({ description: "Shell command to run in the background" }),
-			cwd: Type.Optional(Type.String({ description: "Directory to run in, inside the project (a relative path resolves from the session directory). Default: the session directory." })),
-			name: Type.Optional(Type.String({ description: "Short label shown in listings and the overlay (default: the start of the command)" })),
+			command: Type.String({ description: "Shell command to run" }),
+			cwd: Type.Optional(Type.String({ description: "Directory to run in, inside the project (relative to the session directory). Default: the session directory." })),
+			name: Type.Optional(Type.String({ description: "Short label for listings (default: the start of the command)" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			parentCtx = ctx;
@@ -165,8 +165,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bg_status",
 		label: "Background process status",
-		description: "State, exit code, and the tail of the output of one background process. Asking about a process that already exited tells you its outcome, so its exit message is not sent again.",
-		parameters: Type.Object({ id: Type.String({ description: "Process id from bg_start or bg_list, e.g. bg-1" }) }),
+		description: "State, exit code, and output tail of one background process. Asking about one that already exited tells you its outcome, so its exit message is not sent.",
+		parameters: Type.Object({ id: Type.String({ description: "Process id, e.g. bg-1" }) }),
 		async execute(_id, params) {
 			const snapshot = manager.status(params.id);
 			if (!snapshot) throw unknownId(params.id);
@@ -177,7 +177,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bg_list",
 		label: "List background processes",
-		description: "List the background processes of this session with their state.",
+		description: "List this session's background processes and their state.",
 		parameters: Type.Object({}),
 		async execute() {
 			const snapshots = manager.list();
@@ -188,8 +188,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bg_kill",
 		label: "Kill background process",
-		description: "Stop a background process and everything it started (SIGTERM, then SIGKILL after 5 s). Returns its final state and output tail.",
-		parameters: Type.Object({ id: Type.String({ description: "Process id from bg_start or bg_list, e.g. bg-1" }) }),
+		description: "Stop a background process and what it started (SIGTERM, then SIGKILL after 5 s); returns its final state and output tail.",
+		parameters: Type.Object({ id: Type.String({ description: "Process id, e.g. bg-1" }) }),
 		async execute(_id, params) {
 			if (!manager.get(params.id)) throw unknownId(params.id);
 			const snapshot = await manager.kill(params.id);

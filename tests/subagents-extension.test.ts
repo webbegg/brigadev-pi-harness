@@ -380,6 +380,55 @@ describe("/btw: a side question that never enters the model's context", () => {
 		});
 	});
 
+	it("a failing aside is recorded as a failed entry with an error notice, and never sent to the model", { timeout: 60_000 }, async () => {
+		fs.rmSync(repoDocsDir(cwd), { recursive: true, force: true });
+		const failing = path.join(root, "failing-child.mjs");
+		fs.writeFileSync(failing, 'process.stderr.write("boom: the child could not run\\n");\nprocess.exit(3);\n');
+		savedArgv1 = process.argv[1];
+		process.argv[1] = failing;
+		const { pi, ctx } = load({ hasUI: true, idle: true });
+		try {
+			await pi.fire("session_start", { reason: "startup" }, ctx);
+			await pi.commands.get("btw").handler("will this fail?", ctx);
+			const id = startedId(ctx);
+			assert.ok(id, JSON.stringify(ctx.notifications));
+			await until(() => pi.entries.length > 0);
+			assert.equal(pi.entries.length, 1);
+			assert.equal(pi.entries[0].type, "brigadev-btw");
+			const data = pi.entries[0].data as { id: string; status: string; question: string; error?: string };
+			assert.deepEqual({ id: data.id, status: data.status, question: data.question }, { id, status: "failed", question: "will this fail?" });
+			assert.ok(data.error, "the entry says why it failed");
+			const notice = ctx.notifications.find((n) => /failed/.test(n.message) && n.message.includes(id));
+			assert.equal(notice?.type, "error", JSON.stringify(ctx.notifications));
+			await pi.fire("agent_settled", {}, ctx);
+			assert.equal(pi.messages.length, 0, "sendMessage is never called for a failed aside");
+		} finally {
+			await pi.fire("session_shutdown", {}, ctx);
+			process.argv[1] = savedArgv1!;
+		}
+	});
+
+	it("a rejected launch tells the user with an error notice and records nothing", async () => {
+		const agentsDir = path.join(process.env.PI_CODING_AGENT_DIR!, "agents");
+		const broken = path.join(agentsDir, "brigadev-explore.md");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		// A user definition overrides the package one by name; its output schema does not exist, so the launch is rejected before any child starts.
+		fs.writeFileSync(broken, "---\nname: brigadev-explore\ndescription: broken on purpose\noutput: missing-schema.json\n---\nYou answer questions.\n");
+		const { pi, ctx } = load({ hasUI: true, idle: true });
+		try {
+			await pi.fire("session_start", { reason: "startup" }, ctx);
+			await pi.commands.get("btw").handler("anything", ctx);
+			assert.equal(ctx.notifications.length, 1, JSON.stringify(ctx.notifications));
+			assert.equal(ctx.notifications[0].type, "error");
+			assert.match(ctx.notifications[0].message, /rejected|output schema/i);
+			assert.deepEqual(pi.entries, []);
+			assert.equal(pi.messages.length, 0);
+		} finally {
+			fs.rmSync(broken, { force: true });
+			await pi.fire("session_shutdown", {}, ctx);
+		}
+	});
+
 	it("without a question it says how to use it and starts nothing", async () => {
 		const { pi, ctx } = load({ hasUI: true });
 		await pi.fire("session_start", { reason: "startup" }, ctx);

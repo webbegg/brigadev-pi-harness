@@ -7,8 +7,8 @@ import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { BG_KILL_GRACE_MS, BgError, createBgProcesses, MAX_RUNNING, MAX_SETTLED_KEPT, shellEnvironment, TailBuffer, type BgChild, type BgProcessDeps } from "../lib/bg-processes.ts";
-import { CLOSE_DRAIN_MS, createChildTracker, KILL_GRACE_MS } from "../lib/child-run.ts";
+import { BG_KILL_GRACE_MS, BgError, createBgProcesses, LEFTOVER_NOTE, MAX_RUNNING, MAX_SETTLED_KEPT, shellEnvironment, TailBuffer, type BgChild, type BgProcessDeps } from "../lib/bg-processes.ts";
+import { CLOSE_DRAIN_MS, createChildTracker, KILL_GRACE_MS, type ProcessEntry } from "../lib/child-run.ts";
 
 class FakeChild extends EventEmitter {
 	pid: number | undefined;
@@ -228,7 +228,7 @@ describe("output and exit", () => {
 		assert.equal(manager.runningCount(), 0);
 	});
 
-	it("settles after the drain bound when a descendant holds the pipes open, ending the group", () => {
+	it("settles after the drain bound when a descendant holds the pipes open: the group is ended and the process is reported killed, with a note", () => {
 		const { manager, children, timers, groupKills } = harness();
 		const { id } = manager.start({ command: "x", cwd: "/w" });
 		children[0].emit("exit", 0, null);
@@ -236,8 +236,23 @@ describe("output and exit", () => {
 		assert.equal(CLOSE_DRAIN_MS, 1000);
 		timers.fire(CLOSE_DRAIN_MS);
 		assert.deepEqual(groupKills, [[100, "SIGKILL"]]);
-		assert.equal(manager.get(id)!.state, "done");
-		assert.equal(manager.get(id)!.exitCode, 0);
+		const snap = manager.get(id)!;
+		assert.equal(snap.state, "killed");
+		assert.equal(snap.exitCode, 0);
+		assert.equal(snap.error, LEFTOVER_NOTE);
+		assert.match(LEFTOVER_NOTE, /left running after the shell exited/);
+	});
+
+	it("an empty group at the drain (nothing was left running) keeps the real outcome", () => {
+		const { manager, children, timers } = harness({
+			killGroup: () => {
+				throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+			},
+		});
+		const { id } = manager.start({ command: "x", cwd: "/w" });
+		children[0].emit("exit", 0, null);
+		timers.fire(CLOSE_DRAIN_MS);
+		assert.deepEqual({ state: manager.get(id)!.state, error: manager.get(id)!.error }, { state: "done", error: undefined });
 	});
 
 	it("ignores output after it settled", () => {
@@ -336,6 +351,42 @@ describe("killing", () => {
 		void win.manager.kill(b.id);
 		assert.deepEqual(win.groupKills, []);
 		assert.deepEqual(win.children[0].signals, ["SIGTERM"]);
+	});
+
+	it("lists the descendants before SIGTERM and SIGKILLs the ones in their own group when the shell exits early", async () => {
+		let table: ProcessEntry[] = [
+			{ pid: 100, ppid: 1, pgid: 100 },
+			{ pid: 200, ppid: 100, pgid: 200 },
+			{ pid: 1, ppid: 0, pgid: 1 },
+		];
+		const { manager, children, groupKills, timers } = harness({ listProcesses: () => table });
+		const { id } = manager.start({ command: "x", cwd: "/w" });
+		const killing = manager.kill(id);
+		assert.deepEqual(groupKills, [[100, "SIGTERM"]], "SIGTERM goes to the shell's group only");
+		table = [{ pid: 1, ppid: 0, pgid: 1 }]; // the shell is gone: the parent chain no longer exists
+		children[0].emit("exit", null, "SIGTERM");
+		assert.deepEqual(groupKills, [[100, "SIGTERM"], [200, "SIGKILL"]]);
+		children[0].emit("close", null, "SIGTERM");
+		assert.equal((await killing)!.state, "killed");
+		assert.equal(timers.pending().length, 0);
+	});
+
+	it("never signals pid or group 0/1, the parent, or the parent's group", async () => {
+		const table: ProcessEntry[] = [
+			{ pid: 50, ppid: 1, pgid: 50 }, // the parent (selfPid)
+			{ pid: 100, ppid: 50, pgid: 100 },
+			{ pid: 150, ppid: 100, pgid: 50 }, // shares the parent's group: by pid only
+			{ pid: 151, ppid: 100, pgid: 1 },
+			{ pid: 152, ppid: 100, pgid: 0 },
+			{ pid: 1, ppid: 0, pgid: 1 },
+		];
+		const { manager, children, groupKills, pidKills } = harness({ listProcesses: () => table, selfPid: 50 });
+		const { id } = manager.start({ command: "x", cwd: "/w" });
+		void manager.kill(id);
+		children[0].emit("exit", null, "SIGTERM");
+		children[0].emit("close", null, "SIGTERM");
+		assert.deepEqual(groupKills, [[100, "SIGTERM"]]);
+		assert.deepEqual(pidKills, [[150, "SIGKILL"]]);
 	});
 
 	it("the forced pass also kills descendants that sit in their own process group", async () => {
@@ -587,7 +638,8 @@ describe("real processes", { skip: process.platform === "win32" }, () => {
 			assert.ok(await until(() => /pid=\d+/.test(manager.get(id)!.output)));
 			track(pidIn(manager.get(id)!.output));
 			assert.ok(await until(() => manager.get(id)!.state !== "running", CLOSE_DRAIN_MS + 3000));
-			assert.equal(manager.get(id)!.state, "done");
+			assert.equal(manager.get(id)!.state, "killed");
+			assert.match(manager.get(id)!.error ?? "", /left running after the shell exited/);
 			assert.ok(await until(() => !alive(pidIn(manager.get(id)!.output)), 2000), "the leftover descendant was ended");
 		});
 	});
