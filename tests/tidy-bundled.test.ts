@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import type { TidyInputs } from "../lib/tidy-detect.ts";
+import { tidyInstalled, tidyState, type TidyInputs } from "../lib/tidy-detect.ts";
 import { createFakeCtx, createFakePi } from "./helpers/fake-pi.ts";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
 
@@ -30,6 +33,86 @@ function setup(options: { child?: boolean; inputs?: TidyInputs | (() => TidyInpu
 	return { calls, factory };
 }
 
+describe("readTidyInputs sources", () => {
+	let root: string;
+	let agent: string;
+	let project: string;
+	let readTidyInputs: typeof import("../extensions/tidy-bundled.ts").readTidyInputs;
+
+	before(async () => {
+		({ readTidyInputs } = await import("../extensions/tidy-bundled.ts"));
+		root = mkdtempSync(join(tmpdir(), "tidy-inputs-"));
+		agent = join(root, "agent");
+		project = join(root, "project");
+		mkdirSync(join(agent, "extensions"), { recursive: true });
+		mkdirSync(join(project, ".pi"), { recursive: true });
+	});
+	after(() => rmSync(root, { recursive: true, force: true }));
+
+	const write = (path: string, value: unknown) => writeFileSync(path, JSON.stringify(value));
+	const read = (options: { argv?: string[]; bundledRoots?: string[] } = {}) => readTidyInputs(project, agent, { argv: [], bundledRoots: [], ...options });
+	const installed = (inputs: TidyInputs) => tidyInstalled(inputs);
+
+	it("sees nothing when no source mentions pi-tidy", () => {
+		write(join(agent, "settings.json"), { extensions: ["/x/other.ts"] });
+		write(join(project, ".pi", "settings.json"), { extensions: ["/y/other.ts"] });
+		assert.equal(installed(read({ argv: ["-e", "/z/other.ts"] })), false);
+	});
+
+	it("sees pi-tidy in the global settings extensions array", () => {
+		write(join(agent, "settings.json"), { extensions: ["/g/pi-tidy/src/index.ts"] });
+		write(join(project, ".pi", "settings.json"), {});
+		assert.equal(tidyState(read(), { bundled: true }), "separate");
+	});
+
+	it("sees pi-tidy in the project settings extensions array", () => {
+		write(join(agent, "settings.json"), {});
+		write(join(project, ".pi", "settings.json"), { extensions: ["npm:pi-tidy"] });
+		assert.equal(tidyState(read(), { bundled: true }), "separate");
+	});
+
+	it("sees pi-tidy passed with -e or --extension on the command line", () => {
+		write(join(agent, "settings.json"), {});
+		write(join(project, ".pi", "settings.json"), {});
+		for (const argv of [["-e", "/c/pi-tidy"], ["--extension", "/c/pi-tidy/src/index.ts"], ["--extension=npm:pi-tidy@1"]]) {
+			assert.equal(installed(read({ argv })), true, argv.join(" "));
+		}
+	});
+
+	it("sees pi-tidy.js in the agent extensions folder", () => {
+		write(join(agent, "settings.json"), {});
+		writeFileSync(join(agent, "extensions", "pi-tidy.js"), "");
+		try {
+			assert.equal(installed(read()), true);
+		} finally {
+			rmSync(join(agent, "extensions", "pi-tidy.js"));
+		}
+	});
+
+	it("tolerates a non-array extensions value", () => {
+		write(join(agent, "settings.json"), { extensions: "/g/pi-tidy" });
+		write(join(project, ".pi", "settings.json"), { extensions: { a: 1 } });
+		assert.equal(installed(read()), false);
+	});
+
+	it("never treats brigadev's own bundled pi-tidy path as a separate install", () => {
+		const bundled = join(root, "brigadev", "node_modules", "pi-tidy");
+		write(join(agent, "settings.json"), { extensions: [bundled, join(bundled, "src", "index.ts")] });
+		write(join(project, ".pi", "settings.json"), {});
+		assert.equal(installed(read({ bundledRoots: [bundled], argv: ["-e", bundled, "--extension", `${bundled}/src/index.ts`] })), false);
+		// a different pi-tidy checkout still counts
+		assert.equal(installed(read({ bundledRoots: [bundled], argv: ["-e", join(root, "other", "pi-tidy")] })), true);
+	});
+
+	it("the default bundled roots include this package's node_modules/pi-tidy", async () => {
+		const { PACKAGE_ROOT } = await import("../lib/runtime.ts");
+		write(join(agent, "settings.json"), {});
+		write(join(project, ".pi", "settings.json"), {});
+		const own = join(PACKAGE_ROOT, "node_modules", "pi-tidy");
+		assert.equal(installed(readTidyInputs(project, agent, { argv: ["-e", own] })), false);
+	});
+});
+
 describe("tidy-bundled wrapper", () => {
 	it("registers nothing and loads nothing in a child session", async () => {
 		const pi = createFakePi();
@@ -50,10 +133,19 @@ describe("tidy-bundled wrapper", () => {
 		}
 	});
 
-	it("does nothing when pi-tidy is disabled in its own settings", async () => {
+	it("still runs the bundled pi-tidy when disabled in its own settings (it switches its patches off itself)", async () => {
 		const { calls, factory } = setup({ inputs: { piSettings: { tidy: { enabled: false } } } });
 		await factory(createFakePi() as never);
-		assert.equal(calls.loads, 0);
+		assert.equal(calls.loads, 1);
+		assert.equal(calls.installs.length, 1);
+	});
+
+	it("does nothing when a separate pi-tidy comes from a settings or CLI extensions entry", async () => {
+		for (const inputs of [{ extensions: ["/x/pi-tidy/src/index.ts"] }, { extensions: ["npm:pi-tidy"] }, { extensionEntries: ["pi-tidy.js"] }]) {
+			const { calls, factory } = setup({ inputs });
+			await factory(createFakePi() as never);
+			assert.equal(calls.loads, 0, JSON.stringify(inputs));
+		}
 	});
 
 	it("loads the bundled pi-tidy once, handing it the same pi", async () => {
