@@ -8,7 +8,7 @@
 // while it was held is skipped at flush. Sync launches never reach this buffer:
 // they are not in the registry, so no settle event exists for them.
 //
-// One message per flush (D1): a flush hands every ready launch (held, not consumed), in settle
+// One message per flush: a flush hands every ready launch (held, not consumed), in settle
 // order, to ONE `deliver` call, which the host turns into ONE message that starts ONE parent turn.
 // (Live, with Pi 1.5.2: one message per launch started a turn each, because Pi takes a second
 // steer only after the run the first one started has settled; and the first turn's model saw only
@@ -21,7 +21,7 @@
 // released unconsumed, so `subagent_wait` can still collect it, and `onDeliveryFailed` tells the
 // user, once per item. Items are marked consumed only after `deliver` returned, all of the batch.
 //
-// What counts as an attempt (R3-101): a failure spends the batch's budget at most once per idle signal.
+// What counts as an attempt: a failure spends the batch's budget at most once per idle signal.
 // The public `flush()` is the idle signal (the host calls it on `agent_settled`); each call starts a new
 // idle epoch. A flush that a settle triggers also retries the earlier-failed batch (so it can still get
 // through without waiting), but if its items already failed in the current epoch, the failure is not
@@ -58,7 +58,7 @@ export interface ResultDelivery<R> {
 	settled(event: { launch: Delivered<R>["launch"]; result?: R }): void;
 	/** The parent became idle: deliver everything held as one batch, in settle order, skipping what was collected meanwhile. */
 	flush(): void;
-	/** Ids held and not yet delivered, in settle order. */
+	/** Ids held and not yet delivered, in settle order (no production caller; tests observe the buffer through it). */
 	held(): string[];
 	isHeld(id: string): boolean;
 	/** Forgets held results and starts accepting settles (session start). */

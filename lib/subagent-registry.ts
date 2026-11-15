@@ -6,7 +6,8 @@
 // `consumedBy` records who took it first (`wait`, `cancel`, or `delivered` by the
 // idle delivery; `delivered-omitted` when that delivery left the text out for a
 // pointer), so a `wait` after delivery can tell the model what it already has.
-// `subscribe` emits start/progress/settle for delivery and the footer count.
+// `subscribe` emits start/progress/settle; the idle delivery listens for `settle`. (The footer's running
+// count does not come from here: it is derived from the launches' result placeholders.)
 
 export const MAX_SETTLED_LAUNCHES = 64;
 
@@ -56,7 +57,9 @@ export interface SubagentRegistry<R> {
 	/** Starts the launch in the background and returns its id at once. */
 	start(options: { total: number; run: (signal: AbortSignal, control: LaunchControl) => Promise<R> }): string;
 	get(id: string): LaunchSummary | undefined;
+	/** Every launch held, running or settled (no production caller; tests read the registry through it). */
 	list(): LaunchSummary[];
+	/** Running and settled launch totals (no production caller; tests pin the prune cap through it). */
 	counts(): { running: number; settled: number };
 	progress(id: string, done: number, total?: number): void;
 	/** Blocks until the launch settles (and consumes it), the timeout elapses, or `signal` aborts (both leave it unconsumed). */

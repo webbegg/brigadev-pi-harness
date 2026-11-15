@@ -1,6 +1,6 @@
 // The run loop of one subagent child process: spawn it in Pi's RPC mode (argv/env/stdio
 // come from lib/child-launch.ts), send the task as the RPC `prompt`, fold its JSON lines
-// into a run snapshot, answer its extension UI requests with a cancellation (S0: nothing
+// into a run snapshot, answer its extension UI requests with a cancellation (nothing
 // waits for a person), close its stdin when the agent settles so it exits, expose a
 // steering handle while it runs, capture stderr, watch for stalls, terminate on abort
 // (SIGTERM, then SIGKILL after 5 s, which also reaches the descendants' own process groups), check structured output, and save the attempt's
@@ -153,7 +153,31 @@ export function finalText(messages: Message[]): string {
 	return "";
 }
 
-export const failed = (r: RunResult) => r.exitCode > 0 || r.stopReason === "error" || r.stopReason === "aborted";
+export const failed = (r: Pick<RunResult, "exitCode" | "stopReason">) => r.exitCode > 0 || r.stopReason === "error" || r.stopReason === "aborted";
+
+/** Where a run stands: what the card, the viewer, the footer count, and the result text all read. */
+export type RunStatus = "queued" | "running" | "done" | "failed" | "cancelled";
+
+/**
+ * The one run-state rule. Exit code -1 is a placeholder: with no end time it is unfinished (queued until it gets a slot,
+ * else running); with an end time it settled without finishing (cancelled when it never started, else failed).
+ * Any other exit code is a real run: failed per `failed`, else done.
+ */
+export function runStatus(r: Pick<RunResult, "exitCode" | "endedAt" | "queued" | "cancelled" | "stopReason">): RunStatus {
+	if (r.exitCode === -1) {
+		if (r.endedAt === undefined) return r.queued ? "queued" : "running";
+		return r.cancelled ? "cancelled" : "failed";
+	}
+	return failed(r) ? "failed" : "done";
+}
+
+/** Queued or running: not finished yet. */
+export const isUnfinished = (status: RunStatus): boolean => status === "queued" || status === "running";
+
+/** The three-state view the card and the transcript row use: queued counts as running, cancelled as failed. */
+export function toRunState(status: RunStatus): "running" | "done" | "failed" {
+	return isUnfinished(status) ? "running" : status === "done" ? "done" : "failed";
+}
 
 /** What the parent is told for one run: the error, the structured payload, or the final text. */
 export const output = (r: RunResult) =>
@@ -489,7 +513,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			// steer/follow_up commands wait here for Pi's response (matched by id); nothing is left waiting once input ends.
 			const commands = createCommandTracker();
 
-			// Commands and UI answers go to the child as one JSON record per line (rpc.md:50-56); false once the pipe is closed.
+			// Commands and UI answers go to the child as one JSON record per line (rpc.md, framing); false once the pipe is closed.
 			const send = (record: RpcCommand | UiResponse): boolean => {
 				if (!inputOpen) return false;
 				try {
@@ -499,7 +523,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					return false;
 				}
 			};
-			// Closing stdin asks the child to shut down in order (rpc.md:91-93); a finished run takes no more input, so it has no handle.
+			// Closing stdin asks the child to shut down in order (rpc.md, shutdown); a finished run takes no more input, so it has no handle.
 			const endInput = () => {
 				if (!inputOpen) return;
 				inputOpen = false;
@@ -562,7 +586,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				},
 				commands,
 			});
-			// The task is the first command (rpc.md:20; the child has no positional prompt).
+			// The task is the first command (rpc.md; the child has no positional prompt).
 			send({ type: "prompt", message: options.taskText });
 			controlGiven = true;
 			hook(() => options.onControl?.(control));
@@ -574,18 +598,18 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					else if (event.type === "activity") watchdog.activity(event.label);
 					else if (event.type === "run") {
 						streaming = event.phase === "start";
-						// `agent_end` can be followed by retries, compaction, or queued messages; `agent_settled` is the end (rpc.md:69).
+						// `agent_end` can be followed by retries, compaction, or queued messages; `agent_settled` is the end (rpc.md, commands).
 						if (event.phase === "settled") finishInput();
 					} else if (event.type === "response") {
-						// The answer to a steer/follow_up settles that command's outcome (rpc.md:35-44).
+						// The answer to a steer/follow_up settles that command's outcome (rpc.md, command ids).
 						commands.respond(event);
-						// A rejected prompt starts no run, and a handled one starts none either (rpc.md:67): neither will ever settle.
+						// A rejected prompt starts no run, and a handled one starts none either (rpc.md, commands): neither will ever settle.
 						if (event.command === "prompt" && !event.success) {
 							Object.assign(result, { stopReason: "error", errorMessage: `Pi rejected the task: ${event.error ?? "unknown error"}` });
 							finishInput();
 						} else if (event.command === "prompt" && event.disposition === "handled") finishInput();
 					} else if (event.type === "ui_request") {
-						// S0: a child's dialog is cancelled on the spot, never shown to the user and never left pending.
+						// A child's dialog is cancelled on the spot, never shown to the user and never left pending.
 						const answer = answerUiRequest(event.request);
 						if (answer) send(answer);
 					}

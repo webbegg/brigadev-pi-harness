@@ -1,19 +1,19 @@
 // The Pi RPC protocol as a subagent child speaks it (`pi --mode rpc`): command
-// encoding, record decoding, the S0 policy for extension UI requests, and the
+// encoding, record decoding, the no-prompt policy for extension UI requests, and the
 // steering handle a running task exposes. Pure: no Pi imports, no I/O.
 //
 // Pi docs (installed 1.5.2, docs/):
-// - rpc.md:22-33 record families; :35-48 optional command `id`, matching response; :50-56 strict JSONL framing (LF only)
-// - rpc.md:58-71 `prompt` is acknowledged, not completed; `agent_settled` says Pi will not continue by itself;
+// - rpc.md, record families and strict JSONL framing (LF only)
+// - rpc.md, commands: `prompt` is acknowledged, not completed; `agent_settled` says Pi will not continue by itself;
 //   disposition "handled" means no run started (don't wait for `agent_settled`)
-// - rpc.md:91-97 closing stdin requests an orderly shutdown
-// - rpc-commands.md:7-44 `prompt`; :46-68 `steer`; :70-92 `follow_up`; :94-105 `abort`
-// - rpc-extension-ui.md:5-10 dialog methods (select, confirm, input, editor) block until answered;
+// - rpc.md, shutdown: closing stdin requests an orderly shutdown
+// - rpc-commands.md: `prompt`, `steer`, `follow_up`, `abort`
+// - rpc-extension-ui.md: dialog methods (select, confirm, input, editor) block until answered;
 //   fire-and-forget methods (notify, setStatus, setWidget, setTitle, set_editor_text) expect nothing;
-//   :172-194 responses; the cancellation response `{"type":"extension_ui_response","id":...,"cancelled":true}` dismisses any dialog
-// - rpc.md:35-44 every command accepts an optional string `id`; the response repeats it; "command handling is asynchronous,
+//   the cancellation response `{"type":"extension_ui_response","id":...,"cancelled":true}` dismisses any dialog
+// - rpc.md, command ids: every command accepts an optional string `id`; the response repeats it; "command handling is asynchronous,
 //   so clients should correlate by ID rather than response order"
-// - rpc-commands.md:63-66 (steer) and :87-90 (follow_up): success response `data.disposition` is "queued" or "handled"
+// - rpc-commands.md, `steer` and `follow_up`: success response `data.disposition` is "queued" or "handled"
 
 /** Commands the parent writes to a child's stdin. */
 export type RpcCommand =
@@ -22,7 +22,7 @@ export type RpcCommand =
 	| { type: "follow_up"; message: string; id?: string }
 	| { type: "abort" };
 
-/** The parent's answer to a dialog (rpc-extension-ui.md:188-194). */
+/** The parent's answer to a dialog (rpc-extension-ui.md, responses). */
 export interface UiResponse {
 	type: "extension_ui_response";
 	id: string;
@@ -43,12 +43,12 @@ export type RpcRecord =
 	/** A session event (json.md): anything that is neither a response nor a UI request. */
 	| { kind: "event"; event: any };
 
-/** Methods that block the child until the client answers (rpc-extension-ui.md:7). */
+/** Methods that block the child until the client answers (rpc-extension-ui.md). Documents the protocol; only tests read it. */
 export const UI_DIALOG_METHODS: readonly string[] = ["select", "confirm", "input", "editor"];
-/** Methods that expect no answer (rpc-extension-ui.md:8). */
+/** Methods that expect no answer (rpc-extension-ui.md). */
 export const FIRE_AND_FORGET_METHODS: readonly string[] = ["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"];
 
-/** One record, LF-terminated (rpc.md:52). JSON escapes newlines inside strings, so the terminator is the only raw LF. */
+/** One record, LF-terminated (rpc.md, framing). JSON escapes newlines inside strings, so the terminator is the only raw LF. */
 export const encodeCommand = (record: RpcCommand | UiResponse): string => `${JSON.stringify(record)}\n`;
 
 /** Decodes one stdout line; blank or broken lines (and a CR from CRLF) decode to nothing or are tolerated. */
@@ -78,7 +78,7 @@ export function decodeRecord(line: string): RpcRecord | undefined {
 }
 
 /**
- * S0: a subagent never asks the user for anything and never waits for an answer.
+ * No-prompt rule: a subagent never asks the user for anything and never waits for an answer.
  * Every dialog gets the cancellation response at once (the extension then sees
  * `undefined`, or `false` for confirm); fire-and-forget requests are ignored.
  * A method this version does not know is answered like a dialog: if it is a
@@ -118,6 +118,7 @@ export interface CommandTracker {
 	forget(id: string): void;
 	/** The child's input ended or it exited: everything still waiting is not delivered. */
 	settleAll(): void;
+	/** Commands still waiting for their response (no production caller; tests assert nothing is left waiting). */
 	pending(): number;
 }
 
@@ -153,13 +154,13 @@ export function createCommandTracker(prefix = "cmd"): CommandTracker {
 /** What a running task exposes for takeover; gone once the run has finished. */
 export interface ChildControl {
 	/**
-	 * Queues text to be delivered after the current turn's tool calls, before the next model call (rpc-commands.md:46-48).
+	 * Queues text to be delivered after the current turn's tool calls, before the next model call (rpc-commands.md, `steer`).
 	 * Settles from Pi's response to this command (matched by id), not from the write.
 	 */
 	steer(text: string): Promise<CommandOutcome>;
-	/** Queues text for when the child has no more work; use it between turns (rpc-commands.md:70-72). Settles like `steer`. */
+	/** Queues text for when the child has no more work; use it between turns (rpc-commands.md, `follow_up`). Settles like `steer`. */
 	followUp(text: string): Promise<CommandOutcome>;
-	/** Asks the child to abort its current operation (rpc-commands.md:94-96). False when it could not send. */
+	/** Asks the child to abort its current operation (rpc-commands.md, `abort`). False when it could not send. */
 	abort(): boolean;
 	/** True between `agent_start` and `agent_end`: steer applies; otherwise follow up. */
 	isStreaming(): boolean;
