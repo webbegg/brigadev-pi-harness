@@ -248,6 +248,28 @@ describe("result delivery: idle and busy", () => {
 		assert.deepEqual(seen, [["L1", "L2"]]);
 		assert.equal(consumed.has("L1") && consumed.has("L2"), true);
 	});
+
+	it("S9: after a throwing deliver, the retry's omitted ids are marked delivered-omitted, the rest delivered; held in between", () => {
+		const marks: string[] = [];
+		let failing = true;
+		const delivery = createResultDelivery<string>({
+			isIdle: () => true,
+			isConsumed: () => false,
+			markConsumed: (id, by) => void marks.push(`${id}:${by}`),
+			deliver: () => {
+				if (failing) throw new Error("stale");
+				return { omitted: ["L1"] };
+			},
+		});
+		delivery.settled({ launch: summary("L1"), result: "a" });
+		delivery.settled({ launch: summary("L2"), result: "b" });
+		assert.deepEqual(marks, [], "the throwing deliver marked nothing");
+		assert.deepEqual(delivery.held(), ["L1", "L2"], "both stayed held");
+		failing = false;
+		delivery.flush();
+		assert.deepEqual(marks, ["L1:delivered-omitted", "L2:delivered"]);
+		assert.deepEqual(delivery.held(), []);
+	});
 });
 
 describe("result delivery: a delivery that throws is retried, then reported", () => {

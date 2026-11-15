@@ -1,6 +1,7 @@
 // What one subagent run is and where it stands: the run snapshot type and the one run-state rule
 // (`runStatus`, `isUnfinished`, `toRunState`, `failed`) plus the text the parent is told (`finalText`, `output`).
-// Dependency-free: no process or file-system imports (the view modules read these; lib/child-run.ts re-exports them).
+// No child_process: the view modules read these without pulling in the process module (lib/child-run.ts re-exports them).
+// It reaches node:fs only through lib/structured-output.ts (`formatStructured`).
 
 import type { Message } from "@earendil-works/pi-ai";
 import type { RunState } from "./agents-card.ts";

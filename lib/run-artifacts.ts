@@ -90,9 +90,10 @@ export function pruneWarning(result: Pick<PruneResult, "errors">): string | unde
  * beyond `maxFolders`, at most `maxRemovals` per call (oldest first; the count rule only gets what the
  * age rule left of the cap). Age comes from the timestamp in the folder name, not the mtime, so
  * copying or touching a folder does not revive it. The exception is a name dated more than a day after `now`
- * (a wrong clock, or a made-up id): by its name it would sort as the newest forever and hold a slot, so its age
- * comes from its mtime instead and the age and count rules apply to it like any other. Only real directories (lstat, never a
- * symlink) whose name is a generated run id are touched; everything else is left alone.
+ * (a made-up or copied id whose mtime is real): by its name it would sort as the newest forever and hold a slot, so its age
+ * comes from its mtime instead and the age and count rules apply to it like any other. A folder written while the clock
+ * itself was wrong has a future mtime too: it still waits until the clock catches up.
+ * Only real directories (lstat, never a symlink) whose name is a generated run id are touched; everything else is left alone.
  * Never throws; a missing runs folder is a no-op.
  */
 export function pruneRunFolders(docsDir: string, options: PruneOptions = {}): PruneResult {

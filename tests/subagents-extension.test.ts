@@ -200,10 +200,13 @@ describe("session_start run-folder pruning", () => {
 		fs.chmodSync(docsRuns(), 0o555);
 		try {
 			const { pi, ctx } = load({ hasUI: true });
+			let notifyCalls = 0;
 			(ctx.ui as any).notify = () => {
+				notifyCalls++;
 				throw new Error("stale context");
 			};
 			await assert.doesNotReject(pi.fire("session_start", { reason: "startup" }, ctx));
+			assert.equal(notifyCalls, 1, "the prune-error warning was attempted once, so the throwing path really ran");
 		} finally {
 			fs.chmodSync(docsRuns(), 0o755);
 		}
@@ -220,6 +223,13 @@ describe("async launches: delivered-omitted wiring end to end", () => {
 		savedArgv1 = process.argv[1];
 		process.argv[1] = FAKE_CHILD;
 		const { pi, ctx } = load({ hasUI: true, idle: false });
+		// The extension asks `ctx.isIdle()` exactly once per settled launch it holds (and per idle flush, none before the signal below),
+		// so the count is the number of launches whose registry settle reached the delivery.
+		let idleChecks = 0;
+		ctx.isIdle = () => {
+			idleChecks++;
+			return ctx.idle;
+		};
 		try {
 			await pi.fire("session_start", { reason: "startup" }, ctx);
 			const start = async (task: string) => {
@@ -233,7 +243,9 @@ describe("async launches: delivered-omitted wiring end to end", () => {
 			assert.notEqual(ids[0], ids[1]);
 			for (let i = 0; i < 400 && !/2 done/.test(finishedStatus(ctx)); i++) await sleep(50);
 			assert.match(finishedStatus(ctx), /2 done/, "both children finished");
-			await sleep(150); // their registry settle follows the card update
+			// The card update comes first; the registry settle (which the delivery holds) follows. Wait for both, observed through the idle checks.
+			for (let i = 0; i < 200 && idleChecks < 2; i++) await sleep(50);
+			assert.equal(idleChecks, 2, "both launches settled in the registry and are held");
 			assert.equal(pi.messages.length, 0, "nothing is delivered while the parent is busy");
 
 			ctx.idle = true;
