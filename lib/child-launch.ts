@@ -1,5 +1,5 @@
 // How a subagent child process is launched: argv, environment, and stdio.
-// One pure function for every launch (sync and async), so the S0 guarantee is
+// One pure function for every launch (sync and async), so the no-prompt rule is
 // stated in one place: a child never asks for permission and hangs. It runs
 // Pi's RPC mode (`--mode rpc --no-session`, stdin piped so a running child can be
 // steered), with the guard extension (which denies instead of confirming for
