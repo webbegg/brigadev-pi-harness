@@ -1,6 +1,7 @@
 // Turns a subagent run's messages into readable rows for the Agents viewer:
-// assistant text, tool calls with a short argument preview, and the first
-// lines of each tool result. Pure.
+// assistant text, tool calls with a short argument preview, the first lines of
+// each tool result, and the messages the user sent while taking over (steering
+// and follow-ups come back from the child as user messages). Pure.
 
 import type { Row } from "./two-pane.ts";
 import { wrapText } from "./two-pane.ts";
@@ -39,8 +40,14 @@ function textOf(content: MessageLike["content"]): string {
 export function threadRows(header: string[], messages: readonly MessageLike[], width: number, partial?: string): Row[] {
 	const rows: Row[] = header.map((text, i) => ({ text, tone: i === 0 ? "accent" : "muted" }));
 	rows.push({ text: "" });
-	for (const message of messages) {
-		if (message.role === "assistant" && Array.isArray(message.content)) {
+	for (const [index, message] of messages.entries()) {
+		// The first user message is the task, which the header already shows; later ones are what the user sent.
+		if (message.role === "user" && index > 0) {
+			const text = textOf(message.content).trim();
+			if (!text) continue;
+			for (const line of wrapText(`▸ you: ${text}`, width)) rows.push({ text: line, tone: "accent" });
+			rows.push({ text: "" });
+		} else if (message.role === "assistant" && Array.isArray(message.content)) {
 			for (const part of message.content) {
 				if (part.type === "text" && part.text?.trim()) {
 					for (const line of wrapText(part.text.trim(), width)) rows.push({ text: line, tone: "text" });

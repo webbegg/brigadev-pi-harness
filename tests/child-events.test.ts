@@ -200,3 +200,45 @@ describe("foldChildEvent: the single fold that builds a run snapshot", () => {
 		assert.equal(snap.usage.input, 20);
 	});
 });
+
+describe("parseChildLine: RPC records (Pi rpc.md:24-33, json.md:31-48, rpc-extension-ui.md)", () => {
+	it("agent_start, agent_end and agent_settled become run phases after the sign of life", () => {
+		assert.deepEqual(parseChildLine(line({ type: "agent_start" })), [{ type: "activity", label: "agent_start" }, { type: "run", phase: "start" }]);
+		assert.deepEqual(parseChildLine(line({ type: "agent_end", messages: [], willRetry: false })), [{ type: "activity", label: "agent_end" }, { type: "run", phase: "end" }]);
+		assert.deepEqual(parseChildLine(line({ type: "agent_settled", aborted: false })), [{ type: "activity", label: "agent_settled" }, { type: "run", phase: "settled", aborted: false }]);
+		assert.deepEqual(parseChildLine(line({ type: "agent_settled", aborted: true })).at(-1), { type: "run", phase: "settled", aborted: true });
+	});
+
+	it("a command response is its own event, never a transcript message", () => {
+		const events = parseChildLine(line({ id: "p1", type: "response", command: "prompt", success: true, data: { disposition: "started" } }));
+		assert.deepEqual(events, [{ type: "activity", label: "response" }, { type: "response", command: "prompt", success: true, disposition: "started", id: "p1" }]);
+		assert.ok(!events.some((e) => e.type === "message"));
+	});
+
+	it("a response that carries a message-shaped payload is still not a message", () => {
+		const snap = emptySnapshot();
+		const stream = [line({ type: "response", command: "get_messages", success: true, data: { messages: [assistant([{ type: "text", text: "x" }])] } }), line({ type: "response", command: "prompt", success: false, error: "no model" })];
+		for (const raw of stream) for (const event of parseChildLine(raw)) foldChildEvent(snap, event);
+		assert.deepEqual(snap.messages, []);
+		assert.equal(snap.usage.turns, 0);
+	});
+
+	it("an extension UI request is carried whole for the run loop's answer, and is a sign of life", () => {
+		const events = parseChildLine(line({ type: "extension_ui_request", id: "u1", method: "confirm", title: "Sure?" }));
+		assert.deepEqual(events, [{ type: "activity", label: "extension_ui_request" }, { type: "ui_request", request: { id: "u1", method: "confirm", title: "Sure?" } }]);
+	});
+
+	it("run, response and ui_request events do not change the snapshot", () => {
+		const snap = emptySnapshot();
+		for (const event of [{ type: "run", phase: "settled", aborted: false }, { type: "response", command: "prompt", success: true }, { type: "ui_request", request: { id: "u", method: "notify" } }] as ChildEvent[]) assert.equal(foldChildEvent(snap, event), false);
+		assert.deepEqual(snap.messages, []);
+	});
+
+	it("a steering message comes back as an ordinary user message_end and is folded once", () => {
+		const snap = emptySnapshot();
+		const user = { role: "user", content: "go left instead", timestamp: 1 };
+		for (const event of parseChildLine(line({ type: "message_start", message: user }))) foldChildEvent(snap, event);
+		for (const event of parseChildLine(line({ type: "message_end", message: user }))) foldChildEvent(snap, event);
+		assert.deepEqual(snap.messages, [user]);
+	});
+});

@@ -1,6 +1,7 @@
 /**
  * brigadev subagents: focused agents with isolated context, each in its own
- * `pi --mode json -p` process. Adapted from Pi's official subagent example.
+ * `pi --mode rpc` process (the task is sent as an RPC prompt, so a running child can
+ * be steered or aborted from the Agents viewer). Adapted from Pi's official subagent example.
  *
  * Adds the brigadev delegation contract on top: every launch names its
  * reason, the verifier needs a named risk item, writers need disjoint
@@ -15,7 +16,8 @@ import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@ear
 import { Box, Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { agentsCard, FINISHED_TTL_MS, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
-import { autoScroll, buildEntries, entryDetail, listRow, moveSelection, resolveSelection, scrollView, viewerTitle, type RecordedRun, type Selection, type TrackedRun } from "../lib/subagent-viewer.ts";
+import { autoScroll, buildEntries, canTakeOver, entryDetail, listRow, moveSelection, openTakeover, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, viewerFooter, viewerTitle, type RecordedRun, type Selection, type TakeoverKey, type TakeoverState, type TrackedRun } from "../lib/subagent-viewer.ts";
+import type { ChildControl } from "../lib/child-rpc.ts";
 import { formatStatus, statusCounts } from "../lib/subagent-status.ts";
 import { queuedFields, runState, subagentRow, syncRowTimer, type RowInput, type RowTimerState } from "../lib/subagent-row.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
@@ -147,6 +149,8 @@ export default function (pi: ExtensionAPI) {
 	// and of the viewer's live rows, so nothing is counted by hand and no exit path can leave a count behind.
 	const launches = new Map<RunResult[], number>();
 	let launchSeq = 0;
+	// Steering handles of the running children, by viewer entry key (`<launch>:<task>`). A finished run has none.
+	const controls = new Map<string, ChildControl>();
 	// Runs of launches that ended in this session, for the viewer (async launches stay visible before they are collected).
 	let settled: TrackedRun[] = [];
 	// Bumped on session start: a launch left from the previous session must not add to the new one.
@@ -267,6 +271,7 @@ export default function (pi: ExtensionAPI) {
 		registry.clear();
 		runs = [];
 		launches.clear();
+		controls.clear();
 		settled = [];
 		epoch++;
 		showCard(ctx);
@@ -372,6 +377,7 @@ export default function (pi: ExtensionAPI) {
 
 				// Agents card rows, one per task that got a slot.
 				const cards = new Map<number, AgentRun>();
+				const id = launchSeq++;
 				const syncCard = (cardRun: AgentRun, r: RunResult) => {
 					cardRun.tokens = r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output;
 					cardRun.cost = r.usage.cost;
@@ -403,9 +409,14 @@ export default function (pi: ExtensionAPI) {
 						showCard(ctx);
 						repaintViewer?.();
 					},
+					control(index, control) {
+						const key = `${id}:${index}`;
+						if (control) controls.set(key, control);
+						else controls.delete(key);
+						repaintViewer?.();
+					},
 				};
 
-				const id = launchSeq++;
 				const launchEpoch = epoch;
 				launches.set(results, id);
 				syncStatus(ctx);
@@ -417,7 +428,7 @@ export default function (pi: ExtensionAPI) {
 						slots,
 						runAgent: (call) =>
 							runChild(
-								{ cwd: ctx.cwd, agent: tasks[call.index].agent, request: tasks[call.index].request, taskText: call.taskText, route: call.route, routeLabel: call.routeLabel, schema: schemas[call.index], price, signal: call.signal, onUpdate: call.onUpdate },
+								{ cwd: ctx.cwd, agent: tasks[call.index].agent, request: tasks[call.index].request, taskText: call.taskText, route: call.route, routeLabel: call.routeLabel, schema: schemas[call.index], price, signal: call.signal, onUpdate: call.onUpdate, onControl: call.onControl },
 								{ piInvocation },
 							),
 						skills: () => skills,
@@ -449,7 +460,9 @@ export default function (pi: ExtensionAPI) {
 						snapshot: () => takeSnapshot(exec, canonicalPath(ctx.cwd)),
 					},
 				).finally(() => {
-					// Whatever way the launch ended: it no longer counts as running, its rows settle, and its runs stay viewable.
+					// Whatever way the launch ended: no child of it can be steered any more.
+					results.forEach((_, i) => controls.delete(`${id}:${i}`));
+					// It no longer counts as running, its rows settle, and its runs stay viewable.
 					if (launchEpoch !== epoch) return;
 					launches.delete(results);
 					for (const cardRun of cards.values()) if (cardRun.state === "running") Object.assign(cardRun, { state: "failed", endedAt: Date.now() });
@@ -582,6 +595,17 @@ export default function (pi: ExtensionAPI) {
 			let selection: Selection = { key: undefined, index: 0 };
 			let view = scrollView.initial();
 			let detailOnly = false;
+			// Takeover: the open input line (steer / follow up), and a one-line result shown in the footer until the next key.
+			let takeover: TakeoverState | undefined;
+			let notice: string | undefined;
+			// What the user typed goes to the child as an RPC steer while it is streaming, as a follow_up between turns.
+			const sendTakeover = (key: string, text: string): string => {
+				const control = controls.get(key);
+				if (!control) return "Not sent: the run has finished";
+				const kind = takeoverKind(control.isStreaming());
+				const sent = kind === "steer" ? control.steer(text) : control.followUp(text);
+				return sent ? (kind === "steer" ? "Steering message sent" : "Follow-up queued") : "Not sent: the run has finished";
+			};
 			// The list changes while the viewer is open: repaint on every progress update, and once a second so elapsed times tick.
 			repaintViewer = () => tui.requestRender();
 			const timer = setInterval(() => tui.requestRender(), 1000);
@@ -599,6 +623,30 @@ export default function (pi: ExtensionAPI) {
 					const entries = viewerEntries(ctx);
 					selection = resolveSelection(entries, selection);
 					const entry = entries[selection.index];
+					notice = undefined;
+					if (takeover && !controls.has(takeover.key)) [takeover, notice] = [undefined, "The run finished"];
+					if (takeover) {
+						// The input line owns every key until Enter or Esc, so j/k/q/x are typed, not commands.
+						const typed = printableText(data);
+						const key: TakeoverKey | undefined = matchesKey(data, Key.enter)
+							? { kind: "submit" }
+							: matchesKey(data, Key.escape)
+								? { kind: "cancel" }
+								: matchesKey(data, Key.backspace)
+									? { kind: "backspace" }
+									: matchesKey(data, "ctrl+u")
+										? { kind: "clear" }
+										: typed !== undefined
+											? { kind: "text", text: typed }
+											: undefined;
+						if (key) {
+							const open = takeover;
+							const step = takeoverKey(open, key);
+							takeover = step.state;
+							if (step.submit !== undefined) notice = sendTakeover(open.key, step.submit);
+						}
+						return tui.requestRender();
+					}
 					const bodyHeight = Math.max(1, tui.terminal.rows - 3);
 					const total = entryDetail(entry, detailWidth(tui.terminal.columns), home).length;
 					// Scroll keys act on what is on screen (a pinned thread is at its end).
@@ -611,6 +659,13 @@ export default function (pi: ExtensionAPI) {
 					else if (data === "g") view = scrollView.to(shown, "top", total, bodyHeight);
 					else if (data === "G") view = scrollView.to(shown, "bottom", total, bodyHeight);
 					else if (data === "F") detailOnly = !detailOnly;
+					else if (matchesKey(data, Key.enter)) {
+						takeover = openTakeover(entry, entry !== undefined && controls.has(entry.key));
+						if (!takeover) notice = "Only a running agent can be steered";
+					} else if (data === "x") {
+						const control = entry && controls.get(entry.key);
+						notice = canTakeOver(entry, control !== undefined) && control?.abort() ? "Abort sent" : "Only a running agent can be aborted";
+					}
 					tui.requestRender();
 				},
 				render(width: number): string[] {
@@ -618,6 +673,7 @@ export default function (pi: ExtensionAPI) {
 					selection = resolveSelection(entries, selection);
 					const entry = entries[selection.index];
 					const detail = entryDetail(entry, detailWidth(width), home);
+					if (takeover && !controls.has(takeover.key)) [takeover, notice] = [undefined, "The run finished"];
 					const bodyHeight = Math.max(1, tui.terminal.rows - 3);
 					// A queued or running thread follows its newest lines until the user scrolls up.
 					view = { scroll: autoScroll(view, detail.length, bodyHeight, entry?.active ?? false), follow: view.follow };
@@ -632,7 +688,7 @@ export default function (pi: ExtensionAPI) {
 							detailScroll: view.scroll,
 							detailOnly,
 							empty: "No subagent runs in this session yet",
-							footer: "j/k run · space/J/K scroll · g/G top/end · F thread only · q close",
+							footer: takeover ? takeoverFooter(takeover, takeoverKind(controls.get(takeover.key)?.isStreaming() ?? false), width) : (notice ?? viewerFooter(canTakeOver(entry, entry !== undefined && controls.has(entry.key)))),
 						},
 						painter,
 					);

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { RunResult } from "../lib/child-run.ts";
 import { emptyTally } from "../lib/cost.ts";
-import { autoScroll, buildEntries, entryDetail, listRow, moveSelection, resolveSelection, scrollView, viewerTitle, type RecordedRun, type TrackedRun } from "../lib/subagent-viewer.ts";
+import { autoScroll, buildEntries, canTakeOver, entryDetail, listRow, moveSelection, openTakeover, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, viewerFooter, viewerTitle, type RecordedRun, type TrackedRun, type ViewerEntry } from "../lib/subagent-viewer.ts";
 
 const NOW = 1_000_000;
 const result = (over: Partial<RunResult> = {}): RunResult => ({ agent: "scout", task: "map the code", exitCode: 0, messages: [], stderr: "", usage: emptyTally(), stopReason: "stop", ...over });
@@ -204,5 +204,111 @@ describe("selection survives live updates", () => {
 		assert.deepEqual(moveSelection(list, { key: "a", index: 0 }, 1), { key: "b", index: 1 });
 		assert.deepEqual(moveSelection(list, { key: "c", index: 2 }, 1), { key: "c", index: 2 });
 		assert.deepEqual(moveSelection(list, { key: "a", index: 0 }, -1), { key: "a", index: 0 });
+	});
+});
+
+describe("entryDetail: messages sent to the child show once in the transcript (S4)", () => {
+	const entry = (r: RunResult) => buildEntries({ tracked: [tracked("x", r)], recorded: [], now: NOW })[0];
+	const said = (text: string) => ({ role: "assistant", content: [{ type: "text", text }] });
+	const texts = (r: RunResult, width = 60) => entryDetail(entry(r), width).map((row) => row.text);
+
+	it("shows a steering message where the child received it, and only once", () => {
+		const messages = [{ role: "user", content: "THE TASK" }, said("working"), { role: "user", content: "go left instead" }, said("going left")] as any;
+		const rows = texts(runningRun({ messages }));
+		assert.equal(rows.filter((t) => t.includes("go left instead")).length, 1);
+		assert.ok(rows.indexOf("working") < rows.findIndex((t) => t.includes("go left instead")));
+		assert.ok(rows.findIndex((t) => t.includes("go left instead")) < rows.indexOf("going left"));
+		assert.equal(entryDetail(entry(runningRun({ messages })), 60).find((row) => row.text.includes("go left instead"))?.tone, "accent");
+	});
+
+	it("does not repeat the task itself, which the header shows", () => {
+		assert.ok(!texts(runningRun({ messages: [{ role: "user", content: "THE TASK, long" }, said("ok")] as any })).some((t) => t.includes("THE TASK, long")));
+	});
+
+	it("reads text parts of an array content and wraps long messages", () => {
+		const messages = [{ role: "user", content: "task" }, { role: "user", content: [{ type: "text", text: "please also check the migration files carefully" }] }] as any;
+		const rows = texts(runningRun({ messages }), 24);
+		const at = rows.findIndex((t) => t.startsWith("▸ you: "));
+		assert.ok(at >= 0);
+		assert.ok(rows.slice(at).filter(Boolean).every((t) => t.length <= 24));
+		assert.ok(rows.join(" ").includes("migration"));
+	});
+
+	it("a thread that starts with the child's own message still shows a later steering message", () => {
+		assert.ok(texts(runningRun({ messages: [said("hi"), { role: "user", content: "late steer" }] as any })).some((t) => t.includes("late steer")));
+	});
+});
+
+describe("takeover: steer, follow up, abort (pure state)", () => {
+	const entryOf = (r: RunResult): ViewerEntry => buildEntries({ tracked: [tracked("x", r)], recorded: [], now: NOW })[0];
+
+	it("only a running run with a live handle can be taken over", () => {
+		assert.equal(canTakeOver(entryOf(runningRun()), true), true);
+		assert.equal(canTakeOver(entryOf(runningRun()), false), false, "no handle: the child is finished or not started");
+		assert.equal(canTakeOver(entryOf(queuedRun()), true), false);
+		assert.equal(canTakeOver(entryOf(doneRun()), true), false, "finished runs are not restarted");
+		assert.equal(canTakeOver(entryOf(doneRun({ exitCode: 1 })), true), false);
+		assert.equal(canTakeOver(undefined, true), false);
+	});
+
+	it("opening starts an empty input for that run; nothing opens for a run that cannot be taken over", () => {
+		assert.deepEqual(openTakeover(entryOf(runningRun()), true), { key: "x", text: "" });
+		assert.equal(openTakeover(entryOf(doneRun()), true), undefined);
+		assert.equal(openTakeover(entryOf(runningRun()), false), undefined);
+	});
+
+	it("a streaming child is steered, an idle one is followed up", () => {
+		assert.equal(takeoverKind(true), "steer");
+		assert.equal(takeoverKind(false), "follow_up");
+	});
+
+	it("typing appends, backspace removes one character, ctrl+u clears", () => {
+		let state = { key: "x", text: "" };
+		state = takeoverKey(state, { kind: "text", text: "hel" }).state!;
+		state = takeoverKey(state, { kind: "text", text: "lo" }).state!;
+		assert.equal(state.text, "hello");
+		assert.equal(takeoverKey(state, { kind: "backspace" }).state!.text, "hell");
+		assert.equal(takeoverKey({ key: "x", text: "" }, { kind: "backspace" }).state!.text, "");
+		assert.equal(takeoverKey({ key: "x", text: "a😀" }, { kind: "backspace" }).state!.text, "a", "one character, not half a surrogate pair");
+		assert.equal(takeoverKey(state, { kind: "clear" }).state!.text, "");
+	});
+
+	it("the input is bounded", () => {
+		const long = takeoverKey({ key: "x", text: "a".repeat(1990) }, { kind: "text", text: "b".repeat(50) }).state!;
+		assert.equal(long.text.length, 2000);
+	});
+
+	it("submit hands the trimmed text out and closes the input; blank text stays open", () => {
+		assert.deepEqual(takeoverKey({ key: "x", text: "  go left " }, { kind: "submit" }), { submit: "go left" });
+		assert.deepEqual(takeoverKey({ key: "x", text: "   " }, { kind: "submit" }), { state: { key: "x", text: "   " } });
+	});
+
+	it("cancel closes the input without sending anything", () => {
+		assert.deepEqual(takeoverKey({ key: "x", text: "draft" }, { kind: "cancel" }), {});
+	});
+
+	it("printableText accepts typed and pasted text, and rejects control sequences", () => {
+		assert.equal(printableText("a"), "a");
+		assert.equal(printableText("héllo wörld"), "héllo wörld");
+		assert.equal(printableText("line one\nline two"), "line one line two", "a pasted newline does not send");
+		assert.equal(printableText("a\r\nb"), "a b");
+		assert.equal(printableText("\x1b[A"), undefined, "an arrow key");
+		assert.equal(printableText("\x03"), undefined, "ctrl+c");
+		assert.equal(printableText("\t"), undefined);
+		assert.equal(printableText(""), undefined);
+	});
+
+	it("the footer shows the input line with what it will send, keeping the end of long text visible", () => {
+		assert.equal(takeoverFooter({ key: "x", text: "go left" }, "steer", 80), "steer › go left▍ · enter send · esc back");
+		assert.equal(takeoverFooter({ key: "x", text: "" }, "follow_up", 80), "follow-up › ▍ · enter send · esc back");
+		const narrow = takeoverFooter({ key: "x", text: "0123456789abcdefghij" }, "steer", 40);
+		assert.ok(narrow.length <= 39, "one column is left for the footer's indent");
+		assert.ok(narrow.includes("…fghij▍"), narrow);
+	});
+
+	it("the key hints list steering and abort only where they work", () => {
+		assert.ok(!viewerFooter(false).includes("steer"));
+		assert.ok(viewerFooter(true).includes("enter steer") && viewerFooter(true).includes("x abort"));
+		assert.ok(viewerFooter(false).includes("q close") && viewerFooter(true).includes("q close"));
 	});
 });

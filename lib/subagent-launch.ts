@@ -6,6 +6,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { AgentDefinition } from "./agents.ts";
+import type { ChildControl } from "./child-rpc.ts";
 import { failed, finalText, output, type RunResult } from "./child-run.ts";
 import { emptyTally } from "./cost.ts";
 import { buildChildTask, type ActiveWriter, type LaunchRequest, type SkillRef } from "./delegation.ts";
@@ -98,6 +99,8 @@ export interface AgentCall {
 	routeLabel: string;
 	signal?: AbortSignal;
 	onUpdate: (result: RunResult) => void;
+	/** The attempt's steering handle while its child runs; `undefined` once the run has finished. */
+	onControl?: (control: ChildControl | undefined) => void;
 }
 
 /** Card/viewer hooks for one task; the extension keeps the card rows and the live results. */
@@ -110,6 +113,8 @@ export interface TaskView {
 	update(index: number, result: RunResult): void;
 	/** The task ended (any outcome): settle its row and the running count. */
 	finish(index: number, result: RunResult): void;
+	/** The task's child can be steered (`control`) or can no longer be (`undefined`: it finished). */
+	control?(index: number, control: ChildControl | undefined): void;
 }
 
 export interface FallbackStep {
@@ -216,6 +221,8 @@ export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<L
 		// or out-of-quota models moved behind usable ones.
 		const chain = deps.chain(index);
 		const failedModels: string[] = [];
+		// Whether the view holds this task's handle: a task that ends abnormally must not leave one behind.
+		let held = false;
 		try {
 			for (let step = 0; step < chain.length; step++) {
 				const attempt = chain[step];
@@ -233,6 +240,10 @@ export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<L
 						route: stepRoute,
 						routeLabel: label,
 						signal,
+						onControl: (control) => {
+							held = control !== undefined;
+							deps.view.control?.(index, control);
+						},
 						onUpdate: (partial) => {
 							Object.assign(partial, { startedAt, ...trail() });
 							results[index] = partial;
@@ -260,6 +271,7 @@ export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<L
 			}
 			if (failedModels.length) results[index].fallbacks = failedModels;
 		} finally {
+			if (held) deps.view.control?.(index, undefined);
 			results[index].endedAt ??= now();
 			deps.view.finish(index, results[index]);
 		}

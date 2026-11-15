@@ -1,7 +1,8 @@
 // Pure state for the Agents viewer: the list of runs (sync and async, queued,
 // running, settled), selection that survives live updates, scroll pinning, and
-// the detail pane of one run. The extension owns the terminal and feeds this
-// the runs it tracks; nothing here imports Pi or the TUI.
+// the detail pane of one run, and the takeover input line (steer / follow up /
+// abort a running child). The extension owns the terminal and feeds this the
+// runs it tracks; nothing here imports Pi or the TUI.
 
 import { threadRows } from "./agent-thread.ts";
 import { formatElapsed } from "./agents-card.ts";
@@ -149,6 +150,70 @@ export const scrollView = {
 		return where === "top" ? { scroll: 0, follow: false } : { scroll: maxScroll(total, visible), follow: true };
 	},
 };
+
+/** A key of the takeover input line, as the extension maps it from the terminal. */
+export type TakeoverKey = { kind: "text"; text: string } | { kind: "backspace" } | { kind: "clear" } | { kind: "submit" } | { kind: "cancel" };
+
+/** The input line open on one run (`key` is the entry key). */
+export interface TakeoverState {
+	key: string;
+	text: string;
+}
+
+export const MAX_TAKEOVER_CHARS = 2000;
+
+/** Only a running run whose child still takes input can be steered or aborted; finished runs are not restarted. */
+export const canTakeOver = (entry: ViewerEntry | undefined, hasControl: boolean): entry is ViewerEntry => entry?.state === "running" && hasControl;
+
+export const openTakeover = (entry: ViewerEntry | undefined, hasControl: boolean): TakeoverState | undefined => (canTakeOver(entry, hasControl) ? { key: entry.key, text: "" } : undefined);
+
+/** A streaming child is steered (delivered before its next model call); one between turns is followed up. */
+export const takeoverKind = (streaming: boolean): "steer" | "follow_up" => (streaming ? "steer" : "follow_up");
+
+/**
+ * One key on the input line. `submit` is the trimmed text to send, and the input closes with it; blank text
+ * stays open; `cancel` closes without sending. No `state` means the input is closed.
+ */
+export function takeoverKey(state: TakeoverState, key: TakeoverKey): { state?: TakeoverState; submit?: string } {
+	switch (key.kind) {
+		case "text":
+			return { state: { ...state, text: (state.text + key.text).slice(0, MAX_TAKEOVER_CHARS) } };
+		case "backspace":
+			return { state: { ...state, text: Array.from(state.text).slice(0, -1).join("") } };
+		case "clear":
+			return { state: { ...state, text: "" } };
+		case "submit":
+			return state.text.trim() ? { submit: state.text.trim() } : { state };
+		case "cancel":
+			return {};
+	}
+}
+
+/**
+ * The text a key press types: typed or pasted characters. A pasted newline becomes a space (it must not send);
+ * control keys and escape sequences (arrows, ctrl+c) are not text.
+ */
+export function printableText(data: string): string | undefined {
+	if (!data || data.startsWith("\x1b")) return undefined;
+	const text = data.replace(/\r\n|\r|\n/g, " ");
+	return /[\u0000-\u001f\u007f]/.test(text) ? undefined : text;
+}
+
+/** The footer while the input line is open: what it will send, with the end of long text kept in view. */
+export function takeoverFooter(state: TakeoverState, kind: "steer" | "follow_up", width: number): string {
+	const prefix = `${kind === "steer" ? "steer" : "follow-up"} › `;
+	const suffix = "▍ · enter send · esc back";
+	// renderTwoPane indents the footer by one column.
+	const room = Math.max(1, width - 1 - prefix.length - suffix.length);
+	const chars = Array.from(state.text);
+	const shown = chars.length > room ? `…${chars.slice(-(room - 1)).join("")}` : state.text;
+	return `${prefix}${shown}${suffix}`;
+}
+
+const BASE_HINTS = ["j/k run", "space/J/K scroll", "g/G top/end", "F thread only"];
+
+/** Key hints; `steer` and `abort` only appear where the selected run can take them. */
+export const viewerFooter = (takeover: boolean): string => [...BASE_HINTS, ...(takeover ? ["enter steer", "x abort"] : []), "q close"].join(" · ");
 
 /** The scroll offset to draw: the bottom for a pinned active run, otherwise the stored one kept inside the content. */
 export function autoScroll(state: ScrollState, total: number, visible: number, active: boolean): number {

@@ -23,7 +23,7 @@ Check it loaded: `/brigadev:status`.
 | --- | --- | --- |
 | Orchestrator | `extensions/orchestrator.ts`, `assets/orchestrator.md` | Injects the ODD contract into the parent session: task sizing, high-risk list, Risk line, delegation triggers. Re-read on every prompt, so edits apply immediately. |
 | ODD tracking | `assets/odd-tracking.md`, `/track` | Large work gets one feature document at `<repo docs>/tasks/<name>.md` (Specs quoted verbatim, Tasks, Log) and a `todo` projection. Small work stays inline with no artifacts. See [Repo docs folder](#repo-docs-folder). |
-| Subagents | `extensions/subagents.ts`, `assets/agents/` | `subagent` tool runs each agent in its own `pi` process. Every launch needs a `reason`; the verifier needs `Risk: item N`; writers need narrow `allowedEditSurfaces`, and parallel writers must be disjoint. Specs travel by reference (`featureDoc`), skills by exact path. |
+| Subagents | `extensions/subagents.ts`, `assets/agents/` | `subagent` tool runs each agent in its own `pi --mode rpc` process, at most 4 at a time across all launches. With `async: true` it returns a launch id at once: `subagent_wait` collects the result, `subagent_cancel` stops it, and a result nobody collected is delivered to the session once, when it is idle. Children never wait on a person: the guard denies what would need confirmation and every dialog a child extension opens is answered as cancelled. Every launch needs a `reason`; the verifier needs `Risk: item N`; writers need narrow `allowedEditSurfaces`, and parallel writers must be disjoint. Specs travel by reference (`featureDoc`), skills by exact path. |
 | Review | `skills/brigadev-review`, `/review` | 4R lenses (Risk, Readability, Reliability, Resilience) on one frozen candidate; only the lenses that fit. |
 | Judgment Day | `skills/brigadev-judgment-day`, `/skill:brigadev-judgment-day` | Two blind judges, frozen ledger, at most two scoped fix and re-judgment rounds. |
 | Safety guard | `extensions/guard.ts` | Confirms destructive, delivery, publish, and privileged commands (a commit on a feature branch runs without asking in normal mode); hard-denies catastrophic ones; asks before writes outside the project (the repo docs folder excepted) or touching secret files. In subagents: blocks all of those and enforces allowed edit surfaces. |
@@ -31,7 +31,7 @@ Check it loaded: `/brigadev:status`.
 | Compact tool rows | `extensions/compact-tools.ts` | `read`, `grep`, `find`, `ls`, `bash`, `edit`, `write` show one line when collapsed (live timer, then `✓ Ran npm test · 3.2s`; errors keep the header plus 1–3 lines). Ctrl+O expands to the full output. Presentation only: tool results are unchanged. When [pi-tidy](https://github.com/Andy8647/pi-tidy) is installed and enabled, these rows step aside and pi-tidy draws built-in tools; `ui.compactTools` in `brigadev.json` (`"auto"` default, `true`, `false`) overrides it, and `/brigadev:doctor` shows the effective mode. |
 | Status bar | `extensions/shell-bar.ts` | One-line footer: repo, branch ±dirty, yolo, model · thinking, context gauge, cost, profile. |
 | Phase label | `extensions/odd-phase.ts` | The working message shows the ODD phase (exploring, implementing, checking, delegating · agent). |
-| Agents card | `extensions/subagents.ts` | Live rows above the editor while subagents run (model · thinking, tokens, cost, elapsed). |
+| Agents card | `extensions/subagents.ts` | Live rows above the editor while subagents run (model · thinking, tokens, cost, elapsed), and a footer count: `agents: N running · M done · alt+a`. |
 | Ask dialog | `extensions/ask-user.ts` | `ask_user_choice`: focused questions as a dialog with a recommended option. |
 | Model routing | `extensions/profiles.ts` | Named profiles route the orchestrator and every agent to a model and thinking level. |
 | Workflow menu | `extensions/workflow-menu.ts`, `assets/workflows/` | `/brigadev:start` (`alt+w`): pick a day-to-day workflow, answer its questions, review the composed request, and start it. See [Workflows](#workflows). |
@@ -56,7 +56,7 @@ Check it loaded: `/brigadev:status`.
 | `ctrl+shift+t` / `ctrl+shift+a` | Collapse the todo card / the agents card |
 | `alt+g` or `/brigadev:changes` | Changes viewer: uncommitted files and their diffs (`o` opens the file in `$VISUAL` / `$EDITOR`) |
 | `alt+k` or `/brigadev:commands` | Command palette: search the brigadev commands, Enter runs one |
-| `alt+a` or `/brigadev:runs` | Agents viewer: subagent runs with their threads |
+| `alt+a` or `/brigadev:runs` | Agents viewer: sync and async subagent runs with their live threads and saved folder. On a running run, `Enter` opens an input line that steers it (or queues a follow-up between turns), `x` aborts it, `Esc` goes back |
 | `alt+o` or `/brigadev:panel` | Side panel: todos, agents, changes, and session at a glance. Needs a terminal at least 140 columns wide. It draws over the right 44 columns of the transcript while open; a docked rail would need private Pi internals. (`alt+p` is Pi's own "previous model" key on Windows and WSL, so the panel uses `alt+o`.) |
 | `/brigadev:mode [normal\|yolo\|default <mode>]` | Permission mode for this session, or the default for new sessions |
 | `/brigadev:force-commit` | One-shot: the next `git commit` of the current working tree skips the evidence gate (see below). Only you can run it |
@@ -155,7 +155,7 @@ Changes that touch only prose (`.md`, `.markdown`, `.rst`, `.adoc`, `LICENSE`, `
 
 ## Repo docs folder
 
-Harness documents live outside the project, in `~/.brigadev/<repo>/` (`BRIGADEV_HOME` overrides `~/.brigadev`): feature documents in `tasks/`, review ledgers in `reviews/`. `<repo>` is the basename of the main worktree root, so every worktree of a repository shares one folder; outside git it is the directory name. The parent session writes there without asking; subagents still cannot write outside the project. `/brigadev:status` and `/brigadev:doctor` print the resolved folder.
+Harness documents live outside the project, in `~/.brigadev/<repo>/` (`BRIGADEV_HOME` overrides `~/.brigadev`): feature documents in `tasks/`, review ledgers in `reviews/`, and one folder per subagent run in `runs/<runId>/` (`task.md`, `transcript.json`, `result.json`, user-only permissions; never pruned, so delete old ones when you like). `<repo>` is the basename of the main worktree root, so every worktree of a repository shares one folder; outside git it is the directory name. The parent session writes there without asking; subagents still cannot write outside the project. `/brigadev:status` and `/brigadev:doctor` print the resolved folder.
 
 ## Workflows
 

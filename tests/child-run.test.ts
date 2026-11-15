@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import type { ChildControl } from "../lib/child-rpc.ts";
 import { failed, output, runChild, type ChildProcessLike, type RunOptions, type RunResult, type SpawnFn } from "../lib/child-run.ts";
 import { CHILD_ENV, STRUCTURED_OUTPUT_EXTENSION_PATH } from "../lib/runtime.ts";
 
@@ -34,7 +35,31 @@ function fakeTime() {
 	};
 }
 
+/** The child's stdin: what the parent wrote (one JSON record per line) and whether it closed the pipe. */
+class FakeStdin extends EventEmitter {
+	written: string[] = [];
+	ended = false;
+	/** Writes after the pipe was closed (a bug in the run loop; node would emit an error). */
+	late = 0;
+	write(chunk: string) {
+		if (this.ended) this.late++;
+		else this.written.push(chunk);
+		return true;
+	}
+	end() {
+		this.ended = true;
+	}
+	/** Every record written so far, parsed; each must be exactly one LF-terminated JSON line. */
+	records(): any[] {
+		return this.written.map((chunk) => {
+			assert.ok(chunk.endsWith("\n") && chunk.indexOf("\n") === chunk.length - 1, "one LF-terminated record per write");
+			return JSON.parse(chunk);
+		});
+	}
+}
+
 class FakeChild extends EventEmitter implements ChildProcessLike {
+	stdin = new FakeStdin();
 	stdout = new EventEmitter();
 	stderr = new EventEmitter();
 	kills: string[] = [];
@@ -58,7 +83,7 @@ const assistant = (text: string, extra: Record<string, unknown> = {}) => ({
 	message: { role: "assistant", content: [{ type: "text", text }], provider: "anthropic", model: "claude-x", stopReason: "stop", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.25 } }, ...extra },
 });
 
-function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.ProcessEnv; signal?: AbortSignal; schema?: RunOptions["schema"]; price?: RunOptions["price"] } = {}) {
+function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.ProcessEnv; signal?: AbortSignal; schema?: RunOptions["schema"]; price?: RunOptions["price"]; onControl?: RunOptions["onControl"] } = {}) {
 	const time = fakeTime();
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "brigadev-child-run-"));
 	const tmpRoot = path.join(root, "tmp");
@@ -93,6 +118,7 @@ function harness(over: { agent?: Partial<RunOptions["agent"]>; env?: NodeJS.Proc
 				routeLabel: "definition",
 				schema: over.schema,
 				price: over.price ?? (() => undefined),
+				onControl: over.onControl,
 				signal: over.signal,
 				onUpdate: (r) => {
 					h.updates++;
@@ -130,10 +156,11 @@ describe("runChild: output folding", () => {
 		const promise = h.start();
 		const proc = await h.ready();
 		assert.equal(h.spawned!.command, "pi-bin");
-		assert.deepEqual(h.spawned!.args.slice(0, 4), ["--wrapped", "--mode", "json", "-p"]);
-		assert.equal(h.spawned!.args.at(-1), "## Task\nmap the code");
+		assert.deepEqual(h.spawned!.args.slice(0, 4), ["--wrapped", "--mode", "rpc", "--no-session"]);
+		assert.ok(!h.spawned!.args.includes("## Task\nmap the code"), "the task is not an argument");
+		assert.deepEqual(proc.stdin.records(), [{ type: "prompt", message: "## Task\nmap the code" }], "the task is the RPC prompt");
 		assert.equal(h.spawned!.options.shell, false);
-		assert.deepEqual(h.spawned!.options.stdio, ["ignore", "pipe", "pipe"]);
+		assert.deepEqual(h.spawned!.options.stdio, ["pipe", "pipe", "pipe"]);
 		assert.equal(h.spawned!.options.env[CHILD_ENV.CHILD], "1");
 		assert.equal(h.spawned!.options.env.PATH, "/bin");
 		assert.equal(h.spawned!.promptFile, "You are a scout.");
@@ -269,6 +296,254 @@ describe("runChild: failures", () => {
 		assert.ok(failed(result));
 		assert.equal(result.stopReason, "error");
 		assert.equal(output(result), "429 rate limit");
+	});
+});
+
+const settled = (aborted = false) => ({ type: "agent_settled", aborted });
+const ack = (command: string, extra: Record<string, unknown> = {}) => ({ type: "response", command, success: true, ...extra });
+const uiRequest = (method: string, extra: Record<string, unknown> = {}) => ({ type: "extension_ui_request", id: `ui-${method}`, method, ...extra });
+
+describe("runChild: RPC lifecycle (Pi rpc.md:58-97)", () => {
+	it("closes stdin once the agent settles, after folding the final messages, and the child then exits", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line(ack("prompt", { data: { disposition: "started" } }));
+		proc.line({ type: "agent_start" });
+		proc.line(assistant("the answer"));
+		assert.equal(proc.stdin.ended, false, "still open: more work can follow");
+		proc.line({ type: "agent_end", messages: [], willRetry: false });
+		assert.equal(proc.stdin.ended, false, "agent_end alone is not the end: retries, compaction, queued messages can follow");
+		proc.line(settled());
+		assert.equal(proc.stdin.ended, true);
+		proc.close(0);
+		const result = await promise;
+		assert.equal(result.exitCode, 0);
+		assert.equal(output(result), "the answer");
+		assert.equal(result.messages.length, 1, "the response record is not a transcript message");
+		assert.equal(proc.stdin.late, 0);
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("a message in the same chunk as agent_settled is still folded", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.say(`${JSON.stringify(assistant("tail"))}\n${JSON.stringify(settled())}\n`);
+		assert.equal(proc.stdin.ended, true);
+		proc.close(0);
+		assert.equal(output(await promise), "tail");
+	});
+
+	it("a prompt Pi rejects ends the run as an error instead of waiting for a run that never starts", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "response", command: "prompt", success: false, error: "No model selected" });
+		assert.equal(proc.stdin.ended, true);
+		proc.close(0);
+		const result = await promise;
+		assert.equal(result.stopReason, "error");
+		assert.match(result.errorMessage ?? "", /No model selected/);
+		assert.ok(failed(result));
+	});
+
+	it("a prompt that was handled starts no run: stdin closes at once (rpc.md:67)", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line(ack("prompt", { data: { disposition: "handled" } }));
+		assert.equal(proc.stdin.ended, true);
+		proc.close(0);
+		await promise;
+	});
+
+	it("a response to some other command never ends the run", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "response", command: "steer", success: false, error: "not streaming" });
+		proc.line(ack("abort"));
+		assert.equal(proc.stdin.ended, false);
+		proc.close(0);
+		await promise;
+	});
+
+	it("a stdin error (the child exited early) is absorbed", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.stdin.emit("error", new Error("EPIPE"));
+		proc.close(1);
+		assert.equal((await promise).exitCode, 1);
+	});
+
+	it("a silent child is still stopped by the stall watchdog (the backstop)", async () => {
+		const h = harness({ env: { BRIGADEV_STALL_TIMEOUT_MS: "60000" } });
+		const promise = h.start();
+		const proc = await h.ready();
+		h.time.advance(60_000);
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		proc.close(null);
+		assert.equal((await promise).stopReason, "error");
+	});
+});
+
+describe("runChild: S0, a child's UI requests are answered by the parent, never by a person", () => {
+	for (const method of ["select", "confirm", "input", "editor"]) {
+		it(`${method}: answered at once with the cancellation response, nothing else written`, async () => {
+			const h = harness();
+			const promise = h.start();
+			const proc = await h.ready();
+			proc.line(uiRequest(method, { title: "Allow?", options: ["a"], timeout: 10_000 }));
+			assert.deepEqual(proc.stdin.records().slice(1), [{ type: "extension_ui_response", id: `ui-${method}`, cancelled: true }]);
+			proc.line(settled());
+			proc.close(0);
+			const result = await promise;
+			assert.equal(result.messages.length, 0, "the request is not a transcript message");
+		});
+	}
+
+	it("fire-and-forget requests are ignored, and a dialog after them is still answered", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		for (const method of ["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"]) proc.line(uiRequest(method, { message: "hi" }));
+		assert.equal(proc.stdin.records().length, 1, "only the prompt was written");
+		proc.line(uiRequest("confirm"));
+		assert.deepEqual(proc.stdin.records().at(-1), { type: "extension_ui_response", id: "ui-confirm", cancelled: true });
+		proc.close(0);
+		await promise;
+	});
+
+	it("a request that arrives after the pipe closed is dropped without a write", async () => {
+		const h = harness();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line(settled());
+		proc.line(uiRequest("confirm"));
+		assert.equal(proc.stdin.late, 0);
+		proc.close(0);
+		await promise;
+	});
+
+	it("a dialog counts as a sign of life for the watchdog", async () => {
+		const h = harness({ env: { BRIGADEV_STALL_TIMEOUT_MS: "60000" } });
+		const promise = h.start();
+		const proc = await h.ready();
+		h.time.advance(59_000);
+		proc.line(uiRequest("input"));
+		h.time.advance(59_000);
+		assert.deepEqual(proc.kills, []);
+		proc.close(0);
+		await promise;
+	});
+});
+
+describe("runChild: the steering handle (S4)", () => {
+	const controlled = () => {
+		const seen: Array<ChildControl | undefined> = [];
+		const h = harness({ onControl: (c) => void seen.push(c) });
+		return { h, seen };
+	};
+
+	it("is exposed once the child is spawned and sends steer and follow_up as RPC commands", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		assert.equal(seen.length, 1);
+		const control = seen[0]!;
+		assert.equal(control.steer("go left"), true);
+		assert.equal(control.followUp("then right"), true);
+		assert.deepEqual(proc.stdin.records().slice(1), [
+			{ type: "steer", message: "go left" },
+			{ type: "follow_up", message: "then right" },
+		]);
+		proc.close(0);
+		await promise;
+	});
+
+	it("knows whether the child is streaming (agent_start .. agent_end)", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		const control = seen[0]!;
+		assert.equal(control.isStreaming(), false);
+		proc.line({ type: "agent_start" });
+		assert.equal(control.isStreaming(), true);
+		proc.line({ type: "agent_end", messages: [], willRetry: true });
+		assert.equal(control.isStreaming(), false);
+		proc.line({ type: "agent_start" });
+		assert.equal(control.isStreaming(), true);
+		proc.close(0);
+		await promise;
+	});
+
+	it("is withdrawn when the agent settles: a finished run has no handle and takes no more input", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		const control = seen[0]!;
+		proc.line(settled());
+		assert.equal(seen.at(-1), undefined);
+		assert.equal(control.steer("too late"), false);
+		assert.equal(control.abort(), false);
+		assert.equal(proc.stdin.late, 0);
+		proc.close(0);
+		await promise;
+	});
+
+	it("is withdrawn when the child exits, and when it fails to start", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.close(1);
+		await promise;
+		assert.equal(seen.at(-1), undefined);
+
+		const errored = controlled();
+		const failing = errored.h.start();
+		const proc2 = await errored.h.ready();
+		proc2.emit("error", new Error("ENOENT pi"));
+		await failing;
+		assert.equal(errored.seen.at(-1), undefined);
+	});
+
+	it("abort: sends the RPC abort, the child settles aborted, and the run ends as aborted without throwing", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		assert.equal(seen[0]!.abort(), true);
+		assert.deepEqual(proc.stdin.records().at(-1), { type: "abort" });
+		assert.deepEqual(proc.kills, [], "a polite abort first");
+		proc.line(assistant("", { stopReason: "aborted" }));
+		proc.line(settled(true));
+		assert.equal(proc.stdin.ended, true);
+		proc.close(0);
+		const result = await promise;
+		assert.equal(result.stopReason, "aborted");
+		assert.equal(result.errorMessage, "Aborted by the user");
+		assert.ok(failed(result));
+		assert.equal(h.time.pending(), 0, "the escalation timer is cleared");
+		assert.deepEqual(proc.kills, []);
+	});
+
+	it("abort: a child that does not stop within the grace period is terminated (SIGTERM, then SIGKILL)", async () => {
+		const { h, seen } = controlled();
+		const promise = h.start();
+		const proc = await h.ready();
+		seen[0]!.abort();
+		h.time.advance(4999);
+		assert.deepEqual(proc.kills, []);
+		h.time.advance(1);
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		h.time.advance(5000);
+		assert.deepEqual(proc.kills, ["SIGTERM", "SIGKILL"]);
+		proc.close(null);
+		const result = await promise;
+		assert.equal(result.stopReason, "aborted");
+		assert.equal(h.time.pending(), 0);
 	});
 });
 
