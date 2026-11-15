@@ -27,7 +27,7 @@ import { failed, installParentExitGuard, KILL_GRACE_MS, liveChildren, output, ru
 import { newRunId } from "../lib/run-artifacts.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
 import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
-import { createResultDelivery, deliveredNote, omittedResultText, resultBatchMessage, resultCard, RESULT_MESSAGE_TYPE, type BatchEntry, type ResultMessageDetails } from "../lib/result-delivery.ts";
+import { createResultDelivery, deliveredNote, omittedLaunchIds, omittedResultText, resultBatchMessage, resultCard, RESULT_MESSAGE_TYPE, type BatchEntry, type ResultMessageDetails } from "../lib/result-delivery.ts";
 import { createSubagentRegistry, type WaitOutcome } from "../lib/subagent-registry.ts";
 import { admitLaunch, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
 import { cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
@@ -181,6 +181,8 @@ export default function (pi: ExtensionAPI) {
 	// starts a turn when idle and joins the run when busy (L1627-1649); `ctx.isIdle()` (L1255-1257); `agent_settled` is the
 	// final-idle signal, `agent_end` is not (L336, L661-693); a renderer is registered per customType (L1805, L3165-3200).
 	let parentCtx: ExtensionContext | undefined;
+	// Launches the last delivery left as a pointer (size guard): recorded as such when the delivery succeeds.
+	let omittedInDelivery = new Set<string>();
 	const delivery = createResultDelivery<LaunchResult>({
 		isIdle: () => {
 			try {
@@ -190,7 +192,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 		isConsumed: (id) => registry.get(id)?.consumed ?? true,
-		markConsumed: (id) => void registry.markConsumed(id),
+		markConsumed: (id) => void registry.markConsumed(id, omittedInDelivery.has(id) ? "delivered-omitted" : "delivered"),
 		// One message per flush (D1): every ready launch in one combined message, so one parent turn starts and its model sees all of them.
 		deliver: (batch) => {
 			const entries = batch.map(({ id, launch, result }): BatchEntry => {
@@ -198,7 +200,9 @@ export default function (pi: ExtensionAPI) {
 				const tasks = (result?.details.results ?? []).map((r) => ({ agent: r.agent, artifactsDir: r.artifactsDir }));
 				return { id, text: collectedResult.content.map((c) => c.text).join("\n"), failed: collectedResult.isError === true || launch.error !== undefined, pointer: omittedResultText(id, tasks) };
 			});
-			pi.sendMessage(resultBatchMessage(entries), { triggerTurn: true, deliverAs: "steer" });
+			const message = resultBatchMessage(entries);
+			omittedInDelivery = new Set(omittedLaunchIds(entries));
+			pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
 		},
 		// Retried at each idle flush; when the bound is spent the result is still collectable with subagent_wait.
 		onDeliveryFailed: ({ id }) => {

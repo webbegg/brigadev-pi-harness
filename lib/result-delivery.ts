@@ -192,6 +192,28 @@ export interface BatchEntry {
 
 const batchHeading = (id: string, failed: boolean) => `## Launch ${id}: ${failed ? "finished with errors" : "finished"}`;
 
+/** Per entry, whether the size guard replaces its text with the pointer: the first never, then from the first that does not fit within `cap` bytes, all. */
+function omittedFlags(entries: readonly BatchEntry[], cap: number): boolean[] {
+	let used = 0;
+	let overflowed = false;
+	return entries.map((entry, i) => {
+		const size = Buffer.byteLength(entry.text, "utf8");
+		if (i > 0 && (overflowed || used + size > cap)) {
+			overflowed = true;
+			return true;
+		}
+		used += size;
+		return false;
+	});
+}
+
+/** The ids of the launches `resultBatchMessage` leaves as a pointer (same rule), so they can be recorded as delivered without their text. */
+export function omittedLaunchIds(entries: readonly BatchEntry[], cap: number = BATCH_TEXT_CAP): string[] {
+	if (entries.length < 2) return [];
+	const omitted = omittedFlags(entries, cap);
+	return entries.filter((_, i) => omitted[i]).map((e) => e.id);
+}
+
 /**
  * One message for every launch a flush delivers: how many results it holds, then each launch (settle order) under its
  * own heading with the text `subagent_wait` would return. A batch of one is exactly `resultMessage`. The texts are kept
@@ -201,17 +223,8 @@ const batchHeading = (id: string, failed: boolean) => `## Launch ${id}: ${failed
 export function resultBatchMessage(entries: readonly BatchEntry[], cap: number = BATCH_TEXT_CAP) {
 	if (entries.length === 0) throw new Error("resultBatchMessage needs at least one launch");
 	if (entries.length === 1) return resultMessage(entries[0].id, entries[0].text, entries[0].failed);
-	let used = 0;
-	let overflowed = false;
-	const sections = entries.map((entry, i) => {
-		const size = Buffer.byteLength(entry.text, "utf8");
-		if (i > 0 && (overflowed || used + size > cap)) {
-			overflowed = true;
-			return `${batchHeading(entry.id, entry.failed)}\n\n${entry.pointer}`;
-		}
-		used += size;
-		return `${batchHeading(entry.id, entry.failed)}\n\n${entry.text}`;
-	});
+	const omitted = omittedFlags(entries, cap);
+	const sections = entries.map((entry, i) => `${batchHeading(entry.id, entry.failed)}\n\n${omitted[i] ? entry.pointer : entry.text}`);
 	const header = `${entries.length} async subagent results delivered automatically (${entries.map((e) => e.id).join(", ")}). They are already collected, so do not call subagent_wait for them.`;
 	const details: ResultMessageDetails = { launchId: entries[0].id, failed: entries.some((e) => e.failed), launches: entries.map((e) => ({ id: e.id, failed: e.failed })) };
 	return { customType: RESULT_MESSAGE_TYPE, content: `${header}\n\n${sections.join("\n\n")}`, display: true, details };
@@ -232,8 +245,11 @@ export function omittedResultText(id: string, tasks: ReadonlyArray<{ agent: stri
  * What `subagent_wait` answers for a launch whose result the idle delivery already put in the session: the launch id,
  * that it was delivered, and each task's saved folder (run-artifacts.ts), so the full text can still be read. Not the result.
  */
-export function alreadyDeliveredText(id: string, tasks: ReadonlyArray<{ agent: string; artifactsDir?: string }>): string {
-	return [`Launch ${id} was already delivered to this session: its result is in the conversation above, so it is not repeated here.`, ...savedFolderLines(tasks)].join("\n");
+export function alreadyDeliveredText(id: string, tasks: ReadonlyArray<{ agent: string; artifactsDir?: string }>, options: { omitted?: boolean } = {}): string {
+	const lead = options.omitted
+		? `Launch ${id} was delivered to this session, but its result was too large to include in the delivered message: read it from the saved folders below (result.json).`
+		: `Launch ${id} was already delivered to this session: its result is in the conversation above, so it is not repeated here.`;
+	return [lead, ...savedFolderLines(tasks)].join("\n");
 }
 
 /**
@@ -241,10 +257,13 @@ export function alreadyDeliveredText(id: string, tasks: ReadonlyArray<{ agent: s
  * should be collected normally. One decision for `subagent_wait` and `subagent_cancel`, so neither repeats a delivered result.
  */
 export function deliveredNote<R extends { details: { results: ReadonlyArray<{ agent: string; artifactsDir?: string }> } }>(id: string, outcome: WaitOutcome<R>): string | undefined {
-	if (outcome.status !== "settled" || outcome.launch.consumedBy !== "delivered") return undefined;
+	if (outcome.status !== "settled") return undefined;
+	const by = outcome.launch.consumedBy;
+	if (by !== "delivered" && by !== "delivered-omitted") return undefined;
 	return alreadyDeliveredText(
 		id,
 		(outcome.result?.details.results ?? []).map((r) => ({ agent: r.agent, artifactsDir: r.artifactsDir })),
+		{ omitted: by === "delivered-omitted" },
 	);
 }
 

@@ -4,7 +4,8 @@
 // settles once. `wait` and `cancel` collect a result and mark it `consumed`, so
 // a later delivery (idle notification) can skip what the model already has.
 // `consumedBy` records who took it first (`wait`, `cancel`, or `delivered` by the
-// idle delivery), so a `wait` after delivery can tell the model it already has it.
+// idle delivery; `delivered-omitted` when that delivery left the text out for a
+// pointer), so a `wait` after delivery can tell the model what it already has.
 // `subscribe` emits start/progress/settle for delivery and the footer count.
 
 export const MAX_SETTLED_LAUNCHES = 64;
@@ -25,7 +26,7 @@ export interface LaunchSummary {
 	error: string | undefined;
 }
 
-export type ConsumedBy = "wait" | "cancel" | "delivered";
+export type ConsumedBy = "wait" | "cancel" | "delivered" | "delivered-omitted";
 
 export type RegistryEvent<R = unknown> =
 	| { type: "start"; launch: LaunchSummary }
@@ -62,8 +63,8 @@ export interface SubagentRegistry<R> {
 	wait(id: string, timeoutMs: number, signal?: AbortSignal): Promise<WaitOutcome<R>>;
 	/** Aborts the launch, waits for its partial result, and consumes it. */
 	cancel(id: string): Promise<WaitOutcome<R>>;
-	/** Marks a settled, unconsumed launch consumed as `delivered` (its result went to the session another way); false when unknown, running, or already consumed. */
-	markConsumed(id: string): boolean;
+	/** Marks a settled, unconsumed launch consumed as `delivered` (its result went to the session another way), or `delivered-omitted` when only a pointer to its saved folders did; false when unknown, running, or already consumed. */
+	markConsumed(id: string, by?: "delivered" | "delivered-omitted"): boolean;
 	/** Aborts every running launch (session shutdown). */
 	abortAll(): void;
 	/** Aborts every running launch and forgets all of them (session start). */
@@ -198,10 +199,10 @@ export function createSubagentRegistry<R>(deps: RegistryDeps): SubagentRegistry<
 			return outcome(entry);
 		},
 
-		markConsumed(id) {
+		markConsumed(id, by = "delivered") {
 			const entry = entries.get(id);
 			if (!entry || entry.summary.status !== "settled" || entry.summary.consumed) return false;
-			consume(entry, "delivered");
+			consume(entry, by);
 			return true;
 		},
 
