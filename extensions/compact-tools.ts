@@ -10,7 +10,7 @@
 import type { ExtensionAPI, Theme, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { compactToolResolver, type RowLine } from "../lib/compact-tools.ts";
-import { resolveCompactTools } from "../lib/runtime.ts";
+import { resolveTidy } from "./tidy-bundled.ts";
 
 function row(get: () => RowLine[], theme: Theme): Component {
 	return {
@@ -36,7 +36,7 @@ export default function (pi: ExtensionAPI) {
 			packages = pi.getSettings().packages;
 			settingsRead = true;
 		} catch {}
-		const decision = resolveCompactTools(packages).ours;
+		const decision = resolveTidy(packages).ours;
 		// Cache only once the package list was readable; otherwise decide again on the next resolve.
 		if (settingsRead) ours = decision;
 		return decision;

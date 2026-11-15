@@ -50,9 +50,27 @@ export function tidyInstalled(input: TidyInputs): boolean {
 	return (input.extensionEntries ?? []).some((name) => name === TIDY || name === `${TIDY}.ts`);
 }
 
-/** Installed and not disabled in its own config. */
-export function tidyActive(input: TidyInputs): boolean {
-	return tidyInstalled(input) && tidyEnabled(input.piSettings);
+export interface TidyOptions {
+	/** True when brigadev ships a loadable copy of pi-tidy (a dependency that resolves). */
+	bundled?: boolean;
+}
+
+/**
+ * Which pi-tidy draws the transcript: `separate` (installed on its own, always wins), `bundled`
+ * (brigadev's copy, only when nothing is installed separately) or `off` (not available, or
+ * `tidy.enabled: false`). Pure: the answer depends only on the inputs, never on load order.
+ */
+export type TidyState = "separate" | "bundled" | "off";
+
+export function tidyState(input: TidyInputs, options: TidyOptions = {}): TidyState {
+	if (!tidyEnabled(input.piSettings)) return "off";
+	if (tidyInstalled(input)) return "separate";
+	return options.bundled ? "bundled" : "off";
+}
+
+/** Installed (separately, or bundled when `options.bundled`) and not disabled in its own config. */
+export function tidyActive(input: TidyInputs, options: TidyOptions = {}): boolean {
+	return tidyState(input, options) !== "off";
 }
 
 export type CompactToolsSetting = "auto" | boolean | undefined;
