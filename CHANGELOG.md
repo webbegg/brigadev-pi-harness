@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+- Background terminals: `bg_start` runs a long command without blocking the turn; `bg_status`, `bg_list`, and `bg_kill` manage it, and `/brigadev:ps` lists them with their output. At most 8 running, stdin ignored, a 256 KB output tail each. An exit the model has not seen is delivered to the session once, when it is idle. The guard decides `bg_start` exactly like `bash`, including the cwd. Each process runs in its own process group and is stopped on `bg_kill`, at session shutdown, and if Pi exits. Parent session only.
+- `/btw <question>`: a read-only `brigadev-explore` agent answers a side question in the background; the answer is shown to you and never enters the model context or the async result delivery.
+- `/brigadev:copy-all`: copies the conversation's user and assistant text to the clipboard.
+- `/brigadev:pr` and a `PR #N` footer segment for the current branch's pull request, via `gh` (silent when `gh` is missing, signed out, or offline).
+- `fd` and `rg` tools when the binaries are already on PATH; bounded output, secret files excluded, explicit paths decided like `read`.
+- The footer's context gauge shows `?%` (with the window size when known) when occupancy is unknown.
+
 ## [0.15.0] - 2026-11-15
 
 - Async subagents: `subagent` takes an optional `async: true`. Validation still runs first, then the launch starts in the background and the call returns a launch id. `subagent_wait {"launchId": ...}` blocks for up to 300 s (default 60) and returns the same text a sync call would; `subagent_cancel` stops a launch and returns partial results. A result nobody collected is delivered to the session once, when it is idle; several waiting results arrive as one message in one turn. At most 4 subagents run at once across all launches, sync and async. Without `async`, behavior is unchanged.

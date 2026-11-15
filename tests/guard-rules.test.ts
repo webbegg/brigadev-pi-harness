@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import type { BranchFacts } from "../lib/commit-branch.ts";
 import { canonicalPath } from "../lib/paths.ts";
-import { bashWritesEvidence, decideBashCommand, decideFileAccess, type FileAccessInput } from "../lib/guard-rules.ts";
+import { bashWritesEvidence, decideBashCommand, decideFileAccess, shellCallOf, type FileAccessInput } from "../lib/guard-rules.ts";
 import { PERMISSION_MODE } from "../lib/permission-policy.ts";
+import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
 
 describe("file access decision", () => {
 	let scratch: string;
@@ -159,6 +161,13 @@ describe("bash decision", () => {
 		assert.deepEqual(await decide("{ cd /x; git commit -m y; }"), { action: "confirm", cwds: [] });
 	});
 
+	it("a commit that runs in another repository (bg_start cwd) is not a branch-rule candidate, as `cd x && git commit`", async () => {
+		const elsewhere = await decideBashCommand({ command: "git commit -m x", mode: PERMISSION_MODE.NORMAL, isChild: false, cwd: "/work/other", elsewhere: true, readFacts: async () => FEATURE });
+		assert.equal(elsewhere.action, "confirm");
+		const here = await decideBashCommand({ command: "git commit -m x", mode: PERMISSION_MODE.NORMAL, isChild: false, cwd: "/work/session", elsewhere: false, readFacts: async () => FEATURE });
+		assert.equal(here.action, "allow");
+	});
+
 	it("keeps the subagent and yolo rules", async () => {
 		assert.deepEqual(await decide("git commit -m x", { isChild: true }), { action: "block", cwds: [] });
 		assert.deepEqual(await decide("git commit -m x", { mode: "yolo" }), { action: "allow", cwds: [] });
@@ -219,9 +228,246 @@ describe("evidence log protection", () => {
 		}
 	});
 
+	it("resolves relative paths against the bg_start cwd (docs folder or the evidence folder itself)", () => {
+		for (const command of ["echo x >> evidence/f.jsonl", "printf x | tee evidence/f.jsonl", "rm ./evidence/f.jsonl"]) {
+			assert.equal(bashWritesEvidence(command, dirs, "/h", docs), true, command);
+		}
+		assert.equal(bashWritesEvidence("echo x >> f.jsonl", dirs, "/h", evidence), true);
+		assert.equal(bashWritesEvidence("echo x >> ../evidence/f.jsonl", dirs, "/h", `${docs}/tasks`), true);
+		assert.equal(bashWritesEvidence("cat evidence/f.jsonl", dirs, "/h", docs), false);
+		assert.equal(bashWritesEvidence("echo x >> evidence/f.jsonl", dirs, "/h", "/work/project"), false);
+		assert.equal(bashWritesEvidence("echo x >> evidence/f.jsonl", dirs, "/h"), false);
+	});
+
 	it("ignores writes that do not mention the evidence path", () => {
 		for (const command of ["echo x > /tmp/a", "npm test > out.txt", "rm -rf build", `cat ${docs}/tasks/x.md > /tmp/y`]) {
 			assert.equal(bashWritesEvidence(command, dirs), false, command);
 		}
+	});
+});
+
+describe("shellCallOf", () => {
+	it("knows bash and bg_start, and no other tool", () => {
+		assert.deepEqual(shellCallOf("bash", { command: "ls" }), { command: "ls" });
+		assert.deepEqual(shellCallOf("bg_start", { command: "npm run dev" }), { command: "npm run dev" });
+		assert.deepEqual(shellCallOf("bg_start", { command: "x", cwd: "web", name: "n" }), { command: "x", cwd: "web" });
+		for (const tool of ["read", "write", "edit", "bg_status", "bg_kill", "bg_list", "subagent"]) assert.equal(shellCallOf(tool, { command: "ls" }), undefined, tool);
+	});
+
+	it("never hands a non-string command to the rules; a blank cwd is no cwd", () => {
+		assert.deepEqual(shellCallOf("bg_start", { command: 42, cwd: "  " }), { command: "" });
+		assert.deepEqual(shellCallOf("bg_start", undefined), { command: "" });
+		assert.deepEqual(shellCallOf("bash", null), { command: "" });
+	});
+
+	it("bash never carries a cwd, whatever the input says", () => {
+		assert.deepEqual(shellCallOf("bash", { command: "ls", cwd: "/elsewhere" }), { command: "ls" });
+	});
+});
+
+// extensions/guard.ts loaded for real (Pi's packages stubbed): a `bg_start` call must get the decision `bash` gets.
+describe("bg_start is guarded exactly like bash (S1a)", () => {
+	const saved = { ...process.env };
+	let dir: string;
+	let repo: string;
+	let home: string;
+	let uninstall: () => void;
+	let guard: (pi: any) => void;
+
+	before(async () => {
+		dir = realpathSync(mkdtempSync(join(tmpdir(), "brigadev-bg-guard-")));
+		repo = join(dir, "repo");
+		home = join(dir, "home");
+		mkdirSync(join(repo, "sub"), { recursive: true });
+		mkdirSync(join(repo, ".ssh"));
+		mkdirSync(join(dir, "elsewhere"));
+		mkdirSync(join(dir, "other"));
+		for (const key of Object.keys(process.env)) if (key.startsWith("BRIGADEV_")) delete process.env[key];
+		process.env.BRIGADEV_HOME = home;
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8" });
+		git("init", "-q", "-b", "feat/x");
+		writeFileSync(join(repo, "src.ts"), "export const a = 1;\n");
+		git("add", "-A");
+		git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init");
+		appendFileSync(join(repo, "src.ts"), "export const b = 2;\n"); // a source change with no recorded test: the commit gate applies
+		uninstall = installPiStubs();
+		guard = (await import("../extensions/guard.ts")).default;
+	});
+
+	after(() => {
+		uninstall();
+		for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+		Object.assign(process.env, saved);
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	interface Setup {
+		hasUI: boolean;
+		/** What the user answers every dialog. */
+		answer?: boolean;
+		yolo?: boolean;
+	}
+
+	async function session(setup: Setup) {
+		const handlers: Record<string, Function[]> = {};
+		const pi: any = {
+			on: (event: string, handler: Function) => (handlers[event] ??= []).push(handler),
+			registerCommand: () => {},
+			registerShortcut: () => {},
+			appendEntry: () => {},
+			exec: async (command: string, args: string[], options: { cwd: string }) => {
+				try {
+					return { stdout: execFileSync(command, args, { cwd: options.cwd, encoding: "utf8" }), stderr: "", code: 0 };
+				} catch (error: any) {
+					return { stdout: String(error.stdout ?? ""), stderr: "", code: typeof error.status === "number" ? error.status : 1 };
+				}
+			},
+		};
+		guard(pi);
+		const asked: string[] = [];
+		const entries = setup.yolo ? [{ type: "custom", customType: "brigadev-mode", data: { mode: "yolo" } }] : [];
+		const ctx: any = { cwd: repo, hasUI: setup.hasUI, sessionManager: { getBranch: () => entries }, ui: { confirm: async (title: string) => (asked.push(title), setup.answer ?? false), notify: () => {}, setStatus: () => {} } };
+		for (const handler of handlers.session_start ?? []) await handler({}, ctx);
+		let id = 0;
+		return {
+			asked,
+			/** The block reason, or undefined when the call may run. */
+			async call(toolName: string, input: Record<string, unknown>): Promise<string | undefined> {
+				for (const handler of handlers.tool_call ?? []) {
+					const result = await handler({ toolName, toolCallId: String(++id), input }, ctx);
+					if (result?.block) return result.reason as string;
+				}
+				return undefined;
+			},
+		};
+	}
+
+	const outcome = async (toolName: "bash" | "bg_start", input: Record<string, unknown>, setup: Setup) => {
+		const s = await session(setup);
+		const reason = await s.call(toolName, input);
+		return { reason, asked: s.asked };
+	};
+
+	const setups: Array<[string, Setup]> = [
+		["no UI", { hasUI: false }],
+		["UI, user declines", { hasUI: true, answer: false }],
+		["UI, user allows", { hasUI: true, answer: true }],
+		["yolo, no UI", { hasUI: false, yolo: true }],
+		["yolo, user allows", { hasUI: true, answer: true, yolo: true }],
+	];
+
+	// One command per guarded kind; `expect` is what no-UI normal mode does with it (so the comparison below is not vacuous).
+	const evidenceLog = () => join(home, "repo", "evidence", "feat-x.jsonl");
+	const kinds: Array<[string, () => string, RegExp | undefined]> = [
+		["an ordinary command", () => "ls -la", undefined],
+		["a hard-deny command", () => "rm -rf ~", /never allowed/],
+		["a destructive command", () => "rm -rf build", /User declined/],
+		["a delivery command", () => "git push origin feat/x", /User declined/],
+		["a dependency command", () => "npm install left-pad", /User declined/],
+		["a privileged command", () => "sudo true", /User declined/],
+		["a commit the evidence gate stops", () => "git commit -am change", /evidence gate/],
+		["a write to the evidence log", () => `echo '{"v":1}' >> ${evidenceLog()}`, /evidence log/],
+	];
+
+	for (const [label, command, expected] of kinds) {
+		it(`${label}: same decision, same dialogs as bash in every mode`, async () => {
+			const text = command();
+			for (const [name, setup] of setups) {
+				const viaBash = await outcome("bash", { command: text }, setup);
+				const viaBg = await outcome("bg_start", { command: text, name: "x" }, setup);
+				assert.deepEqual(viaBg, viaBash, `${label} (${name})`);
+			}
+			const plain = await outcome("bg_start", { command: text }, { hasUI: false });
+			if (expected) assert.match(String(plain.reason), expected);
+			else assert.equal(plain.reason, undefined);
+		});
+	}
+
+	it("a hard-deny command is blocked even when the user would say yes", async () => {
+		const result = await outcome("bg_start", { command: "rm -rf ~" }, { hasUI: true, answer: true });
+		assert.match(String(result.reason), /never allowed/);
+		assert.deepEqual(result.asked, []);
+	});
+
+	it("asks in normal mode and not for ordinary delivery in yolo, as bash does", async () => {
+		assert.deepEqual((await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true })).asked, ["brigadev: git push"]);
+		assert.deepEqual(await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true, yolo: true }), { reason: undefined, asked: [] });
+		assert.deepEqual((await outcome("bg_start", { command: "rm -rf build" }, { hasUI: true, answer: true, yolo: true })).asked.length, 1, "destructive still asks in yolo");
+	});
+
+	it("a command that reads the evidence log is not blocked", async () => {
+		assert.equal((await outcome("bg_start", { command: `tail -f ${evidenceLog()}` }, { hasUI: false })).reason, undefined);
+	});
+
+	it("a relative write into the evidence log is blocked like the absolute form when the working directory is the docs folder", async () => {
+		const docs = join(home, "repo");
+		mkdirSync(join(docs, "evidence"), { recursive: true });
+		for (const [command, cwd] of [["echo x >> evidence/feat-x.jsonl", docs], ["printf x | tee ./evidence/feat-x.jsonl", docs], ["echo x >> feat-x.jsonl", join(docs, "evidence")]] as const) {
+			const result = await outcome("bg_start", { command, cwd }, { hasUI: false });
+			assert.match(String(result.reason), /evidence log/, `${command} in ${cwd}`);
+		}
+		assert.equal((await outcome("bg_start", { command: "cat evidence/feat-x.jsonl", cwd: docs }, { hasUI: false })).reason, undefined);
+	});
+
+	it("the commit gate reads the repository at the working directory the process runs in", async () => {
+		const viaBash = await outcome("bash", { command: "git commit -am change" }, { hasUI: false });
+		const viaSub = await outcome("bg_start", { command: "git commit -am change", cwd: "sub" }, { hasUI: false });
+		assert.deepEqual(viaSub, viaBash);
+	});
+
+	describe("the working directory", () => {
+		it("inside the project asks nothing", async () => {
+			for (const cwd of ["sub", join(repo, "sub"), ".", "./sub/.."]) {
+				assert.deepEqual(await outcome("bg_start", { command: "ls", cwd }, { hasUI: false }), { reason: undefined, asked: [] }, cwd);
+			}
+		});
+
+		it("outside the project is the write-outside-project rule: declined without a UI", async () => {
+			for (const cwd of [join(dir, "elsewhere"), "../elsewhere", "/"]) {
+				const result = await outcome("bg_start", { command: "ls", cwd }, { hasUI: false });
+				assert.match(String(result.reason), /User declined write outside the project root/, cwd);
+			}
+		});
+
+		it("outside the project asks the user, once, and grants that directory only", async () => {
+			const s = await session({ hasUI: true, answer: true });
+			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(dir, "elsewhere") }), undefined);
+			assert.deepEqual(s.asked, ["brigadev: write outside project"]);
+			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(dir, "elsewhere") }), undefined);
+			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(dir, "elsewhere", "deeper") }), undefined);
+			assert.equal(s.asked.length, 1, "the grant covers that directory and below");
+			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(dir, "other") }), undefined);
+			assert.equal(s.asked.length, 2, "a sibling directory is a new question: the grant was not widened to the parent");
+		});
+
+		it("a user who declines blocks the start", async () => {
+			const result = await outcome("bg_start", { command: "ls", cwd: join(dir, "elsewhere") }, { hasUI: true, answer: false });
+			assert.match(String(result.reason), /User declined write outside the project root/);
+		});
+
+		it("a sensitive directory asks first, and is declined without a UI", async () => {
+			const cwd = join(repo, ".ssh");
+			assert.match(String((await outcome("bg_start", { command: "ls", cwd }, { hasUI: false })).reason), /User declined access to sensitive file/);
+			const yes = await outcome("bg_start", { command: "ls", cwd }, { hasUI: true, answer: true });
+			assert.deepEqual(yes, { reason: undefined, asked: ["brigadev: sensitive file"] });
+		});
+
+		it("the evidence log folder is never a working directory", async () => {
+			const result = await outcome("bg_start", { command: "ls", cwd: join(home, "repo", "evidence") }, { hasUI: true, answer: true });
+			assert.match(String(result.reason), /evidence log/);
+		});
+
+		it("does not change what bash is asked: the same rules for a file in that directory", async () => {
+			const s = await session({ hasUI: true, answer: true });
+			assert.equal(await s.call("write", { path: join(dir, "elsewhere", "x.txt") }), undefined);
+			assert.deepEqual(s.asked, ["brigadev: write outside project"]);
+			assert.equal(await s.call("read", { path: join(repo, ".ssh", "id_rsa") }), undefined);
+			assert.deepEqual(s.asked, ["brigadev: write outside project", "brigadev: sensitive file"]);
+		});
+	});
+
+	it("the other background tools are not shell commands: the guard leaves them alone", async () => {
+		const s = await session({ hasUI: false });
+		for (const tool of ["bg_status", "bg_list", "bg_kill"]) assert.equal(await s.call(tool, { id: "bg-1", command: "rm -rf ~" }), undefined, tool);
 	});
 });

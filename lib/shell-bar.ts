@@ -2,6 +2,8 @@
 // priority first, until the line fits. Pure: width measuring and colors are
 // supplied by the caller.
 
+import { formatTokens } from "./cost.ts";
+
 export type Tone = "accent" | "muted" | "dim" | "success" | "warning" | "error" | "text" | "borderMuted";
 
 export interface Segment {
@@ -26,9 +28,16 @@ export function layoutSegments(segments: readonly Segment[], width: number, meas
 	return kept;
 }
 
-/** Context gauge such as "▰▰▰▱▱▱▱▱ 45%", or "?%" when unknown (right after compaction). */
-export function contextGauge(percent: number | null | undefined, cells = 8): { text: string; tone: Tone } {
-	if (percent === null || percent === undefined || !Number.isFinite(percent)) return { text: `ctx ${"▱".repeat(cells)} ?%`, tone: "dim" };
+/**
+ * Context gauge such as "▰▰▰▱▱▱▱▱ 45%". When occupancy is unknown (right after
+ * compaction) it stays visible as "?%", with the model's capacity ("?%/200k")
+ * when that is known.
+ */
+export function contextGauge(percent: number | null | undefined, cells = 8, capacity?: number | null): { text: string; tone: Tone } {
+	if (percent === null || percent === undefined || !Number.isFinite(percent)) {
+		const known = typeof capacity === "number" && Number.isFinite(capacity) && capacity > 0;
+		return { text: `ctx ${"▱".repeat(cells)} ?%${known ? `/${formatTokens(capacity)}` : ""}`, tone: "dim" };
+	}
 	const clamped = Math.max(0, Math.min(100, percent));
 	const filled = Math.round((clamped / 100) * cells);
 	const tone: Tone = clamped >= 95 ? "error" : clamped >= 80 ? "warning" : "muted";
@@ -53,6 +62,9 @@ export function statusSegment(key: string, text: string): Segment | undefined {
 			const tone: Tone = /limit reached/.test(text) || top >= 95 ? "error" : top >= 80 ? "warning" : "dim";
 			return { id: key, text: `◷ ${text}`, tone, priority: 65 };
 		}
+		// Drops before the repo segment (50) on narrow widths, after the profile (40).
+		case "brigadev-pr":
+			return { id: key, text, tone: "accent", priority: 45 };
 		case "brigadev-harness":
 			return { id: key, text, tone: "warning", priority: 95 };
 		default:
@@ -61,4 +73,4 @@ export function statusSegment(key: string, text: string): Segment | undefined {
 }
 
 /** Statuses the bar renders as its own segments, in this order, before third-party ones. */
-export const KNOWN_STATUS_ORDER = ["brigadev-harness", "brigadev-mode", "brigadev-agents", "brigadev-cost", "brigadev-usage", "brigadev-profile"];
+export const KNOWN_STATUS_ORDER = ["brigadev-harness", "brigadev-mode", "brigadev-agents", "brigadev-cost", "brigadev-usage", "brigadev-pr", "brigadev-profile"];

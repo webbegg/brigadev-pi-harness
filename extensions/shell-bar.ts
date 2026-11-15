@@ -54,7 +54,8 @@ export default function (pi: ExtensionAPI) {
 				invalidate() {},
 				render(width: number): string[] {
 					const branch = footerData.getGitBranch();
-					const gauge = contextGauge(ctx.getContextUsage()?.percent);
+					const usage = ctx.getContextUsage();
+					const gauge = contextGauge(usage?.percent, undefined, usage?.contextWindow ?? ctx.model?.contextWindow);
 					const segments: Segment[] = [
 						{ id: "repo", text: `◆ ${basename(ctx.cwd)}${branch ? ` ${branch}` : ""}${dirty ? ` ±${dirty}` : ""}`, tone: "muted", priority: 50 },
 						{ id: "model", text: ctx.model ? `${ctx.model.id} · ${pi.getThinkingLevel()}` : "no model", tone: "text", priority: 80 },

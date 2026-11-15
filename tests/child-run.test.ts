@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { ChildControl } from "../lib/child-rpc.ts";
-import { CLOSE_DRAIN_MS, createChildTracker, descendantTargets, failed, listProcessesWithPs, parseProcessList, installParentExitGuard, KILL_GRACE_MS, output, runChild, type ParentProcessLike, type ChildProcessLike, type ChildRunDeps, type RunOptions, type RunResult, type SpawnFn } from "../lib/child-run.ts";
+import { CLOSE_DRAIN_MS, createChildTracker, createProcessSignaller, descendantTargets, failed, mergeDescendantTargets, listProcessesWithPs, parseProcessList, installParentExitGuard, KILL_GRACE_MS, output, runChild, type ParentProcessLike, type ChildProcessLike, type ChildRunDeps, type RunOptions, type RunResult, type SpawnFn } from "../lib/child-run.ts";
 import { CHILD_ENV, STRUCTURED_OUTPUT_EXTENSION_PATH } from "../lib/runtime.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -1580,5 +1580,81 @@ describe("forced kills also reach the child's descendant process groups (D2, S5)
 			assert.deepEqual(sorted(t.groupKills), [[4242, "SIGKILL"], [5000, "SIGKILL"], [5100, "SIGKILL"]]);
 			await t.finish();
 		}
+	});
+});
+
+describe("the shared process signaller", () => {
+	const make = (overrides: Partial<Parameters<typeof createProcessSignaller>[0]> = {}) => {
+		const calls: string[] = [];
+		const signaller = createProcessSignaller({
+			pid: () => 100,
+			killSelf: (signal) => void calls.push(`self:${signal}`),
+			killGroup: (pid, signal) => void calls.push(`group:${pid}:${signal}`),
+			killPid: (pid, signal) => void calls.push(`pid:${pid}:${signal}`),
+			listProcesses: () => [
+				{ pid: 100, ppid: 50, pgid: 100 },
+				{ pid: 200, ppid: 100, pgid: 200 },
+				{ pid: 50, ppid: 1, pgid: 50 },
+			],
+			selfPid: 50,
+			platform: "linux",
+			...overrides,
+		});
+		return { signaller, calls };
+	};
+
+	it("signals the group, then SIGKILLs the listed descendants' groups", () => {
+		const { signaller, calls } = make();
+		signaller.signal("SIGKILL", signaller.descendants());
+		assert.deepEqual(calls, ["group:100:SIGKILL", "group:200:SIGKILL"]);
+	});
+
+	it("signals the group only when no descendants are given; the process alone without a group", () => {
+		const a = make();
+		a.signaller.signal("SIGTERM");
+		assert.deepEqual(a.calls, ["group:100:SIGTERM"]);
+		const b = make({ platform: "win32" });
+		b.signaller.signal("SIGTERM", b.signaller.descendants());
+		assert.deepEqual(b.calls, ["self:SIGTERM"]);
+		const c = make({ pid: () => undefined });
+		c.signaller.signal("SIGTERM");
+		assert.deepEqual(c.calls, ["self:SIGTERM"]);
+	});
+
+	it("falls back to pids when a descendant group cannot be signalled, and never throws", () => {
+		const calls: string[] = [];
+		const { signaller } = make({
+			killGroup: (pid, signal) => {
+				if (pid === 200) throw new Error("ESRCH");
+				calls.push(`group:${pid}:${signal}`);
+			},
+			killPid: () => {
+				throw new Error("ESRCH");
+			},
+		});
+		signaller.signal("SIGKILL", signaller.descendants());
+		assert.deepEqual(calls, ["group:100:SIGKILL"]);
+	});
+
+	it("killDescendants skips the process's own group when asked", () => {
+		const { signaller, calls } = make();
+		signaller.killDescendants({ groups: [{ pgid: 100, pids: [101] }, { pgid: 200, pids: [200] }], pids: [7] }, true);
+		assert.deepEqual(calls, ["group:200:SIGKILL", "pid:7:SIGKILL"]);
+	});
+
+	it("a failed listing means no descendants", () => {
+		const { signaller } = make({
+			listProcesses: () => {
+				throw new Error("ps failed");
+			},
+		});
+		assert.equal(signaller.descendants(), undefined);
+	});
+
+	it("mergeDescendantTargets joins two listings without repeats", () => {
+		assert.equal(mergeDescendantTargets(undefined, undefined), undefined);
+		const one = { groups: [{ pgid: 2, pids: [20] }], pids: [5] };
+		assert.equal(mergeDescendantTargets(one, undefined), one);
+		assert.deepEqual(mergeDescendantTargets(one, { groups: [{ pgid: 2, pids: [21] }, { pgid: 3, pids: [30] }], pids: [5, 6] }), { groups: [{ pgid: 2, pids: [20, 21] }, { pgid: 3, pids: [30] }], pids: [5, 6] });
 	});
 });

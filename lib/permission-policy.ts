@@ -41,17 +41,29 @@ export function decideCommand(matches: CommandMatch[], mode: PermissionMode, isC
 	return { action: "confirm", reason: [...new Set(needsConfirmation.map((m) => m.reason))].join("; ") };
 }
 
-const SENSITIVE_PATTERNS = [
-	/(^|\/)\.env(\.[^/]*)?$/,
-	/(^|\/)\.ssh\//,
-	/(^|\/)\.aws\/credentials$/,
-	/(^|\/)\.npmrc$/,
-	/(^|\/)\.netrc$/,
-	/(^|\/)id_(rsa|ed25519|ecdsa|dsa)(\.pub)?$/,
-	/\.(pem|key|p12|pfx)$/,
-	/(^|\/)credentials\.json$/,
-	/(^|\/)\.pi\/agent\/auth\.json$/,
+/**
+ * Each family of secret-bearing paths with the globs fd (`--exclude`) and rg (`--glob '!…'`) use to skip it, so the
+ * search tools' excludes live next to the rule they mirror. The globs are an optimization: the tools also filter every
+ * result with `isSensitivePath`, which is the guarantee. The `.env.*` globs leave out names that start with e, s, or t
+ * after the dot (`.env.example`/`.sample`/`.template` are allowed by `isSensitivePath`); `.env.staging` and `.env.test`
+ * are caught by that result filter instead.
+ */
+export const SENSITIVE_RULES: ReadonlyArray<{ pattern: RegExp; globs: readonly string[] }> = [
+	{ pattern: /(^|\/)\.env(\.[^/]*)?$/, globs: ["**/.env", "**/.env.[!est]*"] },
+	{ pattern: /(^|\/)\.ssh\//, globs: ["**/.ssh"] },
+	{ pattern: /(^|\/)\.aws\/credentials$/, globs: ["**/.aws/credentials"] },
+	{ pattern: /(^|\/)\.npmrc$/, globs: ["**/.npmrc"] },
+	{ pattern: /(^|\/)\.netrc$/, globs: ["**/.netrc"] },
+	{ pattern: /(^|\/)id_(rsa|ed25519|ecdsa|dsa)(\.pub)?$/, globs: ["**/id_rsa*", "**/id_ed25519*", "**/id_ecdsa*", "**/id_dsa*"] },
+	{ pattern: /\.(pem|key|p12|pfx)$/, globs: ["**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx"] },
+	{ pattern: /(^|\/)credentials\.json$/, globs: ["**/credentials.json"] },
+	{ pattern: /(^|\/)\.pi\/agent\/auth\.json$/, globs: ["**/.pi/agent/auth.json"] },
 ];
+
+const SENSITIVE_PATTERNS = SENSITIVE_RULES.map((rule) => rule.pattern);
+
+/** The globs of every rule, for fd and rg. */
+export const SENSITIVE_GLOBS: readonly string[] = SENSITIVE_RULES.flatMap((rule) => rule.globs);
 
 /** True for paths that commonly hold secrets or credentials. */
 export function isSensitivePath(path: string): boolean {

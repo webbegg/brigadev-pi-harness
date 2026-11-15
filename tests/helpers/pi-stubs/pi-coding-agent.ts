@@ -1,10 +1,17 @@
 // TEST-ONLY stub of `@earendil-works/pi-coding-agent` (a Pi runtime package that is not installed in this repo).
 // Only the values extensions/subagents.ts and lib/pi-adapters.ts import.
 
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 export const getMarkdownTheme = () => ({});
+
+/** Pi's `isToolCallEventType`: narrows a tool_call event by its tool name (extensions/guard.ts). */
+export const isToolCallEventType = (toolName: string, event: { toolName?: string }): boolean => event.toolName === toolName;
+
+/** Pi's `getShellConfig()`: the shell a bash command runs in (/bin/bash, else sh), as `{ shell, args }` (extensions/background-terminals.ts). */
+export const getShellConfig = (): { shell: string; args: string[]; commandTransport?: "stdin" } => (existsSync("/bin/bash") ? { shell: "/bin/bash", args: ["-c"] } : { shell: "sh", args: ["-c"] });
 
 /** Pi's agent dir; the harness's own `PI_CODING_AGENT_DIR` override applies, so tests can point it at a temp dir. */
 export const getAgentDir = (): string => process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
