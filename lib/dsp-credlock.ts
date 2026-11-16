@@ -1,18 +1,22 @@
-// DSP credential lock (S10, user decision L5). In DSP every shell command the parent session runs (`bash`, `bg_start`)
+// DSP credential lock (S10, user decisions L5 and L6). In DSP every shell command the parent session runs (`bash`, `bg_start`)
 // starts without the user's push credentials, unless that exact call was approved in the S5 remote dialog.
-// The builder here is pure: given the parent environment, the home dir and a private dir, it returns the environment to
-// spawn with and the files to create; `writeCredLock` is the only function that touches the disk. No Pi imports.
+//
+// The lock depends on NO file or directory the agent's processes can write (round 3 found a race on a lock script in a writable
+// temp dir). It is made of two things that need no disk: a static prelude put in front of each `bash` command (a shell line that
+// unsets and exports), and the same values handed to `bg_start` through its spawn environment. Everything it points at is a place
+// nobody can write: `/dev/null`, the system `false`, and an empty system folder (or a path that cannot be created).
+// No Pi imports; the only file-system reads are the two probes in `lockPlaces`.
 //
 // What the lock takes away (the README lists what it does not cover):
 //   - the ssh agent (`SSH_AUTH_SOCK`, `SSH_AGENT_PID`) and every variable whose name looks like a secret (LOCKED_NAME);
-//   - gh (`GH_CONFIG_DIR` -> an empty dir), git credential helpers (reset through GIT_CONFIG_COUNT, which also covers
-//     the macOS keychain helper of the system config), git's ssh identities (`core.sshCommand`), askpass programs;
-//   - npm (`NPM_CONFIG_USERCONFIG` -> a copy of the user's npmrc without auth lines), docker (`DOCKER_CONFIG` -> a copy
-//     of config.json without auths and credential helpers), AWS (`AWS_SHARED_CREDENTIALS_FILE` -> an empty file).
+//   - gh (`GH_CONFIG_DIR` -> a path nobody can create, so gh is not logged in), git credential helpers (reset through
+//     GIT_CONFIG_COUNT, which also covers the macOS keychain helper of the system config), git's ssh identities
+//     (`core.sshCommand`, GIT_SSH_COMMAND), askpass programs (the system `false`);
+//   - npm (`NPM_CONFIG_USERCONFIG` -> /dev/null), docker (`DOCKER_CONFIG` -> the same unreachable path: no auths, no credential
+//     helpers, and also no plugins or contexts of the user's config), AWS (`AWS_SHARED_CREDENTIALS_FILE` -> /dev/null).
 // HOME is unchanged: plain fetches of public remotes and installs from public registries keep working.
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { accessSync, constants, existsSync, statSync } from "node:fs";
 
 /**
  * Names that look like secrets. A word has to stand between underscores or at an edge of the name, so `TOKENIZERS_PARALLELISM`
@@ -34,18 +38,47 @@ export function isLockedVariable(name: string): boolean {
 	return AGENT_VARIABLES.includes(name.toUpperCase()) || LOCKED_NAME.test(name);
 }
 
-export interface LockPaths {
-	dir: string;
-	gh: string;
-	askpass: string;
-	awsCredentials: string;
-	npmrc: string;
-	docker: string;
+// ── the places the lock points at ───────────────────────────────────────────────────────────────────────────
+
+/** Where the lock points gh and docker (a config dir that does not exist and cannot be created) and git/ssh askpass (a program that fails). */
+export interface LockPlaces {
+	configDir: string;
+	deny: string;
 }
 
-export function lockPaths(dir: string): LockPaths {
-	return { dir, gh: join(dir, "gh"), askpass: join(dir, "askpass"), awsCredentials: join(dir, "aws-credentials"), npmrc: join(dir, "npmrc"), docker: join(dir, "docker") };
+/** The two probes `lockPlaces` makes; tests replace them. */
+export interface PlaceProbe {
+	/** True when `path` is a directory this process cannot write to. */
+	readOnlyDirectory(path: string): boolean;
+	exists(path: string): boolean;
 }
+
+const fileProbe: PlaceProbe = {
+	readOnlyDirectory(path) {
+		try {
+			if (!statSync(path).isDirectory()) return false;
+			accessSync(path, constants.W_OK);
+			return false;
+		} catch {
+			return existsSync(path);
+		}
+	},
+	exists: existsSync,
+};
+
+/**
+ * The config dir is `/var/empty/brigadev` when `/var/empty` is a read-only directory (macOS, BSD, many Linux): gh and docker find no
+ * config file and no login, and nothing can create it. Otherwise it is `/dev/null/brigadev`, which cannot exist either (ENOTDIR);
+ * gh refuses to start with it ("failed to read configuration"), docker warns, and both then have no credentials.
+ * The askpass program is the system `false`, found once; an absolute path nobody can overwrite.
+ */
+export function lockPlaces(probe: PlaceProbe = fileProbe): LockPlaces {
+	const configDir = probe.readOnlyDirectory("/var/empty") ? "/var/empty/brigadev" : "/dev/null/brigadev";
+	const deny = ["/usr/bin/false", "/bin/false"].find((path) => probe.exists(path)) ?? "/usr/bin/false";
+	return { configDir, deny };
+}
+
+// ── the environment ─────────────────────────────────────────────────────────────────────────────────────────
 
 export interface LockedEnvironment {
 	/** The environment to spawn with. */
@@ -56,24 +89,28 @@ export interface LockedEnvironment {
 	set: Record<string, string>;
 }
 
+/** Startup files a non-interactive shell runs (bash: $BASH_ENV, sh/ksh: $ENV): removed so they cannot export tokens again. */
+const STARTUP_VARIABLES = ["BASH_ENV", "ENV"];
+
 /** `GIT_CONFIG_COUNT` as git reads it: a non-negative integer; anything else is dropped (git refuses to run with it). */
 function configCount(value: string | undefined): number {
 	return value !== undefined && /^\d+$/.test(value) ? Number(value) : 0;
 }
 
 /** The locked environment: the parent's without secrets, plus the overrides. Pure; the input is not changed. */
-export function lockEnvironment(base: NodeJS.ProcessEnv, dir: string): LockedEnvironment {
-	const paths = lockPaths(dir);
+export function lockEnvironment(base: NodeJS.ProcessEnv, places: LockPlaces = lockPlaces()): LockedEnvironment {
 	const count = configCount(base.GIT_CONFIG_COUNT);
 	const set: Record<string, string> = {
-		GH_CONFIG_DIR: paths.gh,
+		GH_CONFIG_DIR: places.configDir,
+		DOCKER_CONFIG: places.configDir,
+		NPM_CONFIG_USERCONFIG: "/dev/null",
+		AWS_SHARED_CREDENTIALS_FILE: "/dev/null",
+		GIT_ASKPASS: places.deny,
+		SSH_ASKPASS: places.deny,
 		GIT_TERMINAL_PROMPT: "0",
 		GCM_INTERACTIVE: "never",
-		GIT_ASKPASS: paths.askpass,
-		SSH_ASKPASS: paths.askpass,
-		AWS_SHARED_CREDENTIALS_FILE: paths.awsCredentials,
-		NPM_CONFIG_USERCONFIG: paths.npmrc,
-		DOCKER_CONFIG: paths.docker,
+		// zsh reads $ZDOTDIR/.zshenv even for `zsh -c`; pointing it at a place nobody can create keeps ~/.zshenv tokens out.
+		ZDOTDIR: places.configDir,
 		GIT_SSH_COMMAND: SSH_LOCKED_COMMAND,
 		// Appended after the entries the parent has, so they win: an empty credential.helper resets every helper before it.
 		GIT_CONFIG_COUNT: String(count + 2),
@@ -86,187 +123,38 @@ export function lockEnvironment(base: NodeJS.ProcessEnv, dir: string): LockedEnv
 	const removed: string[] = [];
 	for (const [key, value] of Object.entries(base)) {
 		if (value === undefined || key in set) continue; // an assigned name is replaced, not removed
-		if (isLockedVariable(key) || OVERRIDDEN_VARIABLES.includes(key.toUpperCase())) removed.push(key);
+		if (isLockedVariable(key) || OVERRIDDEN_VARIABLES.includes(key.toUpperCase()) || STARTUP_VARIABLES.includes(key)) removed.push(key);
 		else env[key] = value;
 	}
 	return { env: { ...env, ...set }, removed, set };
 }
 
-// ── sanitized copies ────────────────────────────────────────────────────────────────────────────────────────
-
-const NPMRC_AUTH_KEYS = new Set(["_auth", "_authtoken", "_password", "username", "email", "certfile", "keyfile"]);
-const URL_CREDENTIALS = /:\/\/[^/\s:@]+:[^@\s/]*@/;
-
-/** An npmrc without auth lines: `_auth`, `_authToken`, `_password`, `username`, `email`, `certfile`, `keyfile` (also scoped to a registry, `//host/:_authToken`) and any value with `user:password@` in a URL. */
-export function sanitizeNpmrc(text: string): string {
-	return text
-		.split("\n")
-		.filter((line) => {
-			const trimmed = line.trim();
-			if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith(";")) return true;
-			const equals = trimmed.indexOf("=");
-			const key = (equals < 0 ? trimmed : trimmed.slice(0, equals)).trim();
-			if (NPMRC_AUTH_KEYS.has(key.slice(key.lastIndexOf(":") + 1).toLowerCase())) return false;
-			return !(equals >= 0 && URL_CREDENTIALS.test(trimmed.slice(equals + 1)));
-		})
-		.join("\n");
-}
-
-/** A docker config.json without `auths`, `credsStore` and `credHelpers`; one that cannot be read becomes `{}`. */
-export function sanitizeDockerConfig(text: string): string {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(text);
-	} catch {
-		parsed = undefined;
-	}
-	const config = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...(parsed as Record<string, unknown>) } : {};
-	delete config.auths;
-	delete config.credsStore;
-	delete config.credHelpers;
-	return `${JSON.stringify(config, null, 2)}\n`;
-}
-
-// ── the plan ────────────────────────────────────────────────────────────────────────────────────────────────
-
-export interface LockFile {
-	path: string;
-	content: string;
-	mode: number;
-}
-
-export interface CredLockPlan extends LockedEnvironment {
-	dir: string;
-	/** Directories to create (the private dir itself is created with mode 0700 too). */
-	dirs: Array<{ path: string; mode: number }>;
-	files: LockFile[];
-	/** Symlinks into the user's docker dir, so plugins (buildx, compose) and contexts keep working. */
-	links: Array<{ path: string; target: string }>;
-}
-
-export interface BuildInput {
-	env: NodeJS.ProcessEnv;
-	home: string;
-	/** The private temp dir (created by the caller or by `writeCredLock`, mode 0700). */
-	dir: string;
-	/** Returns a file's text, or undefined when it cannot be read. Default: the file system. */
-	readFile?: (path: string) => string | undefined;
-	exists?: (path: string) => boolean;
-}
-
-const PRIVATE_DIR = 0o700;
-const PRIVATE_FILE = 0o600;
-/** The askpass program must be executable: the one file that is not 0600. */
-const PRIVATE_PROGRAM = 0o700;
-const askpassProgram = "#!/bin/sh\n# brigadev DSP credential lock: no credential is ever given.\nexit 1\n";
-
-function readText(path: string): string | undefined {
-	try {
-		return readFileSync(path, "utf8");
-	} catch {
-		return undefined;
-	}
-}
-
-/** Value of an environment variable whatever the letter case of its name. */
-function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
-	const key = Object.keys(env).find((candidate) => candidate.toUpperCase() === name);
-	return key === undefined ? undefined : env[key];
-}
-
-/** The lock for one session: the environment to spawn with and the files to create. Pure (reads go through `readFile`). */
-export function buildCredLock(input: BuildInput): CredLockPlan {
-	const { env, home, dir } = input;
-	const readFile = input.readFile ?? readText;
-	const exists = input.exists ?? existsSync;
-	const paths = lockPaths(dir);
-	const locked = lockEnvironment(env, dir);
-
-	const npmrcSource = envValue(env, "NPM_CONFIG_USERCONFIG") || join(home, ".npmrc");
-	const dockerSource = envValue(env, "DOCKER_CONFIG") || join(home, ".docker");
-	const links = ["cli-plugins", "contexts"].filter((name) => exists(join(dockerSource, name))).map((name) => ({ path: join(paths.docker, name), target: join(dockerSource, name) }));
-	return {
-		...locked,
-		dir,
-		dirs: [
-			{ path: paths.gh, mode: PRIVATE_DIR },
-			{ path: paths.docker, mode: PRIVATE_DIR },
-		],
-		files: [
-			{ path: paths.awsCredentials, content: "", mode: PRIVATE_FILE },
-			{ path: paths.askpass, content: askpassProgram, mode: PRIVATE_PROGRAM },
-			{ path: paths.npmrc, content: sanitizeNpmrc(readFile(npmrcSource) ?? ""), mode: PRIVATE_FILE },
-			{ path: join(paths.docker, "config.json"), content: sanitizeDockerConfig(readFile(join(dockerSource, "config.json")) ?? ""), mode: PRIVATE_FILE },
-		],
-		links,
-	};
-}
-
-/** Creates the private dir (0700), its subdirectories (0700), files (0600, the askpass 0700) and links. Safe to run again. */
-export function writeCredLock(plan: CredLockPlan): void {
-	mkdirSync(plan.dir, { recursive: true, mode: PRIVATE_DIR });
-	chmodSync(plan.dir, PRIVATE_DIR);
-	for (const { path, mode } of plan.dirs) {
-		mkdirSync(path, { recursive: true, mode });
-		chmodSync(path, mode);
-	}
-	for (const { path, content, mode } of plan.files) {
-		writeFileSync(path, content, { mode });
-		chmodSync(path, mode);
-	}
-	for (const { path, target } of plan.links) {
-		try {
-			symlinkSync(target, path);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		}
-	}
-}
-
 // ── shell prelude (the `bash` tool) ─────────────────────────────────────────────────────────────────────────
 
 const SHELL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** Characters a shell leaves alone in a word (no quoting needed). */
+const PLAIN_WORD = /^[A-Za-z0-9_@%+:,./-]*$/;
 
-const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+/** Quotes only when the shell would change the value. The empty string stays empty (`NAME=`). */
+const shellWord = (value: string): string => (PLAIN_WORD.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`);
 
 /**
- * One line that puts a running POSIX shell into the locked environment: unset what was removed, export what was set; if either
- * fails the shell exits, so a command never runs half-locked. It changes nothing a command can observe but the environment: the
- * exit status is that of the command that follows on the next line, `$?` starts at 0, and stdin and the working directory are untouched.
+ * One line that puts a running POSIX shell (sh, bash, zsh) into the locked environment: unset what was removed, export what was set.
+ * Every step is chained with `&&` and the line ends with `|| exit 1`, so a command never runs half-locked. The guard puts it, then a
+ * newline, before the command; it changes nothing a command can observe but the environment: the exit status is that of the command,
+ * `$?` starts at 0, and stdin and the working directory are untouched. It is static text (computed once per session from the
+ * parent environment) and no file is read or written. The long ssh command is written once; its two other uses refer to it.
  * Names a shell cannot unset (not identifiers) are left out; they only reach children through the bash tool's own spawn.
  */
 export function lockPrelude(locked: LockedEnvironment): string {
 	const names = locked.removed.filter((name) => SHELL_NAME.test(name));
-	const assignments = Object.entries(locked.set).map(([key, value]) => `${key}=${shellQuote(value)}`);
-	return `${names.length > 0 ? `unset -v ${names.join(" ")}` : ":"} && export ${assignments.join(" ")} || exit 1`;
+	const { GIT_SSH_COMMAND: ssh, ...others } = locked.set;
+	const assignments = Object.entries(others).map(([key, value]) => `${key}=${value === ssh ? `"$GIT_SSH_COMMAND"` : shellWord(value)}`);
+	const steps = [...(names.length > 0 ? [`unset -v ${names.join(" ")}`] : []), `export GIT_SSH_COMMAND=${shellWord(ssh)}`, `export ${assignments.join(" ")}`];
+	return `${steps.join("&&")} || exit 1`;
 }
 
-// The `bash` tool does not carry the prelude in the command text: the guard writes it to `lock.sh` in the private dir and the
-// command only gets a short line that sources it. The guard rewrites the file before EVERY locked call, so an edit between two
-// calls cannot weaken the next one.
-
-export const lockScriptPath = (dir: string): string => join(dir, "lock.sh");
-
-/**
- * The line put before the command: `. '<dir>/lock.sh' || exit 1`. If the file cannot be read or any line of it fails, the shell
- * exits and the command does not run. Sourcing keeps `$?` at 0, the working directory and stdin, and the exit status of the command.
- */
-export function lockSourceLine(dir: string): string {
-	return `. ${shellQuote(lockScriptPath(dir))} || exit 1`;
-}
-
-/**
- * Writes `lock.sh` (mode 0600) with the prelude for `env`. The old file is removed first, so a symlink or directory put in its
- * place is replaced and never written through. Throws when it cannot (the guard then blocks the call). Synchronous on purpose.
- */
-export function writeLockScript(dir: string, env: NodeJS.ProcessEnv): void {
-	const path = lockScriptPath(dir);
-	rmSync(path, { recursive: true, force: true });
-	writeFileSync(path, `${lockPrelude(lockEnvironment(env, dir))}\n`, { mode: PRIVATE_FILE, flag: "wx" });
-	chmodSync(path, PRIVATE_FILE);
-}
-
-// ── per-call state shared by the guard, bg_start and the doctor ─────────────────────────────────────────────
+// ── per-call state shared by the guard and bg_start ─────────────────────────────────────────────────────────
 // The guard decides in `tool_call`; `bg_start` (another extension) spawns later. State sits on globalThis under a
 // registered symbol, so it is shared even when the two extensions load their own copy of this module.
 
@@ -274,7 +162,6 @@ export type LockApply = (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
 
 interface Registry {
 	calls: Map<string, LockApply>;
-	dir?: string;
 }
 
 const REGISTRY = Symbol.for("brigadev.dsp-credlock");
@@ -306,16 +193,12 @@ export function clearCredLocks(): void {
 	registry().calls.clear();
 }
 
-/** The session's private lock dir (set by the guard when it creates it, cleared at shutdown). */
-export function setCredLockDir(dir: string | undefined): void {
-	registry().dir = dir;
-}
-
-export function credLockDir(): string | undefined {
-	return registry().dir;
+/** The lock keeps no private directory any more (nothing on disk for the agent to rewrite); kept so callers that ask get `undefined`. */
+export function credLockDir(): undefined {
+	return undefined;
 }
 
 /** The line `/brigadev:doctor` shows in DSP. */
-export function credLockLine(dir: string | undefined = credLockDir()): string {
-	return `DSP credential lock: on — shell commands and background processes start without the SSH agent, gh/GitHub and registry tokens, git credential helpers and the npm/docker/AWS credentials; only a remote call you approve in the dialog gets them (${dir ? `private dir ${dir}` : "private dir is created at the first command"})`;
+export function credLockLine(): string {
+	return "DSP credential lock: on — shell commands and background processes start without the SSH agent, gh/GitHub and registry tokens, git credential helpers and the npm/docker/AWS credentials (no file on disk: an inline prelude, read-only targets); only a remote call you approve in the dialog gets them. npm private-registry auth and docker plugins/contexts from your user config are not available in locked commands";
 }

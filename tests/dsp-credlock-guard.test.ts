@@ -2,11 +2,11 @@
 // unless that exact call was approved in the remote dialog; normal and yolo are untouched.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { credLockDir, markCredLock, takeCredLock } from "../lib/dsp-credlock.ts";
+import { credLockDir, isLockedVariable, lockPlaces, markCredLock, takeCredLock } from "../lib/dsp-credlock.ts";
 import { readDspAudit } from "../lib/dsp-audit.ts";
 import { DSP_REMOTE_TITLE } from "../lib/dsp-policy.ts";
 import { createFakeCtx, createFakePi } from "./helpers/fake-pi.ts";
@@ -88,10 +88,12 @@ describe("S10 guard wiring of the credential lock", () => {
 		};
 	}
 
-	/** The model sees one short line, then the original command. */
-	const PREFIX = /^\. '([^'\n]+)\/lock\.sh' \|\| exit 1\n/;
+	/** The command is one inline prelude line (`[unset -v …&&]export …&&export … || exit 1`), then the original command. */
+	const PREFIX = /^((?:unset -v [^&\n]+&&)?export GIT_SSH_COMMAND=[^\n]* \|\| exit 1)\n/;
 	const isLocked = (command: unknown, original: string) => typeof command === "string" && PREFIX.test(command) && command.endsWith(`\n${original}`) && command.split("\n").length === original.split("\n").length + 1;
-	const lockDirOf = (command: string): string => PREFIX.exec(command)![1];
+	const preludeOf = (command: string): string => PREFIX.exec(command)![1];
+	/** Lock directories a previous version created in the temp dir. */
+	const lockDirsInTmp = () => readdirSync(tmpdir()).filter((name) => name.startsWith("brigadev-lock-"));
 
 	describe("bash", () => {
 		it("DSP: a local command runs locked, and the original command follows the prelude unchanged", async () => {
@@ -100,88 +102,51 @@ describe("S10 guard wiring of the credential lock", () => {
 			assert.equal(blocked, undefined);
 			assert.ok(isLocked(input.command, "echo hi"), String(input.command));
 			assert.equal(input.timeout, 5, "other arguments are untouched");
-			assert.doesNotMatch(input.command, /unset -v|export |GH_CONFIG_DIR|GIT_CONFIG_COUNT/, "the prelude itself stays out of the command text");
-			assert.ok(String(input.command).split("\n")[0].length < 200, "one short line");
+			assert.ok(!/unset -v|export /.test(String(input.command).split("\n").slice(1).join("\n")), "the prelude is only the first line");
 			await s.shutdown();
 		});
 
-		it("DSP: lock.sh (0600, in the private dir) holds the prelude the command sources", async () => {
+		it("DSP: the prelude is inline static text: same for every call of a session, no file or directory is created or read", async () => {
+			const before = lockDirsInTmp();
 			const s = await session({ mode: "dsp" });
-			const lock = lockDirOf((await s.call("bash", { command: "ls" })).input.command);
-			const script = join(lock, "lock.sh");
-			assert.equal(statSync(script).mode & 0o777, 0o600);
-			const text = readFileSync(script, "utf8");
-			assert.match(text, /^unset -v [^\n]*\bSSH_AUTH_SOCK\b|^export /m);
-			assert.match(text, /export [^\n]*GH_CONFIG_DIR='[^']+\/gh'/);
-			assert.match(text, /\|\| exit 1\n$/);
+			const a = preludeOf((await s.call("bash", { command: "ls" })).input.command);
+			const b = preludeOf((await s.call("bash", { command: "pwd" })).input.command);
+			assert.equal(a, b);
+			assert.match(a, /GH_CONFIG_DIR=\S*\/brigadev\b/);
+			assert.match(a, /NPM_CONFIG_USERCONFIG=\/dev\/null\b/);
+			assert.match(a, /GIT_ASKPASS=\/\S*bin\/false\b/);
+			assert.match(a, / \|\| exit 1$/);
+			assert.doesNotMatch(a, /lock\.sh|askpass|\. '|TMPDIR|\/tmp\/|\/var\/folders/);
+			assert.deepEqual(lockDirsInTmp(), before, "no lock dir in the temp dir");
+			assert.equal(credLockDir(), undefined, "there is no private dir to name");
 			await s.shutdown();
 		});
 
-		it("DSP: lock.sh is rewritten before every locked call, so an edit between calls cannot weaken the next one", async () => {
+		it("DSP: a temp dir that does not exist or cannot be written does not matter (the lock needs no file)", async () => {
 			const s = await session({ mode: "dsp" });
-			const lock = lockDirOf((await s.call("bash", { command: "ls" })).input.command);
-			const script = join(lock, "lock.sh");
-			const expected = readFileSync(script, "utf8");
-			writeFileSync(script, "# weakened\n");
-			await s.call("bash", { command: "ls" });
-			assert.equal(readFileSync(script, "utf8"), expected);
-			// A symlink put in its place is replaced, and the file it pointed at is not written.
-			const victim = join(dir, "victim.txt");
-			writeFileSync(victim, "untouched");
-			rmSync(script);
-			symlinkSync(victim, script);
-			await s.call("bash", { command: "ls" });
-			assert.equal(readFileSync(victim, "utf8"), "untouched");
-			assert.equal(readFileSync(script, "utf8"), expected);
-			assert.equal(statSync(script).mode & 0o777, 0o600);
-			await s.shutdown();
-		});
-
-		it("DSP: lock.sh and the lock dir are created again when they are missing", async () => {
-			const s = await session({ mode: "dsp" });
-			const lock = lockDirOf((await s.call("bash", { command: "ls" })).input.command);
-			rmSync(join(lock, "lock.sh"));
-			assert.ok(isLocked((await s.call("bash", { command: "ls" })).input.command, "ls"));
-			assert.ok(existsSync(join(lock, "lock.sh")));
-			rmSync(lock, { recursive: true, force: true });
-			const again = await s.call("bash", { command: "ls" });
-			assert.equal(again.blocked, undefined);
-			assert.ok(existsSync(join(lockDirOf(again.input.command), "lock.sh")));
-			await s.shutdown();
-		});
-
-		it("DSP: when lock.sh cannot be written the call is blocked, not run unlocked", { skip: process.getuid?.() === 0 && "root ignores directory modes" }, async () => {
-			const s = await session({ mode: "dsp" });
-			const lock = lockDirOf((await s.call("bash", { command: "ls" })).input.command);
-			chmodSync(lock, 0o500);
+			const tmp = process.env.TMPDIR;
+			process.env.TMPDIR = join(dir, "does", "not", "exist");
 			try {
 				const result = await s.call("bash", { command: "echo hi" });
-				assert.match(String(result.blocked), /credential lock could not be set up/);
-				assert.equal(result.input.command, "echo hi");
+				assert.equal(result.blocked, undefined);
+				assert.ok(isLocked(result.input.command, "echo hi"));
 			} finally {
-				chmodSync(lock, 0o700);
+				tmp === undefined ? delete process.env.TMPDIR : (process.env.TMPDIR = tmp);
 			}
 			await s.shutdown();
 		});
 
-		it("DSP: the lock dir is private (0700), holds the files, and is removed at session shutdown", async () => {
-			const s = await session({ mode: "dsp" });
-			const { input } = await s.call("bash", { command: "ls" });
-			const lock = lockDirOf(input.command);
-			assert.equal(statSync(lock).mode & 0o777, 0o700);
-			assert.ok(existsSync(join(lock, "gh")) && existsSync(join(lock, "askpass")) && existsSync(join(lock, "npmrc")) && existsSync(join(lock, "docker", "config.json")));
-			assert.equal(credLockDir(), lock);
-			await s.shutdown();
-			assert.equal(existsSync(lock), false);
-			assert.equal(credLockDir(), undefined);
-		});
-
-		it("DSP: the same session reuses one lock dir for every call", async () => {
-			const s = await session({ mode: "dsp" });
-			const a = lockDirOf((await s.call("bash", { command: "ls" })).input.command);
-			const b = lockDirOf((await s.call("bash", { command: "pwd" })).input.command);
-			assert.equal(a, b);
-			await s.shutdown();
+		it("DSP: the command, run by a real bash with the secrets in its environment, sees none of them", async () => {
+			Object.assign(process.env, { GH_TOKEN: "ghp_x", SSH_AUTH_SOCK: "/x.sock", NODE_AUTH_TOKEN: "npm_x" });
+			try {
+				const s = await session({ mode: "dsp" });
+				const { input } = await s.call("bash", { command: 'echo "[$GH_TOKEN][$SSH_AUTH_SOCK][$NODE_AUTH_TOKEN][$GH_CONFIG_DIR][$GIT_CONFIG_COUNT]"' });
+				const out = execFileSync("bash", ["-c", input.command], { env: process.env, cwd: repo, encoding: "utf8" });
+				assert.equal(out.trim(), `[][][][${lockPlaces().configDir}][2]`);
+				await s.shutdown();
+			} finally {
+				for (const name of ["GH_TOKEN", "SSH_AUTH_SOCK", "NODE_AUTH_TOKEN"]) delete process.env[name];
+			}
 		});
 
 		it("DSP: the approved remote call runs unlocked and the next call is locked again", async () => {
@@ -250,27 +215,34 @@ describe("S10 guard wiring of the credential lock", () => {
 			await s.shutdown();
 		});
 
-		it("DSP: a failure to set the lock up blocks the command instead of running it unlocked", async () => {
+		it("DSP: the prelude is computed once per session from the parent environment (a new session recomputes it)", async () => {
 			const s = await session({ mode: "dsp" });
-			const tmp = process.env.TMPDIR;
-			process.env.TMPDIR = join(dir, "does", "not", "exist");
+			const first = preludeOf((await s.call("bash", { command: "ls" })).input.command);
+			process.env.BRIGADEV_TEST_LATE_TOKEN = "x";
 			try {
-				const result = await s.call("bash", { command: "echo hi" });
-				assert.match(String(result.blocked), /credential lock could not be set up/);
-				assert.equal(result.input.command, "echo hi");
+				assert.equal(preludeOf((await s.call("bash", { command: "ls" })).input.command), first);
+				await s.shutdown();
+				const again = await session({ mode: "dsp" });
+				assert.match(preludeOf((await again.call("bash", { command: "ls" })).input.command), /unset -v [^&]*\bBRIGADEV_TEST_LATE_TOKEN\b/);
+				await again.shutdown();
 			} finally {
-				tmp === undefined ? delete process.env.TMPDIR : (process.env.TMPDIR = tmp);
+				delete process.env.BRIGADEV_TEST_LATE_TOKEN;
 			}
-			await s.shutdown();
 		});
 
-		it("DSP: rebuilds the lock files when something removed them", async () => {
-			const s = await session({ mode: "dsp" });
-			const lock = lockDirOf((await s.call("bash", { command: "ls" })).input.command);
-			rmSync(join(lock, "askpass"));
-			await s.call("bash", { command: "ls" });
-			assert.ok(existsSync(join(lock, "askpass")));
-			await s.shutdown();
+		it("DSP: an environment without SSH_AUTH_SOCK or any lockable variable still gets a valid prelude", async () => {
+			const keep = { ...process.env };
+			for (const name of Object.keys(process.env)) if (name === "SSH_AGENT_PID" || name === "SSH_AUTH_SOCK" || isLockedVariable(name)) delete process.env[name];
+			try {
+				const s = await session({ mode: "dsp" });
+				const { input } = await s.call("bash", { command: "echo hi" });
+				assert.ok(isLocked(input.command, "echo hi"), String(input.command));
+				assert.doesNotMatch(String(input.command), /unset/);
+				assert.equal(execFileSync("bash", ["-c", input.command], { env: process.env, cwd: repo, encoding: "utf8" }).trim(), "hi");
+				await s.shutdown();
+			} finally {
+				Object.assign(process.env, keep);
+			}
 		});
 
 		it("normal and yolo: no prelude, no lock dir, whatever the command", async () => {
@@ -375,11 +347,11 @@ describe("S10 guard wiring of the credential lock", () => {
 			}
 		});
 
-		it("names the private dir once the guard has created it", async () => {
-			const s = await session({ mode: "dsp" });
-			const lock = lockDirOf((await s.call("bash", { command: "ls" })).input.command);
-			assert.ok((await doctor("dsp")).includes(lock));
-			await s.shutdown();
+		it("says no file is involved and what the lock leaves out", async () => {
+			const text = await doctor("dsp");
+			assert.match(text, /no file on disk/);
+			assert.match(text, /npm private-registry auth and docker plugins\/contexts/);
+			assert.doesNotMatch(text, /private dir/);
 		});
 	});
 

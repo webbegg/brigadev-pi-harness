@@ -1,28 +1,21 @@
-// S10 credential lock: the pure environment builder (lib/dsp-credlock.ts). No process is spawned here.
+// S10 credential lock: the pure environment builder and the inline prelude (lib/dsp-credlock.ts). No process is spawned here.
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
-	buildCredLock,
+	credLockDir,
 	credLockLine,
 	isLockedVariable,
 	lockEnvironment,
-	lockPaths,
+	lockPlaces,
 	lockPrelude,
-	lockScriptPath,
-	lockSourceLine,
 	markCredLock,
-	sanitizeDockerConfig,
-	sanitizeNpmrc,
 	SSH_LOCKED_COMMAND,
 	takeCredLock,
-	writeLockScript,
+	type LockPlaces,
 } from "../lib/dsp-credlock.ts";
 
-const DIR = "/tmp/brigadev-lock-test";
 const HOME = "/home/user";
+const PLACES: LockPlaces = { configDir: "/var/empty/brigadev", deny: "/usr/bin/false" };
 
 describe("S10 which variables are removed", () => {
 	it("removes the ssh agent variables and every token-like name from the spec", () => {
@@ -65,7 +58,7 @@ describe("S10 which variables are removed", () => {
 	});
 
 	it("drops them from the spawn environment and lists them in `removed`", () => {
-		const locked = lockEnvironment({ PATH: "/usr/bin", HOME, SSH_AUTH_SOCK: "/s", SSH_AGENT_PID: "1", GH_TOKEN: "x", TOKENIZERS_PARALLELISM: "false", AUTHOR_NAME: "a" }, DIR);
+		const locked = lockEnvironment({ PATH: "/usr/bin", HOME, SSH_AUTH_SOCK: "/s", SSH_AGENT_PID: "1", GH_TOKEN: "x", TOKENIZERS_PARALLELISM: "false", AUTHOR_NAME: "a" }, PLACES);
 		assert.equal(locked.env.SSH_AUTH_SOCK, undefined);
 		assert.equal(locked.env.SSH_AGENT_PID, undefined);
 		assert.equal(locked.env.GH_TOKEN, undefined);
@@ -76,40 +69,48 @@ describe("S10 which variables are removed", () => {
 		assert.deepEqual([...locked.removed].sort(), ["GH_TOKEN", "SSH_AGENT_PID", "SSH_AUTH_SOCK"]);
 	});
 
+	it("an environment without any lockable variable removes nothing", () => {
+		assert.deepEqual(lockEnvironment({ PATH: "/usr/bin", HOME }, PLACES).removed, []);
+	});
+
 	it("does not mutate the input environment", () => {
 		const env = { GH_TOKEN: "x", PATH: "/bin" };
-		lockEnvironment(env, DIR);
+		lockEnvironment(env, PLACES);
 		assert.deepEqual(env, { GH_TOKEN: "x", PATH: "/bin" });
 	});
 
 	it("also drops differently-cased copies of an overridden variable (npm_config_userconfig)", () => {
-		const locked = lockEnvironment({ npm_config_userconfig: "/home/user/.npmrc", docker_config: "/d" }, DIR);
+		const locked = lockEnvironment({ npm_config_userconfig: "/home/user/.npmrc", docker_config: "/d" }, PLACES);
 		assert.equal(locked.env.npm_config_userconfig, undefined);
 		assert.equal(locked.env.docker_config, undefined);
-		assert.equal(locked.env.NPM_CONFIG_USERCONFIG, lockPaths(DIR).npmrc);
+		assert.equal(locked.env.NPM_CONFIG_USERCONFIG, "/dev/null");
 	});
 });
 
-describe("S10 which variables are set", () => {
-	const locked = lockEnvironment({ PATH: "/usr/bin" }, DIR);
-	const paths = lockPaths(DIR);
+describe("S10 which variables are set (only places nobody can write)", () => {
+	const locked = lockEnvironment({ PATH: "/usr/bin" }, PLACES);
 
-	it("points gh, aws, npm and docker at private copies and makes the askpass programs fail", () => {
-		assert.equal(locked.env.GH_CONFIG_DIR, paths.gh);
+	it("points gh and docker at an unreachable dir, npm and aws at /dev/null, and makes the askpass programs fail", () => {
+		assert.equal(locked.env.GH_CONFIG_DIR, "/var/empty/brigadev");
+		assert.equal(locked.env.DOCKER_CONFIG, "/var/empty/brigadev");
+		assert.equal(locked.env.NPM_CONFIG_USERCONFIG, "/dev/null");
+		assert.equal(locked.env.AWS_SHARED_CREDENTIALS_FILE, "/dev/null");
+		assert.equal(locked.env.GIT_ASKPASS, "/usr/bin/false");
+		assert.equal(locked.env.SSH_ASKPASS, "/usr/bin/false");
 		assert.equal(locked.env.GIT_TERMINAL_PROMPT, "0");
 		assert.equal(locked.env.GCM_INTERACTIVE, "never");
-		assert.equal(locked.env.GIT_ASKPASS, paths.askpass);
-		assert.equal(locked.env.SSH_ASKPASS, paths.askpass);
-		assert.equal(locked.env.AWS_SHARED_CREDENTIALS_FILE, paths.awsCredentials);
-		assert.equal(locked.env.NPM_CONFIG_USERCONFIG, paths.npmrc);
-		assert.equal(locked.env.DOCKER_CONFIG, paths.docker);
+	});
+
+	it("no assigned value is a path the agent could write: only /dev/null, the system false and the unreachable dir", () => {
+		const allowed = new Set(["/var/empty/brigadev", "/dev/null", "/usr/bin/false", "0", "never", "2", "credential.helper", "core.sshCommand", "", SSH_LOCKED_COMMAND]);
+		for (const [key, value] of Object.entries(locked.set)) assert.ok(allowed.has(value), `${key}=${value}`);
 	});
 
 	it("overrides a parent's value of an overridden variable", () => {
-		const parent = lockEnvironment({ GH_CONFIG_DIR: "/home/user/.config/gh", GIT_ASKPASS: "/usr/bin/real-askpass", AWS_SHARED_CREDENTIALS_FILE: "/home/user/.aws/credentials", GIT_SSH_COMMAND: "ssh -i /k" }, DIR);
-		assert.equal(parent.env.GH_CONFIG_DIR, paths.gh);
-		assert.equal(parent.env.GIT_ASKPASS, paths.askpass);
-		assert.equal(parent.env.AWS_SHARED_CREDENTIALS_FILE, paths.awsCredentials);
+		const parent = lockEnvironment({ GH_CONFIG_DIR: "/home/user/.config/gh", GIT_ASKPASS: "/usr/bin/real-askpass", AWS_SHARED_CREDENTIALS_FILE: "/home/user/.aws/credentials", GIT_SSH_COMMAND: "ssh -i /k" }, PLACES);
+		assert.equal(parent.env.GH_CONFIG_DIR, "/var/empty/brigadev");
+		assert.equal(parent.env.GIT_ASKPASS, "/usr/bin/false");
+		assert.equal(parent.env.AWS_SHARED_CREDENTIALS_FILE, "/dev/null");
 		assert.equal(parent.env.GIT_SSH_COMMAND, SSH_LOCKED_COMMAND, "GIT_SSH_COMMAND would win over core.sshCommand");
 	});
 
@@ -123,7 +124,7 @@ describe("S10 which variables are set", () => {
 	});
 
 	it("appends to GIT_CONFIG_COUNT entries the parent already has, in order, last", () => {
-		const parent = lockEnvironment({ GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "user.name", GIT_CONFIG_VALUE_0: "x", GIT_CONFIG_KEY_1: "credential.helper", GIT_CONFIG_VALUE_1: "store" }, DIR);
+		const parent = lockEnvironment({ GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "user.name", GIT_CONFIG_VALUE_0: "x", GIT_CONFIG_KEY_1: "credential.helper", GIT_CONFIG_VALUE_1: "store" }, PLACES);
 		assert.equal(parent.env.GIT_CONFIG_COUNT, "4");
 		assert.equal(parent.env.GIT_CONFIG_KEY_0, "user.name");
 		assert.equal(parent.env.GIT_CONFIG_VALUE_0, "x");
@@ -136,130 +137,44 @@ describe("S10 which variables are set", () => {
 
 	it("treats an invalid GIT_CONFIG_COUNT as none (git would refuse to run with it)", () => {
 		for (const bad of ["", "abc", "-1", "1.5"]) {
-			const parent = lockEnvironment({ GIT_CONFIG_COUNT: bad }, DIR);
+			const parent = lockEnvironment({ GIT_CONFIG_COUNT: bad }, PLACES);
 			assert.equal(parent.env.GIT_CONFIG_COUNT, "2", JSON.stringify(bad));
 			assert.equal(parent.env.GIT_CONFIG_KEY_0, "credential.helper");
 		}
 	});
 
 	it("`set` lists exactly what was assigned, and `removed` never lists an assigned name", () => {
-		const parent = lockEnvironment({ AWS_SHARED_CREDENTIALS_FILE: "/x", GH_TOKEN: "t" }, DIR);
-		assert.equal(parent.set.AWS_SHARED_CREDENTIALS_FILE, paths.awsCredentials);
+		const parent = lockEnvironment({ AWS_SHARED_CREDENTIALS_FILE: "/x", GH_TOKEN: "t" }, PLACES);
+		assert.equal(parent.set.AWS_SHARED_CREDENTIALS_FILE, "/dev/null");
 		assert.deepEqual(parent.removed, ["GH_TOKEN"]);
 		for (const [key, value] of Object.entries(parent.set)) assert.equal(parent.env[key], value);
 	});
 });
 
-describe("S10 npmrc sanitizing", () => {
-	it("drops auth lines (global and scoped) and keeps registry and other settings", () => {
-		const text = [
-			"# my config",
-			"registry=https://registry.npmjs.org/",
-			"@acme:registry=https://npm.acme.test/",
-			"//registry.npmjs.org/:_authToken=npm_secret",
-			"//npm.acme.test/:_auth=Zm9vOmJhcg==",
-			"//npm.acme.test/:_password=cGFzcw==",
-			"//npm.acme.test/:username=bob",
-			"_authToken=${NPM_TOKEN}",
-			"email=bob@example.com",
-			"certfile=/home/user/cert.pem",
-			"  keyfile = /home/user/key.pem",
-			"_AUTH = abc",
-			"save-exact=true",
-			"",
-		].join("\n");
-		assert.equal(sanitizeNpmrc(text), ["# my config", "registry=https://registry.npmjs.org/", "@acme:registry=https://npm.acme.test/", "save-exact=true", ""].join("\n"));
+describe("S10 where the lock points", () => {
+	it("an empty system dir that nobody can write gives /var/empty/brigadev", () => {
+		const places = lockPlaces({ readOnlyDirectory: (path) => path === "/var/empty", exists: (path) => path === "/bin/false" });
+		assert.deepEqual(places, { configDir: "/var/empty/brigadev", deny: "/bin/false" });
 	});
 
-	it("drops a line that embeds credentials in a URL", () => {
-		const out = sanitizeNpmrc("registry=https://bob:hunter2@npm.acme.test/\nfetch-retries=3\n");
-		assert.doesNotMatch(out, /hunter2/);
-		assert.match(out, /fetch-retries=3/);
+	it("without one (missing, or writable) it falls back to a path that cannot exist: /dev/null/brigadev", () => {
+		assert.equal(lockPlaces({ readOnlyDirectory: () => false, exists: () => true }).configDir, "/dev/null/brigadev");
 	});
 
-	it("an empty or missing file gives an empty file", () => {
-		assert.equal(sanitizeNpmrc(""), "");
+	it("prefers /usr/bin/false, and still names it when neither exists", () => {
+		assert.equal(lockPlaces({ readOnlyDirectory: () => true, exists: () => true }).deny, "/usr/bin/false");
+		assert.equal(lockPlaces({ readOnlyDirectory: () => true, exists: () => false }).deny, "/usr/bin/false");
+	});
+
+	it("the real probe returns an absolute askpass program and one of the two config dirs", () => {
+		const places = lockPlaces();
+		assert.match(places.deny, /^\/(usr\/)?bin\/false$/);
+		assert.match(places.configDir, /^\/(var\/empty|dev\/null)\/brigadev$/);
 	});
 });
 
-describe("S10 docker config sanitizing", () => {
-	it("removes auths, credsStore and credHelpers and keeps the rest", () => {
-		const out = JSON.parse(sanitizeDockerConfig(JSON.stringify({ auths: { "ghcr.io": { auth: "x" } }, credsStore: "osxkeychain", credHelpers: { "gcr.io": "gcloud" }, currentContext: "colima", psFormat: "table" })));
-		assert.deepEqual(out, { currentContext: "colima", psFormat: "table" });
-	});
-
-	it("an unreadable or non-object config becomes an empty one", () => {
-		assert.deepEqual(JSON.parse(sanitizeDockerConfig("not json")), {});
-		assert.deepEqual(JSON.parse(sanitizeDockerConfig("[1]")), {});
-		assert.deepEqual(JSON.parse(sanitizeDockerConfig("")), {});
-	});
-});
-
-describe("S10 the plan: files to create", () => {
-	const reads: Record<string, string> = {
-		[`${HOME}/.npmrc`]: "registry=https://r.test/\n//r.test/:_authToken=secret\n",
-		[`${HOME}/.docker/config.json`]: JSON.stringify({ auths: { x: {} }, credsStore: "desktop", currentContext: "c" }),
-	};
-	const plan = buildCredLock({ env: { GH_TOKEN: "t", PATH: "/bin" }, home: HOME, dir: DIR, readFile: (path) => reads[path], exists: (path) => path === `${HOME}/.docker/cli-plugins` });
-	const file = (path: string) => plan.files.find((f) => f.path === path);
-	const paths = lockPaths(DIR);
-
-	it("carries the environment too", () => {
-		assert.equal(plan.env.GH_TOKEN, undefined);
-		assert.equal(plan.env.GH_CONFIG_DIR, paths.gh);
-	});
-
-	it("creates the empty gh config dir and the docker dir with mode 0700, under the private dir", () => {
-		assert.deepEqual(plan.dirs.map((d) => d.path).sort(), [paths.docker, paths.gh].sort());
-		for (const dir of plan.dirs) assert.equal(dir.mode, 0o700);
-	});
-
-	it("writes an empty AWS credentials file (0600)", () => {
-		assert.deepEqual(file(paths.awsCredentials), { path: paths.awsCredentials, content: "", mode: 0o600 });
-	});
-
-	it("writes a failing askpass program (executable by the owner only)", () => {
-		const askpass = file(paths.askpass);
-		assert.ok(askpass);
-		assert.match(askpass.content, /^#!\/bin\/sh\n/);
-		assert.match(askpass.content, /exit 1/);
-		assert.equal(askpass.mode, 0o700);
-	});
-
-	it("writes the sanitized npmrc and docker config copies (0600)", () => {
-		const npmrc = file(paths.npmrc);
-		assert.equal(npmrc?.mode, 0o600);
-		assert.equal(npmrc?.content, "registry=https://r.test/\n");
-		const docker = file(`${paths.docker}/config.json`);
-		assert.equal(docker?.mode, 0o600);
-		assert.deepEqual(JSON.parse(docker?.content ?? ""), { currentContext: "c" });
-	});
-
-	it("links the user's docker cli-plugins (so buildx/compose keep working) but only when they exist", () => {
-		assert.deepEqual(plan.links, [{ path: `${paths.docker}/cli-plugins`, target: `${HOME}/.docker/cli-plugins` }]);
-	});
-
-	it("missing ~/.npmrc and ~/.docker give an empty npmrc and an empty docker config", () => {
-		const empty = buildCredLock({ env: {}, home: HOME, dir: DIR, readFile: () => undefined, exists: () => false });
-		assert.equal(empty.files.find((f) => f.path === paths.npmrc)?.content, "");
-		assert.deepEqual(JSON.parse(empty.files.find((f) => f.path === `${paths.docker}/config.json`)?.content ?? ""), {});
-		assert.deepEqual(empty.links, []);
-	});
-
-	it("reads the copies from where the parent's NPM_CONFIG_USERCONFIG and DOCKER_CONFIG point", () => {
-		const asked: string[] = [];
-		buildCredLock({ env: { NPM_CONFIG_USERCONFIG: "/etc/custom.npmrc", DOCKER_CONFIG: "/etc/docker-cfg" }, home: HOME, dir: DIR, readFile: (path) => (asked.push(path), undefined), exists: () => false });
-		assert.ok(asked.includes("/etc/custom.npmrc"));
-		assert.ok(asked.includes("/etc/docker-cfg/config.json"));
-	});
-
-	it("never copies a secret into the plan", () => {
-		assert.doesNotMatch(JSON.stringify(plan), /secret/);
-	});
-});
-
-describe("S10 the shell prelude", () => {
-	const locked = lockEnvironment({ GH_TOKEN: "t", SSH_AUTH_SOCK: "/s", "weird-name": "x", FOO_TOKEN: "f" }, DIR);
+describe("S10 the shell prelude (inline, static, no file)", () => {
+	const locked = lockEnvironment({ GH_TOKEN: "t", SSH_AUTH_SOCK: "/s", "weird-name": "x", FOO_TOKEN: "f", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "user.name", GIT_CONFIG_VALUE_0: "x" }, PLACES);
 	const prelude = lockPrelude(locked);
 
 	it("unsets what was removed and exports what was set, in one line that fails closed", () => {
@@ -268,54 +183,66 @@ describe("S10 the shell prelude", () => {
 		assert.match(prelude, /\bGH_TOKEN\b/);
 		assert.match(prelude, /\bSSH_AUTH_SOCK\b/);
 		assert.match(prelude, /\bFOO_TOKEN\b/);
-		assert.match(prelude, /export GH_CONFIG_DIR='/);
+		assert.match(prelude, /export [^&]*GH_CONFIG_DIR=\/var\/empty\/brigadev\b/);
 		assert.match(prelude, /\|\| exit 1$/);
 	});
 
-	it("never mentions a value of a removed variable", () => {
-		assert.doesNotMatch(prelude, /'t'|\/s\b/);
+	it("chains every step with && so one failure exits", () => {
+		const steps = prelude.replace(/ \|\| exit 1$/, "").split("&&");
+		assert.ok(steps.length >= 3);
+		for (const step of steps) assert.match(step, /^(unset -v|export) /);
 	});
 
-	it("quotes values with single quotes, escaping embedded ones", () => {
-		const odd = lockEnvironment({}, "/tmp/it's here");
-		assert.match(lockPrelude(odd), /GH_CONFIG_DIR='\/tmp\/it'\\''s here\/gh'/);
+	it("reads no file and names no private path: only read-only targets", () => {
+		assert.match(prelude, /NPM_CONFIG_USERCONFIG=\/dev\/null\b/);
+		assert.match(prelude, /AWS_SHARED_CREDENTIALS_FILE=\/dev\/null\b/);
+		assert.match(prelude, /GIT_ASKPASS=\/usr\/bin\/false\b/);
+		assert.match(prelude, /SSH_ASKPASS=\/usr\/bin\/false\b/);
+		assert.match(prelude, /DOCKER_CONFIG=\/var\/empty\/brigadev\b/);
+		assert.match(prelude, /GIT_TERMINAL_PROMPT=0\b/);
+		assert.match(prelude, /GCM_INTERACTIVE=never\b/);
+		assert.doesNotMatch(prelude, /brigadev-lock|lock\.sh|askpass|\. '/);
+	});
+
+	it("appends its git config entries after the parent's", () => {
+		assert.match(prelude, /GIT_CONFIG_COUNT=3\b/);
+		assert.match(prelude, /GIT_CONFIG_KEY_1=credential\.helper GIT_CONFIG_VALUE_1= GIT_CONFIG_KEY_2=core\.sshCommand GIT_CONFIG_VALUE_2="\$GIT_SSH_COMMAND"/);
+		assert.doesNotMatch(prelude, /GIT_CONFIG_KEY_0/);
+	});
+
+	it("writes the ssh command once (the other use refers to it)", () => {
+		assert.equal(prelude.split("IdentityAgent=none").length - 1, 1);
+		assert.match(prelude, /export GIT_SSH_COMMAND='ssh -F \/dev\/null /);
+	});
+
+	it("quotes only what the shell would change", () => {
+		assert.doesNotMatch(prelude.replace(/GIT_SSH_COMMAND='[^']*'/, ""), /'/);
+	});
+
+	it("never mentions a value of a removed variable", () => {
+		assert.doesNotMatch(prelude, /'t'|=t\b|\/s\b/);
+	});
+
+	it("an environment with nothing to remove starts at `export` (no empty unset)", () => {
+		const clean = lockPrelude(lockEnvironment({ PATH: "/bin" }, PLACES));
+		assert.match(clean, /^export GIT_SSH_COMMAND=/);
+		assert.doesNotMatch(clean, /unset/);
+	});
+
+	it("quotes a value with spaces, escaping embedded single quotes", () => {
+		const odd = lockPrelude(lockEnvironment({}, { configDir: "/tmp/it's here", deny: "/usr/bin/false" }));
+		assert.match(odd, /GH_CONFIG_DIR='\/tmp\/it'\\''s here'/);
 	});
 
 	it("skips names a shell cannot unset", () => {
-		const bad = lockEnvironment({ "BASH_FUNC_x%%_TOKEN": "() { :; }" }, DIR);
+		const bad = lockEnvironment({ "BASH_FUNC_x%%_TOKEN": "() { :; }" }, PLACES);
 		assert.deepEqual(bad.removed, ["BASH_FUNC_x%%_TOKEN"]);
 		assert.doesNotMatch(lockPrelude(bad), /BASH_FUNC/);
 	});
-});
 
-describe("S10 the short prefix line and lock.sh", () => {
-	it("the line sources lock.sh in the private dir and exits when it cannot", () => {
-		assert.equal(lockScriptPath(DIR), `${DIR}/lock.sh`);
-		assert.equal(lockSourceLine(DIR), `. '${DIR}/lock.sh' || exit 1`);
-	});
-
-	it("quotes a path with single quotes, spaces and shell characters", () => {
-		assert.equal(lockSourceLine("/tmp/it's $x `y`"), `. '/tmp/it'\\''s $x \`y\`/lock.sh' || exit 1`);
-	});
-
-	it("writeLockScript writes the prelude for the given environment, mode 0600, and again over an edited file", () => {
-		const dir = mkdtempSync(join(tmpdir(), "lock-sh-"));
-		try {
-			const env = { GH_TOKEN: "t", PATH: "/bin" };
-			writeLockScript(dir, env);
-			const expected = `${lockPrelude(lockEnvironment(env, dir))}\n`;
-			assert.equal(readFileSync(lockScriptPath(dir), "utf8"), expected);
-			assert.equal(statSync(lockScriptPath(dir)).mode & 0o777, 0o600);
-			writeFileSync(lockScriptPath(dir), "# weakened\n");
-			writeLockScript(dir, env);
-			assert.equal(readFileSync(lockScriptPath(dir), "utf8"), expected);
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-		}
-	});
-
-	it("throws when the directory does not exist (the guard blocks the call)", () => {
-		assert.throws(() => writeLockScript(join(tmpdir(), "brigadev-no-such-dir", "x"), {}));
+	it("stays short for a typical environment", () => {
+		const typical = lockPrelude(lockEnvironment({ PATH: "/usr/bin", HOME, SSH_AUTH_SOCK: "/tmp/agent.sock", GH_TOKEN: "x" }, PLACES));
+		assert.ok(typical.length < 700, `${typical.length}`);
 	});
 });
 
@@ -339,5 +266,11 @@ describe("S10 the per-call registry shared by the guard and bg_start", () => {
 		assert.match(line, /credential lock: on/);
 		assert.match(line, /SSH agent/);
 		assert.match(line, /remote call you approve/);
+		assert.match(line, /no file on disk/);
+		assert.match(line, /npm private-registry auth and docker plugins\/contexts/);
+	});
+
+	it("there is no private lock dir any more", () => {
+		assert.equal(credLockDir(), undefined);
 	});
 });

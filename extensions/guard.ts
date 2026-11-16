@@ -6,15 +6,14 @@
  * Subagents load this file explicitly (`-e`), so it must work standalone.
  */
 
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
 import { createBackup, type BackupPlan } from "../lib/dsp-backup.ts";
-import { buildCredLock, clearCredLocks, lockEnvironment, lockPaths, lockSourceLine, markCredLock, setCredLockDir, writeCredLock, writeLockScript } from "../lib/dsp-credlock.ts";
+import { clearCredLocks, lockEnvironment, lockPlaces, lockPrelude, markCredLock, type LockPlaces } from "../lib/dsp-credlock.ts";
 import { appendDspAudit, dspAuditDir, dspAuditFile, dspAuditRecord, dspStatusLine, noteDspAllowed, resetDspCount } from "../lib/dsp-audit.ts";
 import { bashProtectedTargets, isCredentialPath, protectedPathKind, type ProtectedPathContext } from "../lib/dsp-paths.ts";
 import { auditKind, decideDspCommand, isAutoAllowedForAudit, readRemoteTarget, remoteDialog, type DspResult } from "../lib/dsp-policy.ts";
@@ -43,8 +42,8 @@ export default function (pi: ExtensionAPI) {
 	const outsideGrants = new Set<string>();
 	// Worktree tree the user granted a one-shot commit force for (/brigadev:force-commit). Only that command sets it.
 	let forcedTree: string | undefined;
-	// S10: the private dir of the DSP credential lock, created at the first locked command and removed at shutdown.
-	let lockDir: string | undefined;
+	// S10: the DSP credential lock for this session, computed once from the parent environment (nothing is written to disk).
+	let sessionLock: { places: LockPlaces; prelude: string } | undefined;
 
 	const projectRoot = (ctx: ExtensionContext) => canonicalPath(process.env[CHILD_ENV.PROJECT_ROOT] ?? ctx.cwd);
 	/** DSP applies to the parent session only: subagents never inherit it. */
@@ -204,62 +203,35 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		sessionLock = undefined;
 		resetDspCount();
 		restoreMode(ctx);
 	});
 	pi.on("session_tree", async (_event, ctx) => restoreMode(ctx));
-	// The lock's private dir (empty gh config, sanitized npmrc/docker copies) never outlives the session.
 	pi.on("session_shutdown", async () => {
 		clearCredLocks();
-		const dir = lockDir;
-		lockDir = undefined;
-		setCredLockDir(undefined);
-		if (dir) rmSync(dir, { recursive: true, force: true });
+		sessionLock = undefined;
 	});
-
-	/** The lock's private dir, created on first use (mode 0700) and rebuilt if something removed its files. Throws when it cannot be made. */
-	const ensureLockDir = (): string => {
-		if (lockDir && existsSync(lockPaths(lockDir).askpass)) return lockDir;
-		const dir = lockDir ?? mkdtempSync(join(tmpdir(), "brigadev-lock-"));
-		try {
-			writeCredLock(buildCredLock({ env: process.env, home: homedir(), dir }));
-		} catch (error) {
-			if (!lockDir) rmSync(dir, { recursive: true, force: true });
-			throw error;
-		}
-		lockDir = dir;
-		setCredLockDir(dir);
-		return dir;
-	};
 
 	/**
 	 * S10: runs the call in the credential-locked environment. The decision and every dialog were made on the original command; this
 	 * is the last step. `bg_start` passes the locked environment through its spawn (background-terminals.ts takes the mark for this
-	 * call id); `bash` gets one short line that sources `lock.sh` (see lockSourceLine), because Pi's bash tool has no per-call environment: its spawn
+	 * call id); `bash` gets the prelude as its first line (lockPrelude), because Pi's bash tool has no per-call environment: its spawn
 	 * hook is per tool object and gets no call id, and replacing the tool would drop the user's shellPath/shellCommandPrefix settings.
-	 * Returns a block reason when the lock cannot be set up: a command never runs unlocked by accident.
+	 * The lock depends on no file the agent can write: the prelude is inline static text and every target is read-only.
 	 */
-	const lockCall = (toolName: string, toolCallId: string, input: unknown): string | undefined => {
-		let dir: string;
-		try {
-			dir = ensureLockDir();
-		} catch (error) {
-			return `Blocked by brigadev DSP: the credential lock could not be set up (${error instanceof Error ? error.message : String(error)}), so the command was not run.`;
+	const lockCall = (toolName: string, toolCallId: string, input: unknown): void => {
+		if (!sessionLock) {
+			const places = lockPlaces();
+			sessionLock = { places, prelude: lockPrelude(lockEnvironment(process.env, places)) };
 		}
+		const { places, prelude } = sessionLock;
 		if (toolName === "bg_start") {
-			markCredLock(toolCallId, (env) => lockEnvironment(env, dir).env);
-			return undefined;
+			markCredLock(toolCallId, (env) => lockEnvironment(env, places).env);
+			return;
 		}
 		const fields = input as { command?: unknown };
-		if (typeof fields.command !== "string") return undefined;
-		// Rewritten before every locked call, so an edit of lock.sh between two calls cannot weaken the next one.
-		try {
-			writeLockScript(dir, process.env);
-		} catch (error) {
-			return `Blocked by brigadev DSP: the credential lock could not be set up (${error instanceof Error ? error.message : String(error)}), so the command was not run.`;
-		}
-		fields.command = `${lockSourceLine(dir)}\n${fields.command}`;
-		return undefined;
+		if (typeof fields.command === "string") fields.command = `${prelude}\n${fields.command}`;
 	};
 
 	const kindsOf = (items: Array<{ label: string }>) => [...new Set(items.map((item) => item.label))].join(", ");
@@ -383,10 +355,7 @@ export default function (pi: ExtensionAPI) {
 				if (snapshot) beforeBash.set(event.toolCallId, snapshot);
 			}
 			// S10, last: every rule above decided allow. Only an exact call the user approved in the remote dialog runs unlocked.
-			if (dsp && !remoteApproved) {
-				const reason = lockCall(event.toolName, event.toolCallId, event.input);
-				if (reason) return { block: true, reason };
-			}
+			if (dsp && !remoteApproved) lockCall(event.toolName, event.toolCallId, event.input);
 			return undefined;
 		}
 

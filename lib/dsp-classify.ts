@@ -5,9 +5,10 @@
 
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { extractWriteTargets } from "./bash-writes.ts";
 import { AGENT_VARIABLES, isLockedVariable, OVERRIDDEN_VARIABLES } from "./dsp-credlock.ts";
+import { isCredentialPath } from "./dsp-paths.ts";
 import {
 	basename,
 	classifyCommand,
@@ -82,9 +83,9 @@ interface Runtime {
 
 // ── wrappers ────────────────────────────────────────────────────────────────────────────────────────────────
 
-const DSP_WRAPPERS = new Set(["sudo", "doas", "env", "command", "builtin", "nohup", "time", "nice", "exec", "xargs", "timeout", "caffeinate", "stdbuf", "setsid", "ionice", "watch", "chroot", "unshare", "sshpass", "busybox", "toybox", "unbuffer", "chronic", "taskset"]);
+const DSP_WRAPPERS = new Set(["sudo", "doas", "env", "command", "builtin", "nohup", "time", "nice", "exec", "xargs", "timeout", "caffeinate", "stdbuf", "setsid", "ionice", "watch", "chroot", "unshare", "sshpass", "busybox", "toybox", "unbuffer", "chronic", "taskset", "chrt", "systemd-run", "firejail", "numactl", "cpulimit", "trickle", "proxychains", "proxychains4", "torsocks", "sandbox-exec"]);
 /** Wrappers whose first words (after the options) name something other than the command. */
-const WRAPPER_SKIP_POSITIONALS: Record<string, number> = { chroot: 1, taskset: 1 };
+const WRAPPER_SKIP_POSITIONALS: Record<string, number> = { chroot: 1, taskset: 1, chrt: 1 };
 const WRAPPER_VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
 	sudo: new Set(["-u", "-g", "-h", "-p", "-C", "-r", "-t", "-T", "-U", "-D", "-R", "--user", "--group", "--host", "--prompt", "--chdir"]),
 	doas: new Set(["-u", "-C"]),
@@ -101,6 +102,14 @@ const WRAPPER_VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
 	watch: new Set(["-n", "--interval"]),
 	sshpass: new Set(["-p", "-f", "-d", "-P"]),
 	chroot: new Set(["--userspec", "--groups"]),
+	numactl: new Set(["-C", "-N", "-m", "-i", "-p", "-c", "-w", "--physcpubind", "--cpunodebind", "--membind", "--interleave", "--preferred", "--preferred-many", "--weighted-interleave"]),
+	"systemd-run": new Set(["-u", "--unit", "-p", "--property", "-E", "--setenv", "--slice", "-M", "--machine", "-H", "--host", "--description", "--uid", "--gid", "--working-directory", "--on-active", "--on-boot", "--on-startup", "--on-unit-active", "--on-unit-inactive", "--on-calendar", "--timer-property", "--service-type", "--nice", "-d"]),
+	cpulimit: new Set(["-l", "--limit", "-p", "--pid", "-e", "--exe", "-P", "--path", "-c", "--cpu"]),
+	trickle: new Set(["-d", "-u", "-w", "-t", "-l", "-n"]),
+	proxychains: new Set(["-f"]),
+	proxychains4: new Set(["-f"]),
+	torsocks: new Set(["-a", "--address", "-P", "--port", "-u", "--user", "-p", "--pass", "--password"]),
+	"sandbox-exec": new Set(["-p", "-f", "-n", "-D"]),
 	unshare: new Set(["-R", "-w", "-S", "-G", "--root", "--wd", "--setuid", "--setgid", "--propagation", "--map-user", "--map-group", "--map-users", "--map-groups"]),
 };
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
@@ -151,12 +160,19 @@ function collectReplace(info: XargsInfo, word: string, next: string | undefined)
 }
 
 // Runners that take the command as a text or after their own operands: `su -c 'cmd'`, `script -q /dev/null cmd`, ...
-const RUNNERS = new Set(["su", "runuser", "sg", "script", "flock", "osascript", "parallel", "npx", "npm", "pnpm", "yarn", "bun", "bunx", "uv", "uvx", "poetry", "pdm", "pipenv", "rye", "hatch", "pipx", "bundle", "tmux", "screen"]);
+const RUNNERS = new Set(["su", "runuser", "sg", "script", "flock", "osascript", "parallel", "npx", "npm", "pnpm", "yarn", "bun", "bunx", "uv", "uvx", "poetry", "pdm", "pipenv", "rye", "hatch", "pipx", "bundle", "tmux", "screen", "pnpx", "mise", "rtx", "direnv", "nix-shell", "nix", "conda", "mamba", "micromamba", "devbox", "pixi", "asdf"]);
 const SU_VALUES = new Set(["-s", "--shell", "-g", "--group", "-G", "--supp-group", "-w", "--whitelist-environment"]);
 const SCRIPT_VALUES = new Set(["-T", "-I", "-O", "-B", "-E", "-m", "-F", "-t", "--timing", "--log-in", "--log-out", "--log-io", "--log-timing", "--logging-format", "--echo", "--output-limit"]);
 const FLOCK_VALUES = new Set(["-w", "--timeout", "--wait", "-E", "--conflict-exit-code"]);
 const PARALLEL_VALUES = new Set(["-j", "--jobs", "-n", "--max-args", "-N", "-L", "--max-lines", "-S", "--sshlogin", "--sshloginfile", "--slf", "-a", "--arg-file", "--arg-file-sep", "--colsep", "-C", "-d", "--delimiter", "-I", "--replace", "-E", "--eof", "--results", "--joblog", "--tagstring", "--timeout", "--retries", "--delay", "--load", "--memfree", "--rpl"]);
 const PARALLEL_MARKER = /^::::?\+?$/;
+const MISE_VALUES = new Set(["-C", "--cd", "-j", "--jobs", "-E", "--env"]);
+const NIX_VALUES = new Set(["--option", "--extra-experimental-features", "-I", "--arg", "--argstr", "-E", "--expr", "-A", "--attr", "-j", "--max-jobs", "--override-input", "--keep", "--exclude", "--include", "--profile"]);
+const CONDA_VALUES = new Set(["-n", "--name", "-p", "--prefix", "-r", "--root-prefix", "--cwd", "-a", "--attach"]);
+const DEVBOX_VALUES = new Set(["-c", "--config", "-e", "--env", "--env-file"]);
+const PIXI_VALUES = new Set(["--manifest-path", "-e", "--environment", "--color", "--platform"]);
+/** Registries `nix run <registry>#<program>` takes a program from by name. */
+const NIX_REGISTRY_PROGRAM = /^(?:nixpkgs(?:\/[^#]*)?|nixpkgs-unstable|nixos-[\w.-]+)#([\w.+-]+)/;
 
 interface RunnerResult {
 	rest: string[];
@@ -168,6 +184,26 @@ interface RunnerResult {
 }
 
 const shellText = (text: string): string[] => ["sh", "-c", text];
+
+/** The text after one of `flags` (`--run 'cmd'`, `--run=cmd`), skipping the values of the other options. */
+function flagText(args: string[], flags: readonly string[], values: ReadonlySet<string> = new Set()): string | undefined {
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (flags.includes(arg)) return args[i + 1];
+		const joined = flags.find((flag) => flag.startsWith("--") && arg.startsWith(`${flag}=`));
+		if (joined) return arg.slice(joined.length + 1);
+		if (values.has(arg)) i++;
+	}
+	return undefined;
+}
+
+/** A launcher's command: the text after a shell flag (`-c 'text'`), or the words after `--` (`mise exec node@20 -- npm test`). */
+function dashedCommand(args: string[], flags: readonly string[]): RunnerResult | undefined {
+	const dashes = args.indexOf("--");
+	const text = flagText(dashes === -1 ? args : args.slice(0, dashes), flags);
+	if (text !== undefined) return { rest: shellText(text) };
+	return dashes !== -1 && args.length > dashes + 1 ? { rest: args.slice(dashes + 1) } : undefined;
+}
 
 /** The text after `-c`/`--command` (also in a cluster such as `-lc`, or `--command=text`). `stopAtOperand`: only options before the first operand count. */
 function commandText(args: string[], valueOptions: ReadonlySet<string>, stopAtOperand = false): string | undefined {
@@ -398,6 +434,51 @@ function unwrapRunner(name: string, args: string[]): RunnerResult | undefined {
 			if (!found || found.sub !== (name === "bundle" ? "exec" : "run")) return undefined;
 			return launched(found.rest, name === "pipx" ? PIPX_VALUES : new Set());
 		}
+		case "pnpx":
+			return launched(args, NPX_VALUES, ["-c", "--call"]);
+		case "mise":
+		case "rtx": {
+			const found = subcommandAt(args, MISE_VALUES);
+			return found && (found.sub === "x" || found.sub === "exec") ? dashedCommand(found.rest, ["-c", "--command"]) : undefined;
+		}
+		case "direnv": {
+			const found = subcommandAt(args, new Set());
+			const command = found?.sub === "exec" ? afterOptions(found.rest, new Set(), 1) : [];
+			return command.length > 0 ? { rest: command } : undefined;
+		}
+		case "asdf": {
+			const found = subcommandAt(args, new Set());
+			return found?.sub === "exec" ? launched(found.rest, new Set()) : undefined;
+		}
+		case "nix-shell": {
+			const text = flagText(args, ["--run", "--command"], NIX_VALUES);
+			return text === undefined ? undefined : { rest: shellText(text) };
+		}
+		case "nix": {
+			const found = subcommandAt(args, NIX_VALUES);
+			if (!found) return undefined;
+			if (found.sub === "develop" || found.sub === "shell") {
+				const at = found.rest.findIndex((arg) => arg === "-c" || arg === "--command");
+				return at >= 0 && found.rest.length > at + 1 ? { rest: found.rest.slice(at + 1) } : undefined;
+			}
+			if (found.sub !== "run") return undefined;
+			// `nix run nixpkgs#git -- push` runs git; any other flake app is code the guard cannot read.
+			const program = NIX_REGISTRY_PROGRAM.exec(found.rest.find((arg) => !arg.startsWith("-")) ?? "");
+			const dashes = found.rest.indexOf("--");
+			if (program) return { rest: [program[1], ...(dashes === -1 ? [] : found.rest.slice(dashes + 1))] };
+			return { rest: ["nix", ...args], opaque: "nix run runs a flake app the guard cannot read", stop: true };
+		}
+		case "conda":
+		case "mamba":
+		case "micromamba": {
+			const found = subcommandAt(args, CONDA_VALUES);
+			return found?.sub === "run" ? launched(found.rest, CONDA_VALUES) : undefined;
+		}
+		case "devbox":
+		case "pixi": {
+			const found = subcommandAt(args, name === "pixi" ? PIXI_VALUES : DEVBOX_VALUES);
+			return found?.sub === "run" ? launched(found.rest, name === "pixi" ? PIXI_VALUES : DEVBOX_VALUES) : undefined;
+		}
 		case "tmux":
 			return tmuxCommand(args);
 		case "screen":
@@ -437,6 +518,8 @@ export function dspUnwrap(argv: string[]): UnwrapResult {
 		if (!DSP_WRAPPERS.has(name)) break;
 		if (name === "sudo" || name === "doas" || name === "chroot") privileged = true;
 		if (name === "xargs") xargs ??= { replace: [] };
+		// The service manager starts the command with its own environment, so the credential lock does not reach it.
+		if (name === "systemd-run") opaque.push("systemd-run starts the command from the service manager, outside the credential lock");
 		rest = rest.slice(1);
 		const values = WRAPPER_VALUE_OPTIONS[name];
 		let needsDuration = name === "timeout";
@@ -750,7 +833,8 @@ function gitCommandStrings(args: string[]): string[] {
 			break;
 		}
 		case "bisect":
-			if (rest[0] === "run" && rest.length > 1) texts.push(rest.slice(1).join(" "));
+			// git runs the words as a program and its arguments (`bisect run sh -c 'git push'`), so keep each word whole.
+			if (rest[0] === "run" && rest.length > 1) texts.push(rest.slice(1).map(quote).join(" "));
 			break;
 		default:
 			break;
@@ -1564,6 +1648,387 @@ function packageScriptTags(manager: string, args: string[], rt: Runtime): DspTag
 
 // ── the refine hook ─────────────────────────────────────────────────────────────────────────────────────────
 
+// ── editors, stream editors, `at`, `just` and HTTP clients that run or send what their arguments say ──────────
+
+/** Command texts a program runs through a shell, and why some of what it runs cannot be read. */
+interface CommandTexts {
+	commands: string[];
+	opaque: string[];
+}
+
+const noTexts = (): CommandTexts => ({ commands: [], opaque: [] });
+const mergeTexts = (into: CommandTexts, from: CommandTexts) => {
+	into.commands.push(...from.commands);
+	into.opaque.push(...from.opaque);
+};
+
+/** The string literal that starts at `at` (single quotes too with `single`) and the index after it. */
+function readLiteral(text: string, at: number, single: boolean): { value: string; end: number } | undefined {
+	const open = text[at];
+	if (open !== '"' && !(single && open === "'")) return undefined;
+	let value = "";
+	for (let i = at + 1; i < text.length; i++) {
+		const ch = text[i];
+		if (ch === "\\" && open === '"') {
+			const next = text[++i] ?? "";
+			value += next === "n" || next === "r" || next === "t" ? " " : next;
+			continue;
+		}
+		if (ch === open) {
+			if (open === "'" && text[i + 1] === "'") {
+				value += "'";
+				i++;
+				continue;
+			}
+			return { value, end: i + 1 };
+		}
+		value += ch;
+	}
+	return undefined;
+}
+
+/** The command in the first argument of `system('git push')` or `job_start(['git', 'push'])`; undefined when it is not a plain literal. */
+function callCommand(text: string, from: number): string | undefined {
+	let at = from;
+	while (text[at] === " ") at++;
+	const first = readLiteral(text, at, true);
+	if (first) return /^\s*[,)\]}]/.test(text.slice(first.end)) ? first.value : undefined;
+	if (text[at] !== "[") return undefined;
+	const words: string[] = [];
+	for (at++; ; ) {
+		while (text[at] === " " || text[at] === ",") at++;
+		if (text[at] === "]") return words.length > 0 ? words.map(quote).join(" ") : undefined;
+		const word = readLiteral(text, at, true);
+		if (!word) return undefined;
+		words.push(word.value);
+		at = word.end;
+	}
+}
+
+const EX_EXECUTE = /\bexe(?:c(?:u(?:t(?:e)?)?)?)?(?![\w-])/;
+const EX_PLAIN_EXECUTE = /^[:\s]*(?:silent!?\s+)?exe(?:c(?:u(?:t(?:e)?)?)?)?\s+(["'])((?:(?!\1).)*)\1\s*$/;
+const EX_CALLS = /\b(?:system|systemlist|job_start|term_start|jobstart|termopen|nvim_command|libcall)\s*\(\s*/g;
+const EX_EMBEDDED = /^[\s:]*(?:silent!?\s+)?(?:py3?|python3?|pyx|pythonx|py3do|pydo|lua|luado|perl|perldo|ruby|rubydo|rb|tcl|tcldo|mz|mzscheme)(?![\w])/;
+const cleanEx = (text: string) => text.replace(/^[\s!]+/, "").replace(/(?:\\?<cr>|\\[rn]|["'\s])+$/gi, "");
+
+/** Shell commands in ex/vim command text: `!cmd`, `r !cmd`, `%!cmd`, `system('cmd')`, `:terminal cmd`; code that builds its command at run time asks. */
+function exShellCommands(text: string): CommandTexts {
+	const out = noTexts();
+	for (const raw of text.split("\n")) {
+		const line = raw.trim();
+		if (line === "") continue;
+		let body = line;
+		if (EX_EXECUTE.test(line)) {
+			const plain = EX_PLAIN_EXECUTE.exec(line);
+			if (!plain) {
+				out.opaque.push("the editor runs a command built by execute");
+				continue;
+			}
+			body = plain[2];
+		}
+		const bang = body.indexOf("!");
+		if (bang >= 0) {
+			const command = cleanEx(body.slice(bang + 1));
+			if (command !== "") out.commands.push(command);
+		}
+		for (const call of body.matchAll(EX_CALLS)) {
+			const command = callCommand(body, (call.index ?? 0) + call[0].length);
+			if (command === undefined) out.opaque.push(`${call[0].replace(/\s*\(\s*$/, "")}() is given a command the guard cannot read`);
+			else out.commands.push(command);
+		}
+		const terminal = /(?:^|[\s:|])term(?:inal)?!?\s+(?:\+\+\S+\s+)*(\S.*)$/.exec(body);
+		if (terminal) out.commands.push(cleanEx(terminal[1]));
+		if (EX_EMBEDDED.test(body)) out.opaque.push("the editor runs code in an embedded interpreter");
+	}
+	return out;
+}
+
+const EDITOR_NAMES = new Set(["vim", "vi", "nvim", "ex", "view", "vimdiff", "nvimdiff", "gvim", "mvim", "rvim", "rview", "evim", "ed"]);
+const EDITOR_SKIP_VALUES = new Set(["-i", "-t", "-T", "-U", "-w", "-W", "--startuptime", "--servername", "--listen"]);
+const EX_MODE_FLAG = /^-[A-Za-z]*[eE][A-Za-z]*$/;
+
+/** What vim, nvim, ex and ed run through a shell: `-c`, `+cmd`, `--cmd`, `-S file`, `-u file`, and (in ex mode) commands from standard input. */
+function editorTexts(name: string, args: string[], rt: Runtime, before: string): CommandTexts {
+	const out = noTexts();
+	const readInto = (file: string) => {
+		const path = resolveFrom(file, rt);
+		if (path === undefined) {
+			out.opaque.push(`cannot tell which editor script ${file} is`);
+			return;
+		}
+		const read = reader(rt)(path);
+		if ("text" in read) mergeTexts(out, exShellCommands(read.text));
+		else if (!("missing" in read) && !("notFile" in read)) out.opaque.push(`cannot read the editor script ${file}`);
+	};
+	if (name !== "ed") {
+		for (let i = 0; i < args.length; i++) {
+			const arg = args[i];
+			if (arg === "--") break;
+			if (arg === "-c" || arg === "--cmd") {
+				if (args[i + 1] !== undefined) mergeTexts(out, exShellCommands(args[++i]));
+			} else if (arg.startsWith("--cmd=")) mergeTexts(out, exShellCommands(arg.slice("--cmd=".length)));
+			else if (/^\+./.test(arg)) mergeTexts(out, exShellCommands(arg.slice(1)));
+			else if (arg === "-S" || arg === "-u") {
+				const file = args[++i];
+				if (file !== undefined && !/^(NONE|NORC|DEFAULTS)$/.test(file)) readInto(file);
+			} else if (EDITOR_SKIP_VALUES.has(arg)) i++;
+		}
+	}
+	if (name === "ed" || name === "ex" || args.some((arg) => EX_MODE_FLAG.test(arg))) {
+		let fromInput = false;
+		for (let i = 0; i < args.length; i++) {
+			const arg = args[i];
+			if (arg === "<<<" || arg.startsWith("<<<")) {
+				fromInput = true;
+				mergeTexts(out, exShellCommands(arg === "<<<" ? (args[++i] ?? "") : arg.slice(3)));
+			} else if (arg === "<" || /^<[^<(]/.test(arg)) {
+				fromInput = true;
+				const file = arg === "<" ? args[++i] : arg.slice(1);
+				if (file !== undefined) readInto(file);
+			}
+		}
+		for (const body of heredocBodies(rt.ctx.commandText)) {
+			fromInput = true;
+			mergeTexts(out, exShellCommands(body));
+		}
+		if (!fromInput && before === "|") out.opaque.push("the editor reads its commands from another command's output");
+	}
+	return out;
+}
+
+const ELISP_SHELL = /\(\s*(?:shell-command-to-string|async-shell-command|shell-command-on-region|shell-command|call-process-shell-command|start-process-shell-command|process-file-shell-command|compile|eshell-command|ansi-term|term|vterm)(?![\w-])/g;
+const ELISP_PROGRAM = /\(\s*(call-process-region|call-process|process-file|process-lines|start-file-process|start-process|make-process|async-start-process|make-comint|magit-run-git-async|magit-run-git|magit-call-git)(?![\w-])/g;
+const ELISP_EVAL = /\(\s*(?:load|load-file|eval|funcall|apply|url-retrieve|url-retrieve-synchronously)(?![\w-])/;
+
+/** The s-expression that starts at `start` (a `(`). */
+function sexpFrom(text: string, start: number): string {
+	let depth = 0;
+	for (let i = start; i < text.length; i++) {
+		const ch = text[i];
+		if (ch === '"') {
+			const literal = readLiteral(text, i, false);
+			if (!literal) break;
+			i = literal.end - 1;
+		} else if (ch === "(") depth++;
+		else if (ch === ")" && --depth === 0) return text.slice(start, i + 1);
+	}
+	return text.slice(start);
+}
+
+/** Commands in Emacs Lisp text: the string literals given to `shell-command`, `call-process`, `start-process`, ...; other evaluation asks. */
+function elispCommands(text: string): CommandTexts {
+	const out = noTexts();
+	const strings = (sexp: string) => [...sexp.matchAll(/"((?:[^"\\]|\\[\s\S])*)"/g)].map((found) => found[1].replace(/\\([\s\S])/g, "$1"));
+	for (const found of text.matchAll(ELISP_SHELL)) {
+		const literals = strings(sexpFrom(text, found.index ?? 0));
+		if (literals.length === 0) out.opaque.push(`emacs runs ${found[0].slice(1).trim()} with a command the guard cannot read`);
+		else out.commands.push(...literals);
+	}
+	for (const found of text.matchAll(ELISP_PROGRAM)) {
+		const words = strings(sexpFrom(text, found.index ?? 0));
+		if (words.length === 0) out.opaque.push(`emacs runs ${found[1]} with a program the guard cannot read`);
+		else if (found[1].startsWith("magit-")) out.commands.push(["git", ...words].map(quote).join(" "));
+		else {
+			// The first string may be a process name (`start-process "name" nil "git" "push"`).
+			out.commands.push(words.map(quote).join(" "));
+			if (words.length > 1) out.commands.push(words.slice(1).map(quote).join(" "));
+		}
+	}
+	if (ELISP_EVAL.test(text)) out.opaque.push("emacs loads or evaluates code the guard cannot read");
+	return out;
+}
+
+/** What `emacs --eval`, `-l file` and `emacsclient -e` run. */
+function emacsTexts(args: string[], rt: Runtime, client: boolean): CommandTexts {
+	const out = noTexts();
+	const loadFile = (file: string) => {
+		const path = resolveFrom(file, rt);
+		const read = path === undefined ? undefined : reader(rt)(path);
+		if (read && "text" in read) mergeTexts(out, elispCommands(read.text));
+		else if (!read || (!("missing" in read) && !("notFile" in read))) out.opaque.push(`cannot read the Emacs Lisp file ${file}`);
+	};
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		const joined = /^--?(?:eval|execute)=([\s\S]*)$/.exec(arg);
+		if (joined) mergeTexts(out, elispCommands(joined[1]));
+		else if (/^--?(?:eval|execute)$/.test(arg) || (client && arg === "-e")) mergeTexts(out, elispCommands(args[++i] ?? ""));
+		else if (!client && (arg === "-l" || arg === "--load" || arg === "-load" || arg === "--script")) {
+			const file = args[++i];
+			if (file !== undefined) loadFile(file);
+		}
+	}
+	return out;
+}
+
+const SED_S = /(?:^|[;{}\n]|[\d$\/!,])\s*s([^\w\s\\;])((?:\\[\s\S]|(?!\1)[^\\\n])*)\1((?:\\[\s\S]|(?!\1)[^\\\n])*)\1([A-Za-z0-9]*)/g;
+const SED_E = /(?:^|[;{}\n])\s*(?:(?:\d+|\$|\/(?:\\.|[^\/\\])*\/)(?:\s*,\s*(?:\d+|\$|\/(?:\\.|[^\/\\])*\/))?\s*)?!?\s*e(?![A-Za-z0-9_])([^\n]*)/g;
+
+/** `e command` and `s///e` in a sed script run a shell command (`e` alone and the `e` flag run the pattern space). */
+function sedScriptTexts(script: string): CommandTexts {
+	const out = noTexts();
+	for (const found of script.matchAll(SED_S)) if (found[4].includes("e")) out.opaque.push("sed s///e runs the result of the substitution as a command");
+	for (const found of script.matchAll(SED_E)) {
+		const command = (found[1] ?? "").trim();
+		if (command === "" || /^[;}]/.test(command)) out.opaque.push("sed e runs the pattern space as a command");
+		else out.commands.push(command);
+	}
+	return out;
+}
+
+/** The scripts sed is given (`-e`, `-f file`, or the first operand). */
+function sedTexts(args: string[], rt: Runtime): CommandTexts {
+	const out = noTexts();
+	if (args.includes("--sandbox")) return out;
+	const scripts: string[] = [];
+	const files: string[] = [];
+	const operands: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--") {
+			operands.push(...args.slice(i + 1));
+			break;
+		}
+		if (arg === "--expression" || /^-[A-Za-z]*e$/.test(arg)) {
+			if (args[i + 1] !== undefined) scripts.push(args[++i]);
+		} else if (arg.startsWith("--expression=")) scripts.push(arg.slice("--expression=".length));
+		else if (arg === "--file" || /^-[A-Za-z]*f$/.test(arg)) {
+			if (args[i + 1] !== undefined) files.push(args[++i]);
+		} else if (arg.startsWith("--file=")) files.push(arg.slice("--file=".length));
+		else if (arg === "-l" || arg === "--line-length") i++;
+		else if (!arg.startsWith("-")) operands.push(arg);
+	}
+	// BSD `sed -i '' 's/a/b/' file`: the empty word is the backup suffix.
+	if (scripts.length === 0 && files.length === 0) {
+		const first = operands.find((word) => word !== "");
+		if (first !== undefined) scripts.push(first);
+	}
+	for (const script of scripts) mergeTexts(out, sedScriptTexts(script));
+	for (const file of files) {
+		const path = resolveFrom(file, rt);
+		const read = path === undefined ? undefined : reader(rt)(path);
+		if (read && "text" in read) mergeTexts(out, sedScriptTexts(read.text));
+		else if (!read || (!("missing" in read) && !("notFile" in read))) out.opaque.push(`cannot read the sed script ${file}`);
+	}
+	return out;
+}
+
+/** `at` and `batch` run the commands they are given in a file (`-f`) or on standard input. */
+function atTags(args: string[], rt: Runtime, before: string): DspTag[] {
+	const file = optionValue(args, "-f", "--file");
+	if (file !== undefined) return scriptFileTags(file, rt);
+	const hasInput = args.some((arg) => /^<(?!\()/.test(arg)) || heredocBodies(rt.ctx.commandText).length > 0;
+	if (hasInput) return stdinProgramTags(args, rt);
+	return before === "|" ? [unknownTag("it runs the commands another command prints, which cannot be checked for remote actions", true)] : [];
+}
+
+// `just`: the recipes (and backtick expressions) of a justfile run like a Makefile's.
+const JUST_VALUE_OPTIONS = new Set(["-f", "--justfile", "-d", "--working-directory", "--set", "--shell", "--shell-arg", "--color", "--dotenv-filename", "--dotenv-path", "--chooser", "--command-color", "--dump-format", "--list-heading", "--list-prefix", "--tempdir", "--ceiling", "--timestamp-format"]);
+const JUST_NO_RUN = new Set(["-l", "--list", "--summary", "--dump", "--fmt", "--init", "--evaluate", "--variables", "--show", "-s", "--completions", "--man", "--help", "-h", "--version", "-V", "--groups", "--edit", "-e"]);
+
+function parseJustfile(text: string): { recipes: Map<string, { dependencies: string[]; body: string[] }>; first: string | undefined; backticks: string[] } {
+	const recipes = new Map<string, { dependencies: string[]; body: string[] }>();
+	const backticks: string[] = [];
+	let current: { dependencies: string[]; body: string[] } | undefined;
+	let first: string | undefined;
+	for (const line of text.split("\n")) {
+		if (/^[ \t]/.test(line)) {
+			if (current && line.trim() !== "") current.body.push(line.trim().replace(/^[@-]+/, ""));
+			continue;
+		}
+		if (line.trim() === "") continue;
+		current = undefined;
+		for (const found of line.matchAll(/`([^`]*)`/g)) backticks.push(found[1]);
+		const header = /^@?([A-Za-z_][\w-]*)([^:\n]*?):(?!=)(.*)$/.exec(line);
+		if (!header) continue;
+		current = { dependencies: header[3].split("#")[0].match(/[A-Za-z_][\w-]*/g) ?? [], body: [] };
+		recipes.set(header[1], current);
+		first ??= header[1];
+	}
+	return { recipes, first, backticks };
+}
+
+function justTags(args: string[], rt: Runtime): DspTag[] {
+	if (args.some((arg) => JUST_NO_RUN.has(arg))) return [];
+	if (rt.scope.dir === undefined && optionValue(args, "-f", "--justfile") === undefined) return [unknownTag("cannot tell which justfile just reads (the directory is not literal)", true)];
+	const state: { text?: string; used: string; dir: string | undefined } = { used: "justfile", dir: rt.scope.dir };
+	const explicit = optionValue(args, "-f", "--justfile");
+	const tryRead = (path: string): DspTag[] | undefined => {
+		const read = reader(rt)(path);
+		if ("text" in read) {
+			state.text = read.text;
+			state.used = path;
+			state.dir = dirname(path);
+			return undefined;
+		}
+		if ("missing" in read || "notFile" in read) return undefined;
+		return [unknownTag("tooLarge" in read ? `${path} is too large to scan` : `cannot read ${path} as a justfile`, true)];
+	};
+	if (explicit !== undefined) {
+		const path = resolveFrom(explicit, rt);
+		if (path === undefined) return [unknownTag(`cannot tell which justfile ${explicit} is`, true)];
+		const failed = tryRead(path);
+		if (failed) return failed;
+	} else {
+		let search = rt.scope.dir as string;
+		for (let up = 0; up < 12 && state.text === undefined; up++) {
+			for (const name of ["justfile", "Justfile", ".justfile"]) {
+				const failed = tryRead(join(search, name));
+				if (failed) return failed;
+				if (state.text !== undefined) break;
+			}
+			const parent = dirname(search);
+			if (parent === search) break;
+			search = parent;
+		}
+	}
+	if (state.text === undefined) return [];
+	const { recipes, first, backticks } = parseJustfile(state.text);
+	const targets = positionals(args, JUST_VALUE_OPTIONS)
+		.filter((word) => !word.includes("="))
+		.map((word) => (word.includes("::") ? word.slice(word.lastIndexOf("::") + 2) : word));
+	const wanted = targets.length > 0 ? targets : first ? [first] : [];
+	const seen = new Set<string>();
+	const lines: string[] = [...backticks];
+	const visit = (name: string, depth: number) => {
+		if (seen.has(name) || depth > 20) return;
+		seen.add(name);
+		const recipe = recipes.get(name);
+		if (!recipe) return;
+		recipe.dependencies.forEach((dependency) => visit(dependency, depth + 1));
+		lines.push(...recipe.body);
+	};
+	wanted.forEach((target) => visit(target, 0));
+	return lines.length === 0 ? [] : describeHits(`${basename(state.used)} recipe ${wanted.join(" ")}`, scanText(lines.join("\n"), { ...rt, scope: { ...rt.scope, dir: state.dir } }));
+}
+
+/** curlie: curl's options (the method, the data flags) and httpie's items (`name=value`). */
+function curlieTags(args: string[], piped: boolean): DspTag[] {
+	const curl = curlTags(args);
+	if (curl.length > 0) return curl;
+	const words: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		if (CURL_VALUE_FLAGS.has(args[i]) || args[i] === "-X" || args[i] === "--request") i++;
+		else words.push(args[i]);
+	}
+	return httpieTags(words, piped);
+}
+
+/** aria2c with custom headers or a request body sends more than a download. */
+function aria2Tags(args: string[]): DspTag[] {
+	const sends = args.some((arg) => /^--(header|post-file|post-data|body-data|body-file|method)(=|$)/.test(arg));
+	return sends ? httpWriteTag(args.filter((arg) => /^[a-z][a-z0-9+.-]*:\/\//i.test(arg))) : [];
+}
+
+const LWP_VALUE_OPTIONS = new Set(["-m", "-c", "-t", "-p", "-H", "-b", "-C", "-E", "-o", "-x"]);
+
+/** `lwp-request -m POST url` and the `POST` alias. */
+function lwpTags(name: string, args: string[]): DspTag[] {
+	const attached = args.find((arg) => /^-m./.test(arg))?.slice(2);
+	const method = (name === "POST" ? "POST" : (optionValue(args, "-m") ?? attached))?.toUpperCase();
+	const writes = method !== undefined && (WRITE_METHODS.has(method) || /[$`]/.test(method));
+	return writes ? httpWriteTag(positionals(args, LWP_VALUE_OPTIONS)) : [];
+}
+
 function shellFileArgument(args: string[]): string | undefined {
 	for (let i = 0; i < args.length; i++) {
 		if (SHELL_VALUE_OPTIONS.has(args[i])) i++;
@@ -1583,7 +2048,7 @@ function inlineTags(interpreter: string, code: string, rt: Runtime): DspTag[] {
 // ── environment, credentials and command strings around a segment ───────────────────────────────────────────
 
 const ASSIGNMENT_WORD = /^([A-Za-z_][A-Za-z0-9_]*)\+?=([\s\S]*)$/;
-const ASSIGNING_BUILTINS = new Set(["export", "declare", "typeset", "readonly", "local", "env", "setenv"]);
+const ASSIGNING_BUILTINS = new Set(["export", "declare", "typeset", "readonly", "local", "env", "setenv", "let"]);
 // The names the credential lock (S10) removes or overrides come from lib/dsp-credlock.ts; `GIT_SSH` is not overridden by the lock but asks as well.
 /** `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`, ... */
 const isGitConfigName = (name: string) => /^GIT_CONFIG(_|$)/.test(name);
@@ -1682,6 +2147,244 @@ function embeddedCommands(texts: string[], rt: Runtime): { tags: DspTag[]; neste
 	return { tags, nested };
 }
 
+// ── builtins that assign, shells that load startup files, bulk and glob reads ──
+
+const isRedirectWord = (word: string) => /^[0-9]*[<>]|^&>/.test(word);
+/** The variable a word names: `NAME`, `NAME=value`, `NAME+=value`, `NAME[0]=value` -> `NAME` (`$v=0` stays `$v`: not a literal name). */
+const namePart = (word: string) => word.replace(/^([^=]*)=[\s\S]*$/, "$1").replace(/\+$/, "").replace(/\[[\s\S]*$/, "");
+
+/** The operands of a builtin up to the first redirection, without options (`values`: options that take a separate value). */
+function operandWords(args: string[], values: ReadonlySet<string> = new Set()): string[] {
+	const found: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const word = args[i];
+		if (isRedirectWord(word) || word === "|") break;
+		if (values.has(word)) i++;
+		else if (word === "" || word === "--" || ((word.startsWith("-") || word.startsWith("+")) && word.length > 1)) continue;
+		else found.push(word);
+	}
+	return found;
+}
+
+/** The variables `read` assigns: its operands, the array after `-a`, but not the values of `-d`, `-n`, `-p`, `-t`, `-u`, `-i`, `-N` (also at the end of a cluster such as `-rd ''`). */
+function readTargets(args: string[]): string[] {
+	const names: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const word = args[i];
+		if (isRedirectWord(word) || word === "|") break;
+		if (/^-[A-Za-z]+$/.test(word)) {
+			const last = word[word.length - 1];
+			if (last === "a" || last === "A") {
+				if (args[i + 1] !== undefined) names.push(args[++i]);
+			} else if ("dinNptu".includes(last)) i++;
+			continue;
+		}
+		if (word === "" || word.startsWith("-") || word.startsWith("+")) continue;
+		names.push(word.replace(/\?.*$/, "")); // zsh: `read 'name?prompt'`
+	}
+	return names;
+}
+
+const MAPFILE_VALUES = new Set(["-d", "-n", "-O", "-s", "-u", "-C", "-c"]);
+
+/**
+ * The variables a shell builtin changes without a `NAME=value` word: `read NAME`, `printf -v NAME`, `for NAME in`,
+ * `select NAME`, `getopts opts NAME`, `mapfile NAME`, `wait -p NAME`, `export -n`, `unset`, and `declare|typeset|local|readonly`
+ * with any flags (`typeset +x NAME` unexports it, `declare -n ref=NAME` points a name at it). `export NAME[=value]` only
+ * lists a name that is not a literal (`export "$v=0"`).
+ */
+function builtinTargets(name: string, args: string[]): string[] {
+	switch (name) {
+		case "unset":
+			return operandWords(args).map(namePart);
+		case "export": {
+			const names = operandWords(args).map(namePart);
+			return args.some((arg) => /^-[A-Za-z]*n[A-Za-z]*$/.test(arg)) ? names : names.filter((word) => /[$`]/.test(word));
+		}
+		case "declare":
+		case "typeset":
+		case "local":
+		case "readonly": {
+			const words = operandWords(args);
+			const targets = words.map(namePart);
+			if (args.some((arg) => /^[-+][A-Za-z]*n[A-Za-z]*$/.test(arg))) targets.push(...words.filter((word) => word.includes("=")).map((word) => word.slice(word.indexOf("=") + 1)));
+			return targets;
+		}
+		case "read":
+			return readTargets(args).map(namePart);
+		case "mapfile":
+		case "readarray":
+			return operandWords(args, MAPFILE_VALUES).map(namePart);
+		case "printf": {
+			const at = args.findIndex((arg) => arg === "-v" || /^-v./.test(arg));
+			if (at < 0) return [];
+			return [namePart(args[at] === "-v" ? (args[at + 1] ?? "") : args[at].slice(2))];
+		}
+		case "getopts":
+			return args[1] === undefined ? [] : [namePart(args[1])];
+		case "for":
+		case "select": {
+			const end = args.indexOf("in");
+			return (end === -1 ? args : args.slice(0, end)).filter((word) => !isRedirectWord(word)).map(namePart);
+		}
+		case "wait": {
+			const at = args.indexOf("-p");
+			return at >= 0 && args[at + 1] !== undefined ? [namePart(args[at + 1])] : [];
+		}
+		default:
+			return [];
+	}
+}
+
+/** Shells (and look-alikes) that read startup files when they are interactive or login shells. */
+const STARTUP_SHELLS = new Set([...SHELLS, "ash", "csh", "tcsh", "mksh", "rbash", "pdksh", "yash"]);
+
+/** Why a shell's options make it read startup files (`-i`, `-l`, `--login`, `-ic`, `--rcfile`), or undefined. Only options before the script or command text count. */
+function shellStartupReason(args: string[]): string | undefined {
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--") return undefined;
+		if (arg === "--login" || arg === "--interactive") return `${arg} makes it a login or interactive shell`;
+		if (arg === "--rcfile" || arg === "--init-file" || arg.startsWith("--rcfile=") || arg.startsWith("--init-file=")) return `${arg.split("=")[0]} loads an rc file`;
+		if (SHELL_VALUE_OPTIONS.has(arg)) {
+			i++;
+			continue;
+		}
+		if (/^-[A-Za-z]+$/.test(arg)) {
+			if (/[il]/.test(arg)) return `${arg} makes it a login or interactive shell`;
+			continue;
+		}
+		if (arg.startsWith("-") || arg.startsWith("+")) continue;
+		return undefined;
+	}
+	return undefined;
+}
+
+/** `exec -l cmd` starts the command as a login shell would be started. */
+function execLogin(rawArgv: string[]): boolean {
+	const at = rawArgv.findIndex((word) => basename(word) === "exec");
+	if (at < 0 || !rawArgv.slice(0, at).every((word) => ASSIGNMENT.test(word) || RESERVED_WORDS.has(word))) return false;
+	for (let i = at + 1; i < rawArgv.length; i++) {
+		const word = rawArgv[i];
+		if (word === "-a") i++;
+		else if (/^-[a-z]+$/.test(word)) {
+			if (word.includes("l")) return true;
+		} else break;
+	}
+	return false;
+}
+
+/** The absolute path a word names under `~`, `$HOME`, `${HOME}`, an absolute path or (when the directory is known) a relative one; undefined for other variables. */
+function homePath(word: string, rt: Runtime): string | undefined {
+	const home = rt.env.home ?? homedir();
+	const expanded = word === "~" ? home : word.startsWith("~/") ? join(home, word.slice(2)) : word.replace(/^\$\{?HOME\}?(?=\/|$)/, home);
+	if (/[$`]/.test(expanded)) return undefined;
+	if (isAbsolute(expanded)) return resolve(expanded);
+	return rt.scope.dir === undefined ? undefined : resolve(rt.scope.dir, expanded);
+}
+
+/**
+ * A glob in a hidden path under the home directory (`~/.git-cred` plus a star, `~/.[g]it-credentials`, a star in `~/.config/gh/`):
+ * its directory part could match a credential or startup file, so it asks. A glob whose first segment is not hidden
+ * (a glob in `~/projects`), or a relative one outside the home directory, does not.
+ */
+function globsHiddenHomePath(word: string, rt: Runtime): boolean {
+	const home = resolve(rt.env.home ?? homedir());
+	const spellings = [word.replace(/^[0-9]*[<>]+&?/, ""), ...word.split(/[=:,]/)];
+	return spellings.some((spelling) => {
+		if (!/[*?[]/.test(spelling)) return false;
+		const explicit = isAbsolute(spelling) || spelling.startsWith("~") || /^\$\{?HOME/.test(spelling);
+		if (!explicit && rt.scope.dir !== home) return false;
+		const absolute = homePath(spelling, rt);
+		if (absolute === undefined) return false;
+		// A project that sits in a hidden folder may glob its own files.
+		const cwd = resolve(rt.env.cwd);
+		if (cwd !== home && !relative(cwd, absolute).startsWith("..")) return false;
+		const rel = relative(home, absolute);
+		if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return false;
+		const first = rel.split("/")[0];
+		return first.startsWith(".") || /[[{]/.test(first);
+	});
+}
+
+/** The home directory itself or a hidden folder right under it (`~`, `~/`, `$HOME`, `~/.config`): reading it recursively reads every credential below. */
+function isBulkHomeOperand(word: string, rt: Runtime): boolean {
+	const home = resolve(rt.env.home ?? homedir());
+	const absolute = homePath(word, rt);
+	if (absolute === undefined) return false;
+	return absolute === home || (dirname(absolute) === home && basename(absolute).startsWith("."));
+}
+
+const GREP_VALUES = new Set(["-e", "-f", "-m", "-A", "-B", "-C", "-d", "-D", "--regexp", "--file", "--max-count", "--include", "--exclude", "--exclude-dir", "--exclude-from", "--label", "--after-context", "--before-context", "--context", "--directories", "--devices"]);
+const RG_VALUES = new Set(["-e", "-f", "-g", "-t", "-T", "-A", "-B", "-C", "-m", "-j", "-M", "-E", "-r", "--regexp", "--file", "--glob", "--iglob", "--type", "--type-not", "--type-add", "--max-count", "--threads", "--max-depth", "--max-filesize", "--replace", "--context", "--after-context", "--before-context", "--encoding", "--ignore-file", "--pre", "--pre-glob", "--sort", "--sortr"]);
+const TAR_VALUES = new Set(["-f", "-C", "-T", "-X", "-I", "-L", "--file", "--directory", "--files-from", "--exclude-from", "--exclude", "--use-compress-program", "--transform", "--strip-components"]);
+const CP_VALUES = new Set(["-t", "--target-directory", "-S", "--suffix"]);
+const ZIP_VALUES = new Set(["-x", "-i", "-b", "-t", "-tt", "-P", "-n", "-O", "-Z", "--exclude", "--include", "--password"]);
+
+/** The operands a command reads recursively (everything below them), for the commands that archive, copy or search a tree. */
+function bulkReadOperands(name: string, args: string[], rt: Runtime): string[] {
+	const cluster = (letters: string) => args.some((arg) => new RegExp(`^-[A-Za-z]*[${letters}][A-Za-z]*$`).test(arg));
+	switch (name) {
+		case "grep":
+		case "egrep":
+		case "fgrep":
+		case "zgrep": {
+			if (!(cluster("rR") || hasFlag(args, "--recursive", "--dereference-recursive"))) return [];
+			const words = positionals(args, GREP_VALUES);
+			return hasFlag(args, "-e", "-f", "--regexp", "--file") ? words : words.slice(1);
+		}
+		case "rg":
+		case "ag":
+		case "ack": {
+			if (name === "rg" && hasFlag(args, "--files")) return [];
+			const words = positionals(args, RG_VALUES);
+			return hasFlag(args, "-e", "-f", "--regexp", "--file") ? words : words.slice(1);
+		}
+		case "tar":
+		case "bsdtar":
+		case "gtar": {
+			// Old style: `tar czf out.tgz ~` (no dash on the first word).
+			if (args[0] !== undefined && !args[0].startsWith("-") && /^[A-Za-z]+$/.test(args[0])) return /c/.test(args[0]) ? args.slice(/f/.test(args[0]) ? 2 : 1) : [];
+			return cluster("c") || hasFlag(args, "--create") ? positionals(args, TAR_VALUES) : [];
+		}
+		case "cp":
+		case "ditto":
+		case "rsync": {
+			if (name === "cp" && !(cluster("rRa") || hasFlag(args, "--recursive", "--archive"))) return [];
+			const words = positionals(args, name === "rsync" ? RSYNC_VALUES : CP_VALUES);
+			// The last operand is where it copies to (all of them are sources with `-t dir`).
+			return hasFlag(args, "-t", "--target-directory") ? words : words.slice(0, -1);
+		}
+		case "zip":
+			return cluster("r") || hasFlag(args, "--recurse-paths") ? positionals(args, ZIP_VALUES).slice(1) : [];
+		case "7z":
+		case "7za":
+		case "7zr":
+		case "7zz": {
+			const words = positionals(args);
+			return words[0] === "a" ? words.slice(2) : [];
+		}
+		case "find": {
+			// Names alone are not secrets: it reads when it runs a command on what it finds or hands the names on to one.
+			const runs = args.some((arg) => ["-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"].includes(arg)) || /\bfind\b[^|;&\n]*\|\s*(?:\S*\/)?(?:xargs|parallel)\b/.test(rt.ctx.commandText);
+			if (!runs) return [];
+			let from = 0;
+			while (["-H", "-L", "-P"].includes(args[from])) from++;
+			const stop = args.findIndex((arg, i) => i >= from && (arg.startsWith("-") || arg === "(" || arg === "!" || arg === ","));
+			return args.slice(from, stop === -1 ? undefined : stop);
+		}
+		default:
+			return [];
+	}
+}
+
+/** `/proc/<pid|self|$$|$PPID>/environ` holds the whole environment of a process, the tokens the lock removed included. */
+const PROC_ENVIRON = /\/proc\/[^\s/]*\/(?:task\/[^\s/]*\/)?environ\b/;
+const PS_VALUE_OPTIONS = new Set(["-p", "-u", "-U", "-g", "-G", "-t", "-C", "-o", "-O", "-s", "-N", "-j", "--pid", "--user", "--sort", "--format"]);
+
+/** BSD-style `ps e`, `ps eww`, `ps auxe` print each process's environment. */
+const psShowsEnvironment = (args: string[]) => positionals(args, PS_VALUE_OPTIONS).some((word) => /^[A-Za-z]*e[A-Za-z]*$/.test(word));
+
 function credentialProgramTags(name: string, args: string[]): DspTag[] {
 	const access = (what: string) => [remote(`credential access (${what})`)];
 	switch (name) {
@@ -1717,7 +2420,7 @@ function touchesCredentialPath(word: string, rt: Runtime): boolean {
 		const expanded = spelling === "~" ? home : spelling.startsWith("~/") ? join(home, spelling.slice(2)) : spelling.replace(/^\$\{?HOME\}?(?=\/|$)/, home);
 		if (CREDENTIAL_PATH.test(expanded)) return true;
 		const absolute = isAbsolute(expanded) ? expanded : rt.scope.dir === undefined ? undefined : resolve(rt.scope.dir, expanded);
-		return absolute === join(home, ".npmrc");
+		return absolute !== undefined && isCredentialPath(absolute, home);
 	});
 }
 
@@ -1736,21 +2439,38 @@ function surroundingMatches(seg: SegmentInfo, unwrapped: UnwrapResult, rt: Runti
 			tags.push(...embedded.tags);
 			nested.push(...embedded.nested);
 		} else if (variable === "NODE_OPTIONS") tags.push(...nodePreloadTags(preloadSpecs(tokenize(value).flatMap((segment) => segment.argv)), rt));
-		else if (variable === "BASH_ENV") tags.push(...scriptFileTags(value, rt));
+		// A shell that loads a startup file can export the tokens again: `ENV` only matters to a shell, the others to any command.
+		else if (variable === "BASH_ENV" || variable === "ZDOTDIR" || (variable === "ENV" && (STARTUP_SHELLS.has(name) || argv.length === 0))) tags.push(remote("shell startup file (it can export the tokens the credential lock removed)", { ref: variable }));
 		else if (variable === "WGETRC") {
 			if (rcWrites(value, rt, WGET_WRITE_KEY)) tags.push(remote("HTTP write (wgetrc)", { ref: value }));
 		} else if (variable === "CURL_HOME") {
 			if ([".curlrc", "_curlrc"].some((rc) => rcWrites(`${value}/${rc}`, rt, CURL_WRITE_KEY))) tags.push(remote("HTTP write (curlrc)", { ref: value }));
 		} else if (variable === "GIT_EXEC_PATH") tags.push(unknownTag("GIT_EXEC_PATH makes git run subcommands from another directory", true));
 	}
-	if (name === "unset") for (const word of argv.slice(1)) if (isOverriddenName(word)) change(`unset ${word}`);
+	// `${NAME:=value}` assigns when NAME is unset.
+	for (const word of rawArgv) for (const found of word.matchAll(/\$\{([A-Za-z_]\w*):?=/g)) if (isLockedName(found[1])) change(found[1]);
+	// Builtins that assign, unexport or unset a variable without `NAME=value`; a name the guard cannot read asks.
+	for (const target of builtinTargets(name, argv.slice(1))) {
+		if (/[$`]/.test(target)) change(`${name} with a variable name the guard cannot read (${target})`);
+		else if (name === "unset" ? isOverriddenName(target) : isLockedName(target)) change(name === "unset" ? `unset ${target}` : `${name} ${target}`);
+	}
+	if (STARTUP_SHELLS.has(name)) {
+		const reason = shellStartupReason(argv.slice(1));
+		if (reason !== undefined) tags.push(remote("shell startup files (an interactive or login shell loads the rc files that can export the tokens again)", { ref: reason }));
+	}
+	if (execLogin(rawArgv)) tags.push(remote("shell startup files (exec -l starts a login shell)"));
 	for (const word of unwrapped.env?.unset ?? []) if (isOverriddenName(word)) change(`env -u ${word}`);
 	if (unwrapped.env?.clear) change("environment cleared (the credential lock goes with it)");
 
 	tags.push(...credentialProgramTags(name, argv.slice(1)));
 	if (!CREDENTIAL_READ_EXEMPT.has(name)) {
-		const word = rawArgv.find((candidate) => touchesCredentialPath(candidate, rt));
+		const word = rawArgv.find((candidate) => touchesCredentialPath(candidate, rt) || globsHiddenHomePath(candidate, rt));
 		if (word !== undefined) tags.push(remote("credential access (reads a credential file)", { ref: word }));
+		const bulk = bulkReadOperands(name, argv.slice(1), rt).find((operand) => isBulkHomeOperand(operand, rt));
+		if (bulk !== undefined) tags.push(remote("credential access (reads the home directory recursively)", { ref: bulk }));
+		const environ = rawArgv.find((candidate) => PROC_ENVIRON.test(candidate));
+		if (environ !== undefined) tags.push(remote("credential access (reads a process environment)", { ref: environ }));
+		if (name === "ps" && psShowsEnvironment(argv.slice(1))) tags.push(remote("credential access (ps prints process environments)"));
 	}
 	return tags.length > 0 ? [carrier(tags), ...nested] : nested;
 }
@@ -1830,6 +2550,16 @@ function refineCore(seg: SegmentInfo, found: CommandMatch[], rt: Runtime, unwrap
 		nested.push(...embedded.nested);
 	};
 
+	const embed = (texts: string[]) => {
+		const embedded = embeddedCommands(texts, rt);
+		tags.push(...embedded.tags);
+		nested.push(...embedded.nested);
+	};
+	const embedTexts = (texts: CommandTexts) => {
+		embed(texts.commands);
+		for (const reason of texts.opaque) tags.push(unknownTag(reason, true));
+	};
+
 	// `git-push`, `git-send-pack`: the dashed form of a git subcommand.
 	if (/^git-.+/.test(name)) {
 		const dashed = [name.slice(4), ...args];
@@ -1879,6 +2609,46 @@ function refineCore(seg: SegmentInfo, found: CommandMatch[], rt: Runtime, unwrap
 		case "xhs":
 			tags.push(...httpieTags(args, before === "|"));
 			break;
+		case "curlie":
+			tags.push(...curlieTags(args, before === "|"));
+			break;
+		case "aria2c":
+			tags.push(...aria2Tags(args));
+			break;
+		case "lwp-request":
+		case "POST":
+			tags.push(...lwpTags(name, args));
+			break;
+		case "at":
+		case "batch":
+			tags.push(...atTags(args, rt, before));
+			break;
+		case "just":
+			tags.push(...justTags(args, rt));
+			break;
+		case "vim":
+		case "vi":
+		case "nvim":
+		case "ex":
+		case "view":
+		case "vimdiff":
+		case "nvimdiff":
+		case "gvim":
+		case "mvim":
+		case "rvim":
+		case "rview":
+		case "evim":
+		case "ed":
+			embedTexts(editorTexts(name, args, rt, before));
+			break;
+		case "emacs":
+		case "emacsclient":
+			embedTexts(emacsTexts(args, rt, name === "emacsclient"));
+			break;
+		case "sed":
+		case "gsed":
+			embedTexts(sedTexts(args, rt));
+			break;
 		case "npm":
 		case "pnpm":
 		case "yarn":
@@ -1886,6 +2656,13 @@ function refineCore(seg: SegmentInfo, found: CommandMatch[], rt: Runtime, unwrap
 			tags.push(...publishTags(name, args), ...packageScriptTags(name, args, rt));
 			const inline = name === "bun" ? inlineProgram("bun", args) : undefined;
 			if (inline !== undefined) tags.push(...inlineTags("bun", inline, rt));
+			if (name === "bun") {
+				// `bun --preload ./x.js`, `-r`: a file that runs first; `bun x.ts` and `bun run x.ts` run a file.
+				tags.push(...nodePreloadTags(optionValues(args, ["--preload", "--require", "--import"], ["-r"]), rt));
+				const [first, second] = positionals(args, VALUE_OPTIONS.bun ?? new Set<string>());
+				const file = first === "run" ? second : first;
+				if (file !== undefined && /\.[cm]?[jt]sx?$/.test(file)) tags.push(...scriptFileTags(file, rt));
+			}
 			break;
 		}
 		case "cargo":

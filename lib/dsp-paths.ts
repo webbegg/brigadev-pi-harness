@@ -21,10 +21,24 @@ export interface ProtectedPathContext {
 export type ProtectedKind = "audit" | "protected";
 
 // Folders and files in the home directory that hold credentials (S10): the credential lock hides them from the shell, so the tools ask too.
-const CREDENTIAL_HOME_FOLDERS = [".ssh", ".docker", ".aws", join(".config", "gh")];
-const CREDENTIAL_HOME_FILES = [".netrc", ".npmrc", ".git-credentials", join(".pi", "agent", "auth.json")];
+// Shell startup files are here as well: they export tokens again in an interactive or login shell, and they can hold tokens themselves.
+const CREDENTIAL_HOME_FOLDERS = [".ssh", ".docker", ".aws", join(".config", "gh"), join(".config", "fish")];
+const CREDENTIAL_HOME_FILES = [
+	".netrc",
+	".npmrc",
+	".git-credentials",
+	join(".pi", "agent", "auth.json"),
+	".bashrc",
+	".bash_profile",
+	".bash_login",
+	".profile",
+	".zshrc",
+	".zprofile",
+	".zshenv",
+	".zlogin",
+];
 
-/** True for the home-directory credential stores: `~/.ssh/`, `~/.docker/`, `~/.aws/`, `~/.config/gh/`, `~/.netrc`, `~/.npmrc`, `~/.git-credentials`. DSP asks for any read or write of them. */
+/** True for the home-directory credential stores: `~/.ssh/`, `~/.docker/`, `~/.aws/`, `~/.config/gh/`, `~/.netrc`, `~/.npmrc`, `~/.git-credentials`, and the shell startup files (`~/.bashrc`, `~/.zshrc`, `~/.profile`, `~/.config/fish/`, ...). DSP asks for any read or write of them. */
 export function isCredentialPath(absolute: string, home: string): boolean {
 	const path = canonicalPath(absolute);
 	const base = canonicalPath(home);

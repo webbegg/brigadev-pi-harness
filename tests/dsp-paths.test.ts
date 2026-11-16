@@ -82,8 +82,10 @@ describe("protected paths", () => {
 
 describe("credential stores (S10)", () => {
 	const credentials = [join(home, ".ssh", "id_ed25519"), join(home, ".ssh"), join(home, ".config", "gh", "hosts.yml"), join(home, ".git-credentials"), join(home, ".docker", "config.json"), join(home, ".netrc"), join(home, ".npmrc"), join(home, ".aws", "credentials"), join(home, ".pi", "agent", "auth.json")];
+	// Shell startup files export tokens again in an interactive or login shell: their reads ask too.
+	credentials.push(...[".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zprofile", ".zshenv", ".zlogin"].map((name) => join(home, name)), join(home, ".config", "fish", "config.fish"));
 	for (const path of credentials) it(`${path.slice(home.length)} is a credential path`, () => assert.equal(isCredentialPath(path, home), true));
-	for (const path of [join(project, ".npmrc"), join(home, ".config", "other", "x"), join(home, ".ssh-notes"), join(home, "notes.txt"), join(home, ".docker-compose.yml")]) {
+	for (const path of [join(project, ".npmrc"), join(home, ".config", "other", "x"), join(home, ".ssh-notes"), join(home, "notes.txt"), join(home, ".docker-compose.yml"), join(home, ".gitconfig"), join(project, ".bashrc"), join(home, ".zshrc.bak")]) {
 		it(`${path.slice(home.length) || path} is not`, () => assert.equal(isCredentialPath(path, home), false));
 	}
 	it("a shell write to one is a protected target", () => {
