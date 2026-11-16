@@ -11,7 +11,8 @@ import { applyBridgeHooksPatch, findBridge, readBridgeStatus } from "../lib/brid
 import { CLAUDE_BRIDGE_PROVIDER } from "../lib/cost.ts";
 import { profilesPath, readProfiles } from "../lib/profiles-store.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
-import { isChildSession, readSettings, resolveCompactTools, settingsPath } from "../lib/runtime.ts";
+import { isChildSession, readSettings, settingsPath } from "../lib/runtime.ts";
+import { resolveTidy } from "./tidy-bundled.ts";
 
 const FIX = "fix-bridge-hooks";
 
@@ -74,8 +75,10 @@ export default function (pi: ExtensionAPI) {
 			try {
 				packages = pi.getSettings().packages;
 			} catch {}
-			const compact = resolveCompactTools(packages);
-			mark(true, `compact tool rows: ${compact.ours ? "on" : "off"} (${compact.reason})`);
+			const tidy = resolveTidy(packages);
+			const tidyLine = { separate: "separate install (takes precedence over the bundled copy)", bundled: "bundled with brigadev", off: "off (not available, or tidy.enabled is false)" }[tidy.state];
+			mark(true, `pi-tidy: ${tidyLine}`);
+			mark(true, `compact tool rows: ${tidy.ours ? "on" : "off"} (${tidy.reason})`);
 			mark(true, `repo docs: ${repoDocsDir(ctx.cwd)} (feature documents in tasks/, review ledgers in reviews/)`);
 			mark(true, `model: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none"}`);
 			ctx.ui.notify(lines.join("\n"), "info");

@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+- pi-tidy ships with brigadev (bundled dependency, MIT; notice in `NOTICE.md`). `extensions/tidy-bundled.ts` loads it unless pi-tidy is installed separately (a separate install takes precedence) or `tidy.enabled` is `false`; subagent children never load it. If the bundled copy cannot be loaded (for example a checkout without `node_modules`) you get one warning and brigadev keeps working.
+- Compact tool rows in `auto` mode step aside for the bundled pi-tidy exactly as they do for a separate install, and `/brigadev:doctor` reports the effective state (separate, bundled, or off). `/brigadev:tidy` is unchanged.
+
 ## [0.16.0] - 2026-11-15
 
 - Background terminals: `bg_start` runs a long command without blocking the turn; `bg_status`, `bg_list`, and `bg_kill` manage it, and `/brigadev:ps` lists them with their output. At most 8 running, stdin ignored, a 256 KB output tail each. An exit the model has not seen is delivered to the session once, when it is idle. The guard decides `bg_start` exactly like `bash`, including the cwd. Each process runs in its own process group and is stopped on `bg_kill`, at session shutdown, and if Pi exits. Parent session only.

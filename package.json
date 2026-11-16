@@ -21,6 +21,7 @@
 			"./extensions/todo.ts",
 			"./extensions/compact-tools.ts",
 			"./extensions/tidy.ts",
+			"./extensions/tidy-bundled.ts",
 			"./extensions/profiles.ts",
 			"./extensions/cost.ts",
 			"./extensions/context-backstop.ts",
@@ -71,5 +72,11 @@
 	},
 	"engines": {
 		"node": ">=22.19.0"
-	}
+	},
+	"dependencies": {
+		"pi-tidy": "^0.9.8"
+	},
+	"bundleDependencies": [
+		"pi-tidy"
+	]
 }
