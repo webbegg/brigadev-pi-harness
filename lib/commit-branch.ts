@@ -28,7 +28,8 @@ const WELL_KNOWN_DEFAULTS = ["main", "master"];
 /** A commit the guard may let through if the branch facts allow it. */
 const isCandidate = (match: CommandMatch): boolean => match.kind === COMMAND_KIND.DELIVERY && match.commit === true && !match.elsewhere && !match.hardDeny;
 
-function onFeatureBranch(facts: BranchFacts): boolean {
+/** HEAD is on a named branch that is neither the default branch nor main/master. Any doubt (detached, unknown default) is false. */
+export function onFeatureBranch(facts: BranchFacts): boolean {
 	return facts.currentBranch !== null && facts.defaultBranch !== null && facts.currentBranch !== facts.defaultBranch && !(facts.protectedBranches ?? []).includes(facts.currentBranch);
 }
 

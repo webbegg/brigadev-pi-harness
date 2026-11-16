@@ -31,6 +31,8 @@ export interface SessionInfo {
 	usage?: { text: string; tone: Tone };
 	profile?: string;
 	yolo?: boolean;
+	/** DSP mode (dangerously skip permissions): shown instead of the yolo flag. */
+	dsp?: boolean;
 }
 
 export interface PanelInput {
@@ -148,7 +150,8 @@ function sessionSection(info: SessionInfo): Section {
 	if (info.cost && info.cost.cost > 0) items.push(text(`${formatCost(info.cost.cost)}${info.cost.apiEquivalent ? " API-eq" : ""}`, "muted"));
 	if (info.usage) items.push(text(`◷ ${info.usage.text}`, info.usage.tone));
 	if (info.profile) items.push(text(`profile ${info.profile}`, "dim"));
-	if (info.yolo) items.push(text("🚀 yolo", "warning"));
+	if (info.dsp) items.push(text("⚠ DSP", "warning"));
+	else if (info.yolo) items.push(text("🚀 yolo", "warning"));
 	return { name: "SESSION", summary: [], items, hidden: 0, hint: "" };
 }
 

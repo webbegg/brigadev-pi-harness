@@ -9,6 +9,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { applyBridgeHooksPatch, findBridge, readBridgeStatus } from "../lib/bridge-hooks.ts";
 import { CLAUDE_BRIDGE_PROVIDER } from "../lib/cost.ts";
+import { defaultModeWarning } from "../lib/dsp-policy.ts";
 import { profilesPath, readProfiles } from "../lib/profiles-store.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { isChildSession, readSettings, settingsPath } from "../lib/runtime.ts";
@@ -71,6 +72,8 @@ export default function (pi: ExtensionAPI) {
 			else mark(profiles.problems.length === 0, `profiles: ${Object.keys(profiles.file.profiles).length} in ${profilesPath()}, default ${profiles.file.active ?? "none"}${profiles.problems.length ? ` — ${profiles.problems.join("; ")}` : ""}`);
 			const settings = readSettings();
 			mark(true, `settings: ${settingsPath()} (default mode ${settings.defaultMode ?? "normal"}, bridge pricing ${settings.bridgePricing === false ? "off" : "on"}, footer ${settings.ui?.footer === false ? "off" : "on"}, phase ${settings.ui?.phase === false ? "off" : "on"})`);
+			const dspWarning = defaultModeWarning(settings.defaultMode);
+			if (dspWarning) mark(false, dspWarning);
 			let packages: unknown[] | undefined;
 			try {
 				packages = pi.getSettings().packages;

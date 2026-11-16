@@ -29,7 +29,7 @@ Check it loaded: `/brigadev:status`.
 | Safety guard | `extensions/guard.ts` | Confirms destructive, delivery, publish, and privileged commands (a commit on a feature branch runs without asking in normal mode); hard-denies catastrophic ones; asks before writes outside the project (the repo docs folder excepted) or touching secret files. In subagents: blocks all of those and enforces allowed edit surfaces. |
 | Todo | `extensions/todo.ts` | Visible task list with `pending / in_progress / done / blocked / dropped`. Kept out of the system prompt so updates never break the prompt cache. |
 | Compact tool rows | `extensions/compact-tools.ts` | `read`, `grep`, `find`, `ls`, `bash`, `edit`, `write` show one line when collapsed (live timer, then `✓ Ran npm test · 3.2s`; errors keep the header plus 1–3 lines). Ctrl+O expands to the full output. Presentation only: tool results are unchanged. [pi-tidy](https://github.com/Andy8647/pi-tidy) ships with brigadev (`extensions/tidy-bundled.ts`), so with the defaults these rows step aside and pi-tidy draws built-in tools. A pi-tidy you install yourself (`npm:pi-tidy` in `packages`, a `pi-tidy` entry in the settings `extensions` array or passed with `-e`/`--extension`, or in the agent `extensions/` folder) takes precedence and brigadev's copy does not load. To turn pi-tidy off, set `tidy.enabled` to `false` in Pi's `settings.json` and run `/reload`: brigadev still starts its bundled pi-tidy so it can switch its own patches off (it registers no `/tidy`), and brigadev's own rows come back. `ui.compactTools` in `brigadev.json` (`"auto"` default, `true`, `false`) overrides the choice, and `/brigadev:doctor` shows the effective state (separate, bundled, or off). |
-| Status bar | `extensions/shell-bar.ts`, `extensions/pr-info.ts` | One-line footer: repo, branch ±dirty, `PR #N` for the branch's pull request (via `gh`; silent without it), yolo, model · thinking, context gauge (`?%` when occupancy is unknown, e.g. after compaction), cost, profile. |
+| Status bar | `extensions/shell-bar.ts`, `extensions/pr-info.ts` | One-line footer: repo, branch ±dirty, `PR #N` for the branch's pull request (via `gh`; silent without it), yolo or `⚠ DSP`, model · thinking, context gauge (`?%` when occupancy is unknown, e.g. after compaction), cost, profile. |
 | Background terminals | `extensions/background-terminals.ts` | `bg_start` runs a long command (dev server, watcher, slow build) without blocking the turn; `bg_status`, `bg_list`, `bg_kill` manage it. At most 8 running, stdin ignored, a 256 KB output tail each. When one exits and the model has not looked, the exit is delivered to the session once, when it is idle. The guard decides `bg_start` exactly like `bash`. Each runs in its own process group and is stopped on `bg_kill`, at session shutdown, and if Pi exits. Parent session only. |
 | Search tools | `extensions/file-search.ts` | `fd` (files) and `rg` (content) tools, registered only when the binaries are already on your PATH (never downloaded). Bounded output; secret files are excluded and explicit paths follow the same rule as `read`. |
 | Phase label | `extensions/odd-phase.ts` | The working message shows the ODD phase (exploring, implementing, checking, delegating · agent). |
@@ -64,7 +64,7 @@ Check it loaded: `/brigadev:status`.
 | `/brigadev:pr` | The current branch's pull request: number, title, state, reviews, checks, URL (needs `gh`) |
 | `/brigadev:copy-all` | Copy the conversation's user and assistant text to the clipboard (`pbcopy`, `wl-copy`, `xclip`, `xsel`, or `clip`) |
 | `alt+o` or `/brigadev:panel` | Side panel: todos, agents, changes, and session at a glance. Needs a terminal at least 140 columns wide. It draws over the right 44 columns of the transcript while open; a docked rail would need private Pi internals. (`alt+p` is Pi's own "previous model" key on Windows and WSL, so the panel uses `alt+o`.) |
-| `/brigadev:mode [normal\|yolo\|default <mode>]` | Permission mode for this session, or the default for new sessions |
+| `/brigadev:mode [normal\|yolo\|dsp\|default <mode>\|status]` | Permission mode for this session (`dsp` asks once to confirm), or the default for new sessions; `status` also shows how many commands DSP auto-allowed |
 | `/brigadev:force-commit` | One-shot: the next `git commit` of the current working tree skips the evidence gate (see below). Only you can run it |
 | `/brigadev:agents` | Effective agent list (package, user, trusted project) |
 | `/brigadev:harness on\|off` | Toggle the orchestrator prompt for this session (A/B testing) |
@@ -142,6 +142,29 @@ Each profile route can list fallback models. When a run fails on quota, auth, a 
 A commit runs without asking only when it targets the session's repository on a branch other than the default branch (the one `origin/HEAD` points to, else a lone local `main` or `master`). `main` and `master` stay protected whenever they exist, even if `origin/HEAD` is repointed. It still asks after a `cd`, a branch switch, or `git -C`/`--git-dir`/`--work-tree` earlier in the same command (inside `{ }`, `then`, and `do` blocks too), and a chained `git push` keeps its own prompt. If git cannot answer, it asks. Commands after `then`, `do`, `else`, `{`, `!`, and similar words are classified like their plain forms.
 
 Without a UI (print mode), "ask" means block. The guard recognizes executable forms; it is not a sandbox.
+
+### DSP — dangerously skip permissions
+
+`/brigadev:mode dsp` (after one confirmation dialog; `/brigadev:mode default dsp` makes it the default and `/brigadev:doctor` warns about that) skips brigadev's execution questions: local work runs without asking. **Remote and default-branch actions always ask**, one dialog per command, never remembered for the session, and are denied without a UI. The footer shows `⚠ DSP`. Only brigadev's own guard is affected; Pi's and the CLI's permission checks are untouched, and subagents never inherit DSP (the guard denies their risky commands without asking, as in the other modes).
+
+| Command kind | DSP |
+| --- | --- |
+| ordinary, `git commit` on a feature branch, dependency installs (`npm install`, `pip install`) | run (audited when normal would have asked) |
+| `rm -r`, `find -delete`, `truncate`, `dd of=file` inside the project or the system temp dir; writes outside the project to ordinary paths | run |
+| local discards: `git reset --hard\|--merge\|--keep`, `rebase`, `branch -D`, `clean -f`, `checkout -- .`/`-f`, `restore`, `switch --discard-changes`, `stash drop\|clear`, `worktree remove -f`, `update-ref`, `reflog expire\|delete`, `gc --prune`, `filter-branch\|filter-repo` | run after an automatic backup |
+| remote: `git push` (any form), `gh pr\|issue\|release\|repo` writes, `gh api` with a non-GET method or fields, `gh workflow run`, publish (`npm publish`, `cargo publish`, `twine upload`, `docker push`, ...), HTTP writes (`curl`/`wget`/`http`/`xh` with POST/PUT/PATCH/DELETE or data) to non-local hosts, `git remote add\|set-url\|remove\|rename`, `git config` of `remote.*`, `url.*`, `alias.*`, `credential.*`, `core.hooksPath`, `push.*`, `gh auth\|alias\|config` | **always ask** (dialog `brigadev DSP: remote action — needs your OK`) |
+| default branch: `git commit`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`, `reset`, `pull` while on it (also on a detached HEAD or when the branch cannot be read), and moving or deleting its ref | **always ask** |
+| read-only remote: `git fetch`, `git pull` on a feature branch, `gh pr view\|list\|checks`, `gh api` GET | run |
+| `sudo`, `curl … \| sh`, destructive remote or data commands (`gh repo delete`, `gh api -X DELETE`, `dropdb`, `prisma migrate reset`, `db:drop`, `docker system prune`), destructive commands outside the project, commands the guard cannot read | ask |
+| catastrophic (`rm -rf ~`, `mkfs`, `dd of=/dev/…`) | block |
+
+Backups: before a local discard the guard writes a snapshot commit of the whole working tree (tracked and untracked files that are not ignored, built with a temporary index, parent `HEAD`) to `refs/brigadev/backup/<UTC timestamp>-<reason>`, plus one ref for each ref about to be lost (a deleted branch's tip, a dropped stash). Restore with `git checkout <ref> -- .` or `git branch <name> <ref>`. If the backup fails, the command asks (or is denied without a UI). Backup refs older than 14 days are removed, at most 50 per run. Ignored files are not part of a snapshot.
+
+Audit: every command DSP ran without asking that normal mode would have asked about is appended to `~/.brigadev/<repo>/audit/dsp.jsonl` (time, branch, command preview, kind, backup refs). The model cannot write that file (the same textual protection as `evidence/`), and `/brigadev:mode status` shows `DSP: N auto-allowed this session`.
+
+Not routable around: the remote rules also see through `env`, `command`, `builtin`, `exec`, `nice`, `nohup`, `time`, `timeout`, `xargs`, `sh -c`, `eval`, `$( )` and backticks, `git -C`/`-c`/`--git-dir`, full paths, `hub`, and git aliases (resolved with `git config --get alias.<name>`). Commands whose remote-ness cannot be decided ask: `eval`/`sh -c` with variable or substitution text, a command name that is a variable, a script that is written and run in one command. Running a script (`bash x.sh`, `./x.sh`, `node x.js`, `python x.py`), a `make` target, or an `npm run` script is scanned (up to 256 KB, a few levels of nesting); a remote form inside asks, and an unreadable or too large file asks. Protected paths ask in DSP even though writes outside the project are otherwise allowed: `~/.pi/`, this package's install root (unless the project is the checkout itself), `~/.gitconfig`, `~/.config/git/`, `~/.config/gh/`, `.git/config`, `.git/hooks/`, shell startup files, and the audit log (blocked). Reading secrets (`.env`, keys) still asks.
+
+Residual risk: this is a textual guard, not a sandbox. A program that opens its own network connection (a compiled binary, a script that builds its command from data, `npx` code, a Makefile that includes another, `ssh`/`scp`/`rsync` to a remote host, hooks and interpreters not listed above) is not detectable. Treat DSP as "do not interrupt me for local work", not as a safe place for untrusted instructions.
 
 ## Evidence gate
 
@@ -276,7 +299,7 @@ An authorized change on the default branch starts a `type/description` branch, a
 - **Agents**: override any package agent by name in `~/.pi/agent/agents/<name>.md` or `.pi/agents/<name>.md` (trusted projects). Frontmatter: `name`, `description`, `tools`, `model`, `thinking`, `writer: true`, `admission: risk`, `output: <file>.schema.json` (a JSON Schema next to the agent file: the agent must return its result through a `structured_output` tool, the parent validates it, and a run without a valid result fails after one reminder).
 - **Orchestrator rules**: edit `assets/orchestrator.md` and the lazy files next to it.
 - **Skills**: edit `skills/*/SKILL.md`, then `/reload`.
-- **Default mode**: `/brigadev:mode default yolo` writes `~/.pi/agent/brigadev.json`.
+- **Default mode**: `/brigadev:mode default yolo` (or `normal`, `dsp`) writes `~/.pi/agent/brigadev.json`.
 
 ## Development
 

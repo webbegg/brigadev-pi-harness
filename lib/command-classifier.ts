@@ -27,11 +27,55 @@ export interface CommandMatch {
 	 * `--work-tree` style redirection.
 	 */
 	elsewhere?: boolean;
+	/** Facts DSP mode decides on (lib/dsp-classify.ts). Only set when classifying with `ClassifyOptions`; normal and yolo never read it. */
+	dsp?: DspTag[];
+}
+
+/** What a DSP-mode classification knows about one command, beyond its `kind`. */
+export type DspTag =
+	/** Writes to origin or a forge, publishes, or reshapes remotes and credentials: always asks. */
+	| { type: "remote"; label: string; remote?: string; branch?: string; base?: string; pr?: string; repo?: string; ref?: string }
+	/** Moves or rewrites the current branch (commit, merge, rebase, ...): asks on the default branch. */
+	| { type: "history"; label: string }
+	/** Names refs the command rewrites or deletes; asks when one is the default branch (`current`: HEAD's branch is also touched). */
+	| { type: "default-ref"; label: string; names: string[]; current?: boolean }
+	/** A local discard that runs after an automatic backup: `branches` and `refs` are lost refs to keep, `stash` a dropped stash entry. */
+	| { type: "discard"; slug: string; branches?: string[]; refs?: string[]; stash?: { ref: string } | "all" }
+	/** Deletes or overwrites files: allowed inside the project or the system temp dir (`dir`: where relative targets start, undefined when unknown). */
+	| { type: "files"; label: string; targets: string[]; dir?: string; unknown?: boolean; rootOk?: boolean }
+	/** An unknown git subcommand that may be an alias (resolved by `analyzeDsp`). */
+	| { type: "alias"; name: string; prefix: string[]; rest: string[]; value?: string }
+	/** The classifier cannot decide what this does: DSP asks. `scan`: found while scanning a script's text. */
+	| { type: "unknown"; reason: string; scan?: boolean };
+
+/** What one command segment looks like to a `ClassifyOptions.refine` hook. */
+export interface SegmentInfo {
+	/** The words as written (wrappers included). */
+	rawArgv: string[];
+	/** The words after wrappers and assignments are stripped. */
+	argv: string[];
+	privileged: boolean;
+	before: string;
+}
+
+/**
+ * Hooks that let DSP mode look deeper than the normal classifier without changing what it reports.
+ * Without options `classifyCommand` behaves exactly as it always has.
+ */
+export interface ClassifyOptions {
+	/** Replaces the wrapper stripper. */
+	unwrap?: (argv: string[]) => { argv: string[]; privileged: boolean };
+	/** Called for each segment with what the normal rules found; returns the matches to keep. */
+	refine?: (segment: SegmentInfo, found: CommandMatch[]) => CommandMatch[];
+	/** Command texts run by `$( )` and backticks in a command. */
+	inner?: (command: string) => string[];
+	/** Options for a nested shell (`sh -c`, a substitution): changes there must not leak back. */
+	fork?: () => ClassifyOptions;
 }
 
 const SEPARATORS = new Set([";", "&&", "||", "|", "&", "\n", "(", ")"]);
 // Syntax words that can lead a segment (`then rm -rf x`, `{ git push; }`); the command follows them. `time` is a wrapper.
-const RESERVED_WORDS = new Set(["{", "}", "!", "if", "then", "elif", "else", "fi", "while", "until", "do", "done"]);
+export const RESERVED_WORDS = new Set(["{", "}", "!", "if", "then", "elif", "else", "fi", "while", "until", "do", "done"]);
 const WRAPPERS = new Set(["sudo", "doas", "env", "command", "builtin", "nohup", "time", "nice", "exec", "xargs", "timeout", "caffeinate"]);
 export const SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "ksh"]);
 // Commands whose arguments are data (search patterns, text), not actions.
@@ -92,7 +136,7 @@ function conditionalEnd(text: string, from: number): number {
 }
 
 /** Index just past the `)` closing a `$(` whose opening ends at `from`, or -1. */
-function substitutionEnd(text: string, from: number): number {
+export function substitutionEnd(text: string, from: number): number {
 	let depth = 1;
 	let quote: "'" | '"' | null = null;
 	for (let j = from; j < text.length; j++) {
@@ -331,7 +375,7 @@ function isScratchPath(target: string, root: string = tmpdir().replace(/\/+$/, "
 // Options that take a separate value, per manager, so the value is not
 // mistaken for the subcommand. The same flag can differ: npm -w takes a
 // workspace name, pnpm -w means --workspace-root and takes none.
-const VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
+export const VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
 	npm: new Set(["--prefix", "-w", "--workspace", "--registry", "-C"]),
 	pnpm: new Set(["--filter", "-F", "-C", "--dir", "--registry"]),
 	yarn: new Set(["--cwd", "--registry"]),
@@ -422,7 +466,7 @@ function gitTargetsElsewhere(args: string[], rawArgv: string[]): boolean {
 }
 
 /** Returns the git subcommand index, skipping global options such as -C <dir>. */
-function gitSubcommand(args: string[]): number {
+export function gitSubcommand(args: string[]): number {
 	for (let i = 0; i < args.length; i++) {
 		const a = args[i];
 		if (a === "-C" || a === "-c" || a === "--git-dir" || a === "--work-tree" || a === "--namespace") {
@@ -531,8 +575,15 @@ const SQL_PATTERNS: Array<[RegExp, string]> = [
 	[/\bFLUSH(ALL|DB)\b/i, "Redis flush"],
 ];
 
-function classifySegment(rawArgv: string[], before: string): CommandMatch[] {
-	const { argv, privileged } = unwrap(rawArgv);
+function classifySegment(rawArgv: string[], before: string, options?: ClassifyOptions): CommandMatch[] {
+	const found = classifySegmentRules(rawArgv, before, options);
+	if (!options?.refine) return found;
+	const { argv, privileged } = (options.unwrap ?? unwrap)(rawArgv);
+	return options.refine({ rawArgv, argv, privileged, before }, found);
+}
+
+function classifySegmentRules(rawArgv: string[], before: string, options?: ClassifyOptions): CommandMatch[] {
+	const { argv, privileged } = (options?.unwrap ?? unwrap)(rawArgv);
 	const matches: CommandMatch[] = [];
 	if (privileged) matches.push({ kind: COMMAND_KIND.PRIVILEGED, reason: "elevated privileges (sudo)" });
 	if (argv.length === 0) return matches;
@@ -544,7 +595,8 @@ function classifySegment(rawArgv: string[], before: string): CommandMatch[] {
 		const scriptIndex = name === "eval" ? 0 : args.findIndex((a) => /^-[a-z]*c[a-z]*$/.test(a));
 		const script = name === "eval" ? args.join(" ") : scriptIndex >= 0 ? args[scriptIndex + 1] : undefined;
 		if (script) {
-			const nested = classifyCommand(script);
+			// A new shell gets its own scope; `eval` runs in this one.
+			const nested = classifyCommand(script, name === "eval" ? options : (options?.fork?.() ?? options));
 			// A location variable set on the wrapper applies to every git call inside its script.
 			if (setsGitLocation(rawArgv)) for (const match of nested) if (match.commit) match.elsewhere = true;
 			matches.push(...nested);
@@ -655,15 +707,16 @@ function classifySegment(rawArgv: string[], before: string): CommandMatch[] {
 	return matches;
 }
 
-/** Classifies every recognizable risky segment of a shell command. */
-export function classifyCommand(command: string): CommandMatch[] {
+/** Classifies every recognizable risky segment of a shell command. `options` (DSP mode) look deeper; without them the result is the normal one. */
+export function classifyCommand(command: string, options?: ClassifyOptions): CommandMatch[] {
 	const matches: CommandMatch[] = [];
 	let moved = false;
 	for (const segment of tokenize(blankHeredocs(command))) {
-		const found = classifySegment(segment.argv, segment.before);
+		const found = classifySegment(segment.argv, segment.before, options);
 		if (moved) for (const match of found) if (match.commit) match.elsewhere = true;
 		matches.push(...found);
 		moved ||= changesCommitTarget(segment.argv);
 	}
+	if (options?.inner) for (const inner of options.inner(command)) matches.push(...classifyCommand(inner, options.fork?.() ?? options));
 	return matches;
 }

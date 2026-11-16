@@ -6,22 +6,32 @@
  * Subagents load this file explicitly (`-e`), so it must work standalone.
  */
 
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
+import { createBackup, type BackupPlan } from "../lib/dsp-backup.ts";
+import { appendDspAudit, dspAuditDir, dspAuditFile, dspAuditRecord, dspStatusLine, noteDspAllowed, resetDspCount } from "../lib/dsp-audit.ts";
+import { bashProtectedTargets, protectedPathKind, type ProtectedPathContext } from "../lib/dsp-paths.ts";
+import { auditKind, decideDspCommand, isAutoAllowedForAudit, readRemoteTarget, remoteDialog, type DspResult } from "../lib/dsp-policy.ts";
 import { appendEvidence, commitGateWithForce, evidenceFile, forceRecord, gateDialog, readEvidence, type ForceRecord } from "../lib/evidence.ts";
 import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, shellCallOf, type PathVerdict } from "../lib/guard-rules.ts";
-import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
+import { commandPreview, isPermissionMode, isSensitivePath, MODE_LABEL, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
-import { appendSystemPromptOnce, CHILD_ENV, childAllowedSurfaces, isChildSession, readSettings, writeSettings } from "../lib/runtime.ts";
+import { agentDir, appendSystemPromptOnce, CHILD_ENV, childAllowedSurfaces, isChildSession, PACKAGE_ROOT, readSettings, writeSettings } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
 import { worktreeTreeResult } from "../lib/worktree-tree.ts";
 
 const MODE_ENTRY = "brigadev-mode";
 const STATUS_KEY = "brigadev-mode";
+
+const AUDIT_BLOCK =
+	"Blocked by brigadev guard: the DSP audit log is written only by the guard, so the record of what DSP ran without asking cannot be forged. Read it if you need it.";
+const DSP_SWITCH_BODY =
+	"DSP (dangerously skip permissions) runs local commands without asking: commits on feature branches, dependency installs, deletes inside the project, local history rewrites (backed up first).\n\nEvery remote action (push, PRs, releases, publish, HTTP writes, remote and credential config) and every change to the default branch still asks, each time.\n\nSwitch to DSP?";
 
 
 export default function (pi: ExtensionAPI) {
@@ -33,6 +43,15 @@ export default function (pi: ExtensionAPI) {
 	let forcedTree: string | undefined;
 
 	const projectRoot = (ctx: ExtensionContext) => canonicalPath(process.env[CHILD_ENV.PROJECT_ROOT] ?? ctx.cwd);
+	/** DSP applies to the parent session only: subagents never inherit it. */
+	const inDsp = () => !isChild && mode === PERMISSION_MODE.DSP;
+	const protectedContext = (ctx: ExtensionContext): ProtectedPathContext => ({
+		home: homedir(),
+		agentDir: agentDir(),
+		installRoot: PACKAGE_ROOT,
+		projectRoot: projectRoot(ctx),
+		docsDir: () => repoDocsDir(ctx.cwd),
+	});
 
 	// Writers only: bash must not change files outside the allowed edit surfaces.
 	const writerSurfaces = (): string[] | undefined => (isChild && process.env[CHILD_ENV.READ_ONLY] !== "1" ? childAllowedSurfaces() : undefined);
@@ -42,7 +61,7 @@ export default function (pi: ExtensionAPI) {
 
 	const publishStatus = (ctx: ExtensionContext) => {
 		if (isChild || !ctx.hasUI) return;
-		ctx.ui.setStatus(STATUS_KEY, mode === PERMISSION_MODE.YOLO ? "🚀 brigadev: yolo" : "brigadev: normal");
+		ctx.ui.setStatus(STATUS_KEY, mode === PERMISSION_MODE.YOLO ? "🚀 brigadev: yolo" : mode === PERMISSION_MODE.DSP ? "⚠ brigadev: DSP" : "brigadev: normal");
 	};
 
 	const restoreMode = (ctx: ExtensionContext) => {
@@ -82,7 +101,7 @@ export default function (pi: ExtensionAPI) {
 	 * Returns a block reason, or a `settle` to call once the remaining rules let the commit run: the
 	 * user's force (one-shot or dialog) is spent and logged then, not when a later rule declines.
 	 */
-	const evidenceGate = async (command: string, ctx: ExtensionContext, startsElsewhere: boolean): Promise<{ reason?: string; settle: () => void }> => {
+	const evidenceGate = async (command: string, ctx: ExtensionContext, startsElsewhere: boolean, offerForce = true): Promise<{ reason?: string; settle: () => void }> => {
 		const nothing = { settle: () => {} };
 		const commits = classifyCommand(command).filter((match) => match.commit);
 		if (commits.length === 0) return nothing;
@@ -122,7 +141,8 @@ export default function (pi: ExtensionAPI) {
 				: nothing;
 		}
 
-		if (!isChild && ctx.hasUI) {
+		// In DSP the agent runs the tests; the user's own `/brigadev:force-commit` still works.
+		if (offerForce && !isChild && ctx.hasUI) {
 			const dialog = gateDialog(decision.reason, command);
 			if (await ctx.ui.confirm(dialog.title, dialog.body)) return { settle: () => log("dialog") };
 		}
@@ -137,6 +157,9 @@ export default function (pi: ExtensionAPI) {
 	 */
 	const checkPath = async (toolName: string, rawPath: string, absolute: string, isWrite: boolean, ctx: ExtensionContext, isDirectory = false): Promise<{ block: true; reason: string } | undefined> => {
 		const root = projectRoot(ctx);
+		const dsp = inDsp();
+		const protectedKind = dsp && isWrite && !isDirectory ? protectedPathKind(absolute, protectedContext(ctx)) : undefined;
+		if (protectedKind === "audit") return { block: true, reason: AUDIT_BLOCK };
 		const decision = decideFileAccess({
 			isChild,
 			isWrite,
@@ -158,7 +181,13 @@ export default function (pi: ExtensionAPI) {
 		} else verdict = decision;
 
 		if (verdict.action === "block") return { block: true, reason: verdict.reason };
-		if (verdict.action === "ask") {
+		if (protectedKind === "protected") {
+			// Asked every time, never granted for the session.
+			const ok = await confirm(ctx, "brigadev DSP: protected path", `${toolName} ${absolute}\n\nThis path configures the harness, git, gh, hooks, or your shell, so DSP asks every time. Allow this write?`);
+			if (!ok) return { block: true, reason: ctx.hasUI ? `User declined write to protected path: ${absolute}` : `Blocked by brigadev DSP: ${absolute} is a protected path and there is no UI to ask (print mode).` };
+		}
+		// DSP: writes outside the project run without a grant (protected and sensitive paths were asked above).
+		if (verdict.action === "ask" && !dsp) {
 			if ([...outsideGrants].some((granted) => isInside(granted, absolute))) return undefined;
 			const target = isDirectory ? absolute : verdict.target;
 			const ok = await confirm(ctx, "brigadev: write outside project", `${toolName} ${absolute}\n\nOutside the project root ${root}. Allow writes under ${target} for this session?`);
@@ -168,8 +197,56 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	};
 
-	pi.on("session_start", async (_event, ctx) => restoreMode(ctx));
+	pi.on("session_start", async (_event, ctx) => {
+		resetDspCount();
+		restoreMode(ctx);
+	});
 	pi.on("session_tree", async (_event, ctx) => restoreMode(ctx));
+
+	const kindsOf = (items: Array<{ label: string }>) => [...new Set(items.map((item) => item.label))].join(", ");
+
+	/**
+	 * Carries out a DSP decision up to the moment the command may run: the dialogs (a remote action always asks, with no
+	 * UI it is denied), then the automatic backup. Returns a block reason, or the backup refs made and whether the command
+	 * counts as auto-allowed (it ran without a question although normal mode would have asked).
+	 */
+	const settleDsp = async (result: DspResult, command: string, cwd: string, ctx: ExtensionContext): Promise<{ block: string } | { backups: string[]; autoAllowed: boolean }> => {
+		const d = result.decision;
+		if (d.action === "block") return { block: d.reason };
+		const preview = commandPreview(command);
+		if (d.action === "confirm-remote") {
+			const kinds = kindsOf(d.items);
+			if (isChild || !ctx.hasUI) return { block: `Blocked by brigadev DSP: this is a remote action (${kinds}), remote actions always need your OK, and there is no UI to ask (print mode). Run it yourself.` };
+			const dialog = remoteDialog({ command, items: d.items, target: await readRemoteTarget(exec, cwd, d.items), also: d.also });
+			if (!(await ctx.ui.confirm(dialog.title, dialog.body))) return { block: `User declined: DSP remote action (${kinds})` };
+		} else if (d.action === "confirm") {
+			if (!(await confirm(ctx, `brigadev: ${d.reason}`, `${preview}\n\nRun it?`))) return { block: `User declined: ${d.reason}` };
+		}
+		const plan: BackupPlan | undefined = d.action === "allow" ? undefined : d.backup;
+		let backups: string[] = [];
+		if (plan) {
+			const made = await createBackup(exec, cwd, plan);
+			if (made.ok) backups = made.refs;
+			else if (d.action === "allow-with-backup") {
+				// Nothing was asked yet: fall back to asking, or deny without a UI.
+				const ok = await confirm(ctx, "brigadev DSP: backup failed", `${preview}\n\nThe automatic backup before this local discard failed (${made.error}).\n\nRun it without a backup?`);
+				if (!ok) return { block: ctx.hasUI ? `User declined: the automatic backup failed (${made.error})` : `Blocked by brigadev DSP: the automatic backup before this local discard failed (${made.error}) and there is no UI to ask.` };
+				return { backups: [], autoAllowed: false };
+			} else if (ctx.hasUI) ctx.ui.notify(`brigadev DSP: the automatic backup failed (${made.error}); the command was approved and runs without one.`, "warning");
+		}
+		return { backups, autoAllowed: isAutoAllowedForAudit(result) };
+	};
+
+	/** One audit line for a command DSP ran without asking (a failed write never stops the command). */
+	const recordAudit = async (result: DspResult, command: string, cwd: string, ctx: ExtensionContext, backups: string[]) => {
+		noteDspAllowed();
+		try {
+			const branch = (await readBranchFacts(exec, cwd)).currentBranch;
+			appendDspAudit(dspAuditFile(repoDocsDir(ctx.cwd)), dspAuditRecord({ ts: new Date().toISOString(), branch, command, kind: auditKind(result), backups }));
+		} catch {
+			// The log is a record, not a gate.
+		}
+	};
 
 	pi.on("before_agent_start", async (event) => {
 		if (isChild) return;
@@ -187,6 +264,17 @@ export default function (pi: ExtensionAPI) {
 			const commandCwd = shell.cwd === undefined ? ctx.cwd : canonicalPath(resolve(ctx.cwd, expandHome(shell.cwd)));
 			// Nobody forges a recorded test result: the evidence log is written only by the recorder. (Textual rule; reading stays allowed.)
 			if ((command.includes("evidence") || commandCwd.includes("evidence")) && bashWritesEvidence(command, [join(repoDocsDir(ctx.cwd), "evidence")], undefined, shell.cwd === undefined ? undefined : commandCwd)) return { block: true, reason: EVIDENCE_BLOCK };
+			if (inDsp()) {
+				// The audit log is written only by the guard (same textual rule as the evidence log), and protected paths ask every time.
+				if ((command.includes("audit") || commandCwd.includes("audit")) && bashWritesEvidence(command, [dspAuditDir(repoDocsDir(ctx.cwd))], undefined, shell.cwd === undefined ? undefined : commandCwd)) return { block: true, reason: AUDIT_BLOCK };
+				const touched = bashProtectedTargets(command, commandCwd, protectedContext(ctx));
+				if (touched.some((target) => target.kind === "audit")) return { block: true, reason: AUDIT_BLOCK };
+				if (touched.length > 0) {
+					const paths = touched.map((target) => target.path).join("\n");
+					const ok = await confirm(ctx, "brigadev DSP: protected path", `${commandPreview(command)}\n\nThis command writes or deletes:\n${paths}\n\nThese paths configure the harness, git, gh, hooks, or your shell, so DSP asks every time. Run it?`);
+					if (!ok) return { block: true, reason: ctx.hasUI ? `User declined write to protected path: ${touched[0].path}` : `Blocked by brigadev DSP: ${touched[0].path} is a protected path and there is no UI to ask (print mode).` };
+				}
+			}
 			if (shell.cwd !== undefined) {
 				const blocked = await checkPath(event.toolName, shell.cwd, commandCwd, true, ctx, true);
 				if (blocked) return blocked;
@@ -204,16 +292,25 @@ export default function (pi: ExtensionAPI) {
 
 			// A commit whose directory is in another repository than the session's is "elsewhere" for the branch rule and the gate alike.
 			const startsElsewhere = shell.cwd !== undefined && classifyCommand(command).some((match) => match.commit) && (await repoRoot(commandCwd)) !== (await repoRoot(projectRoot(ctx)));
-			const decision = await decideBashCommand({ command, mode, isChild, cwd: commandCwd, elsewhere: startsElsewhere, readFacts: (cwd) => readBranchFacts(exec, cwd) });
-			if (decision.action === "block") return { block: true, reason: decision.reason };
-			const gated = isChild ? undefined : await evidenceGate(command, ctx, startsElsewhere);
+			const dsp = inDsp();
+			const dspResult = dsp ? await decideDspCommand({ command, cwd: commandCwd, projectRoot: projectRoot(ctx), exec, elsewhere: startsElsewhere }) : undefined;
+			const decision = dspResult ? undefined : await decideBashCommand({ command, mode, isChild, cwd: commandCwd, elsewhere: startsElsewhere, readFacts: (cwd) => readBranchFacts(exec, cwd) });
+			if (dspResult?.decision.action === "block") return { block: true, reason: dspResult.decision.reason };
+			if (decision?.action === "block") return { block: true, reason: decision.reason };
+			const gated = isChild ? undefined : await evidenceGate(command, ctx, startsElsewhere, !dsp);
 			if (gated?.reason) return { block: true, reason: gated.reason };
-			if (decision.action === "confirm") {
+			let audit: { backups: string[] } | undefined;
+			if (dspResult) {
+				const settled = await settleDsp(dspResult, command, commandCwd, ctx);
+				if ("block" in settled) return { block: true, reason: settled.block };
+				if (settled.autoAllowed) audit = { backups: settled.backups };
+			} else if (decision?.action === "confirm") {
 				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(command)}\n\nRun it?`);
 				if (!ok) return { block: true, reason: `User declined: ${decision.reason}` };
 			}
 			// Every rule allowed the commit: only now is the user's force spent and logged.
 			gated?.settle();
+			if (dspResult && audit) await recordAudit(dspResult, command, commandCwd, ctx, audit.backups);
 
 			// The command will run: remember the tree so tool_result can see what it changed.
 			if (surfaces) {
@@ -263,30 +360,40 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("brigadev:mode", {
-		description: "Permission mode: normal | yolo | default <normal|yolo> | status",
+		description: "Permission mode: normal | yolo | dsp | default <normal|yolo|dsp> | status",
 		getArgumentCompletions: (prefix) => {
-			const items = ["normal", "yolo", "status", "default normal", "default yolo"].map((value) => ({ value, label: value }));
+			const items = ["normal", "yolo", "dsp", "status", "default normal", "default yolo", "default dsp"].map((value) => ({ value, label: value }));
 			const filtered = items.filter((i) => i.value.startsWith(prefix));
 			return filtered.length > 0 ? filtered : null;
 		},
 		handler: async (args, ctx) => {
 			const [first, second] = args.trim().split(/\s+/).filter(Boolean);
+			/** DSP takes one confirmation dialog, and needs a UI to show it. */
+			const enterDsp = async (): Promise<void> => {
+				if (mode === PERMISSION_MODE.DSP) return void ctx.ui.notify("brigadev: already in DSP mode", "info");
+				if (!ctx.hasUI) return void ctx.ui.notify("brigadev: DSP needs a UI to confirm the switch, so the mode was not changed.", "error");
+				if (!(await ctx.ui.confirm(`brigadev: switch to ${MODE_LABEL.dsp}?`, DSP_SWITCH_BODY))) return void ctx.ui.notify("brigadev: mode unchanged", "info");
+				setMode(PERMISSION_MODE.DSP, ctx);
+				ctx.ui.notify("⚠ DSP on: local commands run without asking; remote actions and default-branch changes still always ask.", "warning");
+			};
 			if (first === "default") {
-				if (!isPermissionMode(second)) return ctx.ui.notify("Usage: /brigadev:mode default <normal|yolo>", "error");
+				if (!isPermissionMode(second)) return ctx.ui.notify("Usage: /brigadev:mode default <normal|yolo|dsp>", "error");
 				writeSettings({ defaultMode: second });
-				return ctx.ui.notify(`brigadev: new sessions start in ${second} mode`, "info");
+				return ctx.ui.notify(second === PERMISSION_MODE.DSP ? "⚠ brigadev: new sessions start in DSP mode (local commands run without asking; remote actions still ask)" : `brigadev: new sessions start in ${second} mode`, second === PERMISSION_MODE.DSP ? "warning" : "info");
 			}
+			if (first === PERMISSION_MODE.DSP) return enterDsp();
 			if (isPermissionMode(first)) {
 				setMode(first, ctx);
 				return ctx.ui.notify(first === PERMISSION_MODE.YOLO ? "🚀 YOLO on: commits, pushes, and PRs run without asking; destructive commands still ask." : "brigadev: normal mode", "info");
 			}
 			if (!first && ctx.hasUI) {
-				const choice = await ctx.ui.select(`brigadev permission mode (current: ${mode})`, [PERMISSION_MODE.NORMAL, PERMISSION_MODE.YOLO]);
+				const choice = await ctx.ui.select(`brigadev permission mode (current: ${mode})`, [PERMISSION_MODE.NORMAL, PERMISSION_MODE.YOLO, MODE_LABEL.dsp]);
+				if (choice === MODE_LABEL.dsp) return enterDsp();
 				if (isPermissionMode(choice)) setMode(choice, ctx);
 				return;
 			}
 			const saved = readSettings().defaultMode ?? PERMISSION_MODE.NORMAL;
-			ctx.ui.notify(`brigadev mode: ${mode} (default for new sessions: ${saved})`, "info");
+			ctx.ui.notify(`brigadev mode: ${mode} (default for new sessions: ${saved})${mode === PERMISSION_MODE.DSP ? `\n${dspStatusLine()}` : ""}`, "info");
 		},
 	});
 }

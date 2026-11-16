@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- DSP mode ("dangerously skip permissions"): `/brigadev:mode dsp` (one confirmation dialog; `/brigadev:mode default dsp` is allowed and `/brigadev:doctor` warns about it) skips brigadev's execution questions. Local work runs without asking: feature-branch commits, dependency installs, deletes and overwrites inside the project or the temp dir, writes outside the project. Local discards (`reset --hard`, `rebase`, `branch -D`, `clean -f`, `stash drop`, ...) run after an automatic snapshot under `refs/brigadev/backup/` (pruned after 14 days). Every remote action (push, PR/issue/release writes, publish, HTTP writes, remote and credential config) and every change to the default branch always asks, per command, and is denied without a UI. Wrappers, `$( )`, aliases, scripts, Makefile targets and package scripts are looked through; commands the guard cannot read ask. Protected paths (`~/.pi/`, the install root, git and gh config, hooks, shell rc files) ask; the audit log `audit/dsp.jsonl` records what DSP auto-allowed. Footer shows `⚠ DSP`. `normal` and `yolo` are unchanged. See the README for the table and the residual risk.
+
 ## [0.17.0] - 2026-11-16
 
 - pi-tidy ships with brigadev (bundled dependency, MIT; notice in `NOTICE.md`). `extensions/tidy-bundled.ts` loads it unless pi-tidy is installed separately (a separate install takes precedence) or `tidy.enabled` is `false`; subagent children never load it. If the bundled copy cannot be loaded (for example a checkout without `node_modules`) you get one warning and brigadev keeps working.
