@@ -83,12 +83,15 @@ interface Runtime {
 
 // ── wrappers ────────────────────────────────────────────────────────────────────────────────────────────────
 
-const DSP_WRAPPERS = new Set(["sudo", "doas", "env", "command", "builtin", "nohup", "time", "nice", "exec", "xargs", "timeout", "caffeinate", "stdbuf", "setsid", "ionice", "watch", "chroot", "unshare", "sshpass", "busybox", "toybox", "unbuffer", "chronic", "taskset", "chrt", "systemd-run", "firejail", "numactl", "cpulimit", "trickle", "proxychains", "proxychains4", "torsocks", "sandbox-exec"]);
+const DSP_WRAPPERS = new Set(["sudo", "doas", "env", "command", "builtin", "nohup", "time", "nice", "exec", "xargs", "timeout", "caffeinate", "stdbuf", "setsid", "ionice", "watch", "chroot", "unshare", "sshpass", "busybox", "toybox", "unbuffer", "chronic", "taskset", "chrt", "systemd-run", "firejail", "numactl", "cpulimit", "trickle", "proxychains", "proxychains4", "torsocks", "sandbox-exec", "arch", "taskpolicy"]);
 /** Wrappers whose first words (after the options) name something other than the command. */
 const WRAPPER_SKIP_POSITIONALS: Record<string, number> = { chroot: 1, taskset: 1, chrt: 1 };
 const WRAPPER_VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
 	sudo: new Set(["-u", "-g", "-h", "-p", "-C", "-r", "-t", "-T", "-U", "-D", "-R", "--user", "--group", "--host", "--prompt", "--chdir"]),
 	doas: new Set(["-u", "-C"]),
+	// macOS: `arch [-x86_64|-arm64|-arch NAME] [-e VAR=VAL] [-d VAR] cmd`, `taskpolicy [-c clamp] [-t tier] [-l tier] [-g|-d policy] cmd`.
+	arch: new Set(["-arch", "-e", "-d"]),
+	taskpolicy: new Set(["-c", "-t", "-l", "-g", "-d", "-p"]),
 	env: new Set(["-u", "--unset", "-C", "--chdir"]),
 	taskset: new Set(["-c", "--cpu-list"]),
 	exec: new Set(["-a"]),
@@ -2292,7 +2295,50 @@ function globsHiddenHomePath(word: string, rt: Runtime): boolean {
 	const home = resolve(rt.env.home ?? homedir());
 	const spellings = [word.replace(/^[0-9]*[<>]+&?/, ""), ...word.split(/[=:,]/)];
 	return spellings.some((spelling) => {
+		// Brace expansion (`~/.{git-credentials,npmrc}`) names several paths at once: each one is judged like a glob.
+		const alternatives = expandBraces(spelling);
+		if (alternatives.length > 1) return alternatives.some((one) => hiddenHomeTarget(one, rt, home));
 		if (!/[*?[]/.test(spelling)) return false;
+		return hiddenHomeTarget(spelling, rt, home);
+	});
+}
+
+const BRACE_LIMIT = 64;
+
+/** Bash brace expansion of comma lists (`a{b,c}d` -> `abd`, `acd`), nested and repeated, capped at 64 results. A word without a comma list is returned as is. */
+export function expandBraces(word: string): string[] {
+	for (let open = word.indexOf("{"); open !== -1; open = word.indexOf("{", open + 1)) {
+		let depth = 0;
+		const commas: number[] = [];
+		let close = -1;
+		for (let i = open; i < word.length; i++) {
+			const char = word[i];
+			if (char === "{") depth++;
+			else if (char === "}" && --depth === 0) {
+				close = i;
+				break;
+			} else if (char === "," && depth === 1) commas.push(i);
+		}
+		if (close === -1 || commas.length === 0) continue;
+		const cuts = [open, ...commas, close];
+		const parts = cuts.slice(0, -1).map((cut, i) => word.slice(cut + 1, cuts[i + 1]));
+		const prefix = word.slice(0, open);
+		const suffix = word.slice(close + 1);
+		const out: string[] = [];
+		for (const part of parts) {
+			for (const one of expandBraces(`${prefix}${part}${suffix}`)) {
+				out.push(one);
+				if (out.length >= BRACE_LIMIT) return out;
+			}
+		}
+		return out;
+	}
+	return [word];
+}
+
+/** The path a home glob or brace alternative names is under the home directory and its first segment is hidden (or itself a pattern). */
+function hiddenHomeTarget(spelling: string, rt: Runtime, home: string): boolean {
+	{
 		const explicit = isAbsolute(spelling) || spelling.startsWith("~") || /^\$\{?HOME/.test(spelling);
 		if (!explicit && rt.scope.dir !== home) return false;
 		const absolute = homePath(spelling, rt);
@@ -2304,7 +2350,7 @@ function globsHiddenHomePath(word: string, rt: Runtime): boolean {
 		if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return false;
 		const first = rel.split("/")[0];
 		return first.startsWith(".") || /[[{]/.test(first);
-	});
+	}
 }
 
 /** The home directory itself or a hidden folder right under it (`~`, `~/`, `$HOME`, `~/.config`): reading it recursively reads every credential below. */
