@@ -154,3 +154,68 @@ describe("script scanning", () => {
 		});
 	});
 });
+
+describe("script scanning: verifier regressions apply inside a scanned script", () => {
+	let dir: string;
+	const remoteScripts: Record<string, string> = {
+		"merge-main.sh": "#!/bin/sh\ngit switch main\ngit merge feat/x\n",
+		"merge-one-line.sh": "git checkout main && git merge feat/x\n",
+		"rebase-after-switch.sh": "git checkout main\ngit rebase feat/x\n",
+		"sendpack.sh": "git send-pack origin main\n",
+		"helper.sh": "git remote-https origin https://example.com/x.git\n",
+		"herestring.sh": "bash <<< 'git push'\n",
+		"su.sh": "su -c 'git push'\n",
+		"script-cmd.sh": "script -q /dev/null git push\n",
+		"parallel.sh": "parallel ::: 'git push'\n",
+		"osa.sh": "osascript -e 'do shell script \"git push\"'\n",
+		"curlk.sh": "curl -K cfg https://api.github.com/x\n",
+		"ssh.sh": "set -e\nssh deploy@example.com 'git pull'\n",
+		"scp.sh": "scp build.tar deploy@example.com:/srv/\n",
+		"rsync.sh": "rsync -a dist/ deploy@example.com:/srv/\n",
+		"nc.sh": "nc example.com 80 < req.txt\n",
+		"tcp.sh": "exec 3<>/dev/tcp/example.com/80\n",
+		"ssh.js": "const { execSync } = require('child_process');\nexecSync(\"ssh host true\");\n",
+		"args.py": "import subprocess\nsubprocess.run([\"git\", \"push\"])\n",
+	};
+	const askingScripts: Record<string, string> = {
+		"xargs.sh": "echo push | xargs git\n",
+		"xargs-replace.sh": "echo push | xargs -I{} git {}\n",
+		"herestring-var.sh": "bash <<< \"$CMD\"\n",
+		"parallel-file.sh": "parallel < cmds.txt\n",
+		"osa-concat.sh": "osascript -e 'do shell script \"git \" & \"push\"'\n",
+		"inline-spawn.sh": "python3 -c \"import os; os.system(c)\"\n",
+		"inline-node.sh": "node -e 'require(\"child_process\").execSync(c)'\n",
+		"var-sub.sh": "git $SUB origin\n",
+	};
+	before(() => {
+		dir = realTmp("dsp-scan-verify-");
+		writeTree(dir, {
+			...remoteScripts,
+			...askingScripts,
+			"local.sh": "#!/bin/sh\ngit merge feat/y\nrsync -a src/ backup/\necho a b | xargs -n1 echo\npython3 -c 'print(1)'\nscp ./a:b c\n",
+		});
+	});
+	after(() => rmSync(dir, { recursive: true, force: true }));
+	const labels = (command: string) => remoteLabels(classifyDsp(command, { cwd: dir }));
+	const unknown = (command: string) => unknownReasons(classifyDsp(command, { cwd: dir }));
+
+	for (const name of Object.keys(remoteScripts)) {
+		it(`flags ${name}`, () => {
+			const command = name.endsWith(".js") ? `node ${name}` : name.endsWith(".py") ? `python ${name}` : `bash ${name}`;
+			assert.ok(labels(command).some((label) => label.includes(name)), `${command}: ${JSON.stringify(labels(command))}`);
+		});
+	}
+	for (const name of Object.keys(askingScripts)) {
+		it(`asks for ${name}`, () => assert.ok(unknown(`bash ${name}`).length > 0 || labels(`bash ${name}`).length > 0, name));
+	}
+
+	it("names the merge after a switch", () => {
+		assert.ok(labels("bash merge-main.sh").some((label) => label.includes("merge or rebase after a branch switch")), JSON.stringify(labels("bash merge-main.sh")));
+	});
+	it("a script run with a -c argument is scanned, not taken for inline code", () => {
+		assert.ok(labels("python args.py -c 'print(1)'").length > 0);
+	});
+	it("a script with only local work is left alone", () => {
+		assert.deepEqual([labels("bash local.sh"), unknown("bash local.sh")], [[], []]);
+	});
+});

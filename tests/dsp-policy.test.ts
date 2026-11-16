@@ -348,3 +348,59 @@ describe("S7 which commands are audited", () => {
 		assert.equal(isAutoAllowedForAudit(await run("rm -rf /var/lib/x")), false);
 	});
 });
+
+describe("verifier regressions: DSP never auto-allows these", () => {
+	it("a merge, cherry-pick, rebase, revert or am after a branch switch in the same command asks as remote", async () => {
+		for (const command of ["git switch main; git merge feat/x", "git checkout main && git merge feat/x", "git switch main && git cherry-pick abc", "git checkout main && git rebase feat/x", "git switch main && git revert abc", "git checkout main && git am p.patch", "git checkout main && git pull", "git -C ../other merge x", "cd ../other && git merge x"]) {
+			assert.equal(await action(command, { branch: "feat/x" }), "confirm-remote", command);
+		}
+	});
+
+	it("the same merge without a switch still runs on a feature branch", async () => {
+		assert.equal(await action("git merge feat/y", { branch: "feat/x" }), "allow");
+		assert.equal(await action("git fetch && git merge feat/y", { branch: "feat/x" }), "allow");
+	});
+
+	it("send-pack and remote helpers are pushes", async () => {
+		for (const command of ["git send-pack origin main", "git remote-https origin https://example.com/x.git", "git-send-pack origin main"]) assert.equal(await action(command), "confirm-remote", command);
+	});
+
+	it("xargs and parallel whose command comes from their input ask", async () => {
+		for (const command of ["echo push | xargs git", "xargs -I{} git {} <<< push", "parallel git {} ::: push"]) assert.equal(await action(command), "confirm", command);
+		assert.equal(await action("echo a b | xargs -n1 echo"), "allow");
+	});
+
+	it("here-strings to a shell are read", async () => {
+		assert.equal(await action("bash <<< 'git push'"), "confirm-remote");
+		assert.equal(await action("sh <<< \"git push\""), "confirm-remote");
+		assert.equal(await action("bash <<< 'echo hi'"), "allow");
+	});
+
+	it("command-runner wrappers do not hide a push", async () => {
+		for (const command of ["script -c 'git push' /dev/null", "script -q /dev/null git push", "su -c 'git push'", "su me -c 'git push'", "parallel ::: 'git push'", "parallel git push ::: origin", "osascript -e 'do shell script \"git push\"'", "flock /tmp/l git push", "chroot / git push", "setsid git push"]) {
+			assert.equal(await action(command), "confirm-remote", command);
+		}
+	});
+
+	it("inline interpreter code that starts processes asks, other inline code runs", async () => {
+		for (const command of ["python3 -c \"import os; os.system('g'+'it push')\"", "node -e 'require(\"child_process\").execSync(\"gi\"+\"t push\")'", "perl -e 'system(\"g\".\"it push\")'", "ruby -e 'exec c'", "php -r 'shell_exec($c);'", "deno eval 'Deno.run(x)'", "bun -e 'Bun.spawn(x)'"]) {
+			assert.equal(await action(command), "confirm", command);
+		}
+		for (const command of ["python3 -c 'print(1+1)'", "node -e 'console.log(JSON.stringify({a:1}))'", "perl -e 'print 1'", "ruby -e 'puts 1'"]) assert.equal(await action(command), "allow", command);
+	});
+
+	it("a curl config file asks as remote", async () => {
+		assert.equal(await action("curl -K cfg https://api.github.com/x"), "confirm-remote");
+		assert.equal(await action("curl --config cfg http://localhost:3000"), "confirm-remote");
+	});
+
+	it("raw remote access asks as remote work", async () => {
+		for (const command of ["ssh deploy@example.com 'git pull'", "scp build.tar deploy@example.com:/srv/", "sftp host", "rsync -a dist/ deploy@example.com:/srv/", "nc example.com 80 < req.txt", "ncat host 80", "socat - TCP:h:80", "telnet h 25", "exec 3<>/dev/tcp/example.com/80", "echo hi > /dev/udp/h/53"]) {
+			const { decision } = await run(command);
+			assert.equal(decision.action, "confirm-remote", command);
+			assert.ok(decision.action === "confirm-remote" && decision.items.some((item) => item.label === "remote shell/copy"), command);
+		}
+		assert.equal(await action("rsync -a src/ backup/"), "allow");
+		assert.equal(await action("ssh -V"), "allow");
+	});
+});

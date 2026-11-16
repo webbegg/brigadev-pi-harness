@@ -107,7 +107,9 @@ export async function decideDsp(matches: CommandMatch[], facts: DspFacts): Promi
 					break;
 				}
 				case "history":
-					if (!(match.commit && match.elsewhere)) historyLabels.push(tag.label);
+					// After a branch switch (or in another repository) the branch it lands on is unknown: it asks.
+					if (match.elsewhere && !match.commit) remoteItems.push({ label: `${tag.label} (it may land on another branch or in another repository)` });
+					else if (!(match.commit && match.elsewhere)) historyLabels.push(tag.label);
 					break;
 				case "default-ref":
 					refChecks.push({ label: tag.label, names: tag.names, current: tag.current === true });

