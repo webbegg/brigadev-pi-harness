@@ -117,9 +117,10 @@ describe("S9 the prompt layer", () => {
 		assert.match(readme, /opens its own network connection/i);
 	});
 
-	it("the changelog has an Unreleased entry for it", () => {
+	it("the changelog documents it (in Unreleased or a released section)", () => {
 		const changelog = readFileSync(join(root, "CHANGELOG.md"), "utf8");
-		const unreleased = changelog.slice(changelog.indexOf("## [Unreleased]"), changelog.indexOf("## [", changelog.indexOf("## [Unreleased]") + 5));
-		assert.match(unreleased, /DSP/);
+		// Release-proof: renaming `## [Unreleased]` to a version must not break this test.
+		const sections = changelog.split(/^## \[/m).slice(1);
+		assert.ok(sections.some((section) => /^(Unreleased|\d+\.\d+\.\d+)\]/.test(section) && /DSP mode/.test(section)));
 	});
 });
