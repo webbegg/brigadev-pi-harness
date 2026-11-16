@@ -7,6 +7,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { extractWriteTargets } from "./bash-writes.ts";
+import { AGENT_VARIABLES, isLockedVariable, OVERRIDDEN_VARIABLES } from "./dsp-credlock.ts";
 import {
 	basename,
 	classifyCommand,
@@ -81,13 +82,14 @@ interface Runtime {
 
 // ── wrappers ────────────────────────────────────────────────────────────────────────────────────────────────
 
-const DSP_WRAPPERS = new Set(["sudo", "doas", "env", "command", "builtin", "nohup", "time", "nice", "exec", "xargs", "timeout", "caffeinate", "stdbuf", "setsid", "ionice", "watch", "chroot", "unshare", "sshpass"]);
+const DSP_WRAPPERS = new Set(["sudo", "doas", "env", "command", "builtin", "nohup", "time", "nice", "exec", "xargs", "timeout", "caffeinate", "stdbuf", "setsid", "ionice", "watch", "chroot", "unshare", "sshpass", "busybox", "toybox", "unbuffer", "chronic", "taskset"]);
 /** Wrappers whose first words (after the options) name something other than the command. */
-const WRAPPER_SKIP_POSITIONALS: Record<string, number> = { chroot: 1 };
+const WRAPPER_SKIP_POSITIONALS: Record<string, number> = { chroot: 1, taskset: 1 };
 const WRAPPER_VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
 	sudo: new Set(["-u", "-g", "-h", "-p", "-C", "-r", "-t", "-T", "-U", "-D", "-R", "--user", "--group", "--host", "--prompt", "--chdir"]),
 	doas: new Set(["-u", "-C"]),
 	env: new Set(["-u", "--unset", "-C", "--chdir"]),
+	taskset: new Set(["-c", "--cpu-list"]),
 	exec: new Set(["-a"]),
 	time: new Set(["-f", "-o", "--format", "--output"]),
 	nice: new Set(["-n", "--adjustment"]),
@@ -117,6 +119,27 @@ export interface UnwrapResult {
 	xargs?: XargsInfo;
 	/** Why a wrapper's command could not be read (it comes from a file, standard input, a script file, ...). */
 	opaque?: string[];
+	/** What `env` or `exec` did to the directory and the environment (`-C dir`, `-u NAME`, `-i`). */
+	env?: EnvInfo;
+	/** `env -C dir`: the directory the command runs in (`classifyCommand` reads it as a move for a git command). */
+	chdir?: string;
+}
+
+export interface EnvInfo {
+	chdir?: string;
+	unset: string[];
+	/** `env -i`, `env -`, `exec -c`: the command starts with an empty environment (the credential lock is gone). */
+	clear: boolean;
+}
+
+function noteEnvOption(info: EnvInfo, word: string, next: string | undefined) {
+	if (word === "-C" || word === "--chdir") info.chdir = next;
+	else if (word.startsWith("--chdir=")) info.chdir = word.slice("--chdir=".length);
+	else if (/^-C./.test(word)) info.chdir = word.slice(2);
+	else if (word === "-u" || word === "--unset") info.unset.push(next ?? "");
+	else if (word.startsWith("--unset=")) info.unset.push(word.slice("--unset=".length));
+	else if (/^-u./.test(word)) info.unset.push(word.slice(2));
+	else if (word === "--ignore-environment" || /^-[A-Za-z]*i[A-Za-z]*$/.test(word)) info.clear = true;
 }
 
 function collectReplace(info: XargsInfo, word: string, next: string | undefined) {
@@ -128,7 +151,7 @@ function collectReplace(info: XargsInfo, word: string, next: string | undefined)
 }
 
 // Runners that take the command as a text or after their own operands: `su -c 'cmd'`, `script -q /dev/null cmd`, ...
-const RUNNERS = new Set(["su", "runuser", "sg", "script", "flock", "osascript", "parallel"]);
+const RUNNERS = new Set(["su", "runuser", "sg", "script", "flock", "osascript", "parallel", "npx", "npm", "pnpm", "yarn", "bun", "bunx", "uv", "uvx", "poetry", "pdm", "pipenv", "rye", "hatch", "pipx", "bundle", "tmux", "screen"]);
 const SU_VALUES = new Set(["-s", "--shell", "-g", "--group", "-G", "--supp-group", "-w", "--whitelist-environment"]);
 const SCRIPT_VALUES = new Set(["-T", "-I", "-O", "-B", "-E", "-m", "-F", "-t", "--timing", "--log-in", "--log-out", "--log-io", "--log-timing", "--logging-format", "--echo", "--output-limit"]);
 const FLOCK_VALUES = new Set(["-w", "--timeout", "--wait", "-E", "--conflict-exit-code"]);
@@ -203,6 +226,75 @@ function appleScriptCommands(text: string): { commands: string[]; opaque?: strin
 	return { commands };
 }
 
+// Package runners and terminal multiplexers: the words after their own options are the command they run.
+const NPX_VALUES = new Set(["-p", "--package", "--registry", "--cache", "--userconfig", "-w", "--workspace", "--prefix"]);
+const BUNX_VALUES = new Set(["-p", "--package", "--cwd"]);
+const EXEC_VALUES = new Set(["-p", "--package", "-w", "--workspace", "--prefix", "--registry", "--filter", "-F", "-C", "--dir", "--cwd"]);
+const UV_VALUES = new Set(["--with", "--with-editable", "--with-requirements", "--from", "-p", "--python", "--project", "--directory", "--env-file", "--package", "--extra", "--group", "--only-group", "--no-group", "--index", "--default-index", "--index-url", "--extra-index-url", "--config-file", "--cache-dir", "--python-preference"]);
+const PIPX_VALUES = new Set(["--spec", "--python", "--index-url", "--pip-args"]);
+const TMUX_GLOBAL_VALUES = new Set(["-f", "-L", "-S", "-T"]);
+const TMUX_VALUES = new Set(["-s", "-n", "-t", "-c", "-x", "-y", "-e", "-F", "-l", "-p", "-N", "-f"]);
+/** tmux commands that run a shell command (or type one into a pane). */
+const TMUX_RUNNERS = new Set(["new", "new-session", "neww", "new-window", "splitw", "split-window", "respawn-pane", "respawnp", "respawn-window", "respawnw", "run", "run-shell", "if", "if-shell", "send", "send-keys", "pipep", "pipe-pane", "popup", "display-popup"]);
+
+/** The first word that is not an option (skipping the values of `values`) and the words after it. */
+function subcommandAt(args: string[], values: ReadonlySet<string>): { sub: string; rest: string[] } | undefined {
+	for (let i = 0; i < args.length; i++) {
+		if (args[i] === "--") return undefined;
+		if (values.has(args[i])) i++;
+		else if (!args[i].startsWith("-")) return { sub: args[i], rest: args.slice(i + 1) };
+	}
+	return undefined;
+}
+
+/** The command a package launcher runs: the text after its shell flag (`npm exec -c 'text'`), or the words after its options. */
+function launched(args: string[], values: ReadonlySet<string>, shellFlags: readonly string[] = []): RunnerResult | undefined {
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--") return args.length > i + 1 ? { rest: args.slice(i + 1) } : undefined;
+		const flag = shellFlags.find((name) => arg === name || (name.startsWith("--") && arg.startsWith(`${name}=`)));
+		if (flag) return { rest: shellText(arg === flag ? (args[i + 1] ?? "") : arg.slice(flag.length + 1)) };
+		if (values.has(arg)) i++;
+		else if (!arg.startsWith("-")) return { rest: args.slice(i) };
+	}
+	return undefined;
+}
+
+/** `tmux new -d 'cmd'`, `tmux run-shell 'cmd'`, `tmux send-keys 'cmd' Enter`, `tmux -c 'cmd'`. */
+function tmuxCommand(args: string[]): RunnerResult | undefined {
+	let i = 0;
+	for (; i < args.length; i++) {
+		if (args[i] === "-c") return { rest: shellText(args[i + 1] ?? "") };
+		if (TMUX_GLOBAL_VALUES.has(args[i])) i++;
+		else if (!args[i].startsWith("-")) break;
+	}
+	const sub = args[i];
+	if (sub === undefined || !TMUX_RUNNERS.has(sub)) return undefined;
+	const words = positionals(args.slice(i + 1), TMUX_VALUES);
+	return words.length === 0 ? undefined : { rest: shellText(words.join(/^if/.test(sub) ? "\n" : " ")) };
+}
+
+/** `screen -dm cmd`, `screen -dmS name cmd`, `screen -X stuff 'cmd'`. */
+function screenCommand(args: string[]): RunnerResult | undefined {
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--") return args.length > i + 1 ? { rest: args.slice(i + 1) } : undefined;
+		if (arg === "-X") {
+			const [command, ...words] = args.slice(i + 1);
+			if (command === "stuff" && words[0] !== undefined) return { rest: shellText(words[0].replace(/(\\n|\\r|\^M|\r|\n)+$/, "")) };
+			const typed = command === "exec" ? words.filter((word) => !/^[.!]+$/.test(word)) : [];
+			return typed.length > 0 ? { rest: typed } : undefined;
+		}
+		if (/^-(r|R|RR|x|ls|list|wipe|v)$/.test(arg)) return undefined;
+		if (arg === "-Logfile") i++;
+		else if (/^-[A-Za-z]+$/.test(arg)) {
+			// A cluster such as -dmS: its last letter takes the next word when it takes a value.
+			if ("StcpheTs".includes(arg[arg.length - 1])) i++;
+		} else if (!arg.startsWith("-")) return { rest: args.slice(i) };
+	}
+	return undefined;
+}
+
 /** Runners that take the command as text or after their own operands: the command they run, when it can be read. */
 function unwrapRunner(name: string, args: string[]): RunnerResult | undefined {
 	switch (name) {
@@ -271,6 +363,45 @@ function unwrapRunner(name: string, args: string[]): RunnerResult | undefined {
 			if (sources[0] === ":::" && end === -1) return { rest: shellText(literal.join("\n")), ...(host ? { opaque: host } : {}) };
 			return { rest: ["parallel", ...args], opaque: "parallel takes its commands from a file or standard input", stop: true };
 		}
+		case "npx":
+			return launched(args, NPX_VALUES, ["-c", "--call"]);
+		case "bunx":
+			return launched(args, BUNX_VALUES);
+		case "uvx":
+			return launched(args, UV_VALUES);
+		case "npm":
+		case "pnpm":
+		case "yarn":
+		case "bun": {
+			const found = subcommandAt(args, VALUE_OPTIONS[name] ?? new Set());
+			const launchers = name === "npm" ? ["exec", "x"] : name === "bun" ? ["x"] : ["exec", "dlx"];
+			if (!found || !launchers.includes(found.sub)) return undefined;
+			return launched(found.rest, EXEC_VALUES, name === "npm" || name === "pnpm" ? ["-c", "--call", "--shell-mode"] : []);
+		}
+		case "uv": {
+			const found = subcommandAt(args, UV_VALUES);
+			if (!found) return undefined;
+			if (found.sub === "tool" && found.rest[0] === "run") return launched(found.rest.slice(1), UV_VALUES);
+			if (found.sub !== "run") return undefined;
+			const run = launched(found.rest, UV_VALUES);
+			// `uv run script.py` runs the script with python.
+			return run && /\.py$/.test(run.rest[0]) ? { rest: ["python", ...run.rest] } : run;
+		}
+		case "poetry":
+		case "pdm":
+		case "pipenv":
+		case "rye":
+		case "hatch":
+		case "pipx":
+		case "bundle": {
+			const found = subcommandAt(args, new Set());
+			if (!found || found.sub !== (name === "bundle" ? "exec" : "run")) return undefined;
+			return launched(found.rest, name === "pipx" ? PIPX_VALUES : new Set());
+		}
+		case "tmux":
+			return tmuxCommand(args);
+		case "screen":
+			return screenCommand(args);
 		default:
 			return undefined;
 	}
@@ -285,6 +416,7 @@ export function dspUnwrap(argv: string[]): UnwrapResult {
 	let privileged = false;
 	let xargs: XargsInfo | undefined;
 	const opaque: string[] = [];
+	const envInfo: EnvInfo = { unset: [], clear: false };
 	for (let turns = 0; rest.length > 0 && turns < 100; turns++) {
 		const head = rest[0];
 		if (RESERVED_WORDS.has(head) || ASSIGNMENT.test(head)) {
@@ -323,8 +455,30 @@ export function dspUnwrap(argv: string[]): UnwrapResult {
 				rest = [...tokenize(word.slice("--split-string=".length)).flatMap((segment) => segment.argv), ...rest.slice(1)];
 				continue;
 			}
+			// `env -S'cmd'` (the string attached) and `env -iS 'cmd'` (after a cluster of flags).
+			const attached = name === "env" ? /^-([iv0]*)S([\s\S]+)$/.exec(word) : null;
+			if (attached) {
+				if (attached[1].includes("i")) envInfo.clear = true;
+				rest = [...tokenize(attached[2]).flatMap((segment) => segment.argv), ...rest.slice(1)];
+				continue;
+			}
+			const cluster = name === "env" ? /^-([iv0]+)S$/.exec(word) : null;
+			if (cluster && rest.length > 1) {
+				if (cluster[1].includes("i")) envInfo.clear = true;
+				rest = [...tokenize(rest[1]).flatMap((segment) => segment.argv), ...rest.slice(2)];
+				continue;
+			}
+			if (name === "env" && word === "-") {
+				envInfo.clear = true;
+				rest = rest.slice(1);
+				continue;
+			}
 			if (word.startsWith("-") && word.length > 1) {
 				if (name === "xargs" && xargs) collectReplace(xargs, word, rest[1]);
+				if (name === "env") noteEnvOption(envInfo, word, rest[1]);
+				if (name === "exec" && /^-[a-z]*c[a-z]*$/.test(word)) envInfo.clear = true;
+				// `taskset -c 0,1 cmd` has no mask operand.
+				if (name === "taskset" && (word === "-c" || word === "--cpu-list")) skip = 0;
 				rest = rest.slice(values?.has(word) ? 2 : 1);
 				continue;
 			}
@@ -345,7 +499,8 @@ export function dspUnwrap(argv: string[]): UnwrapResult {
 			break;
 		}
 	}
-	return { argv: rest, privileged, ...(xargs ? { xargs } : {}), ...(opaque.length > 0 ? { opaque } : {}) };
+	const touched = envInfo.chdir !== undefined || envInfo.unset.length > 0 || envInfo.clear;
+	return { argv: rest, privileged, ...(xargs ? { xargs } : {}), ...(opaque.length > 0 ? { opaque } : {}), ...(touched ? { env: envInfo } : {}), ...(envInfo.chdir !== undefined ? { chdir: envInfo.chdir } : {}) };
 }
 
 // ── substitutions ───────────────────────────────────────────────────────────────────────────────────────────
@@ -431,8 +586,14 @@ function ownMatch(found: CommandMatch[]): CommandMatch | undefined {
 	return found.find((match) => match.kind !== COMMAND_KIND.PRIVILEGED && !SQL_REASON.test(match.reason));
 }
 
+/** A script that cannot be scanned may have switched branch: what follows it in the same command is treated as moved. */
+function withMove(tags: DspTag[]): DspTag[] {
+	return tags.some((tag) => tag.type === "unknown" && tag.scan === true) && !tags.some((tag) => tag.type === "branch-move") ? [...tags, { type: "branch-move" }] : tags;
+}
+
 function attach(found: CommandMatch[], tags: DspTag[]): CommandMatch[] {
 	if (tags.length === 0) return found;
+	tags = withMove(tags);
 	const own = ownMatch(found);
 	if (own) own.dsp = [...(own.dsp ?? []), ...tags];
 	else found.push(carrier(tags));
@@ -476,7 +637,11 @@ const KNOWN_GIT = new Set(
 );
 
 // Keys that reroute where git talks to, run hooks from elsewhere, or hand out credentials.
-const RESHAPING_CONFIG_KEY = /^(remote\..+|url\..+|alias\..+|credential\..+|core\.hookspath|push\..+|include\..+|includeif\..+)$/i;
+// (`core.sshCommand` and `protocol.*.allow` are here too: they replace the credential lock's ssh or open the `ext::` transport.)
+const RESHAPING_CONFIG_KEY = /^(remote\..+|url\..+|alias\..+|credential\..+|core\.(hookspath|sshcommand)|push\..+|include\..+|includeif\..+|init\.templatedir|protocol\..+\.allow)$/i;
+// Settings whose value is a command string git runs (a pager, an editor, a filter, a diff driver, an ssh program).
+const COMMAND_CONFIG_KEY = /^(core\.(sshcommand|fsmonitor|pager|editor|askpass|gitproxy)|sequence\.editor|diff\.external|.+\.textconv|diff\..+\.command|merge\..+\.(driver|recursivedriver)|filter\..+|gpg\.(.+\.)?program|pager\..+|uploadpack\.packobjectshook|(mergetool|difftool|browser|man)\..+\.(cmd|path)|web\.browser)$/i;
+const REBASE_VALUE_OPTIONS = new Set(["--onto", "-x", "--exec", "-s", "--strategy", "-X", "--strategy-option"]);
 const CONFIG_READ_ONLY = ["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "--name-only", "--show-origin", "--show-scope"];
 const PUSH_VALUE_OPTIONS = new Set(["--repo", "-o", "--push-option", "--receive-pack", "--exec", "--signed"]);
 
@@ -492,6 +657,107 @@ function gitOverrides(prefix: string[]): Array<[string, string]> {
 	return overrides;
 }
 
+/** The command a command-valued setting (`core.pager=less`, `core.fsmonitor=cmd`) runs, or undefined when the value is a boolean or empty. */
+function configCommand(key: string, value: string): string | undefined {
+	if (!COMMAND_CONFIG_KEY.test(key) || /^(true|false|yes|no|on|off|0|1|)$/i.test(value.trim())) return undefined;
+	return value.startsWith("!") ? value.slice(1) : value;
+}
+
+/** `ext::<command> <args>` runs the command (`% ` is a space, `%%` a percent sign, `%s` and the like the service name). */
+function extCommand(url: string): string {
+	const words: string[] = [];
+	let word = "";
+	const body = url.slice("ext::".length);
+	for (let i = 0; i < body.length; i++) {
+		const ch = body[i];
+		if (ch === "%" && i + 1 < body.length) {
+			const next = body[++i];
+			word += next === " " ? " " : next === "%" ? "%" : "service";
+		} else if (ch === " ") {
+			if (word !== "") words.push(word);
+			word = "";
+		} else word += ch;
+	}
+	if (word !== "") words.push(word);
+	return words.map(quote).join(" ");
+}
+
+/** The values of `--name=v`, `--name v`, `-x v` and `-xv` options. */
+function optionValues(args: string[], long: readonly string[], short: readonly string[] = []): string[] {
+	const found: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--") break;
+		const joined = long.find((name) => arg.startsWith(`${name}=`));
+		if (joined) found.push(arg.slice(joined.length + 1));
+		else if (long.includes(arg) || short.includes(arg)) {
+			if (args[i + 1] !== undefined) found.push(args[++i]);
+		} else if (arg.length > 2 && !arg.startsWith("--") && short.includes(arg.slice(0, 2))) found.push(arg.slice(2));
+	}
+	return found;
+}
+
+/** `-c key=value` after `git clone`, which also applies to the clone's own fetch. */
+function cloneOverrides(rest: string[]): Array<[string, string]> {
+	return optionValues(rest, ["--config"], ["-c"]).map((entry): [string, string] => {
+		const [key, ...value] = entry.split("=");
+		return [key, value.join("=")];
+	});
+}
+
+/**
+ * Command strings a git invocation hands to a shell or program: command-valued `-c` settings, `ext::` URLs,
+ * `--upload-pack`/`--receive-pack`/`--exec`, `rebase -x`, `difftool -x`, `submodule foreach`, `bisect run`,
+ * `filter-branch` filters. Each is classified like a shell command by the caller.
+ */
+function gitCommandStrings(args: string[]): string[] {
+	const index = gitSubcommand(args);
+	const prefix = index === -1 ? args : args.slice(0, index);
+	const texts: string[] = [];
+	const add = (key: string, value: string) => {
+		const text = configCommand(key, value);
+		if (text !== undefined) texts.push(text);
+	};
+	for (const [key, value] of gitOverrides(prefix)) add(key, value);
+	if (index === -1) return texts;
+	const sub = args[index];
+	const rest = args.slice(index + 1);
+	texts.push(...rest.filter((word) => word.startsWith("ext::")).map(extCommand));
+	texts.push(...optionValues(rest, ["--upload-pack", "--receive-pack", "--exec", "--upload-archive", "--extcmd"]));
+	switch (sub) {
+		case "clone":
+			texts.push(...optionValues(rest, [], ["-u"]));
+			for (const [key, value] of cloneOverrides(rest)) add(key, value);
+			break;
+		case "rebase":
+			texts.push(...optionValues(rest, [], ["-x"]));
+			break;
+		case "difftool":
+			texts.push(...optionValues(rest, [], ["-x"]));
+			break;
+		case "grep":
+			texts.push(...rest.filter((word) => /^-O./.test(word)).map((word) => word.slice(2)));
+			texts.push(...rest.filter((word) => word.startsWith("--open-files-in-pager=")).map((word) => word.slice(word.indexOf("=") + 1)));
+			break;
+		case "filter-branch":
+			texts.push(...optionValues(rest, ["--env-filter", "--tree-filter", "--index-filter", "--parent-filter", "--msg-filter", "--commit-filter", "--tag-name-filter"]));
+			break;
+		case "submodule": {
+			const at = rest.indexOf("foreach");
+			const words = at === -1 ? [] : rest.slice(at + 1);
+			while (words[0]?.startsWith("-")) words.shift();
+			if (words.length > 0) texts.push(words.join(" "));
+			break;
+		}
+		case "bisect":
+			if (rest[0] === "run" && rest.length > 1) texts.push(rest.slice(1).join(" "));
+			break;
+		default:
+			break;
+	}
+	return texts;
+}
+
 /** DSP facts about a git invocation. `own`: the match the normal rules made for it (only that one is turned into a discard). */
 function gitTags(args: string[], own: CommandMatch | undefined): DspTag[] {
 	const index = gitSubcommand(args);
@@ -501,6 +767,8 @@ function gitTags(args: string[], own: CommandMatch | undefined): DspTag[] {
 	for (const [key] of overrides) if (RESHAPING_CONFIG_KEY.test(key)) tags.push(remote("git config change"));
 	// `--config-env=alias.p=VAR` sets a key from the environment, where the guard cannot see the value.
 	if (prefix.some((arg) => arg.startsWith("--config-env"))) tags.push(remote("git config change"));
+	// `--exec-path=<dir>` runs the git subcommands found in another directory.
+	if (prefix.some((arg) => arg.startsWith("--exec-path="))) tags.push(unknownTag("git --exec-path runs git subcommands from another directory", true));
 	if (index === -1) return tags;
 
 	const sub = args[index];
@@ -513,6 +781,11 @@ function gitTags(args: string[], own: CommandMatch | undefined): DspTag[] {
 	// `git remote-https`, `git http-push`: transports that push or fetch on their own.
 	if (/^remote-/.test(sub) || sub === "http-push" || sub === "imap-send") {
 		tags.push(remote(`git ${sub}`));
+		return tags;
+	}
+	// `git credential fill|approve|reject` and `git credential-osxkeychain get` hand out the stored credentials.
+	if (/^credential(-.+)?$/.test(sub)) {
+		tags.push(remote("credential access (git credential)"));
 		return tags;
 	}
 	if (UNCERTAIN_CONTENT.test(sub)) {
@@ -548,9 +821,20 @@ function gitTags(args: string[], own: CommandMatch | undefined): DspTag[] {
 		case "config": {
 			if (CONFIG_READ_ONLY.some((flag) => rest.includes(flag))) break;
 			const words = rest.filter((arg) => !arg.startsWith("-"));
-			if (hasFlag(rest, "-e", "--edit") || words.some((word) => RESHAPING_CONFIG_KEY.test(word))) tags.push(remote("git config change"));
+			if (hasFlag(rest, "-e", "--edit") || words.some((word) => RESHAPING_CONFIG_KEY.test(word) || COMMAND_CONFIG_KEY.test(word))) tags.push(remote("git config change"));
 			break;
 		}
+		case "difftool":
+		case "mergetool":
+			if (!hasFlag(rest, "--tool-help")) tags.push(unknownTag(`git ${sub} runs the tool command configured for it`, true));
+			break;
+		case "clone":
+			for (const [key] of cloneOverrides(rest)) if (RESHAPING_CONFIG_KEY.test(key)) tags.push(remote("git config change"));
+			if (hasFlag(rest, "--template")) tags.push(unknownTag("git clone --template copies hooks from a template directory", true));
+			break;
+		case "init":
+			if (hasFlag(rest, "--template")) tags.push(unknownTag("git init --template copies hooks from a template directory", true));
+			break;
 		case "lfs":
 			if (rest[0] === "push") tags.push(remote("push (LFS)"));
 			break;
@@ -584,10 +868,16 @@ function gitTags(args: string[], own: CommandMatch | undefined): DspTag[] {
 		case "am":
 			history(sub);
 			break;
-		case "rebase":
+		case "rebase": {
 			history("rebase");
 			discard("rebase");
+			// `git rebase <upstream> <branch>` switches to <branch> first, so naming the default branch rewrites it.
+			const words = positionals(rest, REBASE_VALUE_OPTIONS);
+			const branch = hasFlag(rest, "--root") ? words[0] : words[1];
+			if (branch !== undefined && UNCERTAIN_CONTENT.test(branch)) tags.push(unknownTag("the branch git rebase switches to comes from a variable or substitution", true));
+			else if (branch !== undefined) tags.push({ type: "default-ref", label: "rebase", names: [branch.replace(/^refs\/heads\//, "")] });
 			break;
+		}
 		case "reset": {
 			const flagged = hasFlag(rest, "--hard", "--soft", "--mixed", "--merge", "--keep");
 			const beforePaths = rest.includes("--") ? rest.slice(0, rest.indexOf("--")) : rest;
@@ -691,7 +981,8 @@ function ghTags(args: string[]): DspTag[] {
 		return tag ? [{ ...tag, ...(repo ? { repo } : {}) }] : [];
 	}
 	// Configuration groups: only their `set`/`login`-style actions change anything.
-	if (group === "auth") return action === undefined || action === "status" ? [] : [remote("auth change")];
+	// (`gh auth status --show-token` prints the token.)
+	if (group === "auth") return action === undefined || (action === "status" && !hasFlag(args, "-t", "--show-token")) ? [] : [remote("auth change")];
 	if (group === "alias") return action === undefined || action === "list" ? [] : [remote("alias change")];
 	if (group === "config") return action === undefined || action === "get" || action === "list" ? [] : [remote("config change")];
 	if (!GH_GROUPS.has(group)) return [remote(`gh ${group}`)]; // an installed extension: unknown code
@@ -780,7 +1071,9 @@ function curlTags(args: string[]): DspTag[] {
 			i++;
 			continue;
 		}
-		if (arg.startsWith("--config=")) {
+		// `-Kcfg` (attached) and `-sKcfg` (after flags that take no value).
+		const clustered = /^-([A-Za-z]*?)K.+$/.exec(arg);
+		if (arg.startsWith("--config=") || (clustered && !/[AbcCdDeEFHmoPQrtTuUwxXyYz]/.test(clustered[1]))) {
 			config = true;
 			continue;
 		}
@@ -809,10 +1102,34 @@ function curlTags(args: string[]): DspTag[] {
 	return writes ? httpWriteTag(urls) : [];
 }
 
-function wgetTags(args: string[]): DspTag[] {
+// wgetrc and curlrc settings that make a request a write (wgetrc names ignore case, `-` and `_`).
+const WGET_WRITE_KEY = /post[-_]*(data|file)|body[-_]*(data|file)|\bmethod\b/i;
+const CURL_WRITE_KEY = /^\s*(-X|-d|-F|-T|--(request|data[\w-]*|form[\w-]*|json|upload-file)|request|data[\w-]*|form[\w-]*|json|upload-file)\b/im;
+
+/** A config file (`wget --config`, `WGETRC`, `.curlrc`) that sets a write, or cannot be read: it asks. A missing file is left to fail. */
+function rcWrites(raw: string, rt: Runtime, key: RegExp): boolean {
+	const path = resolveFrom(raw, rt);
+	if (path === undefined) return true;
+	const read = reader(rt)(path);
+	if ("missing" in read || "notFile" in read) return false;
+	return !("text" in read) || key.test(read.text);
+}
+
+function wgetTags(args: string[], rt: Runtime): DspTag[] {
 	const method = optionValue(args, "--method")?.toUpperCase();
-	const writes = hasFlag(args, "--post-data", "--post-file", "--body-data", "--body-file") || (method !== undefined && WRITE_METHODS.has(method));
-	return writes ? httpWriteTag(positionals(args, new Set(["-O", "-o", "-P", "--header", "--user", "--password", "-e", "-t", "-T"]))) : [];
+	let writes = hasFlag(args, "--post-data", "--post-file", "--body-data", "--body-file") || (method !== undefined && WRITE_METHODS.has(method));
+	// `-e 'post_data=x'` and `--execute=...` run wgetrc commands; `--config=file` reads a whole wgetrc.
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		let command: string | undefined;
+		if (arg === "-e" || arg === "--execute" || /^-[A-Za-z]+e$/.test(arg)) command = args[++i] ?? "";
+		else if (arg.startsWith("--execute=")) command = arg.slice("--execute=".length);
+		else if (/^-e./.test(arg)) command = arg.slice(2);
+		if (command !== undefined && (WGET_WRITE_KEY.test(command) || UNCERTAIN_CONTENT.test(command))) writes = true;
+		const config = arg === "--config" ? (args[++i] ?? "") : arg.startsWith("--config=") ? arg.slice("--config=".length) : undefined;
+		if (config !== undefined && rcWrites(config, rt, WGET_WRITE_KEY)) writes = true;
+	}
+	return writes ? httpWriteTag(positionals(args, new Set(["-O", "-o", "-P", "--header", "--user", "--password", "-e", "-t", "-T", "--config", "--execute"]))) : [];
 }
 
 const HTTPIE_VALUE_FLAGS = new Set(["-a", "--auth", "-A", "--auth-type", "-p", "--print", "-s", "--style", "--pretty", "--timeout", "--proxy", "--verify", "--cert", "--cert-key", "-o", "--output", "--session", "--session-read-only", "--max-redirects", "--default-scheme", "--ssl"]);
@@ -874,13 +1191,23 @@ function rawRemoteTags(name: string, args: string[]): DspTag[] {
 const SUBCOMMAND_TOOLS = new Set(["git", "hub", "gh", "npm", "pnpm", "yarn", "bun", "cargo", "twine", "gem", "poetry", "uv", "flit", "hatch", "helm", "docker", "podman", "buildah"]);
 const HTTP_TOOLS = new Set(["curl", "wget", "http", "https", "xh", "xhs"]);
 
+function stripInputRedirects(words: string[]): string[] {
+	const kept: string[] = [];
+	for (let i = 0; i < words.length; i++) {
+		if (words[i] === "<" || words[i] === "<<" || words[i] === "<<<") i++;
+		else if (!/^<[^(]/.test(words[i])) kept.push(words[i]);
+	}
+	return kept;
+}
+
 /**
  * `xargs` and `parallel` append words from standard input (or `:::`) to the command, or substitute them where the
  * replacement string is. When those words can decide whether the command is remote, it cannot be judged.
  */
 function xargsReason(info: XargsInfo, argv: string[]): string | undefined {
 	const name = basename(argv[0]);
-	const args = argv.slice(1);
+	// `xargs git < args.txt`: the redirection feeds xargs, it is not a git subcommand.
+	const args = stripInputRedirects(argv.slice(1));
 	const holds = (word: string) => info.replace.some((text) => text !== "" && word.includes(text)) || (info.placeholder?.test(word) ?? false);
 	const input = "words that xargs or parallel take from their input";
 	if (holds(argv[0])) return `the command name is one of the ${input}`;
@@ -925,6 +1252,7 @@ const INLINE_FLAG: Record<string, RegExp> = {
 	php: /^-[a-zA-Z]*r$/,
 	lua: /^-[a-zA-Z]*e$/,
 	python: /^-[a-zA-Z]*c$/,
+	expect: /^-c$/,
 };
 
 /** The program text a `python -c`, `node -e`, `perl -e`, `php -r`, `deno eval`, `bun -e` command runs, when it is inline. */
@@ -963,6 +1291,8 @@ const SPAWN_CODE = new RegExp(
 
 function spawnsProcesses(interpreter: string, code: string): boolean {
 	if (SPAWN_CODE.test(code)) return true;
+	// tcl runs a program with `exec` (or `open "|cmd"`), expect with `spawn`.
+	if (interpreter === "tclsh" || interpreter === "wish" || interpreter === "expect") return /\b(?:exec|eval|spawn|uplevel|subst)\b|\bopen\s+["{]?\|/.test(code);
 	// Backticks and `qx`, `%x`, `open("cmd |")` run a shell in perl, ruby and php.
 	return ["perl", "ruby", "php"].includes(interpreter) && /`|%x[({[<|!]|\bqx\b|\bopen\s*\(?[^;]*\||\b(?:system|exec|spawn)\s+[\w$@"'(]/.test(code);
 }
@@ -998,7 +1328,9 @@ function filesTag(name: string, args: string[], dir: string | undefined, viaXarg
 
 // ── scripts, Makefiles, package scripts ─────────────────────────────────────────────────────────────────────
 
-const FILE_INTERPRETERS = new Set(["node", "nodejs", "deno", "bun", "tsx", "ts-node", "babel-node", "ruby", "perl", "php", "lua", "Rscript", "python"]);
+const FILE_INTERPRETERS = new Set(["node", "nodejs", "deno", "bun", "tsx", "ts-node", "babel-node", "ruby", "perl", "php", "lua", "Rscript", "python", "tclsh", "wish", "expect"]);
+/** Paths that name the program a shell or interpreter reads from standard input. */
+const STDIN_PATH = /^(\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/;
 const SHELL_VALUE_OPTIONS = new Set(["-o", "+o", "-O", "+O", "--rcfile", "--init-file"]);
 const UNCERTAIN_CONTENT = /\$[A-Za-z_{(@*#!0-9]|`/;
 // Words that start a command somewhere in a line of code (a script is not always shell).
@@ -1035,14 +1367,14 @@ function stdinProgramTags(args: string[], rt: Runtime, interpreter?: string): Ds
 	return tags;
 }
 
-const interpreterOf = (name: string) => (/^python[\d.]*$/.test(name) ? "python" : name);
+const interpreterOf = (name: string) => (/^python[\d.]*$/.test(name) ? "python" : /^(tclsh|wish)[\d.]*$/.test(name) ? name.replace(/[\d.]+$/, "") : name);
 
 function nestedMatches(text: string, rt: Runtime, depth = rt.ctx.depth): CommandMatch[] {
 	return classifyCommand(text, makeOptions(rt.env, { ...rt.scope }, { depth, commandText: text, visited: rt.ctx.visited }));
 }
 
 /** What a body of code (a script, a recipe, an inline program) runs that reaches a remote, and why it could not be scanned. */
-function scanText(text: string, rt: Runtime): { hits: string[]; unknown: string[] } {
+function scanText(text: string, rt: Runtime): { hits: string[]; unknown: string[]; moves?: boolean } {
 	if (rt.ctx.depth >= MAX_SCAN_DEPTH) return { hits: [], unknown: ["scripts are nested too deeply to scan"] };
 	const hits = new Set<string>();
 	const unknown = new Set<string>();
@@ -1065,18 +1397,19 @@ function scanText(text: string, rt: Runtime): { hits: string[]; unknown: string[
 		for (const match of lineMatches) {
 			if ((branchMoved || match.elsewhere) && !match.commit && match.dsp?.some((tag) => tag.type === "history")) hits.add("a merge or rebase after a branch switch");
 		}
-		if (BRANCH_MOVE.test(line)) branchMoved = true;
+		if (BRANCH_MOVE.test(line) || lineMatches.some((match) => match.dsp?.some((tag) => tag.type === "branch-move"))) branchMoved = true;
 		// Code such as `execSync("git push")` or `["git", "push"]`: look at what follows each command word.
 		const spaced = line.replace(/["'`,[\](){}]/g, " ");
 		for (const match of spaced.matchAll(COMMAND_WORDS)) collect(nestedMatches(spaced.slice(match.index), rt, depth));
 	}
-	return { hits: [...hits], unknown: [...unknown] };
+	return { hits: [...hits], unknown: [...unknown], moves: branchMoved };
 }
 
-function describeHits(label: string, scanned: { hits: string[]; unknown: string[] }): DspTag[] {
+function describeHits(label: string, scanned: { hits: string[]; unknown: string[]; moves?: boolean }): DspTag[] {
 	const tags: DspTag[] = [];
 	if (scanned.hits.length > 0) tags.push(remote(`${label} runs ${scanned.hits.join(", ")}`));
 	for (const reason of scanned.unknown) tags.push(unknownTag(reason, true));
+	if (scanned.moves) tags.push({ type: "branch-move" });
 	return tags;
 }
 
@@ -1243,14 +1576,196 @@ function shellFileArgument(args: string[]): string | undefined {
 function inlineTags(interpreter: string, code: string, rt: Runtime): DspTag[] {
 	const tags = describeHits("inline code", scanText(code, rt));
 	if (spawnsProcesses(interpreter, code)) tags.push(unknownTag(`inline ${interpreter} code starts processes, so the command it runs cannot be checked for remote actions`, true));
+	if (CREDENTIAL_CODE.test(code)) tags.push(remote("credential access (inline code names a credential file)"));
 	return tags;
 }
 
-function refineSegment(seg: SegmentInfo, found: CommandMatch[], rt: Runtime): CommandMatch[] {
+// ── environment, credentials and command strings around a segment ───────────────────────────────────────────
+
+const ASSIGNMENT_WORD = /^([A-Za-z_][A-Za-z0-9_]*)\+?=([\s\S]*)$/;
+const ASSIGNING_BUILTINS = new Set(["export", "declare", "typeset", "readonly", "local", "env", "setenv"]);
+// The names the credential lock (S10) removes or overrides come from lib/dsp-credlock.ts; `GIT_SSH` is not overridden by the lock but asks as well.
+/** `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`, ... */
+const isGitConfigName = (name: string) => /^GIT_CONFIG(_|$)/.test(name);
+/** The prompt switches only stop questions (`GIT_TERMINAL_PROMPT=0` is common in scripts), so setting them does not ask. */
+const PROMPT_SWITCHES = ["GIT_TERMINAL_PROMPT", "GCM_INTERACTIVE"];
+const isOverriddenName = (name: string) => {
+	const upper = name.toUpperCase();
+	return AGENT_VARIABLES.includes(upper) || (OVERRIDDEN_VARIABLES.includes(upper) && !PROMPT_SWITCHES.includes(upper)) || name === "GIT_SSH" || isGitConfigName(name);
+};
+const isLockedName = (name: string) => isOverriddenName(name) || isLockedVariable(name);
+/** Variables whose value is a command string that git or ssh runs. */
+const COMMAND_ENV = new Set(["GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXTERNAL_DIFF", "GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PROXY_COMMAND", "GIT_ASKPASS", "SSH_ASKPASS", "EDITOR", "VISUAL", "PAGER"]);
+const KEYCHAIN_COMMANDS = /^(find-.+|dump-keychain|export|import|unlock-keychain|show-keychain-info|add-(generic|internet)-password|set-key-partition-list)$/;
+// Files that hold credentials; `.npmrc` counts only in the home directory (a project's own `.npmrc` is ordinary).
+const CREDENTIAL_PATH = /(^|\/)(\.ssh|\.netrc|\.git-credentials|\.docker|\.aws\/credentials|\.config\/gh|\.pi\/agent\/auth\.json)(\/|$)/;
+const CREDENTIAL_CODE = /\.(ssh|netrc|npmrc|git-credentials|docker)\b|\.aws\/credentials|\.config\/gh\b/;
+/** Commands that only list, test or print a name: mentioning a credential path does not read it. */
+const CREDENTIAL_READ_EXEMPT = new Set(["ls", "stat", "test", "[", "[[", "echo", "printf"]);
+
+/** `NAME=value` words that assign: the leading ones, and those after `export`, `declare`, `env`, ... */
+function assignments(rawArgv: string[]): Array<{ name: string; value: string }> {
+	const found: Array<{ name: string; value: string }> = [];
+	let leading = true;
+	let assigning = false;
+	for (const word of rawArgv) {
+		const match = ASSIGNMENT_WORD.exec(word);
+		if (match) {
+			if (leading || assigning) found.push({ name: match[1], value: match[2] });
+			continue;
+		}
+		if (leading && RESERVED_WORDS.has(word)) continue;
+		leading = false;
+		if (ASSIGNING_BUILTINS.has(basename(word))) assigning = true;
+	}
+	return found;
+}
+
+/** Modules node loads before the program: `-r x`, `--require x`, `--import x`, `--loader x` (also with `=`). */
+function preloadSpecs(args: string[]): string[] {
+	return optionValues(args, ["--require", "--import", "--loader", "--experimental-loader"], ["-r"]);
+}
+
+/** A preloaded file is a script that runs first: scan it. A bare name is a package from node_modules. */
+function nodePreloadTags(specs: string[], rt: Runtime): DspTag[] {
+	const tags: DspTag[] = [];
+	for (const spec of specs) {
+		if (/^data:/i.test(spec) || UNCERTAIN_CONTENT.test(spec)) tags.push(unknownTag("a node preload is inline code or built from a variable, so it cannot be checked for remote actions", true));
+		else if (/^(\.{0,2}\/|~\/|file:)/.test(spec)) tags.push(...scriptFileTags(spec.replace(/^file:\/\//, ""), rt));
+	}
+	return tags;
+}
+
+// awk starts processes with `system(...)`, `"cmd" | getline` and `print | "cmd"`.
+const AWK_SPAWN = /\bsystem\s*\(|(?<![|])\|&?\s*getline\b|\bprintf?\b[^;}\n]*?(?<![|])\|(?![|])/;
+const AWK_VALUE_OPTIONS = new Set(["-F", "-v", "-i", "-l", "-E", "-W"]);
+
+/** awk, gawk, mawk: a program that spawns a process asks (what it runs can be assembled at run time). */
+function awkTags(args: string[], rt: Runtime): DspTag[] {
+	const tags: DspTag[] = [];
+	const spawn = () => tags.push(unknownTag("awk code starts processes (system, getline from a command, print to a command), so the command it runs cannot be checked for remote actions", true));
+	let hasSource = false;
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "-f" || arg === "--file" || arg.startsWith("--file=")) {
+			hasSource = true;
+			const file = arg.startsWith("--file=") ? arg.slice("--file=".length) : args[++i];
+			const path = file === undefined ? undefined : resolveFrom(file, rt);
+			const read = path === undefined ? undefined : reader(rt)(path);
+			if (file !== undefined && (read === undefined || (!("text" in read) && !("missing" in read) && !("notFile" in read)) || ("text" in read && AWK_SPAWN.test(read.text)))) spawn();
+		} else if (arg === "-e" || arg === "--source" || arg.startsWith("--source=")) {
+			hasSource = true;
+			const code = arg.startsWith("--source=") ? arg.slice("--source=".length) : args[++i];
+			if (code !== undefined && AWK_SPAWN.test(code)) spawn();
+		} else if (AWK_VALUE_OPTIONS.has(arg)) i++;
+		else if (arg === "--") {
+			if (!hasSource && args[i + 1] !== undefined && AWK_SPAWN.test(args[i + 1])) spawn();
+			break;
+		} else if (!arg.startsWith("-") || arg === "-") {
+			if (!hasSource && AWK_SPAWN.test(arg)) spawn();
+			break;
+		}
+	}
+	return tags;
+}
+
+/** Classifies command strings that git, ssh or a variable hand to a shell: literal ones like a shell command, the others ask. */
+function embeddedCommands(texts: string[], rt: Runtime): { tags: DspTag[]; nested: CommandMatch[] } {
+	const tags: DspTag[] = [];
+	const nested: CommandMatch[] = [];
+	for (const text of texts) {
+		if (text.trim() === "") continue;
+		if (UNCERTAIN_CONTENT.test(text)) tags.push(unknownTag(`a command string (${text.slice(0, 40)}) is built from a variable or substitution: it cannot be checked for remote actions`, true));
+		else if (rt.ctx.depth >= MAX_SCAN_DEPTH) tags.push(unknownTag("command strings are nested too deeply to scan", true));
+		else nested.push(...nestedMatches(text, rt, rt.ctx.depth + 1));
+	}
+	return { tags, nested };
+}
+
+function credentialProgramTags(name: string, args: string[]): DspTag[] {
+	const access = (what: string) => [remote(`credential access (${what})`)];
+	switch (name) {
+		case "ssh-add":
+			return access("ssh-add");
+		case "launchctl": {
+			const [sub] = positionals(args);
+			return sub !== undefined && ["getenv", "setenv", "unsetenv", "asuser", "export"].includes(sub) ? access(`launchctl ${sub}`) : [];
+		}
+		case "security": {
+			const [sub] = positionals(args);
+			return sub !== undefined && KEYCHAIN_COMMANDS.test(sub) ? access(`security ${sub}`) : [];
+		}
+		case "ssh":
+		case "scp":
+		case "sftp":
+		case "mosh":
+		case "autossh": {
+			const identity = args.some((arg, i) => arg === "-i" || /^-i./.test(arg) || /^-[A-Za-z]+i$/.test(arg) || (args[i - 1] === "-o" && /^Identity(File|Agent)/i.test(arg)) || /^-oIdentity(File|Agent)/i.test(arg));
+			return identity ? access(`${name} with an identity file`) : [];
+		}
+		default:
+			return [];
+	}
+}
+
+/** A word naming a credential file: `~/.ssh/id_rsa`, `$HOME/.netrc`, `<~/.git-credentials`, `--file=~/.docker/config.json`. */
+function touchesCredentialPath(word: string, rt: Runtime): boolean {
+	const home = rt.env.home ?? homedir();
+	// Also the parts of `--file=path`, `NAME=path`, `-v ~/.ssh:/root/.ssh` and `--mount source=path,target=x`.
+	const spellings = [word.replace(/^[0-9]*[<>]+&?/, ""), ...word.split(/[=:,]/)];
+	return spellings.some((spelling) => {
+		const expanded = spelling === "~" ? home : spelling.startsWith("~/") ? join(home, spelling.slice(2)) : spelling.replace(/^\$\{?HOME\}?(?=\/|$)/, home);
+		if (CREDENTIAL_PATH.test(expanded)) return true;
+		const absolute = isAbsolute(expanded) ? expanded : rt.scope.dir === undefined ? undefined : resolve(rt.scope.dir, expanded);
+		return absolute === join(home, ".npmrc");
+	});
+}
+
+/** What surrounds a segment's command: assigned variables (the credential lock, command strings, preloads), `unset`, `env -u|-i`, credential programs and credential files. */
+function surroundingMatches(seg: SegmentInfo, unwrapped: UnwrapResult, rt: Runtime): CommandMatch[] {
+	const { rawArgv, argv } = seg;
+	const tags: DspTag[] = [];
+	const nested: CommandMatch[] = [];
+	const name = argv.length > 0 ? basename(argv[0]) : "";
+	const change = (ref: string) => tags.push(remote("credential environment change", { ref }));
+
+	for (const { name: variable, value } of assignments(rawArgv)) {
+		if (isLockedName(variable)) change(variable);
+		if (COMMAND_ENV.has(variable)) {
+			const embedded = embeddedCommands([value], rt);
+			tags.push(...embedded.tags);
+			nested.push(...embedded.nested);
+		} else if (variable === "NODE_OPTIONS") tags.push(...nodePreloadTags(preloadSpecs(tokenize(value).flatMap((segment) => segment.argv)), rt));
+		else if (variable === "BASH_ENV") tags.push(...scriptFileTags(value, rt));
+		else if (variable === "WGETRC") {
+			if (rcWrites(value, rt, WGET_WRITE_KEY)) tags.push(remote("HTTP write (wgetrc)", { ref: value }));
+		} else if (variable === "CURL_HOME") {
+			if ([".curlrc", "_curlrc"].some((rc) => rcWrites(`${value}/${rc}`, rt, CURL_WRITE_KEY))) tags.push(remote("HTTP write (curlrc)", { ref: value }));
+		} else if (variable === "GIT_EXEC_PATH") tags.push(unknownTag("GIT_EXEC_PATH makes git run subcommands from another directory", true));
+	}
+	if (name === "unset") for (const word of argv.slice(1)) if (isOverriddenName(word)) change(`unset ${word}`);
+	for (const word of unwrapped.env?.unset ?? []) if (isOverriddenName(word)) change(`env -u ${word}`);
+	if (unwrapped.env?.clear) change("environment cleared (the credential lock goes with it)");
+
+	tags.push(...credentialProgramTags(name, argv.slice(1)));
+	if (!CREDENTIAL_READ_EXEMPT.has(name)) {
+		const word = rawArgv.find((candidate) => touchesCredentialPath(candidate, rt));
+		if (word !== undefined) tags.push(remote("credential access (reads a credential file)", { ref: word }));
+	}
+	return tags.length > 0 ? [carrier(tags), ...nested] : nested;
+}
+
+function refineSegment(seg: SegmentInfo, found: CommandMatch[], base: Runtime): CommandMatch[] {
+	const unwrapped = dspUnwrap(seg.rawArgv);
+	// `env -C dir cmd` runs cmd in dir: relative scripts and targets mean what they mean there.
+	const rt: Runtime = unwrapped.chdir === undefined ? base : { ...base, scope: { ...base.scope, dir: resolveFrom(unwrapped.chdir, base) } };
+	return [...refineCore(seg, found, rt, unwrapped), ...surroundingMatches(seg, unwrapped, rt)];
+}
+
+function refineCore(seg: SegmentInfo, found: CommandMatch[], rt: Runtime, unwrapped: UnwrapResult): CommandMatch[] {
 	const { argv, rawArgv, before } = seg;
 	const { scope, env } = rt;
 	// A wrapper whose command the guard cannot read (a script file, standard input, a remote host).
-	const unwrapped = dspUnwrap(rawArgv);
 	for (const reason of unwrapped.opaque ?? []) found = [...found, unknownMatch(reason, true)];
 	// bash opens network connections itself through /dev/tcp and /dev/udp.
 	const devNet = rawArgv.find((word) => /\/dev\/(tcp|udp)\//.test(word));
@@ -1299,17 +1814,28 @@ function refineSegment(seg: SegmentInfo, found: CommandMatch[], rt: Runtime): Co
 		}
 		if (name === "eval") return found;
 		const file = name === "source" || name === "." ? args[0] : shellFileArgument(args);
-		if (file !== undefined && file !== "<" && !file.startsWith("<")) return attach(found, scriptFileTags(file, rt));
-		return attach(found, stdinProgramTags(args, rt));
+		if (file !== undefined && file !== "<" && !file.startsWith("<") && !STDIN_PATH.test(file)) return attach(found, scriptFileTags(file, rt));
+		// `bash /dev/stdin <<< 'text'`, `. /dev/stdin < file`: the program is on standard input.
+		const piped = file !== undefined && STDIN_PATH.test(file) && before === "|" ? [unknownTag("it runs a program piped in from another command, which cannot be checked for remote actions", true)] : [];
+		return attach(found, [...stdinProgramTags(args, rt), ...piped]);
 	}
 
 	const own = ownMatch(found);
 	const tags: DspTag[] = [];
 	const nested: CommandMatch[] = [];
 	let handled = true;
+	const gitStrings = (gitArgs: string[]) => {
+		const embedded = embeddedCommands(gitCommandStrings(gitArgs), rt);
+		tags.push(...embedded.tags);
+		nested.push(...embedded.nested);
+	};
 
 	// `git-push`, `git-send-pack`: the dashed form of a git subcommand.
-	if (/^git-.+/.test(name)) return attach(found, gitTags([name.slice(4), ...args], own));
+	if (/^git-.+/.test(name)) {
+		const dashed = [name.slice(4), ...args];
+		gitStrings(dashed);
+		return [...attach(found, [...gitTags(dashed, own), ...tags]), ...nested];
+	}
 
 	switch (name) {
 		case "ssh":
@@ -1323,10 +1849,14 @@ function refineSegment(seg: SegmentInfo, found: CommandMatch[], rt: Runtime): Co
 			break;
 		case "git":
 			tags.push(...gitTags(args, own));
+			gitStrings(args);
 			break;
 		case "hub":
 			tags.push(...hubTags(args));
-			if (tags.length === 0) tags.push(...gitTags(args, own));
+			if (tags.length === 0) {
+				tags.push(...gitTags(args, own));
+				gitStrings(args);
+			}
 			break;
 		case "gh":
 			tags.push(...ghTags(args));
@@ -1335,7 +1865,13 @@ function refineSegment(seg: SegmentInfo, found: CommandMatch[], rt: Runtime): Co
 			tags.push(...curlTags(args));
 			break;
 		case "wget":
-			tags.push(...wgetTags(args));
+			tags.push(...wgetTags(args, rt));
+			break;
+		case "awk":
+		case "gawk":
+		case "mawk":
+		case "nawk":
+			tags.push(...awkTags(args, rt));
 			break;
 		case "http":
 		case "https":
@@ -1398,13 +1934,22 @@ function refineSegment(seg: SegmentInfo, found: CommandMatch[], rt: Runtime): Co
 		// An interpreter running a file or inline code, or a file run directly.
 		const interpreter = interpreterOf(name);
 		if (FILE_INTERPRETERS.has(interpreter)) {
+			// `node -r ./x.js`, `--require`, `--import`, `--loader` run a file before the program.
+			const preloads = interpreter === "node" || interpreter === "nodejs" ? preloadSpecs(args) : [];
+			tags.push(...nodePreloadTags(preloads, rt));
 			const inline = inlineProgram(interpreter, args);
 			if (inline !== undefined) {
 				tags.push(...inlineTags(interpreter, inline, rt));
 			} else {
-				const candidates = args.filter((arg) => !arg.startsWith("-")).slice(0, 4);
+				const candidates = args.filter((arg) => !arg.startsWith("-") && !preloads.includes(arg)).slice(0, 4);
 				let scanned = false;
+				let fromStdin = false;
 				for (const candidate of candidates) {
+					if (STDIN_PATH.test(candidate)) {
+						fromStdin = true;
+						scanned = true;
+						break;
+					}
 					const path = resolveFrom(candidate, rt);
 					if (path !== undefined && "missing" in reader(rt)(path)) continue;
 					tags.push(...scriptFileTags(candidate, rt));
@@ -1412,7 +1957,7 @@ function refineSegment(seg: SegmentInfo, found: CommandMatch[], rt: Runtime): Co
 					break;
 				}
 				if (!scanned && candidates[0] !== undefined && writtenHere(candidates[0], rt)) tags.push(unknownTag(`${candidates[0]} is written and run in the same command, so its text cannot be checked`, true));
-				if (!scanned || args.includes("-")) tags.push(...stdinProgramTags(args, rt, interpreter));
+				if (fromStdin || !scanned || args.includes("-")) tags.push(...stdinProgramTags(args, rt, interpreter));
 			}
 		} else if (head.includes("/")) {
 			tags.push(...scriptFileTags(head, rt));

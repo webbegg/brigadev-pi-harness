@@ -130,6 +130,9 @@ export async function decideDsp(matches: CommandMatch[], facts: DspFacts): Promi
 				case "alias":
 					confirmReasons.push(`git alias ${tag.name} was not resolved: it may run a remote action`);
 					break;
+				case "branch-move":
+					// Only moves what follows in the same command (`classifyCommand` reads it): nothing to ask here.
+					break;
 				case "unknown":
 					confirmReasons.push(tag.reason);
 					break;

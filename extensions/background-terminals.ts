@@ -21,6 +21,7 @@ import { BG_EXIT_MESSAGE_TYPE, createBgDelivery, type BgExitDetails } from "../l
 import { BgError, createBgProcesses, shellEnvironment } from "../lib/bg-processes.ts";
 import { detailWidth, killText, listText, psDetail, psFooter, psRows, psTitle, sanitizeOutput, startedText, statusLine, statusText } from "../lib/bg-view.ts";
 import { installParentExitGuard } from "../lib/child-run.ts";
+import { takeCredLock } from "../lib/dsp-credlock.ts";
 import { canonicalPath, expandHome } from "../lib/paths.ts";
 import { isChildSession } from "../lib/runtime.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
@@ -140,9 +141,11 @@ export default function (pi: ExtensionAPI) {
 			cwd: Type.Optional(Type.String({ description: "Directory to run in, inside the project (relative to the session directory). Default: the session directory." })),
 			name: Type.Optional(Type.String({ description: "Short label for listings (default: the start of the command)" })),
 		}),
-		async execute(_id, params, _signal, _onUpdate, ctx) {
+		async execute(id, params, _signal, _onUpdate, ctx) {
 			parentCtx = ctx;
 			if (ctx.hasUI) statusCtx = ctx;
+			// DSP credential lock (S10): the guard marks this call id when the process must start without the user's credentials.
+			const lock = takeCredLock(id);
 			// The same resolution the guard decided on (extensions/guard.ts), so the directory it approved is the one used.
 			const cwd = params.cwd?.trim() ? canonicalPath(resolve(ctx.cwd, expandHome(params.cwd))) : ctx.cwd;
 			let isDirectory = false;
@@ -152,12 +155,8 @@ export default function (pi: ExtensionAPI) {
 				// Missing: reported below.
 			}
 			if (!isDirectory) throw new BgError(`cwd is not a directory: ${cwd}`);
-			const snapshot = manager.start({
-				command: params.command,
-				cwd,
-				name: params.name,
-				env: shellEnvironment(process.env, { binDir: join(getAgentDir(), "bin"), session: sessionEnvironment(ctx) }),
-			});
+			const env = shellEnvironment(process.env, { binDir: join(getAgentDir(), "bin"), session: sessionEnvironment(ctx) });
+			const snapshot = manager.start({ command: params.command, cwd, name: params.name, env: lock ? lock(env) : env });
 			return textResult(startedText(snapshot), { id: snapshot.id, name: snapshot.name, cwd: snapshot.cwd, pid: snapshot.pid });
 		},
 	});

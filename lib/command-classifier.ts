@@ -46,7 +46,9 @@ export type DspTag =
 	/** An unknown git subcommand that may be an alias (resolved by `analyzeDsp`). */
 	| { type: "alias"; name: string; prefix: string[]; rest: string[]; value?: string }
 	/** The classifier cannot decide what this does: DSP asks. `scan`: found while scanning a script's text. */
-	| { type: "unknown"; reason: string; scan?: boolean };
+	| { type: "unknown"; reason: string; scan?: boolean }
+	/** Running this (a script, recipe or package script) may switch the branch: what follows in the same command acts on another branch. */
+	| { type: "branch-move" };
 
 /** What one command segment looks like to a `ClassifyOptions.refine` hook. */
 export interface SegmentInfo {
@@ -63,8 +65,8 @@ export interface SegmentInfo {
  * Without options `classifyCommand` behaves exactly as it always has.
  */
 export interface ClassifyOptions {
-	/** Replaces the wrapper stripper. */
-	unwrap?: (argv: string[]) => { argv: string[]; privileged: boolean };
+	/** Replaces the wrapper stripper. `chdir`: a wrapper (`env -C dir`) runs the command in another directory. */
+	unwrap?: (argv: string[]) => { argv: string[]; privileged: boolean; chdir?: string };
 	/** Called for each segment with what the normal rules found; returns the matches to keep. */
 	refine?: (segment: SegmentInfo, found: CommandMatch[]) => CommandMatch[];
 	/** Command texts run by `$( )` and backticks in a command. */
@@ -722,12 +724,14 @@ function classifyFrom(command: string, options: ClassifyOptions | undefined, sta
 		const found = classifySegment(segment.argv, segment.before, options);
 		if (state.moved) for (const match of found) if (touchesBranch(match)) match.elsewhere = true;
 		if (options?.refine) {
-			// `git -C other merge x` acts on another repository's branch.
-			const { argv } = (options.unwrap ?? unwrap)(segment.argv);
-			if (argv.length > 0 && basename(argv[0]) === "git" && gitTargetsElsewhere(argv.slice(1), segment.argv)) for (const match of found) if (touchesBranch(match)) match.elsewhere = true;
+			// `git -C other merge x` and `env -C other git merge x` act on another repository's branch.
+			const { argv, chdir } = (options.unwrap ?? unwrap)(segment.argv) as { argv: string[]; chdir?: string };
+			const elsewhere = chdir !== undefined || (argv.length > 0 && basename(argv[0]) === "git" && gitTargetsElsewhere(argv.slice(1), segment.argv));
+			if (elsewhere) for (const match of found) if (touchesBranch(match)) match.elsewhere = true;
 		}
 		matches.push(...found);
-		state.moved ||= changesCommitTarget(segment.argv, options?.unwrap);
+		// A script, recipe or package script that switches branch moves what follows (DSP's `branch-move` tag).
+		state.moved ||= changesCommitTarget(segment.argv, options?.unwrap) || found.some((match) => match.dsp?.some((tag) => tag.type === "branch-move"));
 	}
 	// Substitutions run in the same shell: they start where the command ended up.
 	if (options?.inner) for (const inner of options.inner(command)) matches.push(...classifyFrom(inner, options.fork?.() ?? options, state));

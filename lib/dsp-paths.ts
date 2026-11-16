@@ -20,6 +20,17 @@ export interface ProtectedPathContext {
 
 export type ProtectedKind = "audit" | "protected";
 
+// Folders and files in the home directory that hold credentials (S10): the credential lock hides them from the shell, so the tools ask too.
+const CREDENTIAL_HOME_FOLDERS = [".ssh", ".docker", ".aws", join(".config", "gh")];
+const CREDENTIAL_HOME_FILES = [".netrc", ".npmrc", ".git-credentials", join(".pi", "agent", "auth.json")];
+
+/** True for the home-directory credential stores: `~/.ssh/`, `~/.docker/`, `~/.aws/`, `~/.config/gh/`, `~/.netrc`, `~/.npmrc`, `~/.git-credentials`. DSP asks for any read or write of them. */
+export function isCredentialPath(absolute: string, home: string): boolean {
+	const path = canonicalPath(absolute);
+	const base = canonicalPath(home);
+	return CREDENTIAL_HOME_FOLDERS.some((folder) => isInside(join(base, folder), path)) || CREDENTIAL_HOME_FILES.some((file) => path === join(base, file));
+}
+
 const SHELL_RC_FILES = [".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".profile", ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout"];
 // `.git/config` and everything under `.git/hooks`, in any repository.
 const GIT_CONFIG_OR_HOOKS = /(^|\/)\.git\/(config|config\.worktree|hooks(\/|$))/;
@@ -39,12 +50,12 @@ export function protectedPathKind(absolute: string, ctx: ProtectedPathContext): 
 	}
 
 	const home = canonicalPath(ctx.home);
-	folders.push(join(home, ".pi"), canonicalPath(ctx.agentDir), join(home, ".config", "git"), join(home, ".config", "gh"), join(home, ".config", "fish"));
+	folders.push(join(home, ".pi"), canonicalPath(ctx.agentDir), join(home, ".config", "git"), join(home, ".config", "gh"), join(home, ".config", "fish"), ...CREDENTIAL_HOME_FOLDERS.map((folder) => join(home, folder)));
 	// A session working on the harness itself edits its own checkout: that is the project, not an installed copy.
 	const installRoot = canonicalPath(ctx.installRoot);
 	if (!isInside(installRoot, canonicalPath(ctx.projectRoot))) folders.push(installRoot);
 	if (folders.some((folder) => isInside(folder, path))) return "protected";
-	if (path === join(home, ".gitconfig") || SHELL_RC_FILES.some((name) => path === join(home, name))) return "protected";
+	if (path === join(home, ".gitconfig") || SHELL_RC_FILES.some((name) => path === join(home, name)) || CREDENTIAL_HOME_FILES.some((name) => path === join(home, name))) return "protected";
 	return GIT_CONFIG_OR_HOOKS.test(path.replace(/\\/g, "/")) ? "protected" : undefined;
 }
 

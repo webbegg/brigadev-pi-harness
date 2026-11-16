@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { classifyCommand } from "../lib/command-classifier.ts";
-import { analyzeDsp, classifyDsp } from "../lib/dsp-classify.ts";
+import { analyzeDsp, classifyDsp, dspUnwrap } from "../lib/dsp-classify.ts";
 import { fakeExec, realTmp, remoteLabels, unknownReasons } from "./dsp-fixtures.test.ts";
 
 const cwd = realTmp("dsp-classify-");
@@ -465,11 +465,111 @@ describe("verifier regressions: raw remote access", () => {
 		it(`is remote work: ${command}`, () => assert.ok(remote(command).includes("remote shell/copy"), command));
 	}
 
-	for (const command of ["rsync -a src/ backup/", "rsync -a --exclude 'a:b' src/ backup/", "rsync -a ./a:b dst/", "scp a.txt b.txt", "scp ./x:y z", "ssh -V", "ssh-keygen -l -f key", "ssh-add -l", "cat /dev/null > out.txt", "echo hi > /dev/stderr"]) {
+	for (const command of ["rsync -a src/ backup/", "rsync -a --exclude 'a:b' src/ backup/", "rsync -a ./a:b dst/", "scp a.txt b.txt", "scp ./x:y z", "ssh -V", "ssh-keygen -l -f key", "cat /dev/null > out.txt", "echo hi > /dev/stderr"]) {
 		it(`stays local: ${command}`, () => assert.deepEqual([remote(command), unknown(command)], [[], []], command));
 	}
 
 	it("a /dev path built from a variable asks", () => {
 		assert.ok(unknown("exec 3<>/dev/$PROTO/example.com/80").length > 0);
+	});
+});
+
+describe("verifier round 2: launchers, wrappers and environment edits", () => {
+	const unwrap = (command: string) => dspUnwrap(command.split(" "));
+	const unwrapped: Array<[string, string[]]> = [
+		["npx vitest run", ["vitest", "run"]],
+		["npx --yes -p typescript tsc --noEmit", ["tsc", "--noEmit"]],
+		["npx -c git", ["sh", "-c", "git"]],
+		["pnpm exec tsc", ["tsc"]],
+		["pnpm --filter web exec tsc", ["tsc"]],
+		["pnpm dlx cowsay hi", ["cowsay", "hi"]],
+		["yarn exec jest", ["jest"]],
+		["yarn dlx -p x y", ["y"]],
+		["npm exec -- eslint .", ["eslint", "."]],
+		["npm exec --package=x -- y", ["y"]],
+		["npm x y", ["y"]],
+		["bunx tsc", ["tsc"]],
+		["bun x tsc", ["tsc"]],
+		["uv run pytest", ["pytest"]],
+		["uv run --with rich python x.py", ["python", "x.py"]],
+		["uv run script.py", ["python", "script.py"]],
+		["uv tool run ruff check", ["ruff", "check"]],
+		["uvx ruff check", ["ruff", "check"]],
+		["poetry run pytest", ["pytest"]],
+		["pipx run --spec x y", ["y"]],
+		["bundle exec rspec", ["rspec"]],
+		["busybox ls", ["ls"]],
+		["taskset 1 ls", ["ls"]],
+		["taskset -c 0,1 ls", ["ls"]],
+		["unbuffer ls", ["ls"]],
+		["chronic ls", ["ls"]],
+		["tmux new -d -s x ls", ["sh", "-c", "ls"]],
+		["tmux -L sock run-shell ls", ["sh", "-c", "ls"]],
+		["screen -dmS name ls", ["ls"]],
+		["env -C src ls", ["ls"]],
+	];
+	for (const [command, expected] of unwrapped) it(`${command} runs ${expected.join(" ")}`, () => assert.deepEqual(unwrap(command).argv, expected));
+
+	it("launchers that run nothing are left alone", () => {
+		for (const command of ["npm install", "npm run build", "pnpm add x", "yarn", "bun install", "uv sync", "uv pip install x", "poetry install", "tmux ls", "screen -ls", "screen -r x", "npx"]) assert.equal(unwrap(command).argv[0], command.split(" ")[0], command);
+	});
+
+	it("env reports a directory change, unset names and a cleared environment", () => {
+		assert.equal(dspUnwrap(["env", "-C", "src", "ls"]).chdir, "src");
+		assert.equal(dspUnwrap(["env", "--chdir=src", "ls"]).chdir, "src");
+		assert.deepEqual(dspUnwrap(["env", "-u", "A", "--unset=B", "ls"]).env?.unset, ["A", "B"]);
+		assert.equal(dspUnwrap(["env", "-i", "ls"]).env?.clear, true);
+		assert.equal(dspUnwrap(["env", "-", "ls"]).env?.clear, true);
+		assert.equal(dspUnwrap(["exec", "-c", "ls"]).env?.clear, true);
+		assert.equal(dspUnwrap(["env", "-iS", "ls -l"]).env?.clear, true);
+		assert.deepEqual(dspUnwrap(["env", "-Sgit push"]).argv, ["git", "push"]);
+		assert.equal(dspUnwrap(["env", "A=1", "ls"]).env, undefined);
+	});
+
+	it("a script that switches branch moves what follows it; one that does not, does not", () => {
+		const readFile = (path: string) => (path.endsWith("sw.sh") ? { text: "git switch main\n" } : path.endsWith("ok.sh") ? { text: "echo hi\n" } : { missing: true as const });
+		const after = (command: string) => classifyDsp(command, { cwd, readFile }).find((match) => match.dsp?.some((tag) => tag.type === "history"));
+		assert.equal(after("bash sw.sh; git merge x")?.elsewhere, true);
+		assert.equal(after("bash ok.sh; git merge x")?.elsewhere, undefined);
+		assert.equal(after("git merge x")?.elsewhere, undefined);
+	});
+
+	it("a script that cannot be read moves what follows it", () => {
+		const readFile = () => ({ error: "EACCES" });
+		const match = classifyDsp("bash locked.sh; git merge x", { cwd, readFile }).find((found) => found.dsp?.some((tag) => tag.type === "history"));
+		assert.equal(match?.elsewhere, true);
+	});
+
+	it("env -C marks a git command that rewrites history as elsewhere", () => {
+		const match = classifyDsp("env -C ../other git merge x", { cwd }).find((found) => found.dsp?.some((tag) => tag.type === "history"));
+		assert.equal(match?.elsewhere, true);
+		assert.equal(classifyDsp("env -C src git status", { cwd }).some((found) => found.elsewhere), false);
+		// normal classification does not know about it
+		assert.equal(classifyCommand("env -C ../other git commit -m x").find((found) => found.commit)?.elsewhere, undefined);
+	});
+
+	it("git rebase <upstream> <branch> names the branch it switches to", () => {
+		const names = (command: string) => classifyDsp(command, { cwd }).flatMap((match) => (match.dsp ?? []).flatMap((tag) => (tag.type === "default-ref" && tag.label === "rebase" ? tag.names : [])));
+		assert.deepEqual(names("git rebase main feat/x"), ["feat/x"]);
+		assert.deepEqual(names("git rebase --onto a b main"), ["main"]);
+		assert.deepEqual(names("git rebase -x 'npm test' -s ours main refs/heads/topic"), ["topic"]);
+		assert.deepEqual(names("git rebase main"), []);
+		assert.deepEqual(names("git rebase --continue"), []);
+		assert.deepEqual(names("git rebase --root main"), ["main"]);
+		assert.ok(unknown("git rebase main $BRANCH").length > 0);
+	});
+
+	it("git command strings are classified like shell commands", () => {
+		for (const command of ["git -c core.pager='gh pr merge 1' log", "git rebase -x 'gh pr merge 1' HEAD", "git submodule foreach --recursive gh pr merge 1", "git bisect run gh pr merge 1", "git filter-branch --msg-filter 'gh pr merge 1' HEAD", "git fetch --upload-pack='gh pr merge 1' origin", "git clone 'ext::gh pr merge 1' x", "GIT_PAGER='gh pr merge 1' git log"]) {
+			assert.ok(remote(command).some((label) => /PR merge/.test(label)), command);
+		}
+		assert.ok(unknown("git -c core.pager=\"$P\" log").length > 0);
+		assert.ok(unknown("git rebase -x \"$(cat cmd)\" HEAD").length > 0);
+		assert.deepEqual([remote("git -c core.pager=less log"), unknown("git -c core.pager=less log")], [[], []]);
+	});
+
+	it("awk programs that spawn processes ask; plain ones do not", () => {
+		for (const program of ['BEGIN{system("ls")}', '{"date" | getline d}', '{print $1 | "sort"}', '{printf "%s\\n", $1 | "cat"}']) assert.ok(unknown(`awk '${program}' f`).length > 0, program);
+		for (const program of ["{print $1}", "/a|b/ {print}", "$1 == 1 || $2 == 2 {print $3}", "{n++} END {print n}"]) assert.deepEqual(unknown(`awk '${program}' f`), [], program);
 	});
 });

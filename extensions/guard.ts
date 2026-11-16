@@ -6,15 +6,17 @@
  * Subagents load this file explicitly (`-e`), so it must work standalone.
  */
 
-import { homedir } from "node:os";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
 import { createBackup, type BackupPlan } from "../lib/dsp-backup.ts";
+import { buildCredLock, clearCredLocks, lockEnvironment, lockPaths, lockSourceLine, markCredLock, setCredLockDir, writeCredLock, writeLockScript } from "../lib/dsp-credlock.ts";
 import { appendDspAudit, dspAuditDir, dspAuditFile, dspAuditRecord, dspStatusLine, noteDspAllowed, resetDspCount } from "../lib/dsp-audit.ts";
-import { bashProtectedTargets, protectedPathKind, type ProtectedPathContext } from "../lib/dsp-paths.ts";
+import { bashProtectedTargets, isCredentialPath, protectedPathKind, type ProtectedPathContext } from "../lib/dsp-paths.ts";
 import { auditKind, decideDspCommand, isAutoAllowedForAudit, readRemoteTarget, remoteDialog, type DspResult } from "../lib/dsp-policy.ts";
 import { appendEvidence, commitGateWithForce, evidenceFile, forceRecord, gateDialog, readEvidence, type ForceRecord } from "../lib/evidence.ts";
 import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, shellCallOf, type PathVerdict } from "../lib/guard-rules.ts";
@@ -41,6 +43,8 @@ export default function (pi: ExtensionAPI) {
 	const outsideGrants = new Set<string>();
 	// Worktree tree the user granted a one-shot commit force for (/brigadev:force-commit). Only that command sets it.
 	let forcedTree: string | undefined;
+	// S10: the private dir of the DSP credential lock, created at the first locked command and removed at shutdown.
+	let lockDir: string | undefined;
 
 	const projectRoot = (ctx: ExtensionContext) => canonicalPath(process.env[CHILD_ENV.PROJECT_ROOT] ?? ctx.cwd);
 	/** DSP applies to the parent session only: subagents never inherit it. */
@@ -167,7 +171,9 @@ export default function (pi: ExtensionAPI) {
 			absolutePath: absolute,
 			projectRoot: root,
 			docsDir: () => repoDocsDir(ctx.cwd),
-			sensitive: isSensitivePath(isDirectory ? `${absolute}/` : absolute),
+			// In DSP the credential stores the lock hides from the shell (`~/.git-credentials`, `~/.docker/`, `~/.config/gh/`, ...) ask on a read too
+			// (a write to one that DSP protects, such as `~/.config/gh/`, already asks as a protected path).
+			sensitive: isSensitivePath(isDirectory ? `${absolute}/` : absolute) || (dsp && !isWrite && isCredentialPath(absolute, homedir())),
 			readOnly: process.env[CHILD_ENV.READ_ONLY] === "1",
 			surfaces: isChild ? childAllowedSurfaces() : undefined,
 			agent: process.env[CHILD_ENV.AGENT],
@@ -202,6 +208,59 @@ export default function (pi: ExtensionAPI) {
 		restoreMode(ctx);
 	});
 	pi.on("session_tree", async (_event, ctx) => restoreMode(ctx));
+	// The lock's private dir (empty gh config, sanitized npmrc/docker copies) never outlives the session.
+	pi.on("session_shutdown", async () => {
+		clearCredLocks();
+		const dir = lockDir;
+		lockDir = undefined;
+		setCredLockDir(undefined);
+		if (dir) rmSync(dir, { recursive: true, force: true });
+	});
+
+	/** The lock's private dir, created on first use (mode 0700) and rebuilt if something removed its files. Throws when it cannot be made. */
+	const ensureLockDir = (): string => {
+		if (lockDir && existsSync(lockPaths(lockDir).askpass)) return lockDir;
+		const dir = lockDir ?? mkdtempSync(join(tmpdir(), "brigadev-lock-"));
+		try {
+			writeCredLock(buildCredLock({ env: process.env, home: homedir(), dir }));
+		} catch (error) {
+			if (!lockDir) rmSync(dir, { recursive: true, force: true });
+			throw error;
+		}
+		lockDir = dir;
+		setCredLockDir(dir);
+		return dir;
+	};
+
+	/**
+	 * S10: runs the call in the credential-locked environment. The decision and every dialog were made on the original command; this
+	 * is the last step. `bg_start` passes the locked environment through its spawn (background-terminals.ts takes the mark for this
+	 * call id); `bash` gets one short line that sources `lock.sh` (see lockSourceLine), because Pi's bash tool has no per-call environment: its spawn
+	 * hook is per tool object and gets no call id, and replacing the tool would drop the user's shellPath/shellCommandPrefix settings.
+	 * Returns a block reason when the lock cannot be set up: a command never runs unlocked by accident.
+	 */
+	const lockCall = (toolName: string, toolCallId: string, input: unknown): string | undefined => {
+		let dir: string;
+		try {
+			dir = ensureLockDir();
+		} catch (error) {
+			return `Blocked by brigadev DSP: the credential lock could not be set up (${error instanceof Error ? error.message : String(error)}), so the command was not run.`;
+		}
+		if (toolName === "bg_start") {
+			markCredLock(toolCallId, (env) => lockEnvironment(env, dir).env);
+			return undefined;
+		}
+		const fields = input as { command?: unknown };
+		if (typeof fields.command !== "string") return undefined;
+		// Rewritten before every locked call, so an edit of lock.sh between two calls cannot weaken the next one.
+		try {
+			writeLockScript(dir, process.env);
+		} catch (error) {
+			return `Blocked by brigadev DSP: the credential lock could not be set up (${error instanceof Error ? error.message : String(error)}), so the command was not run.`;
+		}
+		fields.command = `${lockSourceLine(dir)}\n${fields.command}`;
+		return undefined;
+	};
 
 	const kindsOf = (items: Array<{ label: string }>) => [...new Set(items.map((item) => item.label))].join(", ");
 
@@ -210,15 +269,17 @@ export default function (pi: ExtensionAPI) {
 	 * UI it is denied), then the automatic backup. Returns a block reason, or the backup refs made and whether the command
 	 * counts as auto-allowed (it ran without a question although normal mode would have asked).
 	 */
-	const settleDsp = async (result: DspResult, command: string, cwd: string, ctx: ExtensionContext): Promise<{ block: string } | { backups: string[]; autoAllowed: boolean }> => {
+	const settleDsp = async (result: DspResult, command: string, cwd: string, ctx: ExtensionContext): Promise<{ block: string } | { backups: string[]; autoAllowed: boolean; remoteApproved: boolean }> => {
 		const d = result.decision;
 		if (d.action === "block") return { block: d.reason };
 		const preview = commandPreview(command);
+		let remoteApproved = false;
 		if (d.action === "confirm-remote") {
 			const kinds = kindsOf(d.items);
 			if (isChild || !ctx.hasUI) return { block: `Blocked by brigadev DSP: this is a remote action (${kinds}), remote actions always need your OK, and there is no UI to ask (print mode). Run it yourself.` };
 			const dialog = remoteDialog({ command, items: d.items, target: await readRemoteTarget(exec, cwd, d.items), also: d.also });
 			if (!(await ctx.ui.confirm(dialog.title, dialog.body))) return { block: `User declined: DSP remote action (${kinds})` };
+			remoteApproved = true; // S10: this one call, and only this one, runs without the credential lock
 		} else if (d.action === "confirm") {
 			if (!(await confirm(ctx, `brigadev: ${d.reason}`, `${preview}\n\nRun it?`))) return { block: `User declined: ${d.reason}` };
 		}
@@ -231,10 +292,10 @@ export default function (pi: ExtensionAPI) {
 				// Nothing was asked yet: fall back to asking, or deny without a UI.
 				const ok = await confirm(ctx, "brigadev DSP: backup failed", `${preview}\n\nThe automatic backup before this local discard failed (${made.error}).\n\nRun it without a backup?`);
 				if (!ok) return { block: ctx.hasUI ? `User declined: the automatic backup failed (${made.error})` : `Blocked by brigadev DSP: the automatic backup before this local discard failed (${made.error}) and there is no UI to ask.` };
-				return { backups: [], autoAllowed: false };
+				return { backups: [], autoAllowed: false, remoteApproved };
 			} else if (ctx.hasUI) ctx.ui.notify(`brigadev DSP: the automatic backup failed (${made.error}); the command was approved and runs without one.`, "warning");
 		}
-		return { backups, autoAllowed: isAutoAllowedForAudit(result) };
+		return { backups, autoAllowed: isAutoAllowedForAudit(result), remoteApproved };
 	};
 
 	/** One audit line for a command DSP ran without asking (a failed write never stops the command). */
@@ -259,6 +320,9 @@ export default function (pi: ExtensionAPI) {
 		const shell = shellCallOf(event.toolName, event.input);
 		if (shell) {
 			const { command } = shell;
+			// A mark left by an earlier call with this id must not lock (or unlock) this one.
+			markCredLock(event.toolCallId, undefined);
+			let remoteApproved = false;
 			// Where the command starts: a bg_start `cwd` is the same move as `cd <cwd> && <command>`, so relative paths in the
 			// rules below resolve against it and a commit there is decided like bash decides the `cd` form.
 			const commandCwd = shell.cwd === undefined ? ctx.cwd : canonicalPath(resolve(ctx.cwd, expandHome(shell.cwd)));
@@ -304,6 +368,7 @@ export default function (pi: ExtensionAPI) {
 				const settled = await settleDsp(dspResult, command, commandCwd, ctx);
 				if ("block" in settled) return { block: true, reason: settled.block };
 				if (settled.autoAllowed) audit = { backups: settled.backups };
+				remoteApproved = settled.remoteApproved;
 			} else if (decision?.action === "confirm") {
 				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(command)}\n\nRun it?`);
 				if (!ok) return { block: true, reason: `User declined: ${decision.reason}` };
@@ -316,6 +381,11 @@ export default function (pi: ExtensionAPI) {
 			if (surfaces) {
 				const snapshot = await takeSnapshot(exec, projectRoot(ctx));
 				if (snapshot) beforeBash.set(event.toolCallId, snapshot);
+			}
+			// S10, last: every rule above decided allow. Only an exact call the user approved in the remote dialog runs unlocked.
+			if (dsp && !remoteApproved) {
+				const reason = lockCall(event.toolName, event.toolCallId, event.input);
+				if (reason) return { block: true, reason };
 			}
 			return undefined;
 		}

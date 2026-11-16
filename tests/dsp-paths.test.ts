@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { bashProtectedTargets, protectedPathKind, type ProtectedPathContext } from "../lib/dsp-paths.ts";
+import { bashProtectedTargets, isCredentialPath, protectedPathKind, type ProtectedPathContext } from "../lib/dsp-paths.ts";
 import { isSensitivePath } from "../lib/permission-policy.ts";
 import { realTmp } from "./dsp-fixtures.test.ts";
 
@@ -42,6 +42,12 @@ describe("protected paths", () => {
 		["~/.zprofile", join(home, ".zprofile")],
 		["~/.zshenv", join(home, ".zshenv")],
 		["fish config", join(home, ".config", "fish", "config.fish")],
+		["~/.ssh/", join(home, ".ssh", "config")],
+		["~/.docker/config.json", join(home, ".docker", "config.json")],
+		["~/.aws/credentials", join(home, ".aws", "credentials")],
+		["~/.netrc", join(home, ".netrc")],
+		["~/.npmrc", join(home, ".npmrc")],
+		["~/.git-credentials", join(home, ".git-credentials")],
 	];
 	for (const [name, path] of protectedPaths) it(`${name} is protected`, () => assert.equal(kind(path), "protected", path));
 
@@ -58,6 +64,8 @@ describe("protected paths", () => {
 		["~/.config/other", join(home, ".config", "other", "x")],
 		["a lookalike name", join(home, ".zshrc-backup-dir", "x")],
 		["a file named like git config in the project", join(project, "docs", "config")],
+		["a project .npmrc", join(project, ".npmrc")],
+		["a lookalike of ~/.ssh", join(home, ".ssh-notes", "x")],
 	];
 	for (const [name, path] of free) it(`${name} is not protected`, () => assert.equal(kind(path), undefined, path));
 
@@ -69,6 +77,18 @@ describe("protected paths", () => {
 	it("sensitive paths keep their own rule (reading secrets still asks)", () => {
 		assert.equal(isSensitivePath(join(home, ".ssh", "id_rsa")), true);
 		assert.equal(isSensitivePath(join(project, ".env")), true);
+	});
+});
+
+describe("credential stores (S10)", () => {
+	const credentials = [join(home, ".ssh", "id_ed25519"), join(home, ".ssh"), join(home, ".config", "gh", "hosts.yml"), join(home, ".git-credentials"), join(home, ".docker", "config.json"), join(home, ".netrc"), join(home, ".npmrc"), join(home, ".aws", "credentials"), join(home, ".pi", "agent", "auth.json")];
+	for (const path of credentials) it(`${path.slice(home.length)} is a credential path`, () => assert.equal(isCredentialPath(path, home), true));
+	for (const path of [join(project, ".npmrc"), join(home, ".config", "other", "x"), join(home, ".ssh-notes"), join(home, "notes.txt"), join(home, ".docker-compose.yml")]) {
+		it(`${path.slice(home.length) || path} is not`, () => assert.equal(isCredentialPath(path, home), false));
+	}
+	it("a shell write to one is a protected target", () => {
+		const found = bashProtectedTargets("echo x > ~/.netrc", project, ctx);
+		assert.deepEqual(found.map((entry) => entry.kind), ["protected"]);
 	});
 });
 
