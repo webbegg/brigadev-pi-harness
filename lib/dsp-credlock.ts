@@ -16,7 +16,9 @@
 //     helpers, and also no plugins or contexts of the user's config), AWS (`AWS_SHARED_CREDENTIALS_FILE` -> /dev/null).
 // HOME is unchanged: plain fetches of public remotes and installs from public registries keep working.
 
-import { accessSync, constants, existsSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, join } from "node:path";
 
 /**
  * Names that look like secrets. A word has to stand between underscores or at an edge of the name, so `TOKENIZERS_PARALLELISM`
@@ -193,12 +195,72 @@ export function clearCredLocks(): void {
 	registry().calls.clear();
 }
 
-/** The lock keeps no private directory any more (nothing on disk for the agent to rewrite); kept so callers that ask get `undefined`. */
-export function credLockDir(): undefined {
-	return undefined;
+// ── subagents (R1-001) ──────────────────────────────────────────────────────────────────────────────────────
+// A child process gets the parent's full environment (it needs its provider keys), so its own bash calls are what the lock covers:
+// while the parent is in DSP the launcher puts DSP_LOCK_ENV in every child's environment, and the child's guard (extensions/guard.ts)
+// runs every bash call behind the same inline prelude. The guard owns the mode; the launcher (lib/child-launch.ts) only reads this
+// process-level slot at spawn time, so neither depends on which extension loaded first.
+
+/** Set to `1` in a child's environment when its parent session was in DSP at launch. */
+export const DSP_LOCK_ENV = "BRIGADEV_DSP_LOCK";
+
+const PARENT_DSP = Symbol.for("brigadev.dsp-parent-mode");
+
+/** The parent guard says whether this session is in DSP right now (false on every other mode and at shutdown). */
+export function setParentDspLock(on: boolean): void {
+	(globalThis as unknown as Record<symbol, boolean | undefined>)[PARENT_DSP] = on;
+}
+
+/** True while the parent session is in DSP: children launched now get `DSP_LOCK_ENV`. */
+export function parentDspLock(): boolean {
+	return (globalThis as unknown as Record<symbol, boolean | undefined>)[PARENT_DSP] === true;
+}
+
+// ── the prelude in rows and logs ────────────────────────────────────────────────────────────────────────────
+
+const PRELUDE_LINE = /^(?:unset -v [A-Za-z_][A-Za-z0-9_]*(?: [A-Za-z_][A-Za-z0-9_]*)*&&)?export GIT_SSH_COMMAND=[^\n]*&&export [^\n]* \|\| exit 1\n/;
+
+/** The command without the first line `lockPrelude` produced (compact rows and the evidence log show what the agent wrote). Anything else comes back unchanged. */
+export function stripLockPrelude(command: string): string {
+	const match = PRELUDE_LINE.exec(command);
+	return match ? command.slice(match[0].length) : command;
+}
+
+// ── the Pi shell ────────────────────────────────────────────────────────────────────────────────────────────
+// The prelude is POSIX shell text (`unset -v`, `export`, `&&`, `|| exit 1`). Pi's bash tool runs the commands in the shell named by the
+// `shellPath` setting of Pi's settings.json (the project's `.pi/settings.json` wins over the global one in the agent dir), bash by default.
+
+/** Pi's agent directory (the same rule as lib/runtime.ts `agentDir`, repeated so this module imports nothing of the harness). */
+const piAgentDir = () => process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+
+const NON_POSIX_SHELLS = new Set(["fish", "nu", "nushell", "pwsh", "powershell", "elvish", "xonsh", "csh", "tcsh", "cmd"]);
+
+/** The shell's program name when it is not a POSIX shell (fish, nu, pwsh, elvish, xonsh, ...); undefined for sh, bash, zsh and the like or no value. */
+export function nonPosixShell(shellPath: string | undefined): string | undefined {
+	if (!shellPath) return undefined;
+	const name = basename(shellPath.replace(/\\/g, "/")).toLowerCase().replace(/\.exe$/, "");
+	return NON_POSIX_SHELLS.has(name) ? name : undefined;
+}
+
+function shellPathIn(file: string): string | undefined {
+	try {
+		const parsed = JSON.parse(readFileSync(file, "utf8")) as { shellPath?: unknown };
+		return typeof parsed?.shellPath === "string" && parsed.shellPath.trim() ? parsed.shellPath.trim() : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Why DSP cannot be used with Pi's configured shell, or undefined when it can. Reads the two settings files directly (no Pi API, so no load order). */
+export function dspShellProblem(where: { agentDir?: string; cwd?: string } = {}): string | undefined {
+	const shellPath = (where.cwd ? shellPathIn(join(where.cwd, ".pi", "settings.json")) : undefined) ?? shellPathIn(join(where.agentDir ?? piAgentDir(), "settings.json"));
+	const name = nonPosixShell(shellPath);
+	return name === undefined ? undefined : `Pi's shell (${shellPath}) is not a POSIX shell, and the DSP credential lock is a POSIX shell prefix (sh, bash, zsh), so DSP would not lock its commands. DSP is not available with ${name}: set shellPath to bash or zsh in Pi's settings.json, or use normal mode.`;
 }
 
 /** The line `/brigadev:doctor` shows in DSP. */
 export function credLockLine(): string {
+	const problem = dspShellProblem({ cwd: process.cwd() });
+	if (problem) return `DSP credential lock: NOT APPLIED — ${problem}`;
 	return "DSP credential lock: on — shell commands and background processes start without the SSH agent, gh/GitHub and registry tokens, git credential helpers and the npm/docker/AWS credentials (no file on disk: an inline prelude, read-only targets); only a remote call you approve in the dialog gets them. npm private-registry auth and docker plugins/contexts from your user config are not available in locked commands";
 }

@@ -179,6 +179,28 @@ describe("backup refs", () => {
 			await createBackup(realExec, repo, { slug: "x", branches: ["no-such-branch"], refs: [], stashes: [] }, { now: fixedNow });
 			assert.equal(git("for-each-ref", "refs/brigadev/"), "");
 		});
+
+		it("a ref write that fails after another ref was written rolls the first back (real git)", async () => {
+			git("checkout", "-q", "-b", "old");
+			git("checkout", "-q", "feat/x");
+			for (const failAt of [2, 3]) {
+				let updates = 0;
+				const flaky: typeof realExec = async (command, args, options) => {
+					// The Nth ref write (not a delete) fails the way a locked or full ref store would.
+					if (command === "git" && args[0] === "update-ref" && args[1] !== "-d" && ++updates === failAt) return { stdout: "", stderr: "fatal: cannot lock ref\n", code: 128 };
+					return realExec(command, args, options);
+				};
+				const plan = { slug: "branch-delete", branches: ["old"], refs: ["refs/heads/old"], stashes: ["stash@{0}"] };
+				writeFileSync(join(repo, "tracked.txt"), `stash ${failAt}\n`);
+				git("stash", "push", "-q");
+				const result = await createBackup(flaky, repo, plan, { now: fixedNow });
+				assert.equal(result.ok, false, `failAt ${failAt}: ${JSON.stringify(result)}`);
+				assert.match(String((result as any).error), /update-ref .*cannot lock ref/);
+				assert.ok(updates >= failAt, "the failing write was reached after an earlier one");
+				assert.equal(git("for-each-ref", "refs/brigadev/"), "", `failAt ${failAt}: no backup ref is left`);
+				git("stash", "clear");
+			}
+		});
 	});
 
 	describe("pruning", () => {

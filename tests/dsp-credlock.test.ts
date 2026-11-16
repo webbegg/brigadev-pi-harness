@@ -2,7 +2,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
-	credLockDir,
 	credLockLine,
 	isLockedVariable,
 	lockEnvironment,
@@ -268,9 +267,5 @@ describe("S10 the per-call registry shared by the guard and bg_start", () => {
 		assert.match(line, /remote call you approve/);
 		assert.match(line, /no file on disk/);
 		assert.match(line, /npm private-registry auth and docker plugins\/contexts/);
-	});
-
-	it("there is no private lock dir any more", () => {
-		assert.equal(credLockDir(), undefined);
 	});
 });

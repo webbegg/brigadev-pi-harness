@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { credLockDir, isLockedVariable, lockPlaces, markCredLock, takeCredLock } from "../lib/dsp-credlock.ts";
+import { isLockedVariable, lockPlaces, markCredLock, takeCredLock } from "../lib/dsp-credlock.ts";
 import { readDspAudit } from "../lib/dsp-audit.ts";
 import { DSP_REMOTE_TITLE } from "../lib/dsp-policy.ts";
 import { createFakeCtx, createFakePi } from "./helpers/fake-pi.ts";
@@ -118,7 +118,6 @@ describe("S10 guard wiring of the credential lock", () => {
 			assert.match(a, / \|\| exit 1$/);
 			assert.doesNotMatch(a, /lock\.sh|askpass|\. '|TMPDIR|\/tmp\/|\/var\/folders/);
 			assert.deepEqual(lockDirsInTmp(), before, "no lock dir in the temp dir");
-			assert.equal(credLockDir(), undefined, "there is no private dir to name");
 			await s.shutdown();
 		});
 
@@ -252,7 +251,6 @@ describe("S10 guard wiring of the credential lock", () => {
 					const result = await s.call("bash", { command });
 					assert.equal(result.input.command, command, `${mode}: ${command}`);
 				}
-				assert.equal(credLockDir(), undefined, mode);
 				await s.shutdown();
 			}
 		});
@@ -271,7 +269,6 @@ describe("S10 guard wiring of the credential lock", () => {
 			const s = await session({ mode: "dsp", child: true });
 			const result = await s.call("bash", { command: "echo hi" });
 			assert.equal(result.input.command, "echo hi");
-			assert.equal(credLockDir(), undefined);
 		});
 
 		it("a command that is not a string is left alone", async () => {

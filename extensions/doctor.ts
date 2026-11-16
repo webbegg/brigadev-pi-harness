@@ -93,7 +93,8 @@ export default function (pi: ExtensionAPI) {
 			const dspWarning = defaultModeWarning(settings.defaultMode);
 			if (dspWarning) mark(false, dspWarning);
 			if (sessionMode(ctx, settings.defaultMode) === PERMISSION_MODE.DSP) {
-				mark(true, credLockLine());
+				const lockLine = credLockLine();
+				mark(!lockLine.includes("NOT APPLIED"), lockLine);
 				// libcurl reads ~/.netrc for git over https, and the lock does not take it away.
 				if (existsSync(join(homedir(), ".netrc"))) mark(false, "~/.netrc can authenticate git over https; the DSP credential lock does not cover it");
 			}

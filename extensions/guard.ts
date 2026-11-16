@@ -13,7 +13,7 @@ import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
 import { createBackup, type BackupPlan } from "../lib/dsp-backup.ts";
-import { clearCredLocks, lockEnvironment, lockPlaces, lockPrelude, markCredLock, type LockPlaces } from "../lib/dsp-credlock.ts";
+import { clearCredLocks, DSP_LOCK_ENV, dspShellProblem, lockEnvironment, lockPlaces, lockPrelude, markCredLock, setParentDspLock, type LockPlaces } from "../lib/dsp-credlock.ts";
 import { appendDspAudit, dspAuditDir, dspAuditFile, dspAuditRecord, dspStatusLine, noteDspAllowed, resetDspCount } from "../lib/dsp-audit.ts";
 import { bashProtectedTargets, isCredentialPath, protectedPathKind, type ProtectedPathContext } from "../lib/dsp-paths.ts";
 import { auditKind, decideDspCommand, isAutoAllowedForAudit, readRemoteTarget, remoteDialog, type DspResult } from "../lib/dsp-policy.ts";
@@ -37,6 +37,8 @@ const DSP_SWITCH_BODY =
 
 export default function (pi: ExtensionAPI) {
 	const isChild = isChildSession();
+	// R1-001: a subagent launched while its parent was in DSP carries the marker; it has no remote dialog, so every bash call is locked, never unlocked.
+	const lockedChild = isChild && process.env[DSP_LOCK_ENV] === "1";
 	let mode: PermissionMode = PERMISSION_MODE.NORMAL;
 	// Per-session grants for directories outside the project root.
 	const outsideGrants = new Set<string>();
@@ -62,7 +64,13 @@ export default function (pi: ExtensionAPI) {
 	// Working-tree snapshot taken before each allowed bash call, by tool call id.
 	const beforeBash = new Map<string, Snapshot>();
 
+	/** The launcher (lib/child-launch.ts) reads this at spawn time: children launched while the parent is in DSP carry the marker. */
+	const syncParentLock = () => {
+		if (!isChild) setParentDspLock(mode === PERMISSION_MODE.DSP);
+	};
+
 	const publishStatus = (ctx: ExtensionContext) => {
+		syncParentLock();
 		if (isChild || !ctx.hasUI) return;
 		ctx.ui.setStatus(STATUS_KEY, mode === PERMISSION_MODE.YOLO ? "🚀 brigadev: yolo" : mode === PERMISSION_MODE.DSP ? "⚠ brigadev: DSP" : "brigadev: normal");
 	};
@@ -74,6 +82,14 @@ export default function (pi: ExtensionAPI) {
 			if (entry.type === "custom" && entry.customType === MODE_ENTRY) {
 				const value = (entry.data as { mode?: unknown } | undefined)?.mode;
 				if (isPermissionMode(value)) mode = value;
+			}
+		}
+		// The credential lock is a POSIX shell prefix: with another shell DSP would run commands unlocked, so the session starts in normal mode.
+		if (mode === PERMISSION_MODE.DSP && !isChild) {
+			const problem = dspShellProblem({ cwd: ctx.cwd });
+			if (problem) {
+				mode = PERMISSION_MODE.NORMAL;
+				if (ctx.hasUI) ctx.ui.notify(`brigadev: DSP is off for this session. ${problem}`, "warning");
 			}
 		}
 		outsideGrants.clear();
@@ -211,6 +227,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		clearCredLocks();
 		sessionLock = undefined;
+		if (!isChild) setParentDspLock(false);
 	});
 
 	/**
@@ -260,12 +277,12 @@ export default function (pi: ExtensionAPI) {
 		if (plan) {
 			const made = await createBackup(exec, cwd, plan);
 			if (made.ok) backups = made.refs;
-			else if (d.action === "allow-with-backup") {
-				// Nothing was asked yet: fall back to asking, or deny without a UI.
-				const ok = await confirm(ctx, "brigadev DSP: backup failed", `${preview}\n\nThe automatic backup before this local discard failed (${made.error}).\n\nRun it without a backup?`);
+			else {
+				// An earlier "yes" (the confirm or remote dialog) was for the command with a backup: ask again, or deny without a UI.
+				const ok = await confirm(ctx, "brigadev DSP: backup failed", `${preview}\n\nThe automatic backup failed (${made.error}); run without a backup?`);
 				if (!ok) return { block: ctx.hasUI ? `User declined: the automatic backup failed (${made.error})` : `Blocked by brigadev DSP: the automatic backup before this local discard failed (${made.error}) and there is no UI to ask.` };
 				return { backups: [], autoAllowed: false, remoteApproved };
-			} else if (ctx.hasUI) ctx.ui.notify(`brigadev DSP: the automatic backup failed (${made.error}); the command was approved and runs without one.`, "warning");
+			}
 		}
 		return { backups, autoAllowed: isAutoAllowedForAudit(result), remoteApproved };
 	};
@@ -355,7 +372,8 @@ export default function (pi: ExtensionAPI) {
 				if (snapshot) beforeBash.set(event.toolCallId, snapshot);
 			}
 			// S10, last: every rule above decided allow. Only an exact call the user approved in the remote dialog runs unlocked.
-			if (dsp && !remoteApproved) lockCall(event.toolName, event.toolCallId, event.input);
+			// A child launched in DSP has no dialog to approve with: its calls are always locked.
+			if ((dsp && !remoteApproved) || lockedChild) lockCall(event.toolName, event.toolCallId, event.input);
 			return undefined;
 		}
 
@@ -410,6 +428,8 @@ export default function (pi: ExtensionAPI) {
 			/** DSP takes one confirmation dialog, and needs a UI to show it. */
 			const enterDsp = async (): Promise<void> => {
 				if (mode === PERMISSION_MODE.DSP) return void ctx.ui.notify("brigadev: already in DSP mode", "info");
+				const problem = dspShellProblem({ cwd: ctx.cwd });
+				if (problem) return void ctx.ui.notify(`brigadev: DSP refused. ${problem}`, "error");
 				if (!ctx.hasUI) return void ctx.ui.notify("brigadev: DSP needs a UI to confirm the switch, so the mode was not changed.", "error");
 				if (!(await ctx.ui.confirm(`brigadev: switch to ${MODE_LABEL.dsp}?`, DSP_SWITCH_BODY))) return void ctx.ui.notify("brigadev: mode unchanged", "info");
 				setMode(PERMISSION_MODE.DSP, ctx);

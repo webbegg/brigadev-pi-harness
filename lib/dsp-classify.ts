@@ -65,6 +65,8 @@ interface Scope {
 	dir: string | undefined;
 	/** The command has parentheses, so a `cd` may be confined to a subshell the tokenizer does not show. */
 	parens: boolean;
+	/** An earlier part of the command changed directory (`cd`, `pushd`, `popd`) or set a git location variable: a git command after it may act on another repository. */
+	repoMoved?: boolean;
 }
 
 interface Ctx {
@@ -2521,11 +2523,37 @@ function surroundingMatches(seg: SegmentInfo, unwrapped: UnwrapResult, rt: Runti
 	return tags.length > 0 ? [carrier(tags), ...nested] : nested;
 }
 
+const REPO_LOCATION_ASSIGNMENT = /^(GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_INDEX_FILE)=/;
+
+/** The automatic backup is taken in the session's repository: a discard that acts on another one asks instead. */
+const OTHER_REPOSITORY = "the automatic backup can only protect the session's repository";
+
+/** `git -C dir`, `--git-dir`, `--work-tree`, `-c core.worktree=`: the invocation names its own repository. */
+function gitNamesOtherRepository(argv: string[]): boolean {
+	const name = basename(argv[0] ?? "");
+	if (name !== "git" && name !== "hub") return false;
+	const args = argv.slice(1);
+	const index = gitSubcommand(args);
+	const prefix = index === -1 ? args : args.slice(0, index);
+	return prefix.some((arg, i) => arg === "-C" || arg.startsWith("--git-dir") || arg.startsWith("--work-tree") || (arg === "-c" && /^core\.(worktree|bare)\b/i.test(prefix[i + 1] ?? "")));
+}
+
 function refineSegment(seg: SegmentInfo, found: CommandMatch[], base: Runtime): CommandMatch[] {
 	const unwrapped = dspUnwrap(seg.rawArgv);
 	// `env -C dir cmd` runs cmd in dir: relative scripts and targets mean what they mean there.
 	const rt: Runtime = unwrapped.chdir === undefined ? base : { ...base, scope: { ...base.scope, dir: resolveFrom(unwrapped.chdir, base) } };
-	return [...refineCore(seg, found, rt, unwrapped), ...surroundingMatches(seg, unwrapped, rt)];
+	const matches = [...refineCore(seg, found, rt, unwrapped), ...surroundingMatches(seg, unwrapped, rt)];
+	// A discard after a directory move, or naming another repository, is not backed up (the backup is of the session's repository): it asks.
+	const sets = seg.rawArgv.some((word) => REPO_LOCATION_ASSIGNMENT.test(word));
+	const otherRepository = base.scope.repoMoved === true || unwrapped.chdir !== undefined || sets || gitNamesOtherRepository(seg.argv);
+	if (otherRepository) {
+		for (const match of matches) {
+			if (!match.dsp?.some((tag) => tag.type === "discard")) continue;
+			match.dsp = [...match.dsp.filter((tag) => tag.type !== "discard"), unknownTag(OTHER_REPOSITORY)];
+		}
+	}
+	if (sets || ["cd", "pushd", "popd"].includes(basename(seg.argv[0] ?? ""))) base.scope.repoMoved = true;
+	return matches;
 }
 
 function refineCore(seg: SegmentInfo, found: CommandMatch[], rt: Runtime, unwrapped: UnwrapResult): CommandMatch[] {

@@ -3,11 +3,10 @@
 // reads it; the command must still run without the parent's secrets.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { credLockDir } from "../lib/dsp-credlock.ts";
 import { createFakeCtx, createFakePi } from "./helpers/fake-pi.ts";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
 
@@ -52,9 +51,8 @@ describe("S10 lock survives a rewrite of its private files after the decision", 
 		await pi.fire("session_start", {}, ctx);
 		const event = { toolName: "bash", toolCallId: "race-1", input: { command: 'echo "[$GH_TOKEN][$SSH_AUTH_SOCK]"' } };
 		for (const handler of pi.handlers.get("tool_call") ?? []) await handler(event, ctx);
-		// What a loop started by an earlier call does between the decision and the spawn.
-		const lockDir = credLockDir();
-		if (lockDir) for (const name of readdirSync(lockDir)) if (statSync(join(lockDir, name)).isFile()) writeFileSync(join(lockDir, name), name === "askpass" ? "#!/bin/sh\nexit 1\n" : ":\n");
+		// What a loop started by an earlier call does between the decision and the spawn: it would rewrite the lock's files. The lock keeps
+		// none (an inline prelude), so there is nothing to replace, and the command below must still run without the parent's secrets.
 		const output = execFileSync("bash", ["-c", event.input.command], { cwd: repo, env: process.env, encoding: "utf8" });
 		assert.equal(output.trim(), "[][]");
 		await pi.fire("session_shutdown", { reason: "quit" }, ctx);
