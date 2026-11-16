@@ -8,6 +8,7 @@
 // cancellation response (lib/child-rpc.ts), so no child waits for a person.
 // The task is not an argument: the run loop sends it as the RPC `prompt` command.
 
+import { DSP_LOCK_ENV, parentDspLock } from "./dsp-credlock.ts";
 import { CHILD_ENV, EVIDENCE_EXTENSION_PATH, GUARD_EXTENSION_PATH, STRUCTURED_OUTPUT_EXTENSION_PATH } from "./runtime.ts";
 import { STRUCTURED_OUTPUT_TOOL } from "./structured-output.ts";
 
@@ -53,6 +54,9 @@ export function childLaunch(input: ChildLaunchInput): ChildLaunch {
 	else delete env[CHILD_ENV.ALLOWED_SURFACES];
 	if (structured && agent.outputSchema) env[CHILD_ENV.OUTPUT_SCHEMA] = agent.outputSchema;
 	else delete env[CHILD_ENV.OUTPUT_SCHEMA];
+	// The parent is in DSP: the child's guard runs every bash call of this child in the credential-locked shell (its own
+	// environment keeps the provider keys it needs; see lib/dsp-credlock.ts). A marker the parent itself carries (a nested child) stays.
+	if (parentDspLock()) env[DSP_LOCK_ENV] = "1";
 
 	return { args, env, stdio: ["pipe", "pipe", "pipe"] };
 }

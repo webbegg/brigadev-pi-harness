@@ -1,16 +1,24 @@
 import { COMMAND_KIND, type CommandMatch } from "./command-classifier.ts";
 
-export const PERMISSION_MODE = { NORMAL: "normal", YOLO: "yolo" } as const;
+export const PERMISSION_MODE = { NORMAL: "normal", YOLO: "yolo", DSP: "dsp" } as const;
 export type PermissionMode = (typeof PERMISSION_MODE)[keyof typeof PERMISSION_MODE];
 
 export function isPermissionMode(value: unknown): value is PermissionMode {
-	return value === PERMISSION_MODE.NORMAL || value === PERMISSION_MODE.YOLO;
+	return value === PERMISSION_MODE.NORMAL || value === PERMISSION_MODE.YOLO || value === PERMISSION_MODE.DSP;
 }
+
+/** Names shown to the user (mode picker, dialogs). */
+export const MODE_LABEL: Record<PermissionMode, string> = {
+	normal: "Normal",
+	yolo: "YOLO",
+	dsp: "DSP — dangerously skip permissions",
+};
 
 /** One line per mode, appended to the parent's system prompt every turn. */
 export const MODE_PROMPT: Record<PermissionMode, string> = {
 	normal: "Permission mode NORMAL: the guard asks the user before commits on the default branch, pushes, PR/issue writes, and destructive, publish, privileged, or dependency commands. Run the command; don't ask in chat first.",
 	yolo: "Permission mode YOLO: commits, non-force pushes, and PR/issue creation run without asking; destructive, publish, privileged, and dependency (install) commands still ask.",
+	dsp: "Permission mode DSP: local work runs unasked (history is backed up first). Remote actions and default-branch changes always need the user's OK in the guard dialog: run them, let it ask, never route around it.",
 };
 
 export type Decision = { action: "allow" } | { action: "confirm"; reason: string } | { action: "block"; reason: string };
@@ -26,6 +34,7 @@ export type Decision = { action: "allow" } | { action: "confirm"; reason: string
  * - YOLO gives standing permission for ordinary delivery (commits,
  *   non-force pushes, PR/issue creation) but still asks for destructive,
  *   publish, privileged, and dependency commands.
+ * - DSP is decided by lib/dsp-policy.ts; called here it is as strict as YOLO.
  */
 export function decideCommand(matches: CommandMatch[], mode: PermissionMode, isChild: boolean): Decision {
 	if (matches.length === 0) return { action: "allow" };

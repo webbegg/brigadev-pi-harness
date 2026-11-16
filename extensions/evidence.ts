@@ -14,6 +14,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readBranchFacts } from "../lib/commit-branch.ts";
+import { stripLockPrelude } from "../lib/dsp-credlock.ts";
 import { appendEvidence, checkKind, evidenceFile, runRecordFromResult, settleRunTree, type ToolResultLike } from "../lib/evidence.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { CHILD_ENV } from "../lib/runtime.ts";
@@ -28,7 +29,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
 		try {
 			// Cheap test first: hashing the worktree only pays off for a check command.
-			if (event.toolName !== "bash" || typeof event.input?.command !== "string" || checkKind(event.input.command) === undefined) return undefined;
+			if (event.toolName !== "bash" || typeof event.input?.command !== "string" || checkKind(stripLockPrelude(event.input.command)) === undefined) return undefined;
 			treeBefore.set(event.toolCallId, await worktreeTree(ctx.cwd));
 		} catch {
 			// Without the tree before the run, the result is recorded as unknown.
@@ -38,7 +39,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_result", async (event, ctx) => {
 		try {
-			if (event.toolName !== "bash" || typeof event.input?.command !== "string" || checkKind(event.input.command) === undefined) return undefined;
+			if (event.toolName !== "bash" || typeof event.input?.command !== "string" || checkKind(stripLockPrelude(event.input.command)) === undefined) return undefined;
 			const before = treeBefore.get(event.toolCallId);
 			treeBefore.delete(event.toolCallId);
 			const settled = settleRunTree(before, await worktreeTree(ctx.cwd));

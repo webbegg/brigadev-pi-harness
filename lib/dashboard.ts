@@ -86,7 +86,7 @@ const GROUP_TOOLS: Record<string, DashboardEntry[]> = {
 		command("status", "●", "Status", "t", "/brigadev:status"),
 		command("panel", "▯", "Panel", "o", "/brigadev:panel"),
 		command("profile", "◇", "Model profile", "m", "/brigadev:profile use"),
-		// Status only: the permission mode (and the yolo switch with it) stays a typed command.
+		// Status only: the permission mode (and the yolo and DSP switches with it) stays a typed command.
 		command("mode", "⚑", "Permission mode", "e", "/brigadev:mode status"),
 		{ id: "dashboard", icon: "◐", label: "Launch dashboard on/off", key: "h", action: { kind: "toggle-dashboard" } },
 		command("doctor", "✚", "Doctor", "y", "/brigadev:doctor"),

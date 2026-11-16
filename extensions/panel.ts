@@ -119,7 +119,9 @@ export default function (pi: ExtensionAPI) {
 			contextPercent: ctx.getContextUsage()?.percent,
 			usage: snapshot && hasUsage ? { text: formatUsage(snapshot), tone: usageTone(snapshot) } : undefined,
 			profile: effectiveProfile(readProfiles().file, ctx.sessionManager.getBranch()).name,
+			// The panel's warning flag: yolo and DSP both skip questions (the label reads "yolo" until lib/panel-layout.ts names DSP).
 			yolo: isPermissionMode(mode) && mode === PERMISSION_MODE.YOLO,
+			dsp: isPermissionMode(mode) && mode === PERMISSION_MODE.DSP,
 		};
 		repaint?.();
 	};
