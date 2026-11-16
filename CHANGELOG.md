@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.17.0] - 2026-11-16
 
 - pi-tidy ships with brigadev (bundled dependency, MIT; notice in `NOTICE.md`). `extensions/tidy-bundled.ts` loads it unless pi-tidy is installed separately (a separate install takes precedence) or `tidy.enabled` is `false`; subagent children never load it. If the bundled copy cannot be loaded (for example a checkout without `node_modules`) you get one warning and brigadev keeps working.
 - Compact tool rows in `auto` mode step aside for the bundled pi-tidy exactly as they do for a separate install, and `/brigadev:doctor` reports the effective state (separate, bundled, or off). `/brigadev:tidy` is unchanged.
