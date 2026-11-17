@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.19.0] - 2026-11-17
 
 - DSP: a test runner (`node --test`, `vitest`, `jest`, `mocha`, `ava`, `tap`, `pytest`/`python -m pytest`, `go test`, `cargo test`, as a bare name or `node_modules/.bin/<runner>`) no longer asks when its remote findings come only from the files it loads (test files and their imports that mention `git push`, `gh` or credential files as fixtures); it runs without credentials and is recorded in the audit log as `test-runner-locked`. A package script (`npm test`, ...) is read like a command line: its own text and non-runner segments (`"pretest": "git push"`, `"test": "node deploy.js"`) still ask, and only the files its runner segments load are exempt. A push typed in the command line, a file named like a runner (`./jest`), the runner's own head file, `python deploy.py -m pytest` (the flag belongs to the script), or a script that is not a test runner still asks. Known gap: the text layer does not ask about files a test runner loads, so a loaded file that reads credentials the lock does not hide (`~/.netrc`, an `ssh -i` key, a project `.env`) is not caught.
 - The DSP remote-action dialog is bounded: kinds and "Also" reasons are deduplicated and trimmed (at most 6 and 4, each clipped to one line, then "… and N more"), so it never fills the terminal and hides the chat. Presentation only; which commands ask is unchanged.
