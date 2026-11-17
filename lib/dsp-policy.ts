@@ -7,13 +7,15 @@ import { homedir } from "node:os";
 import { classifyCommand, COMMAND_KIND, type CommandMatch } from "./command-classifier.ts";
 import { type BranchFacts, decideWithBranchRule, onFeatureBranch, readBranchFacts } from "./commit-branch.ts";
 import { type BackupPlan } from "./dsp-backup.ts";
-import { analyzeDsp, type ScriptRead } from "./dsp-classify.ts";
+import { analyzeDsp, isTestRunnerFinding, type ScriptRead } from "./dsp-classify.ts";
 import { fileTargetWithinScope, tempRoots as systemTempRoots } from "./dsp-paths.ts";
 import { commandPreview, type Decision, PERMISSION_MODE } from "./permission-policy.ts";
 import type { ExecFn } from "./worktree-snapshot.ts";
 
 export const DSP_REMOTE_TITLE = "brigadev DSP: remote action — needs your OK";
 export const DSP_NEVER_LINE = "DSP never runs remote actions on its own.";
+/** The audit kind of a test run whose remote findings all came from the files the runner loads. */
+export const TEST_RUNNER_AUDIT_KIND = "test-runner-locked";
 
 /** One remote (or default-branch) action a command would take, as the dialog shows it. */
 export interface RemoteItem {
@@ -28,8 +30,9 @@ export interface RemoteItem {
 }
 
 export type DspDecision =
-	| { action: "allow" }
-	| { action: "allow-with-backup"; backup: BackupPlan }
+	/** `testRunner`: a test runner whose remote findings come only from the files it loads (test files and their imports, or what a runner segment of a package script loads): it runs without asking, credential-locked, and is audited. */
+	| { action: "allow"; testRunner?: true }
+	| { action: "allow-with-backup"; backup: BackupPlan; testRunner?: true }
 	/** Always asks: remote actions and changes to the default branch. `also`: other reasons the command needs the user's OK. */
 	| { action: "confirm-remote"; items: RemoteItem[]; also: string[]; backup?: BackupPlan }
 	| { action: "confirm"; reason: string; backup?: BackupPlan }
@@ -71,7 +74,11 @@ export async function decideDsp(matches: CommandMatch[], facts: DspFacts): Promi
 	if (hard) return { action: "block", reason: `Blocked by brigadev guard (never allowed): ${hard.reason}` };
 
 	const remoteItems: RemoteItem[] = [];
+	/** Items that come only from files a test runner loads: they do not ask when they are all there is. */
+	const loadedByRunner = new Set<RemoteItem>();
 	const confirmReasons: string[] = [];
+	/** How many of `confirmReasons` come only from files a test runner loads. */
+	let loadedByRunnerReasons = 0;
 	const plans: BackupPlan[] = [];
 	const historyLabels: string[] = [];
 	const refChecks: Array<{ label: string; names: string[]; current: boolean }> = [];
@@ -104,6 +111,7 @@ export async function decideDsp(matches: CommandMatch[], facts: DspFacts): Promi
 				case "remote": {
 					const { type: _type, ...item } = tag;
 					remoteItems.push(item);
+					if (isTestRunnerFinding(tag)) loadedByRunner.add(item);
 					break;
 				}
 				case "history":
@@ -135,6 +143,8 @@ export async function decideDsp(matches: CommandMatch[], facts: DspFacts): Promi
 					break;
 				case "unknown":
 					confirmReasons.push(tag.reason);
+					// Text in a file the test runner loads that the scan could not read (a fixture that writes a file, a variable).
+					if (isTestRunnerFinding(tag)) loadedByRunnerReasons++;
 					break;
 			}
 		}
@@ -159,9 +169,12 @@ export async function decideDsp(matches: CommandMatch[], facts: DspFacts): Promi
 
 	const backup = mergePlans(plans);
 	const withBackup = backup ? { backup } : {};
-	if (remoteItems.length > 0) return { action: "confirm-remote", items: unique(remoteItems), also: [...new Set(confirmReasons)], ...withBackup };
-	if (confirmReasons.length > 0) return { action: "confirm", reason: [...new Set(confirmReasons)].join("; "), ...withBackup };
-	return backup ? { action: "allow-with-backup", backup } : { action: "allow" };
+	// Anything the command line itself says asks, with every finding in the dialog; only a run whose findings all came from the test runner's files is let through (locked, audited).
+	const typedRemote = remoteItems.some((item) => !loadedByRunner.has(item));
+	if (typedRemote) return { action: "confirm-remote", items: unique(remoteItems), also: [...new Set(confirmReasons)], ...withBackup };
+	if (confirmReasons.length > loadedByRunnerReasons) return { action: "confirm", reason: [...new Set(confirmReasons)].join("; "), ...withBackup };
+	const testRunner = loadedByRunner.size > 0 || loadedByRunnerReasons > 0 ? ({ testRunner: true } as const) : {};
+	return backup ? { action: "allow-with-backup", backup, ...testRunner } : { action: "allow", ...testRunner };
 }
 
 export interface DspCommandInput {
@@ -209,13 +222,17 @@ export async function decideDspCommand(input: DspCommandInput): Promise<DspResul
 	return { decision, normal, legacy, matches };
 }
 
+const testRunnerLocked = (result: DspResult): boolean => (result.decision.action === "allow" || result.decision.action === "allow-with-backup") && result.decision.testRunner === true;
+
 /** DSP ran the command without asking although NORMAL mode would have asked: it goes in the audit log. */
 export function isAutoAllowedForAudit(result: DspResult): boolean {
+	if (testRunnerLocked(result)) return true;
 	return (result.decision.action === "allow" || result.decision.action === "allow-with-backup") && result.normal.action !== "allow";
 }
 
 /** The kinds of risk NORMAL mode would have asked about (dependency, destructive, ...), for the audit record. */
 export function auditKind(result: DspResult): string {
+	if (testRunnerLocked(result)) return TEST_RUNNER_AUDIT_KIND;
 	const kinds = [...new Set(result.legacy.filter((match) => !match.hardDeny).map((match) => match.kind))];
 	return kinds.join(", ") || "other";
 }
