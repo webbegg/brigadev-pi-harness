@@ -186,7 +186,11 @@ export default function (pi: ExtensionAPI) {
 	const checkPath = async (toolName: string, rawPath: string, absolute: string, isWrite: boolean, ctx: ExtensionContext, isDirectory = false): Promise<{ block: true; reason: string } | undefined> => {
 		const root = projectRoot(ctx);
 		const dsp = inDsp();
-		const protectedKind = dsp && isWrite && !isDirectory ? protectedPathKind(absolute, protectedContext(ctx)) : undefined;
+		// Protected paths (git hooks and config, shell startup files, harness config) are never trusted folder content: a secure folder
+		// that holds other repos or dotfiles must not let the parent plant code that runs later. DSP asks for them below; other modes fall back
+		// to the outside-project question.
+		const pathKind = isWrite && !isDirectory ? protectedPathKind(absolute, protectedContext(ctx)) : undefined;
+		const protectedKind = dsp ? pathKind : undefined;
 		if (protectedKind === "audit") return { block: true, reason: AUDIT_BLOCK };
 		const decision = decideFileAccess({
 			isChild,
@@ -202,7 +206,7 @@ export default function (pi: ExtensionAPI) {
 			surfaces: isChild ? childAllowedSurfaces() : undefined,
 			agent: process.env[CHILD_ENV.AGENT],
 			// The system temp dir and the secure-yolo folders: parent writes there run without asking (subagents stay blocked).
-			trustedDirs: isChild ? undefined : [...tempDirs(), ...secureDirs()],
+			trustedDirs: isChild || pathKind ? undefined : [...tempDirs(), ...secureDirs()],
 		});
 
 		let verdict: PathVerdict;

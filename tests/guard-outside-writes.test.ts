@@ -120,6 +120,26 @@ describe("writes outside the project", () => {
 		assert.ok(!paths.includes(join(repo, "inside.ts")));
 	});
 
+	it("still asks for a protected path inside a secure-yolo folder or the temp dir", async () => {
+		const hook = join(secure, "other", ".git", "hooks", "pre-commit");
+		const gitConfig = join("/tmp", `brigadev-x-${process.pid}`, ".git", "config");
+		for (const target of [hook, gitConfig]) {
+			const declined = await session({ answer: false });
+			assert.match(String(await declined.run("write", target)), /declined/);
+			assert.deepEqual(declined.asked, ["brigadev: write outside project"]);
+			assert.ok(!ledger().some((r) => r.path === target));
+		}
+		const granted = await session({ answer: true });
+		assert.equal(await granted.run("edit", hook), undefined);
+		assert.deepEqual(granted.asked, ["brigadev: write outside project"]);
+	});
+
+	it("keeps a plain file in a secure-yolo folder silent next to a protected one", async () => {
+		const s = await session();
+		assert.equal(await s.run("write", join(secure, "other", "plain.txt")), undefined);
+		assert.deepEqual(s.asked, []);
+	});
+
 	it("keeps blocking a subagent in the temp dir and in a secure-yolo folder", async () => {
 		const s = await session({ child: true });
 		assert.match(String(await s.run("write", join("/tmp", "child.txt"))), /outside the project root/);
