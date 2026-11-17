@@ -1462,17 +1462,32 @@ function nestedMatches(text: string, rt: Runtime, depth = rt.ctx.depth): Command
 	return classifyCommand(text, makeOptions(rt.env, { ...rt.scope }, { depth, commandText: text, visited: rt.ctx.visited }));
 }
 
-/** What a body of code (a script, a recipe, an inline program) runs that reaches a remote, and why it could not be scanned. */
-function scanText(text: string, rt: Runtime): { hits: string[]; unknown: string[]; moves?: boolean } {
+interface Scanned {
+	hits: string[];
+	unknown: string[];
+	moves?: boolean;
+	/** `keepRunner` only: what test runners inside the text loaded from files (kept apart, so the caller can keep them marked). */
+	loaded?: { hits: string[]; unknown: string[] };
+}
+
+/**
+ * What a body of code (a script, a recipe, an inline program) runs that reaches a remote, and why it could not be scanned.
+ * `keepRunner`: findings that a test runner inside the text loaded from files come back apart, in `loaded` (a package.json
+ * script is read like a command line: its own text asks, only what its test runner segments load does not). Otherwise they are merged.
+ */
+function scanText(text: string, rt: Runtime, keepRunner = false): Scanned {
 	if (rt.ctx.depth >= MAX_SCAN_DEPTH) return { hits: [], unknown: ["scripts are nested too deeply to scan"] };
 	const hits = new Set<string>();
 	const unknown = new Set<string>();
+	const loadedHits = new Set<string>();
+	const loadedUnknown = new Set<string>();
 	const depth = rt.ctx.depth + 1;
 	const collect = (matches: CommandMatch[]) => {
 		for (const match of matches) {
 			for (const tag of match.dsp ?? []) {
-				if (tag.type === "remote") hits.add(tag.label);
-				else if (tag.type === "unknown" && tag.scan) unknown.add(tag.reason);
+				const loaded = keepRunner && LOADED_BY_TEST_RUNNER.has(tag);
+				if (tag.type === "remote") (loaded ? loadedHits : hits).add(tag.label);
+				else if (tag.type === "unknown" && tag.scan) (loaded ? loadedUnknown : unknown).add(tag.reason);
 			}
 		}
 	};
@@ -1491,10 +1506,99 @@ function scanText(text: string, rt: Runtime): { hits: string[]; unknown: string[
 		const spaced = line.replace(/["'`,[\](){}]/g, " ");
 		for (const match of spaced.matchAll(COMMAND_WORDS)) collect(nestedMatches(spaced.slice(match.index), rt, depth));
 	}
-	return { hits: [...hits], unknown: [...unknown], moves: branchMoved };
+	return { hits: [...hits], unknown: [...unknown], moves: branchMoved, ...(keepRunner ? { loaded: { hits: [...loadedHits], unknown: [...loadedUnknown] } } : {}) };
 }
 
-function describeHits(label: string, scanned: { hits: string[]; unknown: string[]; moves?: boolean }): DspTag[] {
+// ── where a finding comes from ──────────────────────────────────────────────────────────────────────────────
+//
+// A tag is the text of the command line, or what a file the command loads says (a script, its imports, a package.json
+// script). The policy treats one case differently: a test runner (`node --test`, `npm test`, ...) loads test files
+// that mention pushes and credentials as fixtures, so a remote finding that comes only from those files does not ask
+// (the call still runs inside the credential lock). Tags are marked here, by identity, and only when BOTH hold: the
+// tag came from loading files (`scriptFileTags`) and the segment that loaded it is a test runner whose head is the
+// runner itself (a bare name, or `node_modules/.bin/<runner>`), not a file named like one. The head file is the command,
+// not a file the runner loads: it is never marked. Anything typed in the command line, or loaded by another command, is
+// never marked. A package.json script is read like a command line: `npm test` is not a runner, its body's segments are
+// (see `packageScriptTags`).
+
+const LOADED_FROM_FILES = new WeakSet<DspTag>();
+const LOADED_BY_TEST_RUNNER = new WeakSet<DspTag>();
+
+function fromFiles(tags: DspTag[]): DspTag[] {
+	for (const tag of tags) LOADED_FROM_FILES.add(tag);
+	return tags;
+}
+
+/** The finding comes only from files a test runner loaded (test files and their imports, or what a runner segment of a package script loads), not from the command line. */
+export function isTestRunnerFinding(tag: DspTag): boolean {
+	return LOADED_BY_TEST_RUNNER.has(tag);
+}
+
+// `node` options that take the next word as their value, so it is not mistaken for a script.
+const NODE_VALUE_OPTIONS = new Set(["-r", "--require", "--import", "--loader", "--experimental-loader", "--env-file", "-C", "--conditions", "--disable-warning", "--test-name-pattern", "--test-skip-pattern", "--test-reporter", "--test-reporter-destination", "--test-concurrency", "--test-timeout", "--test-shard", "--test-coverage-include", "--test-coverage-exclude"]);
+const TEST_BINARIES = new Set(["vitest", "jest", "mocha", "ava", "tap", "pytest", "py.test"]);
+
+/** `node --test`: the flag comes before the first script word (after it, it belongs to the script). */
+function nodeRunsTests(args: string[]): boolean {
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--test") return true;
+		if (arg === "--" || !arg.startsWith("-")) return false;
+		if (NODE_VALUE_OPTIONS.has(arg)) i++;
+	}
+	return false;
+}
+
+// `python` options that take a value (in a cluster such as `-Werror` the value is the rest of the word).
+const PYTHON_VALUE_OPTIONS = new Set(["W", "X"]);
+
+/** `python -m pytest`: the module comes before the script word (after it, `-m pytest` belongs to the script); `-c` is inline code. */
+function pythonRunsPytest(args: string[]): boolean {
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--check-hash-based-pycs") {
+			i++;
+			continue;
+		}
+		if (arg === "--" || arg === "-" || !arg.startsWith("-")) return false;
+		if (arg.startsWith("--")) continue;
+		for (let at = 1; at < arg.length; at++) {
+			const letter = arg[at];
+			const rest = arg.slice(at + 1);
+			if (letter === "c") return false;
+			if (letter === "m") return (rest === "" ? args[i + 1] : rest) === "pytest";
+			if (PYTHON_VALUE_OPTIONS.has(letter)) {
+				if (rest === "") i++;
+				break;
+			}
+		}
+	}
+	return false;
+}
+
+/** A runner head is a bare name (found on PATH) or `node_modules/.bin/<runner>` (any depth of `./`, `../`), never another path: that is a file run as the command. */
+const RUNNER_BIN_PATH = /^(?:\.{1,2}\/)*node_modules\/\.bin\/[^/]+$/;
+function runnerHead(word: string | undefined): boolean {
+	if (word === undefined || word === "") return false;
+	if (!word.includes("/")) return true;
+	return RUNNER_BIN_PATH.test(word) && TEST_BINARIES.has(basename(word));
+}
+
+/** A command that runs a project's tests and nothing else (and only these: `node --test`, vitest, jest, mocha, ava, tap, pytest, `go test`, `cargo test`). `argv` has its wrappers stripped. A package manager's `test` is not one: the body of the script decides. */
+function isTestRunner(argv: string[]): boolean {
+	if (!runnerHead(argv[0])) return false;
+	const name = basename(argv[0]);
+	const args = argv.slice(1);
+	if (name === "node" || name === "nodejs") return nodeRunsTests(args);
+	if (name === "npx" || name === "bunx") return runnerHead(positionals(args)[0]) && TEST_BINARIES.has(basename(positionals(args)[0]));
+	if (TEST_BINARIES.has(name)) return true;
+	if (interpreterOf(name) === "python") return pythonRunsPytest(args);
+	if (name === "go") return args.find((arg) => !arg.startsWith("-")) === "test";
+	if (name === "cargo") return args.find((arg) => !arg.startsWith("-") && !arg.startsWith("+")) === "test";
+	return false;
+}
+
+function describeHits(label: string, scanned: Scanned): DspTag[] {
 	const tags: DspTag[] = [];
 	if (scanned.hits.length > 0) tags.push(remote(`${label} runs ${scanned.hits.join(", ")}`));
 	for (const reason of scanned.unknown) tags.push(unknownTag(reason, true));
@@ -1541,7 +1645,7 @@ function scriptFileTags(raw: string, rt: Runtime): DspTag[] {
 	if ("binary" in read) return [];
 	rt.ctx.visited.add(path);
 	try {
-		return describeHits(`script ${raw}`, scanText(read.text, rt));
+		return fromFiles(describeHits(`script ${raw}`, scanText(read.text, rt)));
 	} finally {
 		rt.ctx.visited.delete(path);
 	}
@@ -1646,7 +1750,14 @@ function packageScriptTags(manager: string, args: string[], rt: Runtime): DspTag
 			return [unknownTag("cannot read package.json (not valid JSON)", true)];
 		}
 		const bodies = [`pre${script}`, script, `post${script}`].flatMap((name) => (typeof scripts[name] === "string" ? [scripts[name] as string] : []));
-		return bodies.length === 0 ? [] : describeHits(`${manager} script ${script}`, scanText(bodies.join("\n"), { ...rt, scope: { ...rt.scope, dir } }));
+		if (bodies.length === 0) return [];
+		// The body is read like a command line: its own text and its non-runner segments ask. Only what a test runner segment
+		// inside it loads from files (`"test": "node --test tests/"`: the test files and their imports) stays marked.
+		const label = `${manager} script ${script}`;
+		const scanned = scanText(bodies.join("\n"), { ...rt, scope: { ...rt.scope, dir } }, true);
+		const loaded = describeHits(label, { hits: scanned.loaded?.hits ?? [], unknown: scanned.loaded?.unknown ?? [] });
+		for (const tag of loaded) LOADED_BY_TEST_RUNNER.add(tag);
+		return [...describeHits(label, scanned), ...loaded];
 	}
 	return [];
 }
@@ -2618,6 +2729,7 @@ function refineCore(seg: SegmentInfo, found: CommandMatch[], rt: Runtime, unwrap
 	const tags: DspTag[] = [];
 	const nested: CommandMatch[] = [];
 	let handled = true;
+	let headFileTags: DspTag[] = [];
 	const gitStrings = (gitArgs: string[]) => {
 		const embedded = embeddedCommands(gitCommandStrings(gitArgs), rt);
 		tags.push(...embedded.tags);
@@ -2811,10 +2923,14 @@ function refineCore(seg: SegmentInfo, found: CommandMatch[], rt: Runtime, unwrap
 				if (fromStdin || !scanned || args.includes("-")) tags.push(...stdinProgramTags(args, rt, interpreter));
 			}
 		} else if (head.includes("/")) {
-			tags.push(...scriptFileTags(head, rt));
+			// The head file is the command itself, not a file a runner loads: it is never marked.
+			headFileTags = scriptFileTags(head, rt);
+			tags.push(...headFileTags);
 		}
 	}
 
+	// What a test runner loaded from files (not what the command line says, and not the head file) is marked for the policy.
+	if (isTestRunner(argv)) for (const tag of tags) if (LOADED_FROM_FILES.has(tag) && !headFileTags.includes(tag)) LOADED_BY_TEST_RUNNER.add(tag);
 	const result = attach(found, tags);
 	result.push(...nested);
 	return result;
