@@ -20,7 +20,7 @@ import { auditKind, decideDspCommand, isAutoAllowedForAudit, readRemoteTarget, r
 import { appendEvidence, commitGateWithForce, evidenceFile, forceRecord, gateDialog, readEvidence, type ForceRecord } from "../lib/evidence.ts";
 import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, shellCallOf, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_LABEL, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
-import { appendOutsideWrite, formatOutsideWrites, outsideWhy, outsideWritesFile, readOutsideWrites, runYoloDirCommand, secureYoloDirs, trustedTempRoots, type OutsideWriteRecord } from "../lib/outside-writes.ts";
+import { appendOutsideWrite, bashOutsideTargets, changedSince, formatOutsideWrites, outsideWhy, outsideWritesFile, readOutsideWrites, runYoloDirCommand, secureYoloDirs, trustedTempRoots, type OutsideWriteRecord } from "../lib/outside-writes.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
 import { agentDir, appendSystemPromptOnce, CHILD_ENV, childAllowedSurfaces, isChildSession, PACKAGE_ROOT, readSettings, writeSettings } from "../lib/runtime.ts";
@@ -66,6 +66,8 @@ export default function (pi: ExtensionAPI) {
 	const beforeBash = new Map<string, Snapshot>();
 	// Parent write/edit calls allowed outside the project, by tool call id; recorded in the ledger once they succeed.
 	const pendingOutside = new Map<string, Omit<OutsideWriteRecord, "ts">>();
+	// Allowed bash calls that name files outside the project, by tool call id: the check gives the ones the command created or changed.
+	const pendingBash = new Map<string, () => Array<Pick<OutsideWriteRecord, "path" | "why">>>();
 
 	// A secure-yolo folder must not reach the agent folder, every repo's docs (evidence logs), or the harness code.
 	const secureGuard = () => ({ home: homedir(), agentDir: agentDir(), protectedDirs: [brigadevHome(), PACKAGE_ROOT] });
@@ -236,6 +238,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		sessionLock = undefined;
 		pendingOutside.clear();
+		pendingBash.clear();
 		resetDspCount();
 		restoreMode(ctx);
 	});
@@ -387,6 +390,15 @@ export default function (pi: ExtensionAPI) {
 				const snapshot = await takeSnapshot(exec, projectRoot(ctx));
 				if (snapshot) beforeBash.set(event.toolCallId, snapshot);
 			}
+			// Files the command writes outside the project by literal name: stamped now, recorded in tool_result if it created or changed them.
+			if (event.toolName === "bash") {
+				try {
+					const targets = bashOutsideTargets(command, commandCwd, { projectRoot: projectRoot(ctx), docsDir: () => repoDocsDir(ctx.cwd), tempRoots: tempDirs(), secureDirs: secureDirs(), dsp, home: homedir() });
+					if (targets.length > 0) pendingBash.set(event.toolCallId, changedSince(targets));
+				} catch {
+					// Tracking never decides whether a command runs.
+				}
+			}
 			// S10, last: every rule above decided allow. Only an exact call the user approved in the remote dialog runs unlocked.
 			// A child launched in DSP has no dialog to approve with: its calls are always locked.
 			if ((dsp && !remoteApproved) || lockedChild) lockCall(event.toolName, event.toolCallId, event.input);
@@ -418,6 +430,18 @@ export default function (pi: ExtensionAPI) {
 				} catch {
 					// The ledger is a record, not a gate.
 				}
+			}
+		}
+		const bashWrites = pendingBash.get(event.toolCallId);
+		if (bashWrites) {
+			pendingBash.delete(event.toolCallId);
+			// A failed command can still have written files: the stamps decide, not the exit status.
+			try {
+				const agent = isChild ? process.env[CHILD_ENV.AGENT] : undefined;
+				const file = outsideWritesFile(repoDocsDir(ctx.cwd));
+				for (const { path, why } of bashWrites()) appendOutsideWrite(file, { ts: new Date().toISOString(), tool: "bash", path, why, ...(agent ? { agent } : {}) });
+			} catch {
+				// The ledger is a record, not a gate.
 			}
 		}
 		const before = beforeBash.get(event.toolCallId);

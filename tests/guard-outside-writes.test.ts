@@ -1,7 +1,7 @@
 // Drives extensions/guard.ts: parent writes into the system temp dir or a secure-yolo folder run without asking,
 // subagents stay blocked there, and every successful parent write outside the project lands in the ledger.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -76,6 +76,17 @@ async function session(o: { answer?: boolean; child?: boolean } = {}) {
 			for (const h of handlers.tool_result ?? []) await h({ toolName, toolCallId, input: { path }, content: [], isError }, ctx);
 			return undefined;
 		},
+		/** Runs a bash tool_call; when allowed, `effect` stands in for the command running, then tool_result. */
+		async bash(command: string, effect: () => void, isError = false) {
+			const toolCallId = String(++id);
+			for (const h of handlers.tool_call ?? []) {
+				const r = await h({ toolName: "bash", toolCallId, input: { command } }, ctx);
+				if (r?.block) return String(r.reason);
+			}
+			effect();
+			for (const h of handlers.tool_result ?? []) await h({ toolName: "bash", toolCallId, input: { command }, content: [], isError }, ctx);
+			return undefined;
+		},
 	};
 }
 
@@ -138,6 +149,42 @@ describe("writes outside the project", () => {
 		const s = await session();
 		assert.equal(await s.run("write", join(secure, "other", "plain.txt")), undefined);
 		assert.deepEqual(s.asked, []);
+	});
+
+	it("records the files a bash command created or changed outside the project, even when the command failed", async () => {
+		const s = await session();
+		const out = join("/tmp", `brigadev-guard-bash-${process.pid}`);
+		mkdirSync(out, { recursive: true });
+		const made = join(out, "made.txt");
+		const kept = join(out, "kept.txt");
+		writeFileSync(kept, "old");
+		utimesSync(kept, 1000, 1000);
+		assert.equal(await s.bash(`echo x > ${made}; cat ${kept} > /dev/null; touch ${join(repo, "inside.txt")}; false`, () => writeFileSync(made, "x"), true), undefined);
+		assert.deepEqual(s.asked, []);
+		const bashPaths = ledger().filter((r) => r.tool === "bash").map((r) => r.path);
+		assert.ok(bashPaths.includes(canonicalPath(made)), bashPaths.join(", "));
+		assert.ok(!bashPaths.includes(canonicalPath(kept)));
+		assert.ok(!bashPaths.includes(join(repo, "inside.txt")));
+		assert.equal(ledger().find((r) => r.path === canonicalPath(made))?.why, "temp");
+		// A target the command names but never touches is not recorded.
+		await s.bash(`echo x >> ${kept}`, () => {});
+		assert.ok(!ledger().some((r) => r.path === canonicalPath(kept)));
+		rmSync(out, { recursive: true, force: true });
+	});
+
+	it("records a subagent's bash writes outside the project with the agent's name", async () => {
+		const s = await session({ child: true });
+		const made = join("/tmp", `brigadev-guard-child-${process.pid}.txt`);
+		process.env.BRIGADEV_AGENT = "worker";
+		try {
+			assert.equal(await s.bash(`echo x > ${made}`, () => writeFileSync(made, "x")), undefined);
+		} finally {
+			delete process.env.BRIGADEV_AGENT;
+			rmSync(made, { force: true });
+		}
+		const record = ledger().find((r) => r.path === canonicalPath(made)) as { agent?: string; tool: string } | undefined;
+		assert.equal(record?.tool, "bash");
+		assert.equal(record?.agent, "worker");
 	});
 
 	it("keeps blocking a subagent in the temp dir and in a secure-yolo folder", async () => {

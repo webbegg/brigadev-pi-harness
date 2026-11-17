@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
 	appendOutsideWrite,
+	bashOutsideTargets,
+	changedSince,
 	checkSecureDir,
 	formatOutsideWrites,
 	outsideWhy,
@@ -93,6 +95,48 @@ describe("why a write outside the project was allowed", () => {
 		assert.equal(outsideWhy(join(home, "scratch", "x"), scope()), "secure");
 		assert.equal(outsideWhy(join(home, "elsewhere", "x"), scope()), "granted");
 		assert.equal(outsideWhy(join(home, "elsewhere", "x"), { ...scope(), dsp: true }), "dsp");
+		assert.equal(outsideWhy(join(home, "elsewhere", "x"), { ...scope(), dsp: true, shell: true }), "shell");
+		assert.equal(outsideWhy(join(scratch, "tmp", "x"), { ...scope(), shell: true }), "temp");
+	});
+});
+
+describe("files a bash command writes outside the project", () => {
+	const scope = () => ({ projectRoot: join(scratch, "project"), docsDir: join(home, ".brigadev", "project"), tempRoots: [join(scratch, "tmp")], secureDirs: [join(home, "scratch")], dsp: false, shell: true });
+
+	it("names each literal write target outside the project once, with its reason", () => {
+		const command = `echo x > ${join(scratch, "tmp", "a.txt")} && cp f ${join(home, "elsewhere", "b")} && touch inside.txt && echo y >> ${join(scratch, "tmp", "a.txt")} && tee ${join(home, "scratch", "c.log")} < f`;
+		assert.deepEqual(bashOutsideTargets(command, join(scratch, "project"), scope()), [
+			{ path: join(scratch, "tmp", "a.txt"), why: "temp" },
+			{ path: join(home, "elsewhere", "b"), why: "shell" },
+			{ path: join(home, "scratch", "c.log"), why: "secure" },
+		]);
+	});
+
+	it("resolves relative targets against the working directory and skips what the shell would expand", () => {
+		assert.deepEqual(bashOutsideTargets("echo x > ../out.txt", join(scratch, "project"), scope()), [{ path: join(scratch, "out.txt"), why: "shell" }]);
+		assert.deepEqual(bashOutsideTargets("echo x > $OUT && echo y > /tmp/*.log", join(scratch, "project"), scope()), []);
+	});
+
+	it("never names a temp root, the home folder, or the root itself (a copy into the folder, not a file)", () => {
+		assert.deepEqual(bashOutsideTargets(`cp a ${join(scratch, "tmp")} && cp b ${home} && cp c /`, join(scratch, "project"), { ...scope(), home }), []);
+	});
+
+	it("keeps only targets created or changed since the stamp", () => {
+		const dirA = join(scratch, "stamps");
+		mkdirSync(dirA, { recursive: true });
+		const touched = join(dirA, "touched.txt");
+		const untouched = join(dirA, "untouched.txt");
+		const created = join(dirA, "created.txt");
+		const missing = join(dirA, "missing.txt");
+		writeFileSync(touched, "a");
+		writeFileSync(untouched, "a");
+		utimesSync(touched, 1000, 1000);
+		utimesSync(untouched, 1000, 1000);
+		const targets = [touched, untouched, created, missing].map((path) => ({ path, why: "shell" as const }));
+		const check = changedSince(targets);
+		writeFileSync(touched, "b");
+		writeFileSync(created, "new");
+		assert.deepEqual(check().map((t) => t.path), [touched, created]);
 	});
 });
 
@@ -120,8 +164,9 @@ describe("outside-writes ledger", () => {
 		]);
 		const lines = text.split("\n");
 		assert.match(lines[0], /2 files/);
-		assert.match(lines[1], /temp\s+\/tmp\/a\s+\(2 writes\)/);
-		assert.match(lines[2], /granted\s+\/x\/b$/);
+		assert.match(lines[1], /temp\s+edit\s+\/tmp\/a\s+\(2 writes\)/);
+		assert.match(lines[2], /granted\s+write\s+\/x\/b$/);
+		assert.match(formatOutsideWrites([{ ts: "2026-11-17T10:00:00.000Z", tool: "bash", path: "/tmp/c", why: "temp", agent: "worker" }]), /temp\s+bash\s+\/tmp\/c\s+\[worker\]/);
 		assert.match(formatOutsideWrites([]), /No writes outside the project/);
 	});
 });
