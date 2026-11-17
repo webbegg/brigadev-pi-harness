@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+- Writes outside the project: the parent session's `write`/`edit` into the system temp dir (`/tmp`, `/private/tmp`, `$TMPDIR`) and into secure-yolo folders run without the "write outside project" question. `/brigadev:yolo-dir list|add|remove` manages the folders (`secureYoloDirs` in `~/.pi/agent/brigadev.json`); the root, the home folder and its ancestors, and folders overlapping `~/.pi/agent`, `~/.brigadev`, the install root, or a credential folder (`~/.ssh`, `~/.aws`, `~/.docker`, `~/.gnupg`, `~/.kube`, `~/.config/gh|git|fish`) are refused. Sensitive files and DSP protected paths still ask; subagents stay blocked outside the project.
+- Every successful parent `write`/`edit` outside the project is recorded in `~/.brigadev/<repo>/outside-writes.jsonl` with its reason (`temp`, `secure`, `granted`, `docs`, `dsp`); `/brigadev:outside` lists them.
+
 ## [0.18.0] - 2026-11-16
 
 - DSP mode ("dangerously skip permissions"): `/brigadev:mode dsp` (one confirmation dialog; `/brigadev:mode default dsp` is allowed and `/brigadev:doctor` warns about it) skips brigadev's execution questions. Local work runs without asking: feature-branch commits, dependency installs, deletes and overwrites inside the project or the temp dir, writes outside the project. Local discards (`reset --hard`, `rebase`, `branch -D`, `clean -f`, `stash drop`, ...) run after an automatic snapshot under `refs/brigadev/backup/` (pruned after 14 days). Every remote action (push, PR/issue/release writes, publish, HTTP writes, remote and credential config) and every change to the default branch always asks, per command, and is denied without a UI. Wrappers, `$( )`, aliases, scripts, Makefile targets and package scripts are looked through; commands the guard cannot read ask. Protected paths (`~/.pi/`, the install root, git and gh config, hooks, shell rc files) ask; the audit log `audit/dsp.jsonl` records what DSP auto-allowed. Footer shows `⚠ DSP`. `normal` and `yolo` are unchanged. See the README for the table and the residual risk.
