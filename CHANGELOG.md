@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 - The DSP remote-action dialog is bounded: kinds and "Also" reasons are deduplicated and trimmed (at most 6 and 4, each clipped to one line, then "… and N more"), so it never fills the terminal and hides the chat. Presentation only; which commands ask is unchanged.
+- Writes outside the project: the parent session's `write`/`edit` into the system temp dir (`/tmp`, `/private/tmp`, `$TMPDIR`) and into secure-yolo folders run without the "write outside project" question; a `bg_start` working directory there starts without it too. A temp root (including `/tmp`) that is your home folder or holds it is not trusted. `/brigadev:yolo-dir list|add|remove` manages the folders (`secureYoloDirs` in `~/.pi/agent/brigadev.json`); the root, the home folder and its ancestors, and folders overlapping `~/.pi/agent`, `~/.brigadev`, the install root, or a credential folder (`~/.ssh`, `~/.aws`, `~/.docker`, `~/.gnupg`, `~/.kube`, `~/.config/gh|git|fish`) are refused. Sensitive files still ask, and protected paths (`.git/config`, `.git/hooks/`, shell startup files, `~/.pi/`, git and gh config) inside a trusted folder still ask in every mode; subagents stay blocked outside the project.
+- Every successful parent `write`/`edit` outside the project is recorded in `~/.brigadev/<repo>/outside-writes.jsonl` with its reason (`temp`, `secure`, `granted`, `docs`, `dsp`); `/brigadev:outside` lists them.
+- `bash` writes outside the project are tracked too, for the parent and subagents (with the agent's name, reason `shell` outside the trusted folders): every file the command names literally (redirections, `tee`, `cp`/`mv`/`install`/`ln`, `touch`, `mkdir`, `truncate`, `sed -i`) that the call created or changed is recorded, even when the command fails. Best effort: variables, globs, scripts, interpreters, and `bg_start` are not followed.
 
 ## [0.18.0] - 2026-11-16
 

@@ -277,7 +277,8 @@ describe("guard in DSP mode", () => {
 
 	describe("S6c protected paths and S2 writes outside the project", () => {
 		it("writes outside the project to ordinary paths run without a grant dialog in DSP and ask in normal mode", async () => {
-			const target = join(dir, "elsewhere", "notes.txt");
+			// Outside the system temp dir, where normal mode now writes without asking.
+			const target = join("/brigadev-test-not-temp", "elsewhere", "notes.txt");
 			const inDsp = await dsp({ hasUI: true, answer: true });
 			assert.equal(await inDsp.call("write", { path: target, content: "x" }), undefined);
 			assert.deepEqual(inDsp.asked, []);
@@ -309,7 +310,8 @@ describe("guard in DSP mode", () => {
 
 		it("normal mode behaves as before for the same paths (outside-project question only)", async () => {
 			const s = await session({ hasUI: true, answer: true, mode: "normal" });
-			assert.equal(await s.call("write", { path: join(home, ".zshrc"), content: "x" }), undefined);
+			// The fixture home is in the system temp dir, where normal mode writes without asking; this one is not.
+			assert.equal(await s.call("write", { path: join("/brigadev-test-not-temp", ".zshrc"), content: "x" }), undefined);
 			assert.match(s.asked[0].title, /write outside project/);
 			assert.equal(s.asked.length, 1);
 		});

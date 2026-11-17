@@ -63,6 +63,20 @@ describe("file access decision", () => {
 		assert.equal(decideFileAccess(input({ absolutePath: join(scratch, "elsewhere.txt") })).action, "ask");
 	});
 
+	it("lets the parent write inside a trusted directory (temp dir, secure-yolo folder) without asking", () => {
+		const trusted = [join(home, "other-repo")];
+		assert.deepEqual(decideFileAccess(input({ absolutePath: join(home, "other-repo", "x"), trustedDirs: trusted })), { action: "allow" });
+		assert.deepEqual(decideFileAccess(input({ absolutePath: join(home, "other-repo", "deep", "y"), trustedDirs: trusted })), { action: "allow" });
+		// A sibling sharing the name prefix is not inside it.
+		assert.equal(decideFileAccess(input({ absolutePath: join(home, "other-repo-evil", "x"), trustedDirs: trusted })).action, "ask");
+		// A sensitive file still asks first.
+		assert.deepEqual(decideFileAccess(input({ absolutePath: join(home, "other-repo", ".env"), sensitive: true, trustedDirs: trusted })), { action: "ask", kind: "sensitive", then: { action: "allow" } });
+	});
+
+	it("still blocks a subagent writing inside a trusted directory", () => {
+		assert.equal(decideFileAccess(input({ absolutePath: join(home, "other-repo", "x"), isChild: true, trustedDirs: [join(home, "other-repo")] })).action, "block");
+	});
+
 	it("blocks a subagent writing outside the project", () => {
 		assert.equal(decideFileAccess(input({ absolutePath: join(home, "other-repo", "x"), isChild: true })).action, "block");
 	});
@@ -268,6 +282,8 @@ describe("shellCallOf", () => {
 // extensions/guard.ts loaded for real (Pi's packages stubbed): a `bg_start` call must get the decision `bash` gets.
 describe("bg_start is guarded exactly like bash (S1a)", () => {
 	const saved = { ...process.env };
+	// Outside the project and outside the system temp dir (where the parent now writes without asking); never created.
+	const OUTSIDE = "/brigadev-test-not-temp";
 	let dir: string;
 	let repo: string;
 	let home: string;
@@ -423,7 +439,7 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 		});
 
 		it("outside the project is the write-outside-project rule: declined without a UI", async () => {
-			for (const cwd of [join(dir, "elsewhere"), "../elsewhere", "/"]) {
+			for (const cwd of [join(OUTSIDE, "elsewhere"), `${"../".repeat(40)}brigadev-test-not-temp/elsewhere`, "/"]) {
 				const result = await outcome("bg_start", { command: "ls", cwd }, { hasUI: false });
 				assert.match(String(result.reason), /User declined write outside the project root/, cwd);
 			}
@@ -431,18 +447,22 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 
 		it("outside the project asks the user, once, and grants that directory only", async () => {
 			const s = await session({ hasUI: true, answer: true });
-			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(dir, "elsewhere") }), undefined);
+			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(OUTSIDE, "elsewhere") }), undefined);
 			assert.deepEqual(s.asked, ["brigadev: write outside project"]);
-			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(dir, "elsewhere") }), undefined);
-			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(dir, "elsewhere", "deeper") }), undefined);
+			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(OUTSIDE, "elsewhere") }), undefined);
+			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(OUTSIDE, "elsewhere", "deeper") }), undefined);
 			assert.equal(s.asked.length, 1, "the grant covers that directory and below");
-			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(dir, "other") }), undefined);
+			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(OUTSIDE, "other") }), undefined);
 			assert.equal(s.asked.length, 2, "a sibling directory is a new question: the grant was not widened to the parent");
 		});
 
 		it("a user who declines blocks the start", async () => {
-			const result = await outcome("bg_start", { command: "ls", cwd: join(dir, "elsewhere") }, { hasUI: true, answer: false });
+			const result = await outcome("bg_start", { command: "ls", cwd: join(OUTSIDE, "elsewhere") }, { hasUI: true, answer: false });
 			assert.match(String(result.reason), /User declined write outside the project root/);
+		});
+
+		it("in the system temp dir starts without asking", async () => {
+			assert.deepEqual(await outcome("bg_start", { command: "ls", cwd: join(dir, "elsewhere") }, { hasUI: false }), { reason: undefined, asked: [] });
 		});
 
 		it("a sensitive directory asks first, and is declined without a UI", async () => {
@@ -459,7 +479,7 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 
 		it("does not change what bash is asked: the same rules for a file in that directory", async () => {
 			const s = await session({ hasUI: true, answer: true });
-			assert.equal(await s.call("write", { path: join(dir, "elsewhere", "x.txt") }), undefined);
+			assert.equal(await s.call("write", { path: join(OUTSIDE, "elsewhere", "x.txt") }), undefined);
 			assert.deepEqual(s.asked, ["brigadev: write outside project"]);
 			assert.equal(await s.call("read", { path: join(repo, ".ssh", "id_rsa") }), undefined);
 			assert.deepEqual(s.asked, ["brigadev: write outside project", "brigadev: sensitive file"]);
