@@ -2,15 +2,19 @@
 // the system temp dir) and the ledger of every file the parent wrote outside the project,
 // `<repo docs>/outside-writes.jsonl`. Pure helpers plus node:fs; extensions/guard.ts decides and records.
 
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
+import { extractWriteTargets } from "./bash-writes.ts";
 import { canonicalPath, expandHome, isInside } from "./paths.ts";
 import { isSensitivePath } from "./permission-policy.ts";
 import { isRepoDocsPath } from "./repo-docs.ts";
 import type { BrigadevSettings } from "./runtime.ts";
 
-/** Why a parent write outside the project ran: temp dir, secure-yolo folder, a session grant, the repo docs folder, or DSP. */
-export type OutsideWhy = "temp" | "secure" | "granted" | "docs" | "dsp";
+/**
+ * Why a write outside the project ran: temp dir, secure-yolo folder, a session grant, the repo docs folder, DSP, or a
+ * shell command (bash writes are not asked about by path).
+ */
+export type OutsideWhy = "temp" | "secure" | "granted" | "docs" | "dsp" | "shell";
 
 export interface OutsideWriteRecord {
 	ts: string;
@@ -18,6 +22,8 @@ export interface OutsideWriteRecord {
 	/** Canonical absolute path written. */
 	path: string;
 	why: OutsideWhy;
+	/** The subagent that wrote it; absent for the parent session. */
+	agent?: string;
 }
 
 /** Folders a secure-yolo folder must not overlap with. */
@@ -90,6 +96,8 @@ export interface OutsideScope {
 	tempRoots: readonly string[];
 	secureDirs: readonly string[];
 	dsp: boolean;
+	/** The write comes from a shell command: outside the trusted folders it is "shell", whatever the mode. */
+	shell?: boolean;
 }
 
 /** Why an allowed write to `absolute` ran, or undefined when it is inside the project (nothing to record). */
@@ -98,7 +106,50 @@ export function outsideWhy(absolute: string, scope: OutsideScope): OutsideWhy | 
 	if (isRepoDocsPath(typeof scope.docsDir === "function" ? scope.docsDir() : scope.docsDir, absolute)) return "docs";
 	if (scope.tempRoots.some((root) => isInside(root, absolute))) return "temp";
 	if (scope.secureDirs.some((root) => isInside(root, absolute))) return "secure";
+	if (scope.shell) return "shell";
 	return scope.dsp ? "dsp" : "granted";
+}
+
+export interface OutsideTarget {
+	path: string;
+	why: OutsideWhy;
+}
+
+/**
+ * The files a shell command writes outside the project by literal name (`>`, `>>`, `tee`, `cp`/`mv` destinations,
+ * `touch`, `sed -i`, ... as lib/bash-writes.ts reads them), canonical, once each, with their reason. Best effort:
+ * names the shell would expand, scripts, and interpreters are not read. The root, `home`, and the temp and secure
+ * roots themselves are left out: a copy into one of them names the folder, not the file it creates.
+ */
+export function bashOutsideTargets(command: string, cwd: string, scope: OutsideScope & { home?: string }): OutsideTarget[] {
+	const roots = new Set(["/", ...scope.tempRoots, ...scope.secureDirs, ...(scope.home ? [canonicalPath(scope.home)] : [])]);
+	const found: OutsideTarget[] = [];
+	for (const target of extractWriteTargets(command, cwd)) {
+		const path = canonicalPath(target);
+		if (roots.has(path) || found.some((entry) => entry.path === path)) continue;
+		const why = outsideWhy(path, { ...scope, shell: true });
+		if (why) found.push({ path, why });
+	}
+	return found;
+}
+
+function stamp(path: string): string | undefined {
+	try {
+		const stats = statSync(path);
+		return `${stats.ino}:${stats.size}:${stats.mtimeMs}`;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Stamps the targets now; the returned check gives the ones that exist afterwards and were created or changed since. */
+export function changedSince<T extends { path: string }>(targets: readonly T[]): () => T[] {
+	const before = targets.map((target) => stamp(target.path));
+	return () =>
+		targets.filter((target, index) => {
+			const after = stamp(target.path);
+			return after !== undefined && after !== before[index];
+		});
 }
 
 export function outsideWritesFile(docsDir: string): string {
@@ -113,12 +164,12 @@ export function appendOutsideWrite(file: string, record: OutsideWriteRecord): vo
 	if (fresh) chmodSync(file, 0o600);
 }
 
-const WHYS: readonly string[] = ["temp", "secure", "granted", "docs", "dsp"];
+const WHYS: readonly string[] = ["temp", "secure", "granted", "docs", "dsp", "shell"];
 
 function isRecord(value: unknown): value is OutsideWriteRecord {
 	if (!value || typeof value !== "object") return false;
 	const r = value as Record<string, unknown>;
-	return typeof r.ts === "string" && typeof r.tool === "string" && typeof r.path === "string" && typeof r.why === "string" && WHYS.includes(r.why);
+	return typeof r.ts === "string" && typeof r.tool === "string" && typeof r.path === "string" && typeof r.why === "string" && WHYS.includes(r.why) && (r.agent === undefined || typeof r.agent === "string");
 }
 
 /** Every well-formed record in the file, oldest first; a missing file is empty. */
@@ -152,7 +203,7 @@ export function formatOutsideWrites(records: readonly OutsideWriteRecord[], limi
 	}
 	const rows = [...byPath.values()].sort((a, b) => b.last.ts.localeCompare(a.last.ts));
 	const shown = rows.slice(0, limit);
-	const lines = shown.map(({ last, count }) => `${last.ts}  ${last.why.padEnd(7)}  ${last.path}${count > 1 ? `  (${count} writes)` : ""}`);
+	const lines = shown.map(({ last, count }) => `${last.ts}  ${last.why.padEnd(7)}  ${last.tool.padEnd(5)}  ${last.path}${last.agent ? `  [${last.agent}]` : ""}${count > 1 ? `  (${count} writes)` : ""}`);
 	const more = rows.length > shown.length ? `\n… ${rows.length - shown.length} more` : "";
 	return `Files written outside the project: ${rows.length} files\n${lines.join("\n")}${more}`;
 }
