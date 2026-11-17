@@ -159,7 +159,11 @@ describe("writes outside the project", () => {
 		const kept = join(out, "kept.txt");
 		writeFileSync(kept, "old");
 		utimesSync(kept, 1000, 1000);
-		assert.equal(await s.bash(`echo x > ${made}; cat ${kept} > /dev/null; touch ${join(repo, "inside.txt")}; false`, () => writeFileSync(made, "x"), true), undefined);
+		assert.equal(await s.bash(`echo x > ${made}; cat ${kept} > /dev/null; touch ${join(repo, "inside.txt")}; false`, () => {
+			writeFileSync(made, "x");
+			// Created too, so only the project-root rule keeps it out of the ledger.
+			writeFileSync(join(repo, "inside.txt"), "x");
+		}, true), undefined);
 		assert.deepEqual(s.asked, []);
 		const bashPaths = ledger().filter((r) => r.tool === "bash").map((r) => r.path);
 		assert.ok(bashPaths.includes(canonicalPath(made)), bashPaths.join(", "));
