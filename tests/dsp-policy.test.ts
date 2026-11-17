@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { auditKind, decideDspCommand, isAutoAllowedForAudit, type DspDecision } from "../lib/dsp-policy.ts";
+import { auditKind, decideDspCommand, DSP_DIALOG_MAX_LINES, DSP_DIALOG_LINE_CHARS, isAutoAllowedForAudit, remoteDialog, type DspDecision } from "../lib/dsp-policy.ts";
 import { type FakeGit, fakeExec, realTmp } from "./dsp-fixtures.test.ts";
 
 const project = realTmp("dsp-policy-project-");
@@ -402,5 +402,56 @@ describe("verifier regressions: DSP never auto-allows these", () => {
 		}
 		assert.equal(await action("rsync -a src/ backup/"), "allow");
 		assert.equal(await action("ssh -V"), "allow");
+	});
+});
+
+describe("the remote dialog never outgrows the terminal", () => {
+	const bodyLines = (body: string) => body.split("\n");
+	const bigInput = () => {
+		const labels = Array.from({ length: 20 }, (_, i) => `kind ${i}`);
+		const items = Array.from({ length: 60 }, (_, i) => ({ label: labels[i % 20]! }));
+		const also = Array.from({ length: 40 }, (_, i) => `reason ${i % 20}: x is written and run in the same command, so its text cannot be checked; ${"long ".repeat(60)}`);
+		const command = Array.from({ length: 50 }, (_, i) => `echo ${i}`).join("\n") + "\ngit push";
+		return { command, items, also };
+	};
+
+	it("stays under the line budget and the line width whatever the input", () => {
+		const { command, items, also } = bigInput();
+		const target = { remoteName: "origin", url: `git@github.com:${"x".repeat(400)}.git`, branch: "b".repeat(300) };
+		const full = [...items, { label: "PR merge", pr: "1".repeat(300), base: "d".repeat(300), repo: "r".repeat(300), ref: "t".repeat(300) }];
+		const lines = bodyLines(remoteDialog({ command, items: full, target, also }).body);
+		assert.ok(lines.length <= DSP_DIALOG_MAX_LINES, `${lines.length} lines`);
+		for (const line of lines) assert.ok(line.length <= DSP_DIALOG_LINE_CHARS + 6, `${line.length} chars: ${line.slice(0, 40)}`);
+	});
+
+	it("lists each kind once, at most 6, and counts the rest", () => {
+		const { command, items } = bigInput();
+		const kind = bodyLines(remoteDialog({ command, items }).body).find((line) => line.startsWith("Kind: "))!;
+		assert.equal(kind, "Kind: kind 0, kind 1, kind 2, kind 3, kind 4, kind 5, … and 14 more");
+	});
+
+	it("lists each reason once, at most 4, and counts the rest", () => {
+		const { command, items, also } = bigInput();
+		const lines = bodyLines(remoteDialog({ command, items, also }).body);
+		const start = lines.findIndex((line) => line.startsWith("Also:"));
+		const shown = lines.filter((line) => /reason \d+:/.test(line));
+		assert.equal(shown.length, 4);
+		assert.equal(new Set(shown.map((line) => line.match(/reason (\d+):/)![1])).size, 4);
+		assert.ok(start >= 0);
+		assert.ok(lines.slice(start + 1, start + 4).every((line) => line.startsWith("      ")), "continuation lines are indented");
+		assert.ok(lines.includes("      … and 16 more"), lines.join("\n"));
+	});
+
+	it("a small input renders as before", () => {
+		const dialog = remoteDialog({ command: "git push && rm -rf /var/x", items: [{ label: "push" }, { label: "PR create" }, { label: "push" }], target: {}, also: ["rm recursive removal outside the project", "second reason"] });
+		assert.deepEqual(bodyLines(dialog.body), [
+			"git push && rm -rf /var/x",
+			"",
+			"Kind: push, PR create",
+			"Also: rm recursive removal outside the project; second reason",
+			"",
+			"DSP never runs remote actions on its own.",
+			"Allow it this once?",
+		]);
 	});
 });

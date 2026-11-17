@@ -245,23 +245,63 @@ export async function readRemoteTarget(exec: ExecFn, cwd: string, items: RemoteI
 	};
 }
 
-/** Title and body of the dialog that asks the user to approve a remote action. */
+/** A dialog taller than the terminal hides the chat and its own options, so the body has a fixed line budget. */
+export const DSP_DIALOG_MAX_LINES = 24;
+/** Every line of the dialog body after the command preview is clipped to this width. */
+export const DSP_DIALOG_LINE_CHARS = 160;
+
+const DIALOG_MAX_KINDS = 6;
+const DIALOG_MAX_ALSO = 4;
+const DIALOG_ALSO_INDENT = "      ";
+
+const clipLine = (text: string) => {
+	const line = text.replace(/\s+/g, " ").trim();
+	return line.length > DSP_DIALOG_LINE_CHARS ? `${line.slice(0, DSP_DIALOG_LINE_CHARS - 1)}…` : line;
+};
+const uniqueLines = (values: string[]) => [...new Set(values.map((value) => value.replace(/\s+/g, " ").trim()).filter(Boolean))];
+
+/** `Kind: a, b, c, … and N more`: each kind once, at most DIALOG_MAX_KINDS, on one line within the width. */
+function kindLine(labels: string[]): string {
+	const kinds = uniqueLines(labels);
+	const prefix = "Kind: ";
+	let shown = Math.min(kinds.length, DIALOG_MAX_KINDS);
+	const render = (count: number) => {
+		const more = kinds.length - count;
+		return `${prefix}${[...kinds.slice(0, count), ...(more > 0 ? [`… and ${more} more`] : [])].join(", ")}`;
+	};
+	while (shown > 1 && render(shown).length > DSP_DIALOG_LINE_CHARS) shown--;
+	return clipLine(render(shown));
+}
+
+/** `Also: a; b` when it fits on one line as before, otherwise one reason per line, at most DIALOG_MAX_ALSO, then `… and N more`. */
+function alsoLines(reasons: string[]): string[] {
+	const unique = uniqueLines(reasons);
+	if (unique.length === 0) return [];
+	const joined = `Also: ${unique.join("; ")}`;
+	if (unique.length <= DIALOG_MAX_ALSO && joined.length <= DSP_DIALOG_LINE_CHARS) return [joined];
+	const shown = unique.slice(0, DIALOG_MAX_ALSO);
+	const lines = shown.map((reason, i) => (i === 0 ? clipLine(`Also: ${reason}`) : `${DIALOG_ALSO_INDENT}${clipLine(reason)}`));
+	if (unique.length > shown.length) lines.push(`${DIALOG_ALSO_INDENT}… and ${unique.length - shown.length} more`);
+	return lines;
+}
+
+/** Title and body of the dialog that asks the user to approve a remote action. The body is bounded (DSP_DIALOG_MAX_LINES) whatever the input. */
 export function remoteDialog(input: { command: string; items: RemoteItem[]; target?: RemoteTarget; also?: string[] }): { title: string; body: string } {
 	const { items, target = {} } = input;
 	const lines = [commandPreview(input.command), ""];
-	lines.push(`Kind: ${[...new Set(items.map((item) => item.label))].join(", ")}`);
-	if (target.remoteName) lines.push(`Remote: ${target.remoteName}${target.url ? ` (${target.url})` : ""}`);
+	lines.push(kindLine(items.map((item) => item.label)));
+	if (target.remoteName) lines.push(clipLine(`Remote: ${target.remoteName}${target.url ? ` (${target.url})` : ""}`));
 	const branch = target.branch ?? items.find((item) => item.branch)?.branch;
-	if (branch) lines.push(`Branch: ${branch}`);
+	if (branch) lines.push(clipLine(`Branch: ${branch}`));
 	const base = items.find((item) => item.base)?.base;
-	if (base) lines.push(`Base: ${base}`);
+	if (base) lines.push(clipLine(`Base: ${base}`));
 	const pr = items.find((item) => item.pr)?.pr;
-	if (pr) lines.push(`PR: #${pr}`);
+	if (pr) lines.push(clipLine(`PR: #${pr}`));
 	const repo = items.find((item) => item.repo)?.repo;
-	if (repo) lines.push(`Repo: ${repo}`);
+	if (repo) lines.push(clipLine(`Repo: ${repo}`));
 	const ref = items.find((item) => item.ref)?.ref;
-	if (ref) lines.push(`Target: ${ref}`);
-	if (input.also && input.also.length > 0) lines.push(`Also: ${input.also.join("; ")}`);
+	if (ref) lines.push(clipLine(`Target: ${ref}`));
+	lines.push(...alsoLines(input.also ?? []));
 	lines.push("", DSP_NEVER_LINE, "Allow it this once?");
 	return { title: DSP_REMOTE_TITLE, body: lines.join("\n") };
 }

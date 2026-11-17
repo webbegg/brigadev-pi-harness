@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- The DSP remote-action dialog is bounded: kinds and "Also" reasons are deduplicated and trimmed (at most 6 and 4, each clipped to one line, then "… and N more"), so it never fills the terminal and hides the chat. Presentation only; which commands ask is unchanged.
+
 ## [0.18.0] - 2026-11-16
 
 - DSP mode ("dangerously skip permissions"): `/brigadev:mode dsp` (one confirmation dialog; `/brigadev:mode default dsp` is allowed and `/brigadev:doctor` warns about it) skips brigadev's execution questions. Local work runs without asking: feature-branch commits, dependency installs, deletes and overwrites inside the project or the temp dir, writes outside the project. Local discards (`reset --hard`, `rebase`, `branch -D`, `clean -f`, `stash drop`, ...) run after an automatic snapshot under `refs/brigadev/backup/` (pruned after 14 days). Every remote action (push, PR/issue/release writes, publish, HTTP writes, remote and credential config) and every change to the default branch always asks, per command, and is denied without a UI. Wrappers, `$( )`, aliases, scripts, Makefile targets and package scripts are looked through; commands the guard cannot read ask. Protected paths (`~/.pi/`, the install root, git and gh config, hooks, shell rc files) ask; the audit log `audit/dsp.jsonl` records what DSP auto-allowed. Footer shows `⚠ DSP`. `normal` and `yolo` are unchanged. See the README for the table and the residual risk.
