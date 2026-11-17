@@ -30,6 +30,8 @@ export interface FileAccessInput {
 	rawPath?: string;
 	/** Name of the subagent, for messages. */
 	agent?: string;
+	/** Canonical folders outside the project where a parent write runs without asking (system temp dir, secure-yolo folders). Subagents ignore it. */
+	trustedDirs?: readonly string[];
 }
 
 /** What to do with the access once any sensitive-path question is settled. */
@@ -60,6 +62,7 @@ function decideAfterSensitive(input: FileAccessInput): PathVerdict {
 		if (!isChild) {
 			const docsDir = typeof input.docsDir === "function" ? input.docsDir() : input.docsDir;
 			if (isRepoDocsPath(docsDir, absolutePath)) return ALLOW;
+			if (input.trustedDirs?.some((dir) => isInside(dir, absolutePath))) return ALLOW;
 		}
 		if (isChild) return block(`Blocked by brigadev guard: ${input.rawPath ?? absolutePath} is outside the project root ${projectRoot}.`);
 		return { action: "ask", kind: "outside", target: dirname(absolutePath) };
@@ -78,7 +81,7 @@ function decideAfterSensitive(input: FileAccessInput): PathVerdict {
 /**
  * Order: a write into the evidence log is blocked for everyone; then a
  * sensitive path (subagents blocked, the parent asked); then, for writes, the
- * parent-only docs exemption, the outside-project rule, and for a subagent
+ * parent-only docs and trusted-folder exemptions, the outside-project rule, and for a subagent
  * inside the project its read-only flag and edit surfaces.
  */
 export function decideFileAccess(input: FileAccessInput): FileAccessDecision {

@@ -15,13 +15,14 @@ import { readBranchFacts } from "../lib/commit-branch.ts";
 import { createBackup, type BackupPlan } from "../lib/dsp-backup.ts";
 import { clearCredLocks, DSP_LOCK_ENV, dspShellProblem, lockEnvironment, lockPlaces, lockPrelude, markCredLock, setParentDspLock, type LockPlaces } from "../lib/dsp-credlock.ts";
 import { appendDspAudit, dspAuditDir, dspAuditFile, dspAuditRecord, dspStatusLine, noteDspAllowed, resetDspCount } from "../lib/dsp-audit.ts";
-import { bashProtectedTargets, isCredentialPath, protectedPathKind, type ProtectedPathContext } from "../lib/dsp-paths.ts";
+import { bashProtectedTargets, isCredentialPath, protectedPathKind, tempRoots, type ProtectedPathContext } from "../lib/dsp-paths.ts";
 import { auditKind, decideDspCommand, isAutoAllowedForAudit, readRemoteTarget, remoteDialog, type DspResult } from "../lib/dsp-policy.ts";
 import { appendEvidence, commitGateWithForce, evidenceFile, forceRecord, gateDialog, readEvidence, type ForceRecord } from "../lib/evidence.ts";
 import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, shellCallOf, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_LABEL, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
+import { appendOutsideWrite, formatOutsideWrites, outsideWhy, outsideWritesFile, readOutsideWrites, runYoloDirCommand, secureYoloDirs, trustedTempRoots, type OutsideWriteRecord } from "../lib/outside-writes.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
-import { repoDocsDir } from "../lib/repo-docs.ts";
+import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
 import { agentDir, appendSystemPromptOnce, CHILD_ENV, childAllowedSurfaces, isChildSession, PACKAGE_ROOT, readSettings, writeSettings } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
 import { worktreeTreeResult } from "../lib/worktree-tree.ts";
@@ -63,6 +64,14 @@ export default function (pi: ExtensionAPI) {
 	const exec: ExecFn = (command, args, options) => pi.exec(command, args, options);
 	// Working-tree snapshot taken before each allowed bash call, by tool call id.
 	const beforeBash = new Map<string, Snapshot>();
+	// Parent write/edit calls allowed outside the project, by tool call id; recorded in the ledger once they succeed.
+	const pendingOutside = new Map<string, Omit<OutsideWriteRecord, "ts">>();
+
+	// A secure-yolo folder must not reach the agent folder, every repo's docs (evidence logs), or the harness code.
+	const secureGuard = () => ({ home: homedir(), agentDir: agentDir(), protectedDirs: [brigadevHome(), PACKAGE_ROOT] });
+	/** The parent's secure-yolo folders from brigadev.json (re-read each call, so /brigadev:yolo-dir applies at once). */
+	const secureDirs = (): string[] => secureYoloDirs(readSettings().secureYoloDirs, secureGuard());
+	const tempDirs = (): string[] => trustedTempRoots(tempRoots(), homedir());
 
 	/** The launcher (lib/child-launch.ts) reads this at spawn time: children launched while the parent is in DSP carry the marker. */
 	const syncParentLock = () => {
@@ -177,7 +186,11 @@ export default function (pi: ExtensionAPI) {
 	const checkPath = async (toolName: string, rawPath: string, absolute: string, isWrite: boolean, ctx: ExtensionContext, isDirectory = false): Promise<{ block: true; reason: string } | undefined> => {
 		const root = projectRoot(ctx);
 		const dsp = inDsp();
-		const protectedKind = dsp && isWrite && !isDirectory ? protectedPathKind(absolute, protectedContext(ctx)) : undefined;
+		// Protected paths (git hooks and config, shell startup files, harness config) are never trusted folder content: a secure folder
+		// that holds other repos or dotfiles must not let the parent plant code that runs later. DSP asks for them below; other modes fall back
+		// to the outside-project question.
+		const pathKind = isWrite && !isDirectory ? protectedPathKind(absolute, protectedContext(ctx)) : undefined;
+		const protectedKind = dsp ? pathKind : undefined;
 		if (protectedKind === "audit") return { block: true, reason: AUDIT_BLOCK };
 		const decision = decideFileAccess({
 			isChild,
@@ -192,6 +205,8 @@ export default function (pi: ExtensionAPI) {
 			readOnly: process.env[CHILD_ENV.READ_ONLY] === "1",
 			surfaces: isChild ? childAllowedSurfaces() : undefined,
 			agent: process.env[CHILD_ENV.AGENT],
+			// The system temp dir and the secure-yolo folders: parent writes there run without asking (subagents stay blocked).
+			trustedDirs: isChild || pathKind ? undefined : [...tempDirs(), ...secureDirs()],
 		});
 
 		let verdict: PathVerdict;
@@ -220,6 +235,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionLock = undefined;
+		pendingOutside.clear();
 		resetDspCount();
 		restoreMode(ctx);
 	});
@@ -384,10 +400,26 @@ export default function (pi: ExtensionAPI) {
 		const rawPath = String((event.input as { path?: unknown }).path ?? "");
 		if (!rawPath) return undefined;
 		const absolute = canonicalPath(resolve(ctx.cwd, expandHome(rawPath)));
-		return checkPath(event.toolName, rawPath, absolute, isWrite, ctx);
+		const blocked = await checkPath(event.toolName, rawPath, absolute, isWrite, ctx);
+		if (!blocked && isWrite && !isChild) {
+			const why = outsideWhy(absolute, { projectRoot: projectRoot(ctx), docsDir: () => repoDocsDir(ctx.cwd), tempRoots: tempDirs(), secureDirs: secureDirs(), dsp: inDsp() });
+			if (why) pendingOutside.set(event.toolCallId, { tool: event.toolName, path: absolute, why });
+		}
+		return blocked;
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
+		const outsideWrite = pendingOutside.get(event.toolCallId);
+		if (outsideWrite) {
+			pendingOutside.delete(event.toolCallId);
+			if (!event.isError) {
+				try {
+					appendOutsideWrite(outsideWritesFile(repoDocsDir(ctx.cwd)), { ts: new Date().toISOString(), ...outsideWrite });
+				} catch {
+					// The ledger is a record, not a gate.
+				}
+			}
+		}
 		const before = beforeBash.get(event.toolCallId);
 		if (!before) return undefined;
 		beforeBash.delete(event.toolCallId);
@@ -402,6 +434,26 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	if (isChild) return;
+
+	pi.registerCommand("brigadev:outside", {
+		description: "List the files this repo's sessions wrote outside the project (temp dir, secure-yolo folders, granted folders, repo docs)",
+		handler: async (_args, ctx) => {
+			const file = outsideWritesFile(repoDocsDir(ctx.cwd));
+			ctx.ui.notify(`${formatOutsideWrites(readOutsideWrites(file))}\nLedger: ${file}`, "info");
+		},
+	});
+
+	pi.registerCommand("brigadev:yolo-dir", {
+		description: "Secure-yolo folders, where write/edit outside the project run without asking: list | add <folder> | remove <folder>",
+		getArgumentCompletions: (prefix) => {
+			const items = ["list", "add ", "remove "].filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value.trim() }));
+			return items.length > 0 ? items : null;
+		},
+		handler: async (args, ctx) => {
+			const message = runYoloDirCommand(args, { read: readSettings, write: writeSettings }, { ...secureGuard(), tempRoots: tempDirs() });
+			ctx.ui.notify(message, message.startsWith("brigadev: refused") ? "error" : "info");
+		},
+	});
 
 	pi.registerCommand("brigadev:force-commit", {
 		description: "Let the next git commit on the current working tree pass the evidence gate (one-shot; edits cancel it)",
