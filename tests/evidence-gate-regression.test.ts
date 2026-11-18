@@ -134,3 +134,109 @@ describe("commit gate wiring (S4)", () => {
 		assert.match(String(reason), /evidence gate/);
 	});
 });
+
+describe("commit gate in nested repositories and subdirectories (S8b)", () => {
+	let dir: string;
+	let parent: string;
+	let nested: string;
+	let repo: string;
+	const saved = { ...process.env };
+	const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd, encoding: "utf8" });
+	const initRepo = (path: string, branch: string) => {
+		mkdirSync(join(path, "sub"), { recursive: true });
+		git(path, "init", "-q", "-b", branch);
+		writeFileSync(join(path, "sub", "src.ts"), "1\n");
+		git(path, "add", "-A");
+		git(path, "commit", "-qm", "init");
+	};
+
+	before(() => {
+		dir = mkdtempSync(join(tmpdir(), "brigadev-gate-nested-"));
+		for (const key of ["BRIGADEV_CHILD", "BRIGADEV_AGENT", "BRIGADEV_READ_ONLY", "BRIGADEV_PROJECT_ROOT"]) delete process.env[key];
+		process.env.BRIGADEV_HOME = join(dir, "home");
+		parent = join(dir, "parent"); // no repository
+		nested = join(parent, "nested");
+		repo = join(dir, "repo");
+		initRepo(nested, "feat/n");
+		initRepo(repo, "feat/r");
+	});
+	after(() => {
+		process.env = saved;
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	async function session(cwd: string) {
+		const handlers: Record<string, Function[]> = {};
+		const pi: any = {
+			on: (event: string, handler: Function) => (handlers[event] ??= []).push(handler),
+			registerCommand: () => {},
+			registerShortcut: () => {},
+			appendEntry: () => {},
+			exec: async (command: string, args: string[], options: { cwd: string }) => {
+				try {
+					return { stdout: execFileSync(command, args, { cwd: options.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }), stderr: "", code: 0 };
+				} catch (error: any) {
+					return { stdout: String(error.stdout ?? ""), stderr: "", code: typeof error.status === "number" ? error.status : 1 };
+				}
+			},
+		};
+		(await import(`../extensions/guard.ts?${Math.random()}`)).default(pi);
+		(await import(`../extensions/evidence.ts?${Math.random()}`)).default(pi);
+		// Yolo mode: a commit is not confirmed, so only the evidence gate decides.
+		const yolo = [{ type: "custom", customType: "brigadev-mode", data: { mode: "yolo" } }];
+		const ctx: any = { cwd, hasUI: false, sessionManager: { getBranch: () => yolo }, ui: { confirm: async () => false, notify: () => {}, setStatus: () => {} } };
+		for (const handler of handlers.session_start ?? []) await handler({}, ctx);
+		let id = 0;
+		return {
+			async call(command: string) {
+				for (const handler of handlers.tool_call ?? []) {
+					const result = await handler({ toolName: "bash", toolCallId: "c", input: { command } }, ctx);
+					if (result?.block) return result.reason as string;
+				}
+				return undefined;
+			},
+			/** A test run through the handlers: tool_call, then a passing tool_result, so the recorder logs it. */
+			async passingRun(command: string) {
+				const toolCallId = String(++id);
+				for (const handler of handlers.tool_call ?? []) await handler({ toolName: "bash", toolCallId, input: { command } }, ctx);
+				for (const handler of handlers.tool_result ?? []) await handler({ toolName: "bash", toolCallId, input: { command }, content: [{ type: "text", text: "ok" }], structuredContent: { exit_code: 0, output: "ok" } }, ctx);
+			},
+		};
+	}
+
+	const forms = (path: string) => [`git -C ${path} commit -am x`, `cd ${path} && git commit -am x`];
+
+	it("blocks a commit into a nested repository with no passing run there (the normal gate message)", async () => {
+		appendFileSync(join(nested, "sub", "src.ts"), "2\n");
+		const s = await session(parent);
+		for (const command of forms("nested")) assert.match(String(await s.call(command)), /no passing test is recorded/, command);
+	});
+
+	it("lets `git -C nested commit` and `cd nested && git commit` through once a passing run is recorded in that repository", async () => {
+		const s = await session(parent);
+		await s.passingRun("cd nested && npm test");
+		for (const command of forms("nested")) assert.equal(await s.call(command), undefined, command);
+	});
+
+	it("a later edit in the nested repository invalidates that run again", async () => {
+		appendFileSync(join(nested, "sub", "src.ts"), "3\n");
+		const s = await session(parent);
+		for (const command of forms("nested")) assert.match(String(await s.call(command)), /no passing test is recorded/, command);
+	});
+
+	it("`cd sub && git commit` inside the same repository is judged by that repository's runs", async () => {
+		appendFileSync(join(repo, "sub", "src.ts"), "2\n");
+		const s = await session(repo);
+		assert.match(String(await s.call("cd sub && git commit -am x")), /no passing test is recorded/);
+		await s.passingRun("npm test");
+		assert.equal(await s.call("cd sub && git commit -am x"), undefined);
+	});
+
+	it("an unresolvable directory still blocks", async () => {
+		const s = await session(parent);
+		await s.passingRun("cd nested && npm test");
+		for (const command of ["cd $TARGET && git commit -am x", "git -C \"$TARGET\" commit -am x", "git --git-dir=nested/.git commit -am x"]) {
+			assert.match(String(await s.call(command)), /another directory/, command);
+		}
+	});
+});

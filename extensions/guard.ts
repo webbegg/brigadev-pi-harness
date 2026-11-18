@@ -12,8 +12,8 @@ import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
-import { appendEvidence, commitGateWithForce, evidenceFile, forceRecord, gateDialog, readEvidence, type ForceRecord } from "../lib/evidence.ts";
-import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, isGitConfigOrHooksPath, runYoloDirCommand, secureYoloDirs, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
+import { appendEvidence, evaluateCommitGate, forceRecord, gateDialog, type ForceRecord } from "../lib/evidence.ts";
+import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, isProtectedPath, runYoloDirCommand, secureYoloDirs, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
@@ -101,18 +101,12 @@ export default function (pi: ExtensionAPI) {
 	 * Returns a block reason, or a `settle` to call once the remaining rules let the commit run: the
 	 * user's force (one-shot or dialog) is spent and logged then, not when a later rule declines.
 	 */
-	const evidenceGate = async (command: string, ctx: ExtensionContext, startsElsewhere: boolean): Promise<{ reason?: string; settle: () => void }> => {
+	const evidenceGate = async (command: string, ctx: ExtensionContext, commandCwd: string): Promise<{ reason?: string; settle: () => void }> => {
 		const nothing = { settle: () => {} };
-		const commits = classifyCommand(command).filter((match) => match.commit);
-		if (commits.length === 0) return nothing;
-		// The whole repository, not the session folder: a session in a subdirectory commits files elsewhere too.
-		const root = await repoRoot(projectRoot(ctx));
-		const treeResult = await worktreeTreeResult(root);
-		const tree = treeResult.kind === "tree" ? treeResult.tree : undefined;
-		const treeError = treeResult.kind === "error" ? treeResult.reason : undefined;
-		const snapshot = tree === undefined ? undefined : await takeSnapshot(exec, root);
-		const branch = (await readBranchFacts(exec, ctx.cwd)).currentBranch;
-		const file = evidenceFile(repoDocsDir(ctx.cwd), branch);
+		// Judged against the repository the commit runs in (`git -C`, a leading `cd`, a nested repo); none when it commits nothing.
+		const evaluation = await evaluateCommitGate({ exec, command, cwd: commandCwd, forcedTree });
+		if (!evaluation) return nothing;
+		const { decision, consumedForce, file, branch, tree } = evaluation;
 		const log = (via: ForceRecord["via"]) => {
 			try {
 				appendEvidence(file, forceRecord({ ts: new Date().toISOString(), branch, tree, via, command }));
@@ -121,15 +115,6 @@ export default function (pi: ExtensionAPI) {
 			}
 		};
 
-		const { decision, consumedForce } = commitGateWithForce({
-			// Unknown dirty paths count as source: a gate that cannot see the change must not pass it.
-			dirtyPaths: snapshot ? [...snapshot.keys()] : ["(unknown)"],
-			tree,
-			treeError,
-			elsewhere: startsElsewhere || commits.some((match) => match.elsewhere),
-			records: readEvidence(file),
-			forcedTree,
-		});
 		if (decision.action === "allow") {
 			return consumedForce
 				? {
@@ -156,9 +141,9 @@ export default function (pi: ExtensionAPI) {
 	 */
 	const checkPath = async (toolName: string, rawPath: string, absolute: string, isWrite: boolean, ctx: ExtensionContext, isDirectory = false): Promise<{ block: true; reason: string } | undefined> => {
 		const root = projectRoot(ctx);
-		// Git hooks and config are never trusted folder content: a secure folder that holds other repos must not let the parent
-		// plant code that runs later, so those paths fall back to the outside-project question.
-		const gitCode = isWrite && !isDirectory && isGitConfigOrHooksPath(absolute);
+		// Protected paths (the agent folder, ~/.pi, the harness install, credential and shell startup files, git config and hooks) are never
+		// trusted folder content, in any mode: a write there falls back to the outside-project question even under the temp dir or a secure folder.
+		const protectedPath = isWrite && !isDirectory && isProtectedPath(absolute, { home: homedir(), agentDir: agentDir(), installRoot: PACKAGE_ROOT, projectRoot: root });
 		const decision = decideFileAccess({
 			isChild,
 			isWrite,
@@ -171,7 +156,7 @@ export default function (pi: ExtensionAPI) {
 			surfaces: isChild ? childAllowedSurfaces() : undefined,
 			agent: process.env[CHILD_ENV.AGENT],
 			// The system temp dir and the secure-yolo folders: parent writes there run without asking (subagents stay blocked).
-			trustedDirs: isChild || gitCode ? undefined : [...tempDirs(), ...secureDirs()],
+			trustedDirs: isChild || protectedPath ? undefined : [...tempDirs(), ...secureDirs()],
 		});
 
 		let verdict: PathVerdict;
@@ -234,7 +219,7 @@ export default function (pi: ExtensionAPI) {
 			const startsElsewhere = shell.cwd !== undefined && classifyCommand(command).some((match) => match.commit) && (await repoRoot(commandCwd)) !== (await repoRoot(projectRoot(ctx)));
 			const decision = await decideBashCommand({ command, mode, isChild, cwd: commandCwd, elsewhere: startsElsewhere, readFacts: (cwd) => readBranchFacts(exec, cwd) });
 			if (decision.action === "block") return { block: true, reason: decision.reason };
-			const gated = isChild ? undefined : await evidenceGate(command, ctx, startsElsewhere);
+			const gated = isChild ? undefined : await evidenceGate(command, ctx, commandCwd);
 			if (gated?.reason) return { block: true, reason: gated.reason };
 			if (decision.action === "confirm") {
 				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(command)}\n\nRun it?`);

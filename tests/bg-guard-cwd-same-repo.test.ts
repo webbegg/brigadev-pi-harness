@@ -1,5 +1,5 @@
 // S1a regression: a bg_start `cwd` is decided like `cd <cwd> && <command>` for another repository (a symlink into a
-// nested repository counts too), and a subdirectory of the session's own repository is NOT "elsewhere": the evidence
+// nested repository counts too; the gate judges that repository's runs), and a subdirectory of the session's own repository is NOT "elsewhere": the evidence
 // gate then decides on the session's tree, as for a plain `git commit`.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -95,11 +95,11 @@ describe("bg_start cwd: same repository vs another one (S1a)", () => {
 		});
 	}
 
-	it("a symlink cwd into a nested repository is another directory, as `cd lnk && git commit` is", async () => {
+	it("a symlink cwd into a nested repository is judged by that repository's runs (its own untested change), as `cd lnk && git commit` is", async () => {
 		for (const yolo of [false, true]) {
 			const viaBash = await call(clean, "bash", { command: "cd lnk && git commit -am x" }, yolo);
 			const viaBg = await call(clean, "bg_start", { command: "git commit -am x", cwd: "lnk" }, yolo);
-			assert.match(String(viaBash), /runs in another directory/);
+			assert.match(String(viaBash), /no passing test is recorded/);
 			assert.equal(viaBg, viaBash);
 		}
 	});

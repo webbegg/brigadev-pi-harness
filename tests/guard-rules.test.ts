@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import type { BranchFacts } from "../lib/commit-branch.ts";
 import { canonicalPath } from "../lib/paths.ts";
-import { bashWritesEvidence, checkSecureDir, decideBashCommand, decideFileAccess, isGitConfigOrHooksPath, runYoloDirCommand, secureYoloDirs, shellCallOf, tempRoots, trustedTempRoots, type FileAccessInput } from "../lib/guard-rules.ts";
+import { bashWritesEvidence, checkSecureDir, decideBashCommand, decideFileAccess, isGitConfigOrHooksPath, isProtectedPath, runYoloDirCommand, secureYoloDirs, shellCallOf, tempRoots, trustedTempRoots, type FileAccessInput } from "../lib/guard-rules.ts";
 import { PERMISSION_MODE } from "../lib/permission-policy.ts";
 import type { BrigadevSettings } from "../lib/runtime.ts";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
@@ -346,6 +346,16 @@ describe("secure-yolo folders", () => {
 	it("names git config and hook files, in any repository, and nothing else", () => {
 		for (const path of ["/x/repo/.git/config", "/x/repo/.git/config.worktree", "/x/repo/.git/hooks", "/x/repo/.git/hooks/pre-commit"]) assert.equal(isGitConfigOrHooksPath(path), true, path);
 		for (const path of ["/x/repo/.git/HEAD", "/x/repo/docs/config", "/x/repo/.github/hooks/a"]) assert.equal(isGitConfigOrHooksPath(path), false, path);
+	});
+
+	it("names protected paths in any mode: agent folder, ~/.pi, install root (unless it is the project), credential and shell files, git config", () => {
+		const installRoot = join(scratch, "install");
+		const ctx = { home, agentDir, installRoot, projectRoot: join(scratch, "project") };
+		for (const path of [join(agentDir, "brigadev.json"), join(home, ".pi", "x"), join(installRoot, "extensions", "guard.ts"), join(home, ".config", "gh", "hosts.yml"), join(home, ".config", "git", "ignore"), join(home, ".config", "fish", "config.fish"), join(home, ".ssh", "id"), join(home, ".gitconfig"), join(home, ".zshrc"), join(scratch, "repo", ".git", "hooks", "pre-commit")]) {
+			assert.equal(isProtectedPath(path, ctx), true, path);
+		}
+		for (const path of [join(home, "scratch", "a.txt"), join(scratch, "plain.txt"), join(scratch, "repo", ".git", "HEAD")]) assert.equal(isProtectedPath(path, ctx), false, path);
+		assert.equal(isProtectedPath(join(installRoot, "a.ts"), { ...ctx, projectRoot: installRoot }), false, "the install root is the project");
 	});
 
 	describe("/brigadev:yolo-dir", () => {

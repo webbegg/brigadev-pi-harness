@@ -205,6 +205,36 @@ export function isGitConfigOrHooksPath(absolute: string): boolean {
 	return GIT_CONFIG_OR_HOOKS.test(canonicalPath(absolute).replace(/\\/g, "/"));
 }
 
+/** Facts that decide which paths are protected, whatever the permission mode. */
+export interface ProtectedPathContext {
+	home: string;
+	/** Pi's agent folder (`~/.pi/agent` unless relocated); it holds brigadev.json. */
+	agentDir: string;
+	/** The installed harness (this package's root). */
+	installRoot: string;
+	projectRoot: string;
+}
+
+const PROTECTED_HOME_FOLDERS = [".pi", ".ssh", ".aws", ".docker", ".gnupg", ".kube", join(".config", "git"), join(".config", "gh"), join(".config", "fish")];
+const PROTECTED_HOME_FILES = [".gitconfig", ".netrc", ".npmrc", ".git-credentials", ".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".profile", ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout"];
+
+/**
+ * True for a path a parent write must always ask about, even under the system temp dir or a secure-yolo folder: the agent folder
+ * (brigadev.json holds the trusted folders and the default mode), `~/.pi`, the installed harness (unless it is the project),
+ * the home git, gh, fish and credential folders, `~/.gitconfig`, shell startup files, and `.git` config and hooks.
+ */
+export function isProtectedPath(absolute: string, ctx: ProtectedPathContext): boolean {
+	const path = canonicalPath(absolute);
+	const home = canonicalPath(ctx.home);
+	const folders = [canonicalPath(ctx.agentDir), ...PROTECTED_HOME_FOLDERS.map((folder) => join(home, folder))];
+	// A session working on the harness itself edits its own checkout: that is the project, not an installed copy.
+	const installRoot = canonicalPath(ctx.installRoot);
+	if (!isInside(installRoot, canonicalPath(ctx.projectRoot))) folders.push(installRoot);
+	if (folders.some((folder) => isInside(folder, path))) return true;
+	if (PROTECTED_HOME_FILES.some((name) => path === join(home, name))) return true;
+	return isGitConfigOrHooksPath(path);
+}
+
 /** Folders a secure-yolo folder must not overlap with. */
 export interface SecureDirGuard {
 	home: string;
