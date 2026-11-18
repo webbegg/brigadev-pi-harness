@@ -50,6 +50,15 @@ describe("childLaunch: a child can never ask for permission and hang (S0)", () =
 });
 
 describe("childLaunch: arguments", () => {
+	it("S12: every child launches with --no-skills (skills travel by path in the task), and keeps project context files", () => {
+		for (const over of [{}, { agent: { name: "w", writer: true }, allowedEditSurfaces: ["lib/a.ts"] }, { systemPromptPath: "/tmp/s.md" }, { structured: true, agent: { name: "s", writer: false, outputSchema: "/s.json" } }] as Array<Partial<ChildLaunchInput>>) {
+			const { args } = childLaunch(input(over));
+			assert.equal(args.filter((a) => a === "--no-skills").length, 1);
+			assert.ok(args.indexOf("--no-skills") < args.indexOf("--"), "it is an option, not part of the task");
+			assert.ok(!args.includes("--no-context-files") && !args.includes("-nc"), "AGENTS.md conventions still reach workers");
+		}
+	});
+
 	it("puts the system prompt flag before the task", () => {
 		const { args } = childLaunch(input({ systemPromptPath: "/tmp/system.md" }));
 		assert.deepEqual(args.slice(-4), ["--append-system-prompt", "/tmp/system.md", "--", "## Task\nmap the code"]);

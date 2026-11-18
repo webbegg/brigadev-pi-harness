@@ -424,6 +424,28 @@ describe("toResult: the content text", () => {
 		assert.equal(result.isError, undefined);
 	});
 
+	it("S12: a large structured result is compacted and names the saved folder (single and parallel)", async () => {
+		const h = rig([{}, {}]);
+		const structured = { verdicts: [{ spec: "S1", verdict: "met", evidence: "ok" }], blockers: [], advisories: [], regressionTests: [{ path: "tests/r.test.ts", covers: "S1", content: "t".repeat(60_000) }], scratch: [], unverified: [] };
+		h.runner(async (call) => reply(`task ${call.index}`, "", { structured, artifactsDir: `/docs/runs/r${call.index}` }));
+		const single = toResult("single", await h.launch("single"));
+		assert.ok(single.content[0].text.length < 2_000);
+		assert.ok(!single.content[0].text.includes("tttt"));
+		assert.match(single.content[0].text, /tests\/r\.test\.ts/);
+		assert.ok(single.content[0].text.endsWith("Full result: /docs/runs/r0/result.json"));
+		const parallel = toResult("parallel", await h.launch("parallel")).content[0].text;
+		assert.ok(parallel.length < 4_000);
+		assert.ok(parallel.includes("Full result: /docs/runs/r0/result.json") && parallel.includes("Full result: /docs/runs/r1/result.json"));
+	});
+
+	it("S12: a long failure text is cut to head and tail", async () => {
+		const h = rig([{}]);
+		h.runner(async () => errored("task 0", `START${"e".repeat(40_000)}END`));
+		const text = toResult("single", await h.launch("single")).content[0].text;
+		assert.ok(text.length < 9_000);
+		assert.ok(text.startsWith("Agent error: START") && text.endsWith("END"));
+	});
+
 	it("appends warnings: unknown skills", async () => {
 		const h = rig([{ skills: ["nope"] }]);
 		const launched = await h.launch("single");

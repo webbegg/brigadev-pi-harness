@@ -103,10 +103,30 @@ describe("sync launches end to end (fake JSON child)", () => {
 		await withFakeChild(async ({ pi, ctx }) => {
 			const result = await pi.tool("subagent").execute("t", { agent: "brigadev-explore", task: "alpha", reason: "independent units" }, undefined, undefined, ctx);
 			assert.notEqual(result.isError, true, text(result));
-			assert.equal(text(result), "alpha\nsmall result");
+			const [folder] = fs.readdirSync(docsRuns());
+			assert.equal(text(result), `alpha\nsmall result\n\nFull result: ${path.join(docsRuns(), folder, "result.json")}`);
 			assert.equal(result.details.results[0].exitCode, 0);
 			assert.equal(fs.readdirSync(docsRuns()).length, 1, "one run folder");
 			assert.equal(pi.messages.length, 0, "nothing is delivered later: the call itself returned the result");
+		});
+	});
+
+	it("S12: a long answer reaches the parent compacted, names the saved result, and the full text is in the run folder", { timeout: 60_000 }, async () => {
+		await withFakeChild(async ({ pi, ctx }) => {
+			// The fake child answers with the first line of the task, then "small result".
+			const long = `HEAD${"a".repeat(40_000)}`;
+			const result = await pi.tool("subagent").execute("t", { agent: "brigadev-explore", task: long, reason: "independent units" }, undefined, undefined, ctx);
+			const [folder] = fs.readdirSync(docsRuns());
+			const full = path.join(docsRuns(), folder, "result.json");
+			assert.ok(text(result).length < 9_000, `tool result is ${text(result).length} chars`);
+			assert.match(text(result), /^HEAD/);
+			assert.match(text(result), /small result/);
+			assert.match(text(result), /chars omitted/);
+			assert.ok(text(result).endsWith(`Full result: ${full}`));
+			const saved = JSON.parse(fs.readFileSync(full, "utf8"));
+			assert.ok(saved.output.length > 40_000, "the full text is saved");
+			assert.ok(saved.finalText.length > 40_000);
+			assert.ok(result.details.results[0].messages.length > 0, "details keep the full run for the viewer");
 		});
 	});
 
@@ -118,6 +138,7 @@ describe("sync launches end to end (fake JSON child)", () => {
 			assert.match(text(result), /alpha\nsmall result/);
 			assert.match(text(result), /beta\nsmall result/);
 			assert.equal(fs.readdirSync(docsRuns()).length, 2);
+			assert.equal(text(result).split("Full result: ").length, 3, "each section names its saved result");
 		});
 	});
 

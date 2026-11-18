@@ -26,7 +26,7 @@ import type { ResolvedRoute } from "./model-routing.ts";
 import { canonicalPath } from "./paths.ts";
 import { repoDocsDir } from "./repo-docs.ts";
 import { newRunId, writeRunArtifacts } from "./run-artifacts.ts";
-import { failed, output, type RunResult } from "./run-status.ts";
+import { failed, finalText, output, type RunResult } from "./run-status.ts";
 import { createStallWatchdog, resolveStallTimeouts, stallMessage } from "./stall-watchdog.ts";
 import { checkStructuredRun, type JsonSchema } from "./structured-output.ts";
 
@@ -653,6 +653,8 @@ function saveArtifacts(options: RunOptions, result: RunResult, deps: ChildRunDep
 			endedAt: result.endedAt ?? (deps.now ?? Date.now)(),
 			usage: result.usage,
 			output: output(result),
+			structured: result.structured,
+			finalText: finalText(result.messages),
 			messages: result.messages,
 		});
 	} catch {

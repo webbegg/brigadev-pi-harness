@@ -64,7 +64,7 @@ const launchFields = (described: boolean) => {
 	return {
 		agent: Type.String(d("Agent name")),
 		task: Type.String(d("Task; requirements by reference or verbatim")),
-		reason: Type.String(d('Delegation trigger, or "Risk: item N (why)" for brigadev-verify')),
+		reason: Type.String(d('Delegation trigger, or "Risk: <category> (why)" for brigadev-verify')),
 		allowedEditSurfaces: Type.Optional(Type.Array(Type.String(), d("Writers: narrow repo-relative paths/globs"))),
 		featureDoc: Type.Optional(Type.String(d("Feature document path (read until ## Log)"))),
 		skills: Type.Optional(Type.Array(Type.String(), d("Skill names to read first"))),

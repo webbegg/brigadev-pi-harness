@@ -4,7 +4,9 @@
 // stream mode (`--mode json --no-session`; docs/json.md, docs/cli.md): the task is
 // the message, stdin is not connected, and Pi exits after the run, so nothing can
 // wait for a person. The guard extension (which denies instead of confirming for
-// children) and the evidence extension load with it.
+// children) and the evidence extension load with it. `--no-skills` keeps Pi's skills
+// list out of the child's system prompt (the task already names the skills it needs,
+// by path); project context files (AGENTS.md) still load.
 
 import { CHILD_ENV, EVIDENCE_EXTENSION_PATH, GUARD_EXTENSION_PATH, STRUCTURED_OUTPUT_EXTENSION_PATH } from "./runtime.ts";
 import { STRUCTURED_OUTPUT_TOOL } from "./structured-output.ts";
@@ -34,7 +36,7 @@ export function childLaunch(input: ChildLaunchInput): ChildLaunch {
 	const { agent, route } = input;
 	const structured = Boolean(input.structured && agent.outputSchema);
 
-	const args = ["--mode", "json", "--no-session", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
+	const args = ["--mode", "json", "--no-session", "--no-skills", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
 	if (structured) args.push("-e", STRUCTURED_OUTPUT_EXTENSION_PATH);
 	if (route.model) args.push("--model", route.model);
 	if (route.thinking) args.push("--thinking", route.thinking);

@@ -5,10 +5,10 @@ import { CHILD_ENV, EVIDENCE_EXTENSION_PATH, GUARD_EXTENSION_PATH, STRUCTURED_OU
 import { STRUCTURED_OUTPUT_TOOL } from "../lib/structured-output.ts";
 
 // The argv/env runAgent built inline before lib/child-launch.ts existed (8b951f6), transcribed. Only the mode differs:
-// children run `--mode json --no-session` (no stdin), with the task as the message after `--`.
+// children run `--mode json --no-session --no-skills` (no stdin; skills travel by path in the task), with the task as the message after `--`.
 const TASK = "## Task\nt";
 function legacy(agent: { name: string; writer: boolean; tools?: string[]; outputSchema?: string }, surfaces: string[] | undefined, route: { model?: string; thinking?: string }, structured: boolean, cwd: string, promptPath: string | undefined, parentEnv: NodeJS.ProcessEnv) {
-	const args = ["--mode", "json", "--no-session", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
+	const args = ["--mode", "json", "--no-session", "--no-skills", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
 	if (structured) args.push("-e", STRUCTURED_OUTPUT_EXTENSION_PATH);
 	if (route.model) args.push("--model", route.model);
 	if (route.thinking) args.push("--thinking", route.thinking);

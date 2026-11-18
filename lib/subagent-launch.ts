@@ -11,7 +11,7 @@ import { buildChildTask, type ActiveWriter, type LaunchRequest, type SkillRef } 
 import type { ResolvedRoute } from "./model-routing.ts";
 import type { Semaphore } from "./semaphore.ts";
 import { settleQueued } from "./subagent-row.ts";
-import { formatStructured } from "./structured-output.ts";
+import { compactResult } from "./result-compaction.ts";
 import { diffSnapshots, outsideSurfaces, type Snapshot } from "./worktree-snapshot.ts";
 
 const OUTSIDE_WARNING = "files changed outside the writers' allowed edit surfaces";
@@ -19,8 +19,6 @@ const CANCELLED_TEXT = "Cancelled before it started.";
 
 /** A placeholder that never started (aborted while queued): neither a success nor a child failure. */
 const cancelled = (r: RunResult) => runStatus(r) === "cancelled";
-
-export const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
 /**
  * A model that ran out of quota, credit or rate limit. There is no fallback model: the agent's one model
@@ -54,15 +52,11 @@ export interface LaunchHooks {
 	onUpdate?: (result: { content: Array<{ type: "text"; text: string }>; details: Details }) => void;
 }
 
-export function capOutput(text: string): string {
-	if (Buffer.byteLength(text, "utf8") <= PER_TASK_OUTPUT_CAP) return text;
-	let cut = text.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(cut, "utf8") > PER_TASK_OUTPUT_CAP) cut = cut.slice(0, -1);
-	return `${cut}\n\n[Output truncated. Full output is in the tool details.]`;
-}
-
-/** One parallel section's body: a structured result is never cut (compact JSON above the cap); prose is capped. */
-export const sectionOutput = (r: RunResult): string => (!failed(r) && r.structured !== undefined ? formatStructured(r.structured, PER_TASK_OUTPUT_CAP) : capOutput(output(r)));
+/**
+ * What the parent reads of one task (S12): a structured result as verdicts, blockers and paths, long text as head and tail,
+ * and the path of the full result in the run folder. The tool details keep the whole run for the viewer.
+ */
+export const taskOutput = (r: RunResult): string => compactResult({ structured: !failed(r) ? r.structured : undefined, text: output(r), artifactsDir: r.artifactsDir });
 
 /** The content the model reads. */
 export function toResult(mode: Details["mode"], { details, warnings }: Launched): LaunchResult {
@@ -71,10 +65,10 @@ export function toResult(mode: Details["mode"], { details, warnings }: Launched)
 		const r = details.results[0];
 		// A task cancelled while queued is an error that says so, not an empty success.
 		if (cancelled(r)) return { content: [{ type: "text", text: `Agent cancelled: ${CANCELLED_TEXT}${warningText}` }], details, isError: true };
-		return { content: [{ type: "text", text: (failed(r) ? `Agent ${r.stopReason ?? "failed"}: ` : "") + output(r) + warningText }], details, isError: failed(r) };
+		return { content: [{ type: "text", text: (failed(r) ? `Agent ${r.stopReason ?? "failed"}: ` : "") + taskOutput(r) + warningText }], details, isError: failed(r) };
 	}
 	const ok = details.results.filter((r) => !failed(r) && !cancelled(r)).length;
-	const sections = details.results.map((r) => (cancelled(r) ? `### [${r.agent}] cancelled\n\n${CANCELLED_TEXT}` : `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${sectionOutput(r)}`));
+	const sections = details.results.map((r) => (cancelled(r) ? `### [${r.agent}] cancelled\n\n${CANCELLED_TEXT}` : `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${taskOutput(r)}`));
 	return { content: [{ type: "text", text: `Parallel: ${ok}/${details.results.length} succeeded\n\n${sections.join("\n\n---\n\n")}${warningText}` }], details };
 }
 
