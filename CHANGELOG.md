@@ -1,5 +1,46 @@
 # Changelog
 
+## [Unreleased]
+
+### Breaking
+
+- DSP mode is gone: `/brigadev:mode dsp`, the credential lock, DSP backups and audit log. A stored `dsp` mode falls back to `normal`.
+- Subagents are sync-only: no `async`, `subagent_wait`, `subagent_cancel`, idle result delivery, run budget (`budgetMinutes`), steering, or viewer takeover. Children run in `pi --mode json`.
+- Model fallback chains are gone: profile `fallbacks`, `/brigadev:profile fallback`, and the orchestrator and subagent retries on another model.
+- Judgment Day and the four `review-*` lens agents are replaced by one `review-4r` agent; the `jd-*` agents and schema are removed.
+- The `fd`/`rg` tools, the launch dashboard, command palette, side panel, tidy (and the bundled `pi-tidy`), phase label, `/btw`, `/brigadev:copy-all`, `/brigadev:outside` and its outside-writes ledger, and the exploration-budget and context-backstop notices are removed. The `ui.dashboard`, `ui.phase`, and `tidy` settings no longer exist; `ui.compactTools` is now on unless `false` (the `auto` value is gone).
+- `/brigadev:usage` is merged into `/brigadev:cost`.
+- Skills `brigadev-work-unit-commits` and `brigadev-chained-pr` are merged into `brigadev-branch-pr`; `brigadev-skill-creator` is removed.
+- Workflows are down to feature, ticket, bug fix, refactor, my PRs' feedback, and team review; quick change, new feature, and big feature are merged into feature; UI change, dependency upgrade, create issue, and open PR are removed.
+- The verifier admission takes `Risk: <category>` (data, security, contract, concurrency, delivery, untested) instead of `Risk: item N`.
+
+### Added
+
+- `check` tool: runs the configured or detected test command (`check.test`, `focus`), returns pass/fail counts and the failing tail, and records a trusted evidence run.
+- `/brigadev:stats`: cost by phase, context percentiles, cache rebuilds, and gate blocks and forces from Pi's session logs.
+- Context control: automatic compaction at a token threshold or after a long idle gap; configurable under `context` in `brigadev.json`.
+- The parent has Pi's built-in `grep`, `find`, and `ls`, with guard path checks on their `path` argument.
+- `/brigadev:doctor` warns when another package registers a competing delegation tool or large tool definitions.
+
+### Changed
+
+- The orchestrator prompt is about half the size, with one exploration rule and risk as named categories; tracking is for multi-session work only.
+- The permission mode is announced as a context message instead of system prompt text, so switching modes keeps the prompt cache.
+- Subagent children start with `--no-skills` and return a compact result to the parent; the full result stays in `runs/<id>/`.
+- `brigadev-verify` works without a feature document, checking the task's own numbered acceptance criteria.
+- The README is about 8 KB; details moved to `docs/`.
+- compact-tools is the only tool-row renderer.
+- Tests from one-off `verify-*` and round-named files are folded into their behavior files.
+
+### Fixed
+
+- Evidence gate: a piped test run gets `pipefail` and counts; a commit through `git -C <dir>` or `cd <dir> &&` is checked against that repository, and test runs are recorded against their cwd's repository; docs-only edits after a passing run no longer invalidate it.
+- Protected paths (agent folder, `~/.pi`, install root, git and gh config, credential folders, shell rc files, `.git` config and hooks) no longer inherit temp-dir or secure-yolo trust.
+
+### Removed
+
+- Dead code, tests, and docs for everything under Breaking.
+
 ## [0.20.2] - 2026-11-18
 
 - Run budget: a child that already made an accepted `structured_output` call with a payload valid against the agent's schema keeps that result when the wrap-up grace expires without it settling. The run succeeds with the structured result (no `over budget` failure) and the child is still stopped: its input is closed and it is terminated if it has not exited after the exit grace. Without a schema, or with no valid accepted call, the run still fails as `over budget`; a user or signal abort still wins. When the wrap-up steer is rejected and the fallback follow-up then gets no answer, the `over budget` failure now says so: `...; the child rejected the wrap-up steer (<error>) and never acknowledged the follow-up`.
