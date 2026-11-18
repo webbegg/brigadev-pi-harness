@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Run budget: a child that already made an accepted `structured_output` call with a payload valid against the agent's schema keeps that result when the wrap-up grace expires without it settling. The run succeeds with the structured result (no `over budget` failure) and the child is still stopped: its input is closed and it is terminated if it has not exited after the exit grace. Without a schema, or with no valid accepted call, the run still fails as `over budget`; a user or signal abort still wins. When the wrap-up steer is rejected and the fallback follow-up then gets no answer, the `over budget` failure now says so: `...; the child rejected the wrap-up steer (<error>) and never acknowledged the follow-up`.
+
 ## [0.20.1] - 2026-11-18
 
 - Run budget wrap-up: the request is now steered into a running turn. A child that is between turns (before its first turn, or during a retry or compaction) gets it when its next turn starts, instead of as a follow-up it would only read once the whole run ended. A steer the child rejects falls back to one follow-up. When the request never reached the child, the `over budget` failure says why: no turn started, no answer, input closed, or the child's rejection. A run that is already stopping because of its abort signal gets no wrap-up and no second terminate.

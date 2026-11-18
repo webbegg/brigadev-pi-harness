@@ -472,6 +472,8 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 		let stalled = false;
 		// The run budget ran out and the child returned nothing within the wrap-up grace.
 		let overBudget = false;
+		// The wrap-up grace ended a run that already had a valid structured result: that result is its outcome.
+		let keptResult = false;
 		const budget = resolveRunBudget(agent.budgetMinutes, env);
 		// The user aborted this child from the viewer (the RPC `abort`); the run settles as aborted instead of throwing.
 		let userAborted = false;
@@ -613,7 +615,12 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				};
 				void control
 					.steer(text)
-					.then((outcome) => (outcome.status === "rejected" && !stopping() ? control.followUp(text) : outcome))
+					.then((outcome) => {
+						if (outcome.status !== "rejected" || stopping()) return outcome;
+						// Until the follow-up is answered, the steer's rejection is what the failure can say.
+						wrapUp = { state: "sent", steerError: outcome.error };
+						return control.followUp(text);
+					})
 					.then(record, () => undefined);
 			};
 			const onTurnStart = () => {
@@ -630,6 +637,13 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					wrapUpTimer = setTimer(() => {
 						wrapUpTimer = undefined;
 						if (stopping()) return;
+						// A valid, accepted structured result is a finished run that did not settle: keep it, and still stop the child
+						// the way a finished run is stopped (stdin closed, then terminated after the exit grace; `forcedExit` restores the outcome).
+						if (structured && checkStructuredRun(result.messages, options.schema!).ok) {
+							keptResult = true;
+							finishInput();
+							return;
+						}
 						overBudget = true;
 						budgetError = overBudgetMessage(agent.budgetMinutes!, budget.graceMs, wrapUp);
 						Object.assign(result, { stopReason: "error", errorMessage: budgetError });
@@ -720,12 +734,15 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				if (stalled) Object.assign(result, { stopReason: "error", errorMessage: stallError });
 				if (overBudget) Object.assign(result, { stopReason: "error", errorMessage: budgetError });
 				// Our own shutdown of a finished child is not its outcome: drop what it said on the way out and its exit code.
-				if (forcedExit && finished) {
+				// A result the budget kept was cut off mid-turn by our stdin close, so the same holds however the child then exits,
+				// unless the user aborted it.
+				const ours = forcedExit || (keptResult && !userAborted);
+				if (ours && finished) {
 					result.messages.length = finished.messages;
 					Object.assign(result, { stopReason: finished.stopReason, errorMessage: finished.errorMessage });
 				}
 				release();
-				resolveExit(stalled || overBudget ? 1 : forcedExit ? 0 : (code ?? 0));
+				resolveExit(stalled || overBudget ? 1 : ours ? 0 : (code ?? 0));
 			};
 			proc.on("close", settle);
 			// The child exited: it needs no more signals. Its output normally follows in `close`, but a grandchild that

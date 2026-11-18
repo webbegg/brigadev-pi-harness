@@ -5,7 +5,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { ChildControl } from "../lib/child-rpc.ts";
-import { CLOSE_DRAIN_MS, createChildTracker, createProcessSignaller, descendantTargets, failed, mergeDescendantTargets, listProcessesWithPs, parseProcessList, installParentExitGuard, KILL_GRACE_MS, output, runChild, type ParentProcessLike, type ChildProcessLike, type ChildRunDeps, type RunOptions, type RunResult, type SpawnFn } from "../lib/child-run.ts";
+import { CLOSE_DRAIN_MS, createChildTracker, EXIT_GRACE_MS, createProcessSignaller, descendantTargets, failed, mergeDescendantTargets, listProcessesWithPs, parseProcessList, installParentExitGuard, KILL_GRACE_MS, output, runChild, type ParentProcessLike, type ChildProcessLike, type ChildRunDeps, type RunOptions, type RunResult, type SpawnFn } from "../lib/child-run.ts";
+import { classifyFailure } from "../lib/fallback.ts";
 import { CHILD_ENV, STRUCTURED_OUTPUT_EXTENSION_PATH } from "../lib/runtime.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -913,6 +914,23 @@ describe("runChild: run budget", () => {
 		assert.equal((await promise).errorMessage, "over budget: no result 0.2 min after the 1 min wrap-up request");
 	});
 
+	it("a rejected steer followed by an unanswered follow-up keeps the steer's rejection in the failure", async () => {
+		const h = harness(budgeted);
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		h.time.advance(60_000);
+		proc.line({ type: "response", id: sentOf(proc, "steer")[0].id, command: "steer", success: false, error: "Agent is compacting" });
+		await tick();
+		assert.equal(sentOf(proc, "follow_up").length, 1);
+		h.time.advance(10_000);
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		proc.close(143);
+		const result = await promise;
+		assert.equal(result.errorMessage, "over budget: no result 0.2 min after the 1 min budget; the child rejected the wrap-up steer (Agent is compacting) and never acknowledged the follow-up");
+		assert.equal(classifyFailure(result.stopReason, result.errorMessage), undefined, "still never falls back");
+	});
+
 	it("the over-budget failure says when the wrap-up never reached the child", async () => {
 		const cases: Array<[string, (proc: FakeChild) => Promise<void>, RegExp]> = [
 			["no turn started", async () => undefined, /; the wrap-up request was never sent: the child started no turn$/],
@@ -1210,6 +1228,219 @@ describe("runChild: run budget races", () => {
 			proc.close(0);
 			await p;
 		}
+	});
+});
+
+describe("runChild: a finished structured result survives the wrap-up grace", () => {
+	const schema = { type: "object", required: ["verdict"], properties: { verdict: { type: "string" } } };
+	const B = { agent: { budgetMinutes: 1, outputSchema: "/x/schema.json" }, schema, env: { BRIGADEV_WRAP_UP_GRACE_MS: "10000", BRIGADEV_STALL_TIMEOUT_MS: "999999999" } };
+	const call = (args: unknown) => ({ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "structured_output", arguments: args }], stopReason: "toolUse" } });
+	const toolResult = (isError: boolean) => ({ type: "message_end", message: { role: "toolResult", toolCallId: "c1", toolName: "structured_output", isError, content: [] } });
+
+	it("an accepted, valid call that has not settled when the grace expires is the run's result, and the child is still stopped", async () => {
+		const h = harness(B);
+		const p = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		proc.line(call({ verdict: "ok" }));
+		proc.line(toolResult(false));
+		h.time.advance(60_000);
+		h.time.advance(10_000);
+		assert.equal(proc.stdin.ended, true, "input is closed so the child can exit");
+		h.time.advance(EXIT_GRACE_MS);
+		assert.deepEqual(proc.kills, ["SIGTERM"], "the child that never settled is stopped");
+		proc.line(assistant("", { stopReason: "aborted" }));
+		proc.close(143);
+		const r = await p;
+		assert.deepEqual(r.structured, { verdict: "ok" });
+		assert.equal(r.exitCode, 0);
+		assert.notEqual(r.stopReason, "error");
+		assert.equal(r.errorMessage, undefined);
+		assert.ok(!failed(r));
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("an invalid payload is still over budget", async () => {
+		const h = harness(B);
+		const p = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		proc.line(call({ verdict: 7 }));
+		proc.line(toolResult(false));
+		h.time.advance(60_000);
+		h.time.advance(10_000);
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		proc.close(143);
+		const r = await p;
+		assert.equal(r.exitCode, 1);
+		assert.equal(r.stopReason, "error");
+		assert.match(r.errorMessage ?? "", /^over budget: /);
+		assert.equal(r.structured, undefined);
+	});
+
+	it("a call the child's tool rejected, or none at all, is still over budget", async () => {
+		for (const lines of [[call({ verdict: "ok" }), toolResult(true)], [call({ verdict: "ok" })], [assistant("working")]]) {
+			const h = harness(B);
+			const p = h.start();
+			const proc = await h.ready();
+			proc.line({ type: "agent_start" });
+			for (const line of lines) proc.line(line);
+			h.time.advance(60_000);
+			h.time.advance(10_000);
+			assert.deepEqual(proc.kills, ["SIGTERM"]);
+			proc.close(143);
+			const r = await p;
+			assert.equal(r.exitCode, 1);
+			assert.match(r.errorMessage ?? "", /^over budget: /);
+			assert.equal(r.structured, undefined);
+		}
+	});
+
+	it("a user abort after the grace expired still wins over the kept result", async () => {
+		let control: ChildControl | undefined;
+		const h = harness({ ...B, onControl: (c) => void (c && (control = c)) });
+		const p = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		proc.line(call({ verdict: "ok" }));
+		proc.line(toolResult(false));
+		h.time.advance(70_000);
+		control?.abort();
+		proc.close(143);
+		const r = await p;
+		assert.equal(r.stopReason, "aborted");
+		assert.equal(r.errorMessage, "Aborted by the user");
+	});
+
+	it("an AbortSignal abort still rejects the run", async () => {
+		const controller = new AbortController();
+		const h = harness({ ...B, signal: controller.signal });
+		const p = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		proc.line(call({ verdict: "ok" }));
+		proc.line(toolResult(false));
+		h.time.advance(70_000);
+		controller.abort();
+		proc.close(143);
+		await assert.rejects(p, /Subagent was aborted/);
+	});
+});
+
+describe("runChild: a kept structured result survives the child's own shutdown", () => {
+	const schema = { type: "object", required: ["verdict"], properties: { verdict: { type: "string" } } };
+	const B = { agent: { budgetMinutes: 1, outputSchema: "/x/schema.json" }, schema, env: { BRIGADEV_WRAP_UP_GRACE_MS: "10000", BRIGADEV_STALL_TIMEOUT_MS: "999999999" } };
+	const call = { type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "structured_output", arguments: { verdict: "ok" } }], stopReason: "toolUse" } };
+	const toolResult = { type: "message_end", message: { role: "toolResult", toolCallId: "c1", toolName: "structured_output", isError: false, content: [] } };
+	const start = async (signal?: AbortSignal) => {
+		const h = harness({ ...B, signal });
+		const p = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		proc.line(call);
+		proc.line(toolResult);
+		h.time.advance(60_000);
+		h.time.advance(10_000);
+		assert.equal(proc.stdin.ended, true);
+		return { h, p, proc };
+	};
+
+	it("the child aborts its unsettled turn on the stdin close and exits inside the exit grace: the result is kept", async () => {
+		const { h, p, proc } = await start();
+		proc.line(assistant("", { stopReason: "aborted" }));
+		proc.line({ type: "agent_end" });
+		proc.close(0);
+		const r = await p;
+		assert.deepEqual(r.structured, { verdict: "ok" });
+		assert.equal(r.exitCode, 0);
+		assert.notEqual(r.stopReason, "error");
+		assert.notEqual(r.stopReason, "aborted");
+		assert.equal(r.errorMessage, undefined);
+		assert.ok(!failed(r));
+		assert.deepEqual(proc.kills, []);
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("the child exits nonzero on its own inside the exit grace: the result is kept", async () => {
+		const { h, p, proc } = await start();
+		h.time.advance(1_000);
+		proc.close(1);
+		const r = await p;
+		assert.deepEqual(r.structured, { verdict: "ok" });
+		assert.equal(r.exitCode, 0);
+		assert.ok(!failed(r));
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("an aborted message with an error, then exit 1 on its own: the result is kept", async () => {
+		const { p, proc } = await start();
+		proc.line(assistant("", { stopReason: "aborted", errorMessage: "Request was aborted" }));
+		proc.close(1);
+		const r = await p;
+		assert.deepEqual(r.structured, { verdict: "ok" });
+		assert.equal(r.exitCode, 0);
+		assert.equal(r.errorMessage, undefined);
+		assert.ok(!failed(r));
+	});
+
+	it("the child exits 1 and close never comes (drain timeout): the result is kept", async () => {
+		const { h, p, proc } = await start();
+		proc.line(assistant("", { stopReason: "aborted" }));
+		proc.emit("exit", 1);
+		h.time.advance(CLOSE_DRAIN_MS);
+		const r = await p;
+		assert.deepEqual(r.structured, { verdict: "ok" });
+		assert.equal(r.exitCode, 0);
+		assert.ok(!failed(r));
+	});
+
+	it("a user abort sent before the grace ends still wins when the child then closes on its own", async () => {
+		let control: ChildControl | undefined;
+		const h = harness({ ...B, onControl: (c) => void (c && (control = c)) });
+		const p = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		proc.line(call);
+		proc.line(toolResult);
+		h.time.advance(60_000);
+		h.time.advance(5_000);
+		assert.equal(control!.abort(), true);
+		h.time.advance(5_000);
+		proc.line(assistant("", { stopReason: "aborted" }));
+		proc.line({ type: "agent_end" });
+		proc.close(0);
+		const r = await p;
+		assert.equal(r.stopReason, "aborted");
+		assert.equal(r.errorMessage, "Aborted by the user");
+		assert.ok(failed(r));
+	});
+
+	it("a captured handle cannot abort once the result is kept (stdin closed): the result stands", async () => {
+		let control: ChildControl | undefined;
+		const h = harness({ ...B, onControl: (c) => void (c && (control = c)) });
+		const p = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		proc.line(call);
+		proc.line(toolResult);
+		h.time.advance(60_000);
+		h.time.advance(10_000);
+		assert.equal(control!.abort(), false);
+		assert.equal(proc.stdin.late, 0);
+		proc.close(0);
+		const r = await p;
+		assert.deepEqual(r.structured, { verdict: "ok" });
+		assert.equal(r.exitCode, 0);
+		assert.ok(!failed(r));
+	});
+
+	it("an AbortSignal abort after the kept result still rejects the run", async () => {
+		const controller = new AbortController();
+		const { p, proc } = await start(controller.signal);
+		controller.abort();
+		proc.line(assistant("", { stopReason: "aborted" }));
+		proc.close(0);
+		await assert.rejects(p, /Subagent was aborted/);
 	});
 });
 

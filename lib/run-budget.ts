@@ -38,7 +38,8 @@ export const wrapUpMessage = (budgetMinutes: number): string =>
 export type WrapUpDelivery =
 	| { state: "accepted" }
 	| { state: "held" }
-	| { state: "sent" }
+	/** Sent and unanswered; `steerError` is why the steer was rejected when this is the follow-up that followed it. */
+	| { state: "sent"; steerError?: string }
 	| { state: "not_delivered" }
 	| { state: "rejected"; error: string };
 
@@ -49,7 +50,7 @@ const undelivered = (delivery: WrapUpDelivery): string | undefined => {
 		case "held":
 			return "the wrap-up request was never sent: the child started no turn";
 		case "sent":
-			return "the child never acknowledged the wrap-up request";
+			return delivery.steerError === undefined ? "the child never acknowledged the wrap-up request" : `the child rejected the wrap-up steer (${delivery.steerError}) and never acknowledged the follow-up`;
 		case "not_delivered":
 			return "the wrap-up request was not delivered: the child's input was closed";
 		case "rejected":
