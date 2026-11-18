@@ -2,7 +2,9 @@
 // best-effort guard, not a sandbox: it does not expand variables, load
 // scripts, or follow aliases. Unknown shapes are allowed, never guessed.
 
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { canonicalPath } from "./paths.ts";
 
 export const COMMAND_KIND = {
 	DESTRUCTIVE: "destructive",
@@ -669,4 +671,75 @@ export function classifyCommand(command: string): CommandMatch[] {
 		moved ||= changesCommitTarget(segment.argv);
 	}
 	return matches;
+}
+
+/** `dir` moved by a literal `cd`/`-C` word (`~` and `~/x` expand); undefined for a variable, glob, `-`, or other expansion. */
+function moveDirectory(dir: string, word: string | undefined, home: string): string | undefined {
+	const raw = word ?? "~";
+	if (/[$`*?[{]/.test(raw) || raw === "-" || (raw.startsWith("~") && raw !== "~" && !raw.startsWith("~/"))) return undefined;
+	return canonicalPath(resolve(dir, raw === "~" ? home : raw.startsWith("~/") ? join(home, raw.slice(2)) : raw));
+}
+
+/**
+ * The directory in effect when each segment starts (canonical), or undefined
+ * where it cannot be known. Only a literal `cd` that starts an `&&` chain
+ * moves it; after a `cd`, a `;`, `||`, `|`, `&`, or any group makes the rest
+ * unknown, since the `cd` may not have run in this shell or may have failed.
+ */
+export function segmentDirectories(segments: readonly Segment[], cwd: string, home: string = homedir()): Array<string | undefined> {
+	const dirs: Array<string | undefined> = [];
+	let dir: string | undefined = canonicalPath(cwd);
+	let moved = false;
+	segments.forEach((segment, index) => {
+		const chained = segment.before === "" || segment.before === "&&";
+		if (!chained && (moved || segment.before === "(" || segment.before === ")")) dir = undefined;
+		dirs.push(dir);
+		if (dir === undefined) return;
+		const { argv } = unwrap(segment.argv);
+		const name = basename(argv[0] ?? "");
+		if (name === "pushd" || name === "popd") dir = undefined;
+		if (name !== "cd") return;
+		const words = argv.slice(1).filter((word) => word === "-" || !word.startsWith("-"));
+		const next = segments[index + 1];
+		const starts = chained || segment.before === ";" || segment.before === "\n";
+		dir = starts && (!next || next.before === "&&") && words.length <= 1 ? moveDirectory(dir, words[0], home) : undefined;
+		moved = true;
+	});
+	return dirs;
+}
+
+/**
+ * The one directory every `git commit` in the command runs in, resolved from
+ * the session's `cwd`, a leading `cd <dir> &&` chain, and `git -C <dir>`; so a
+ * commit through them is judged against that repository. Undefined when there
+ * is no commit, when the commit is not a plain top-level `git` call, when the
+ * commits land in different directories, or when anything else moves a commit
+ * (a branch switch, `GIT_DIR`, `--git-dir`, `--work-tree`, a non-literal path).
+ */
+export function commitDirectory(command: string, cwd: string, home: string = homedir()): string | undefined {
+	const total = classifyCommand(command).filter((match) => match.commit).length;
+	if (total === 0) return undefined;
+	const segments = tokenize(blankHeredocs(command), { redirections: true });
+	const dirs = segmentDirectories(segments, cwd, home);
+	let found: string | undefined;
+	let count = 0;
+	for (let i = 0; i < segments.length; i++) {
+		const { argv } = unwrap(segments[i].argv);
+		const name = basename(argv[0] ?? "");
+		if (name === "cd") continue;
+		if (changesCommitTarget(segments[i].argv)) return undefined;
+		const args = argv.slice(1);
+		const index = gitSubcommand(args);
+		if (name !== "git" || args[index] !== "commit") continue;
+		let dir = dirs[i];
+		for (let j = 0; j < index && dir !== undefined; j++) {
+			if (args[j] === "-C") dir = moveDirectory(dir, args[++j], home);
+			else if (args[j].startsWith("--git-dir") || args[j].startsWith("--work-tree") || (args[j] === "-c" && /^core\.(worktree|bare)\b/i.test(args[j + 1] ?? ""))) return undefined;
+			else if (args[j] === "-c" || args[j] === "--namespace") j++;
+		}
+		if (dir === undefined || (found !== undefined && dir !== found)) return undefined;
+		found = dir;
+		count++;
+	}
+	return count === total ? found : undefined;
 }

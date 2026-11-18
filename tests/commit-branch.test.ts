@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { after, describe, it } from "node:test";
 import { classifyCommand } from "../lib/command-classifier.ts";
-import { type BranchFacts, decideWithBranchRule, parseOriginHead, pickDefaultBranch, readBranchFacts } from "../lib/commit-branch.ts";
+import { type BranchFacts, decideWithBranchRule, parseOriginHead, pickDefaultBranch, readBranchFacts, readCurrentBranch } from "../lib/commit-branch.ts";
 import { PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import type { ExecFn } from "../lib/worktree-snapshot.ts";
 
@@ -310,5 +310,22 @@ describe("readBranchFacts against real git", () => {
 		} finally {
 			rmSync(plain, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("readCurrentBranch (one git call, no default or protected branch lookups)", () => {
+	it("asks only for HEAD's branch", async () => {
+		const calls: string[] = [];
+		const exec: ExecFn = async (_command, args) => {
+			calls.push(args.join(" "));
+			return { stdout: "feat/x\n", stderr: "", code: 0 };
+		};
+		assert.equal(await readCurrentBranch(exec, "/repo"), "feat/x");
+		assert.deepEqual(calls, ["symbolic-ref --short -q HEAD"]);
+	});
+
+	it("is null when detached, failing, or throwing", async () => {
+		assert.equal(await readCurrentBranch(async () => ({ stdout: "", stderr: "", code: 1 }), "/repo"), null);
+		assert.equal(await readCurrentBranch(async () => { throw new Error("timeout"); }, "/repo"), null);
 	});
 });

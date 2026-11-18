@@ -10,18 +10,39 @@
 import { execFile } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { basename, delimiter, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
+// Prose only: `.txt` and `.mdx` hold requirements, CMake lists, and components, so they count as source.
+const DOC_EXTENSIONS = /\.(md|markdown|rst|adoc)$/i;
+const DOC_NAME = /^(LICENSE|NOTICE|CHANGELOG|COPYING|AUTHORS)/;
+const REMOVE_CHUNK = 200;
+
+/** A path a test run does not depend on: prose (`*.md`, ...), the top-level `docs/` folder, and LICENSE/NOTICE/CHANGELOG/COPYING/AUTHORS files. */
+export function isDocPath(path: string): boolean {
+	return path.startsWith("docs/") || DOC_EXTENSIONS.test(path) || DOC_NAME.test(basename(path));
+}
 /** One budget for the whole call (every git command in it), so a commit attempt or a check run is never held up longer. */
 export const WORKTREE_TREE_TIMEOUT_MS = 10_000;
 
-export type TreeResult = { kind: "tree"; tree: string } | { kind: "no-git" } | { kind: "error"; reason: string };
+export type TreeResult =
+	| {
+			kind: "tree";
+			tree: string;
+			/** Top level of the work tree the key is for. */
+			root: string;
+			/** The same tree without doc paths (`isDocPath`); only with `sourceTree`. A doc-only edit leaves it unchanged. */
+			sourceTree?: string;
+	  }
+	| { kind: "no-git" }
+	| { kind: "error"; reason: string };
 
 export interface WorktreeTreeOptions {
 	/** Overall deadline in milliseconds (default 10 s). */
 	timeoutMs?: number;
+	/** Also compute the tree without doc paths (one more `ls-files`, and a second `write-tree` only when docs exist). */
+	sourceTree?: boolean;
 }
 
 const NOT_A_WORK_TREE = /not a git repository|must be run in a work tree/i;
@@ -77,7 +98,13 @@ export async function worktreeTreeResult(cwd: string, options: WorktreeTreeOptio
 		};
 		await git(["add", "-A", "--", "."], top, env);
 		const tree = await git(["write-tree"], top, env);
-		return /^[0-9a-f]{40,64}$/.test(tree) ? { kind: "tree", tree } : { kind: "error", reason: "git write-tree printed no tree id" };
+		if (!/^[0-9a-f]{40,64}$/.test(tree)) return { kind: "error", reason: "git write-tree printed no tree id" };
+		if (!options.sourceTree) return { kind: "tree", tree, root: top };
+		const docs = (await git(["ls-files", "-z"], top, env)).split("\0").filter((path) => path && isDocPath(path));
+		if (docs.length === 0) return { kind: "tree", tree, root: top, sourceTree: tree };
+		for (let i = 0; i < docs.length; i += REMOVE_CHUNK) await git(["--literal-pathspecs", "rm", "--cached", "-q", "--ignore-unmatch", "--", ...docs.slice(i, i + REMOVE_CHUNK)], top, env);
+		const sourceTree = await git(["write-tree"], top, env);
+		return /^[0-9a-f]{40,64}$/.test(sourceTree) ? { kind: "tree", tree, root: top, sourceTree } : { kind: "error", reason: "git write-tree printed no tree id" };
 	} catch (error) {
 		return { kind: "error", reason: describeFailure(error, budget) };
 	} finally {

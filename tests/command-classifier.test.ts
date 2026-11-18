@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
-import { classifyCommand, COMMAND_KIND } from "../lib/command-classifier.ts";
+import { blankHeredocs, classifyCommand, COMMAND_KIND, commitDirectory, segmentDirectories, tokenize } from "../lib/command-classifier.ts";
 
 const kinds = (command: string) => classifyCommand(command).map((m) => m.kind);
 const hardDenied = (command: string) => classifyCommand(command).some((m) => m.hardDeny);
@@ -290,5 +290,67 @@ describe("commands that rewrite refs", () => {
 
 	it("leaves read-only ref commands and plain renames alone", () => {
 		for (const command of ["git symbolic-ref -m msg HEAD", "git symbolic-ref -q --short HEAD", "git remote show origin", "git branch -m old new"]) assert.deepEqual(kinds(command), [], command);
+	});
+});
+
+describe("commitDirectory (S8b: the repository a commit runs in)", () => {
+	const cwd = "/brigadev-nonexistent/parent";
+	const home = "/brigadev-nonexistent/home";
+
+	it("resolves `git -C <dir>`, relative to the session, composing several", () => {
+		assert.equal(commitDirectory("git commit -m x", cwd, home), cwd);
+		assert.equal(commitDirectory("git -C repo commit -m x", cwd, home), `${cwd}/repo`);
+		assert.equal(commitDirectory("git -C /abs/repo commit -m x", cwd, home), "/abs/repo");
+		assert.equal(commitDirectory("git -C a -C b commit -m x", cwd, home), `${cwd}/a/b`);
+		assert.equal(commitDirectory("git -C ~/proj commit -m x", cwd, home), `${home}/proj`);
+		assert.equal(commitDirectory("git -C 'my repo' commit -m x", cwd, home), `${cwd}/my repo`);
+	});
+
+	it("resolves a leading `cd <dir> &&`, through a chain of &&", () => {
+		assert.equal(commitDirectory("cd repo && git commit -m x", cwd, home), `${cwd}/repo`);
+		assert.equal(commitDirectory("cd repo && git add -A && git commit -m x", cwd, home), `${cwd}/repo`);
+		assert.equal(commitDirectory("cd a && cd b && git commit -m x", cwd, home), `${cwd}/a/b`);
+		assert.equal(commitDirectory("cd a && git -C b commit -m x", cwd, home), `${cwd}/a/b`);
+		assert.equal(commitDirectory("git status; cd repo && git commit -m x", cwd, home), `${cwd}/repo`);
+		assert.equal(commitDirectory("cd /abs/repo && git commit -m x", cwd, home), "/abs/repo");
+	});
+
+	it("is undefined when something else decides where the commit lands", () => {
+		for (const command of [
+			"echo hi",
+			"cd repo; git commit -m x",
+			"cd repo || git commit -m x",
+			"cd repo && make; git commit -m x",
+			"(cd repo && git commit -m x)",
+			"cd $REPO && git commit -m x",
+			"cd - && git commit -m x",
+			"pushd repo && git commit -m x",
+			"git -C $REPO commit -m x",
+			"git checkout other && git commit -m x",
+			"git -C repo checkout other && git -C repo commit -m x",
+			"GIT_DIR=x/.git git commit -m x",
+			"git --git-dir=x/.git commit -m x",
+			"git --work-tree=x commit -m x",
+			"git -c core.worktree=x commit -m x",
+			"bash -c 'git commit -m x'",
+			"git -C a commit -m x && git -C b commit -m y",
+			"git -C a commit -m x && git commit -m y",
+		]) assert.equal(commitDirectory(command, cwd, home), undefined, command);
+	});
+
+	it("accepts several commits that land in the same directory", () => {
+		assert.equal(commitDirectory("cd repo && git commit -m x && git commit --amend --no-edit", cwd, home), `${cwd}/repo`);
+	});
+});
+
+describe("segmentDirectories (S8b: where each segment of a command starts)", () => {
+	const cwd = "/brigadev-nonexistent/parent";
+	const dirs = (command: string) => segmentDirectories(tokenize(blankHeredocs(command), { redirections: true }), cwd, "/h");
+
+	it("follows `cd` joined by && and gives up after a move that may not have happened", () => {
+		assert.deepEqual(dirs("cd repo && npm test"), [cwd, `${cwd}/repo`]);
+		assert.deepEqual(dirs("set -o pipefail; cd repo && npm test | tail"), [cwd, cwd, `${cwd}/repo`, undefined]);
+		assert.deepEqual(dirs("cd repo; npm test"), [cwd, undefined]);
+		assert.deepEqual(dirs("npm test | tail"), [cwd, cwd]);
 	});
 });
