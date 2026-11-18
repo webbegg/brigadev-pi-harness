@@ -397,7 +397,7 @@ export function readEvidence(file: string): EvidenceRecord[] {
 	return records;
 }
 
-/** Docs (`*.md`, `docs/**`, CHANGELOG*, LICENSE*, NOTICE*, ...) never need a test run; everything else is source. */
+/** Prose (`*.md`, `*.rst`, ...) and the LICENSE/NOTICE/CHANGELOG/COPYING/AUTHORS files never need a test run; everything else, code under `docs/` included, is source. */
 export function isSourcePath(path: string): boolean {
 	return !isDocPath(path);
 }

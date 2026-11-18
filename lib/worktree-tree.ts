@@ -16,12 +16,13 @@ import { promisify } from "node:util";
 const run = promisify(execFile);
 // Prose only: `.txt` and `.mdx` hold requirements, CMake lists, and components, so they count as source.
 const DOC_EXTENSIONS = /\.(md|markdown|rst|adoc)$/i;
-const DOC_NAME = /^(LICENSE|NOTICE|CHANGELOG|COPYING|AUTHORS)/;
+// The legal and changelog files by their exact names, bare or with a prose or `.txt` extension (`LICENSE_check.py` is code).
+const DOC_NAME = /^(LICENSE|NOTICE|CHANGELOG|COPYING|AUTHORS)(\.(md|markdown|rst|adoc|txt))?$/;
 const REMOVE_CHUNK = 200;
 
-/** A path a test run does not depend on: prose (`*.md`, ...), the top-level `docs/` folder, and LICENSE/NOTICE/CHANGELOG/COPYING/AUTHORS files. */
+/** A path a test run does not depend on: prose files (`*.md`, ...) anywhere, and the LICENSE/NOTICE/CHANGELOG/COPYING/AUTHORS files. Code never counts, whatever its folder (a `docs/helper.js` a test imports is source). */
 export function isDocPath(path: string): boolean {
-	return path.startsWith("docs/") || DOC_EXTENSIONS.test(path) || DOC_NAME.test(basename(path));
+	return DOC_EXTENSIONS.test(path) || DOC_NAME.test(basename(path));
 }
 /** One budget for the whole call (every git command in it), so a commit attempt or a check run is never held up longer. */
 export const WORKTREE_TREE_TIMEOUT_MS = 10_000;

@@ -173,8 +173,8 @@ describe("records", () => {
 
 describe("isSourcePath", () => {
 	it("treats prose files as docs and everything else as source", () => {
-		for (const path of ["README.md", "docs/guide.markdown", "CHANGELOG.md", "CHANGELOG", "docs/a.rst", "docs/a.adoc", "docs/guide.mdx", "docs/conf.py", "LICENSE", "LICENSE-MIT", "NOTICE", "COPYING", "AUTHORS", "sub/LICENSE"]) assert.equal(isSourcePath(path), false, path);
-		for (const path of ["lib/a.ts", "package.json", "tests/a.test.ts", "assets/agents/x.schema.json", "Makefile", "requirements.txt", "CMakeLists.txt", "src/component.mdx", "src/docs/a.ts"]) assert.equal(isSourcePath(path), true, path);
+		for (const path of ["README.md", "docs/guide.markdown", "CHANGELOG.md", "CHANGELOG", "docs/a.rst", "docs/a.adoc", "LICENSE", "LICENSE.txt", "NOTICE", "COPYING", "AUTHORS", "sub/LICENSE"]) assert.equal(isSourcePath(path), false, path);
+		for (const path of ["lib/a.ts", "package.json", "tests/a.test.ts", "assets/agents/x.schema.json", "Makefile", "requirements.txt", "CMakeLists.txt", "src/component.mdx", "src/docs/a.ts", "docs/guide.mdx", "docs/conf.py", "docs/helper.js", "LICENSE-MIT"]) assert.equal(isSourcePath(path), true, path);
 	});
 });
 

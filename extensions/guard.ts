@@ -13,7 +13,7 @@ import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
 import { appendEvidence, evaluateCommitGate, forceRecord, gateDialog, type ForceRecord } from "../lib/evidence.ts";
-import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, isProtectedPath, runYoloDirCommand, secureYoloDirs, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
+import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
@@ -64,6 +64,8 @@ export default function (pi: ExtensionAPI) {
 		mode = isPermissionMode(saved) ? saved : PERMISSION_MODE.NORMAL;
 		announcedMode = undefined;
 		for (const entry of ctx.sessionManager.getBranch()) {
+			// A compaction summarizes the notices before it away: only a notice after the latest compaction is still in the model's context.
+			if (entry.type === "compaction") announcedMode = undefined;
 			if (entry.type === "custom" && entry.customType === MODE_ENTRY) {
 				const value = (entry.data as { mode?: unknown } | undefined)?.mode;
 				mode = isPermissionMode(value) ? value : PERMISSION_MODE.NORMAL;
@@ -179,6 +181,10 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => restoreMode(ctx));
 	pi.on("session_tree", async (_event, ctx) => restoreMode(ctx));
+	// A compaction drops the notice from the model's context: announce the mode again on the next turn.
+	pi.on("session_compact", async () => {
+		announcedMode = undefined;
+	});
 
 	// The mode reaches the model as a context message, not as system text: a switch never changes the system prompt
 	// (which would rebuild the cached prefix). The message is added at the start of the first turn after a session start
@@ -246,6 +252,23 @@ export default function (pi: ExtensionAPI) {
 		if (!rawPath) return undefined;
 		const absolute = canonicalPath(resolve(ctx.cwd, expandHome(rawPath)));
 		return checkPath(event.toolName, rawPath, absolute, isWrite, ctx, isSearch);
+	});
+
+	// Pi's grep, find, and ls list whatever sits under their path (grep runs `rg --hidden`): a search rooted above a secret
+	// folder would print secret contents. The call is decided on its path; the result is filtered file by file.
+	pi.on("tool_result", async (event, ctx) => {
+		if (!SEARCH_TOOLS.has(event.toolName) || event.isError) return undefined;
+		const rawPath = String((event.input as { path?: unknown }).path ?? "") || ".";
+		const searchPath = canonicalPath(resolve(ctx.cwd, expandHome(rawPath)));
+		let changed = false;
+		const content = event.content.map((part) => {
+			if (part.type !== "text") return part;
+			const filtered = hideSensitiveResults(event.toolName, part.text, searchPath);
+			if (!filtered) return part;
+			changed = true;
+			return { ...part, text: filtered.text };
+		});
+		return changed ? { content } : undefined;
 	});
 
 	pi.on("tool_result", async (event, ctx) => {

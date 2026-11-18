@@ -373,6 +373,14 @@ function timeoutMs(seconds: number | undefined): number {
 	return Math.min(Math.max(value, 1), MAX_TIMEOUT_SECONDS) * 1000;
 }
 
+/** The command `check` runs when the request names none: the configured or detected test command, with the focus. */
+function defaultCommand(focus: string | undefined, env: CheckEnvironment): string | undefined {
+	const choice = resolveCommand({ focus, cwd: env.cwd, settings: env.settings });
+	return "command" in choice ? choice.command : undefined;
+}
+
+const NOT_RECORDED = "Not recorded as test evidence: this is not a recognized test runner or the configured/detected test command, so it does not count toward the commit gate. Run the tests (omit `command`, or use the project's test command).";
+
 export async function runCheck(request: CheckRequest, env: CheckEnvironment): Promise<CheckResult> {
 	const choice = resolveCommand({ command: request.command, focus: request.focus, cwd: env.cwd, settings: env.settings });
 	if ("error" in choice) return { text: `Error: ${choice.error}`, isError: true };
@@ -390,37 +398,44 @@ export async function runCheck(request: CheckRequest, env: CheckEnvironment): Pr
 
 	let outcome: CheckOutcome = run.timedOut || run.aborted ? "unknown" : evidenceOutcome(command, run.exitCode);
 	let recorded = false;
+	// Only a test run vouches for a commit: a runner the evidence gate recognizes, or the configured/detected test command
+	// (whatever its name). Any other command (`true`, `echo ok`) says nothing about the tests, so it leaves no record.
+	const vouches = checkKind(command) === "test" || command === defaultCommand(request.focus, env);
+	if (!vouches) outcome = "unknown";
 	try {
-		const after = await trees(dir);
-		const settled = settleRunTree(before?.tree, after?.tree, before?.sourceTree, after?.sourceTree);
-		if (settled.record) {
-			const branch = await readCurrentBranch(env.exec, dir);
-			const record = buildRunRecord({
-				ts: new Date().toISOString(),
-				branch,
-				tree: settled.tree,
-				srcTree: settled.srcTree,
-				note: settled.note,
-				cwd: env.cwd,
-				topLevel: after?.root,
-				agent: env.agent,
-				command,
-				exitCode: run.exitCode,
-				output: run.output,
-			});
-			// This tool runs tests by definition, whatever the command's name: the kind and the outcome are the tool's, not the command-pattern guess.
-			record.kind = "test";
-			record.outcome = settled.note ? "unknown" : outcome;
-			outcome = record.outcome;
-			appendEvidence(evidenceFile(repoDocsDir(dir), branch), record);
-			recorded = true;
+		if (vouches) {
+			const after = await trees(dir);
+			const settled = settleRunTree(before?.tree, after?.tree, before?.sourceTree, after?.sourceTree);
+			if (settled.record) {
+				const branch = await readCurrentBranch(env.exec, dir);
+				const record = buildRunRecord({
+					ts: new Date().toISOString(),
+					branch,
+					tree: settled.tree,
+					srcTree: settled.srcTree,
+					note: settled.note,
+					cwd: env.cwd,
+					topLevel: after?.root,
+					agent: env.agent,
+					command,
+					exitCode: run.exitCode,
+					output: run.output,
+				});
+				// This tool runs tests by definition, whatever the command's name: the kind and the outcome are the tool's, not the command-pattern guess.
+				record.kind = "test";
+				record.outcome = settled.note ? "unknown" : outcome;
+				outcome = record.outcome;
+				appendEvidence(evidenceFile(repoDocsDir(dir), branch), record);
+				recorded = true;
+			}
 		}
 	} catch {
 		// Evidence is best effort: a failed write must not hide the test result.
 	}
 
+	const shaped = shapeResult({ command, exitCode: run.exitCode, signal: run.signal, timedOut: run.timedOut, aborted: run.aborted, durationMs: run.durationMs, output: run.output, outputFile });
 	return {
-		text: shapeResult({ command, exitCode: run.exitCode, signal: run.signal, timedOut: run.timedOut, aborted: run.aborted, durationMs: run.durationMs, output: run.output, outputFile }),
+		text: vouches ? shaped : `${shaped}\n${NOT_RECORDED}`,
 		details: { command, exitCode: run.exitCode, outcome, outputFile, durationMs: run.durationMs, counts: parseCounts(run.output), recorded },
 	};
 }

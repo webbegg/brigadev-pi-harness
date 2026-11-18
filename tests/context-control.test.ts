@@ -181,6 +181,16 @@ describe("extension", () => {
 		assert.ok(ctx.notifications.some((n: any) => /boom/.test(n.message)));
 	});
 
+	it("never swallows a prompt where nobody resubmits it: rpc input and sessions without a UI", async () => {
+		const old = { branch: [{ type: "message", message: { role: "assistant", timestamp: Date.now() - 90 * MIN } }] };
+		const rpc = setup(120_000, old);
+		assert.deepEqual(await rpc.pi.handlers.get("input")![0]({ text: "x", source: "rpc" }, rpc.ctx), { action: "continue" });
+		const headless = setup(120_000, old);
+		headless.ctx.hasUI = false;
+		assert.deepEqual(await headless.pi.handlers.get("input")![0]({ text: "x", source: "interactive" }, headless.ctx), { action: "continue" });
+		assert.equal(rpc.compactions.length + headless.compactions.length, 0);
+	});
+
 	it("lets a prompt through when the gap is short, for extension messages, and for queued input", async () => {
 		const { pi, ctx, compactions } = setup(120_000, { branch: [{ type: "message", message: { role: "assistant", timestamp: Date.now() - 5 * MIN } }] });
 		const input = pi.handlers.get("input")![0];

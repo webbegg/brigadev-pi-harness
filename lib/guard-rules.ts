@@ -2,6 +2,7 @@
 // tests without the Pi packages that extensions/guard.ts imports. The
 // extension reads the facts (paths, environment, git) and acts on the answer.
 
+import { statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { basename as executableName, blankHeredocs, classifyCommand, tokenize } from "./command-classifier.ts";
@@ -326,4 +327,42 @@ export function runYoloDirCommand(args: string, store: YoloDirStore, env: Secure
 		return `brigadev: removed ${target}`;
 	}
 	return YOLO_DIR_USAGE;
+}
+
+// --- Search results ---------------------------------------------------------
+
+/** `path:12: text` (a match) or `path-12- text` (a context line), as Pi's grep prints them. */
+const GREP_LINE = /^(.+?)[:-]\d+[:-] /;
+/** The bracketed notice Pi appends after a blank line when a result list was cut. */
+const RESULT_NOTICE = /\n\n\[[^\n]*\]$/;
+
+/**
+ * Pi's grep, find, and ls list files under a folder (grep with `rg --hidden`), so a search rooted above a secret folder
+ * prints secret contents or names without a `read`. Drops the lines of `text` whose file is sensitive, resolved against
+ * `searchPath` (what the tool's `path` argument resolves to), and keeps the tool's own trailing notice. Returns
+ * undefined when nothing needs hiding: a search rooted at a file or in a sensitive folder was already decided at the
+ * call, so its results are left alone.
+ */
+export function hideSensitiveResults(toolName: string, text: string, searchPath: string): { text: string; hidden: number } | undefined {
+	if (toolName !== "grep" && toolName !== "find" && toolName !== "ls") return undefined;
+	if (isSensitivePath(searchPath) || isSensitivePath(`${searchPath}/`)) return undefined;
+	try {
+		if (!statSync(searchPath).isDirectory()) return undefined;
+	} catch {
+		return undefined;
+	}
+	const notice = RESULT_NOTICE.exec(text)?.[0] ?? "";
+	const body = notice ? text.slice(0, text.length - notice.length) : text;
+	let hidden = 0;
+	const kept = body.split("\n").filter((line) => {
+		const rel = toolName === "grep" ? GREP_LINE.exec(line)?.[1] : line;
+		if (!rel) return true;
+		const absolute = `${resolve(searchPath, rel)}${rel.endsWith("/") ? "/" : ""}`;
+		if (!isSensitivePath(absolute)) return true;
+		hidden++;
+		return false;
+	});
+	if (hidden === 0) return undefined;
+	const listing = kept.length > 0 ? `${kept.join("\n")}${notice}` : notice.trim();
+	return { text: `${listing}${listing ? "\n" : ""}(${hidden} ${hidden === 1 ? "result" : "results"} from sensitive files hidden)`, hidden };
 }

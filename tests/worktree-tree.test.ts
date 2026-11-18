@@ -25,14 +25,14 @@ const treeOf = async (repo: string) => {
 };
 
 describe("isDocPath (S8c: paths a test run does not depend on)", () => {
-	it("treats prose, docs/, and legal or changelog files as docs", () => {
-		for (const path of ["README.md", "docs/guide.markdown", "docs/conf.py", "docs/a/b.png", "CHANGELOG.md", "CHANGELOG", "LICENSE", "LICENSE-MIT", "NOTICE", "NOTICE.txt", "COPYING", "AUTHORS", "sub/LICENSE", "sub/notes.md", "a.rst", "a.adoc"]) {
+	it("treats prose and the legal or changelog files (exact names, optional prose or .txt extension) as docs", () => {
+		for (const path of ["README.md", "docs/guide.markdown", "CHANGELOG.md", "CHANGELOG", "LICENSE", "NOTICE", "NOTICE.txt", "COPYING", "AUTHORS", "sub/LICENSE", "sub/notes.md", "a.rst", "a.adoc"]) {
 			assert.equal(isDocPath(path), true, path);
 		}
 	});
 
 	it("treats everything else as source", () => {
-		for (const path of ["lib/a.ts", "package.json", "tests/a.test.ts", "Makefile", "requirements.txt", "CMakeLists.txt", "src/docs/a.ts", "documentation.ts", "src/component.mdx"]) {
+		for (const path of ["lib/a.ts", "package.json", "tests/a.test.ts", "Makefile", "requirements.txt", "CMakeLists.txt", "src/docs/a.ts", "documentation.ts", "src/component.mdx", "docs/conf.py", "docs/helper.js", "docs/a/b.png", "LICENSE-MIT", "lib/CHANGELOG.ts"]) {
 			assert.equal(isDocPath(path), false, path);
 		}
 	});

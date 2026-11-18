@@ -7,7 +7,7 @@
  * - input (new prompt): the previous assistant turn ended > context.idleCompactMinutes ago and context >=
  *   context.idleCompactMin -> compact first, then the prompt proceeds. Pi's `input` hook cannot wait for a compaction,
  *   and ctx.compact does not block, so the prompt is "handled" and resubmitted with pi.sendUserMessage once the
- *   compaction finishes (also when it fails). Typed prompts only: extension-sent and queued (steer/follow-up) input passes.
+ *   compaction finishes (also when it fails). Typed prompts only: extension-sent, rpc, and queued (steer/follow-up) input passes, and so does every prompt of a session without a UI.
  *
  * Settings (brigadev.json, read on every decision): context.enabled, compactAt, idleCompactMinutes, idleCompactMin.
  * Never in children, never twice without a new turn in between.
@@ -92,7 +92,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("input", async (event, ctx) => {
-		if (event.source === "extension" || event.streamingBehavior) return { action: "continue" as const };
+		// Only typed prompts of a session with a UI: an rpc client or a print-mode run has no one to resubmit a swallowed prompt.
+		if (event.source === "extension" || event.source === "rpc" || event.streamingBehavior || !ctx.hasUI) return { action: "continue" as const };
 		const s = state(ctx, "input");
 		const decision = decide(s, settings(), Date.now());
 		if (decision.action !== "compact") return { action: "continue" as const };

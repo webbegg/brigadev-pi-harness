@@ -116,14 +116,27 @@ describe("check tool", () => {
 		assert.equal(decision.action, "block");
 	});
 
-	it("records the real exit code of a command no runner pattern recognizes", async () => {
+	it("records the real exit code of the configured test command even when no runner pattern recognizes it", async () => {
+		writeFileSync(join(process.env.PI_CODING_AGENT_DIR!, "brigadev.json"), JSON.stringify({ check: { test: 'node -e "process.exit(3)"' } }));
+		try {
+			const before = records().length;
+			const out = text(await run({}));
+			assert.match(out.split("\n")[0], /^FAIL exit=3 /);
+			const record = records()[before];
+			assert.equal(record.kind, "test");
+			assert.equal(record.outcome, "fail");
+			assert.equal(record.exitCode, 3);
+		} finally {
+			rmSync(join(process.env.PI_CODING_AGENT_DIR!, "brigadev.json"));
+		}
+	});
+
+	it("does not record a command that is neither a recognized runner nor the configured one, and says so", async () => {
 		const before = records().length;
-		const out = text(await run({ command: 'node -e "process.exit(3)"' }));
-		assert.match(out.split("\n")[0], /^FAIL exit=3 /);
-		const record = records()[before];
-		assert.equal(record.kind, "test");
-		assert.equal(record.outcome, "fail");
-		assert.equal(record.exitCode, 3);
+		const result = await run({ command: 'node -e "process.exit(3)"' });
+		assert.match(text(result).split("\n")[0], /^FAIL exit=3 /);
+		assert.match(text(result), /not recorded as test evidence/i);
+		assert.equal(records().length, before);
 	});
 
 	it("takes the runner's exit code through a pipe", async () => {
@@ -150,12 +163,17 @@ describe("check tool", () => {
 	});
 
 	it("times out, kills the run, and records it as unknown", async () => {
-		const before = records().length;
-		const started = Date.now();
-		const out = text(await run({ command: 'node -e "setTimeout(() => {}, 60000)"', timeoutSeconds: 1 }));
-		assert.ok(Date.now() - started < 15_000);
-		assert.match(out.split("\n")[0], /^FAIL exit=timeout /);
-		assert.equal(records()[before].outcome, "unknown");
+		writeFileSync(join(process.env.PI_CODING_AGENT_DIR!, "brigadev.json"), JSON.stringify({ check: { test: 'node -e "setTimeout(() => {}, 60000)"' } }));
+		try {
+			const before = records().length;
+			const started = Date.now();
+			const out = text(await run({ timeoutSeconds: 1 }));
+			assert.ok(Date.now() - started < 15_000);
+			assert.match(out.split("\n")[0], /^FAIL exit=timeout /);
+			assert.equal(records()[before].outcome, "unknown");
+		} finally {
+			rmSync(join(process.env.PI_CODING_AGENT_DIR!, "brigadev.json"));
+		}
 	});
 
 	it("stops when the signal aborts", async () => {

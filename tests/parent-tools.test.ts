@@ -93,6 +93,19 @@ async function guarded(o: { answer?: boolean; child?: boolean } = {}) {
 	let id = 0;
 	return {
 		asked,
+		/** The text a tool_result handler leaves for the model, or undefined when it keeps the output as it is. */
+		async result(toolName: string, input: Record<string, unknown>, text: string) {
+			const event: any = { toolName, toolCallId: String(++id), input, content: [{ type: "text", text }], isError: false };
+			let out: string | undefined;
+			for (const h of pi.handlers.get("tool_result") ?? []) {
+				const r = await h(event, ctx);
+				if (r?.content) {
+					out = r.content.map((c: any) => c.text).join("");
+					event.content = r.content;
+				}
+			}
+			return out;
+		},
 		/** The block reason of a tool_call, or undefined when it may run. */
 		async run(toolName: string, input: Record<string, unknown>) {
 			for (const h of pi.handlers.get("tool_call") ?? []) {
@@ -138,5 +151,38 @@ describe("guard on the path of grep, find, and ls", () => {
 		const s = await guarded({ answer: false });
 		assert.match((await s.run("grep", { path: ".env", pattern: "x" })) ?? "", /declined/);
 		assert.deepEqual(s.asked, ["brigadev: sensitive file"]);
+	});
+});
+
+describe("search results never show sensitive files", () => {
+	async function resultOf(toolName: string, input: Record<string, unknown>, text: string, o: { child?: boolean; answer?: boolean } = {}) {
+		const s = await guarded(o);
+		return s.result(toolName, input, text);
+	}
+
+	it("grep: drops lines of sensitive files, keeps the rest and the trailing notice, and says how many were hidden", async () => {
+		const text = "src/a.ts:3: BEGIN here\n.env:1: BEGIN SECRET\nkeys/id_rsa:2: BEGIN PRIVATE\nkeys/id_rsa-3- context line\nsrc/b.ts:9: BEGIN again\n\n[100 matches limit reached. Use limit=200 for more, or refine pattern]";
+		for (const child of [false, true]) {
+			const out = await resultOf("grep", { pattern: "BEGIN", path: "." }, text, { child });
+			assert.equal(out, "src/a.ts:3: BEGIN here\nsrc/b.ts:9: BEGIN again\n\n[100 matches limit reached. Use limit=200 for more, or refine pattern]\n(3 results from sensitive files hidden)");
+		}
+	});
+
+	it("find and ls: drop sensitive entries", async () => {
+		assert.equal(await resultOf("find", { pattern: "*", path: "." }, "a.ts\n.env\nsub/.env.local\nsub/b.ts"), "a.ts\nsub/b.ts\n(2 results from sensitive files hidden)");
+		assert.equal(await resultOf("ls", { path: "." }, ".env\n.ssh/\nsrc/\nREADME.md"), "src/\nREADME.md\n(2 results from sensitive files hidden)");
+	});
+
+	it("resolves lines against the tool's path, not the working directory", async () => {
+		assert.equal(await resultOf("find", { pattern: "*", path: "~/.ssh/.." }, "id_rsa\nnotes.txt"), "notes.txt\n(1 result from sensitive files hidden)");
+	});
+
+	it("leaves results untouched when nothing is sensitive, and other tools alone", async () => {
+		assert.equal(await resultOf("grep", { pattern: "x", path: "src" }, "a.ts:1: x"), undefined);
+		assert.equal(await resultOf("bash", { command: "cat .env" }, ".env:1: x"), undefined);
+	});
+
+	it("does not hide what the user just allowed: a search rooted in a sensitive folder", async () => {
+		assert.equal(await resultOf("grep", { pattern: "x", path: join(repo, ".ssh") }, "id_rsa:1: x", { answer: true }), undefined);
 	});
 });
