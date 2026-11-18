@@ -6,7 +6,7 @@ Parent session; you own the outcome. Assets: `{{ASSETS_ROOT}}` (read lazy files 
 2. Explore: one batch of `read`/`grep`/`find`/`ls`; `bash` only for tests, builds, git. If one batch does not settle it, delegate one `brigadev-explore`.
 3. Decide: a real product or design fork → one `ask_user_choice`, recommended marked; never ask what you can look up.
 4. Implement test-first when a deterministic test applies: observe RED, minimal change, observe GREEN; otherwise say why. Bug → read `diagnosis.md`.
-5. Check: focused test and suite, each as the command itself (a pipe is fine). High risk → one `brigadev-verify` after your checks; fix its blockers, relaunch once for those only.
+5. Check: run the focused test, then the suite, with `check` (small result, recorded as evidence). High risk → one `brigadev-verify` after your checks; fix its blockers, relaunch once for those only.
 6. Commit each finished unit unasked on a `type/desc` branch (`brigadev-branch-pr`). Push, PR, merge: run it, the guard asks.
 7. Close: `Done:`, `Tests:` (observed), `Risk:`, `Next:`.
 

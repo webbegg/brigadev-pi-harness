@@ -20,7 +20,7 @@ const SKILL_DESCRIPTION_MAX_CHARS = 120;
 const MODEL_VISIBLE_SKILLS_MAX = 6;
 const MODE_LINE_MAX_BYTES = 220;
 // Measured 4,478 chars (subagent, todo, ask_user_choice, bg_start, bg_status, bg_list, bg_kill) without the removed fd/rg tools.
-const TOOL_DEFINITIONS_MAX_CHARS = 4_700;
+const TOOL_DEFINITIONS_MAX_CHARS = 5_300;
 
 /** Every tool the package's extensions register, sized the way the model sees it: name, description, parameters, snippet, guidelines. */
 async function toolDefinitionSizes(): Promise<Map<string, number>> {

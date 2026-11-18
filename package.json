@@ -28,7 +28,10 @@
 			"./extensions/changes-view.ts",
 			"./extensions/workflow-menu.ts",
 			"./extensions/background-terminals.ts",
-			"./extensions/pr-info.ts"
+			"./extensions/pr-info.ts",
+			"./extensions/check.ts",
+			"./extensions/stats.ts",
+			"./extensions/context-control.ts"
 		],
 		"skills": [
 			"./skills"

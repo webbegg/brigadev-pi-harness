@@ -66,6 +66,10 @@ export interface BrigadevSettings {
 		/** One-line rows for built-in tools; on unless false. */
 		compactTools?: boolean;
 	};
+	/** The `check` tool's default test command (lib/check.ts); detected from the project when absent. */
+	check?: { test?: string };
+	/** Automatic compaction (lib/context-control.ts). */
+	context?: { enabled?: boolean; compactAt?: number; idleCompactMinutes?: number; idleCompactMin?: number };
 }
 
 export function agentDir(): string {
