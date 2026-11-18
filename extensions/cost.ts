@@ -12,7 +12,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { addUsage, cacheHitRate, CLAUDE_BRIDGE_PROVIDER, emptyTally, formatCost, formatTokens, priceBridgeMessage, type Tally, type UsageLike } from "../lib/cost.ts";
-import { fallbackState, loadUsage, recordUsage, usagePath } from "../lib/fallback-state.ts";
+import { loadUsage, recordUsage, usagePath, usageState } from "../lib/usage-state.ts";
 import { costCalculator } from "../lib/pi-adapters.ts";
 import { isChildSession, readSettings } from "../lib/runtime.ts";
 import { formatUsage, parseUsageHeaders, usageReportLines, type UsageSnapshot } from "../lib/usage-windows.ts";
@@ -88,7 +88,7 @@ export default function (pi: ExtensionAPI) {
 	const publishUsage = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
 		const provider = ctx.model?.provider;
-		const snapshot = provider ? fallbackState().usage.get(provider) : undefined;
+		const snapshot = provider ? usageState().usage.get(provider) : undefined;
 		ctx.ui.setStatus(USAGE_STATUS_KEY, snapshot && snapshot.windows.length + (snapshot.status === "rejected" ? 1 : 0) > 0 ? formatUsage(snapshot) : undefined);
 	};
 
@@ -160,7 +160,7 @@ export default function (pi: ExtensionAPI) {
 			lines.push(`Total         ${formatCost(all.cost)}${hit(all)}`);
 			if (!pricingEnabled()) lines.push('bridge pricing is off ({"bridgePricing": false} in brigadev.json)');
 			loadUsage(Date.now());
-			const usage = [...fallbackState().usage] as Array<[string, UsageSnapshot]>;
+			const usage = [...usageState().usage] as Array<[string, UsageSnapshot]>;
 			lines.push("", "Subscription usage", ...usageReportLines(usage, Date.now()), `(${usagePath()})`);
 			ctx.ui.notify(lines.join("\n"), "info");
 		},

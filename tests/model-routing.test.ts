@@ -31,6 +31,20 @@ describe("parseProfilesFile", () => {
 		assert.match(problems[0], /ghost/);
 	});
 
+	it("ignores a stored `fallbacks` key silently, even a malformed one", () => {
+		const { file, problems } = parseProfilesFile({
+			profiles: {
+				p: {
+					"brigadev-worker": { model: "a/b", fallbacks: ["c/d", { model: "e/f", thinking: "low" }] },
+					orchestrator: { thinking: "high", fallbacks: "not-an-array" },
+					"*": { fallbacks: ["c/d"] },
+				},
+			},
+		});
+		assert.deepEqual(problems, []);
+		assert.deepEqual(file.profiles.p, { "brigadev-worker": { model: "a/b" }, orchestrator: { thinking: "high" } });
+	});
+
 	it("treats a missing file as empty without problems", () => {
 		assert.deepEqual(parseProfilesFile(undefined).problems, []);
 	});
