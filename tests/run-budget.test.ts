@@ -1,8 +1,29 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import { describe, it } from "node:test";
 import { parseAgent } from "../lib/agents.ts";
 import { classifyFailure } from "../lib/fallback.ts";
 import { DEFAULT_WRAP_UP_GRACE_MS, overBudgetMessage, resolveRunBudget, wrapUpMessage } from "../lib/run-budget.ts";
+import { parseFrontmatter } from "./helpers/pi-stubs/pi-coding-agent.ts";
+
+// Pi's real `parseFrontmatter` (@earendil-works/pi-coding-agent) is a peer dependency that is not installed in this repo, so this
+// uses the test stub of it that the other agent-loading tests use: it keeps `budgetMinutes: 10` as the string "10" where Pi's YAML
+// parser gives the number 10; `budgetMinutesOf` accepts both (see "parseAgent budgetMinutes").
+describe("the shipped brigadev-verify agent", () => {
+	const file = new URL("../assets/agents/brigadev-verify.md", import.meta.url);
+	const content = fs.readFileSync(file, "utf8");
+	const load = (text: string) => parseAgent(text, file.pathname, "package", (source) => parseFrontmatter<Record<string, unknown>>(source));
+
+	it("has a 10 min budget through the frontmatter parser the extension loads agents with", () => {
+		assert.equal(load(content)?.budgetMinutes, 10);
+	});
+
+	it("the check can fail: without its budgetMinutes line the agent has no budget", () => {
+		assert.match(content, /^budgetMinutes: 10$/m);
+		assert.equal(load(content.replace(/^budgetMinutes: 10\n/m, ""))?.budgetMinutes, undefined);
+		assert.equal(load(content.replace(/^budgetMinutes: 10$/m, "budgetMinutes 10"))?.budgetMinutes, undefined);
+	});
+});
 
 describe("parseAgent budgetMinutes", () => {
 	const agent = (budget: unknown) => parseAgent("---\nbody", "/pkg/agents/v.md", "package", () => ({ frontmatter: { name: "v", description: "d", budgetMinutes: budget }, body: "body" }));
@@ -45,6 +66,13 @@ describe("resolveRunBudget", () => {
 });
 
 describe("budget messages", () => {
+	it("names the steer's rejection when the follow-up then went unanswered, and keeps the over-budget prefix", () => {
+		const message = overBudgetMessage(10, 180_000, { state: "sent", steerError: "Agent is compacting" });
+		assert.equal(message, "over budget: no result 3 min after the 10 min budget; the child rejected the wrap-up steer (Agent is compacting) and never acknowledged the follow-up");
+		assert.equal(classifyFailure("error", message), undefined);
+		assert.match(overBudgetMessage(10, 180_000, { state: "sent" }), /; the child never acknowledged the wrap-up request$/);
+	});
+
 	it("the wrap-up request asks for the result now, with unrun checks listed as unverified", () => {
 		const text = wrapUpMessage(10);
 		assert.match(text, /10 min/);
