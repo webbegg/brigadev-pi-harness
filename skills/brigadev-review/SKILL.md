@@ -8,7 +8,7 @@ metadata:
 
 ## When to use
 
-The user asks for a review, a work-unit commit carries a high-risk item, or `brigadev-branch-pr` is about to open a PR (review the branch first). Review is proportionate: never run all four lenses by default.
+The user asks for a review, or `brigadev-branch-pr` is about to open a PR and the user chose a review scope (review the branch once, after the work units are done). Never review per commit during the work loop: high-risk units get `brigadev-verify`. Review is proportionate: never run all four lenses by default.
 
 ## Rules
 

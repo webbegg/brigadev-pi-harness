@@ -22,7 +22,7 @@ Creating or preparing a pull request, or preparing a branch for submission.
 2. Work on a `type/description` branch from the verified default branch (normally already started by the work-unit flow).
 3. Implement in work units (`brigadev-work-unit-commits`), test-first where applicable, running the applicable checks.
 4. If the change exceeds ~400 changed lines, load `brigadev-chained-pr` before opening anything.
-5. **Review before the PR**: run `brigadev-review` on `<default>...HEAD` (only the lenses that fit) and write the ledger to `reviews/<branch with / as ->.md` in the repo docs folder named in the orchestrator prompt. Show the ledger. If it has blockers, ask the user before opening the PR.
+5. **Review before the PR**, once the work units are done: first ask the scope with one `ask_user_choice`: **Full 4R** (all four lenses, slowest), **Fitting lenses** (recommended: only the lenses the change's risk needs), or **Skip the review** (then say so in the PR body's Risk line). Without a UI, ask in your reply and stop. Then run `brigadev-review` on `<default>...HEAD` with the chosen scope and write the ledger to `reviews/<branch with / as ->.md` in the repo docs folder named in the orchestrator prompt. Show the ledger. If it has blockers, ask the user before opening the PR.
 6. Draft the PR body from the repository template (or, with none, the evidence-based body below) and observed evidence. Show it to the user.
 7. On explicit authorization: push, then open the PR with explicit `--repo` and `--base`.
 8. Report required CI status; never call a PR merge-ready on an unverified green claim.

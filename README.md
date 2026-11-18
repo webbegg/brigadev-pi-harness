@@ -334,11 +334,11 @@ It opens by itself only on a fresh start: not on `/reload`, `/new`, `--continue`
 
 ## Delivery flow
 
-An authorized change on the default branch starts a `type/description` branch, and each finished work unit is committed automatically (Conventional Commits, with its tests and docs). Push, PR, and merge stay your decisions. Opening a PR first runs `brigadev-review` on the branch and saves the ledger to `reviews/`; the PR body follows the repository template (else Summary / Changes / Test plan / Risk), and no issue link is added unless you mention one.
+An authorized change on the default branch starts a `type/description` branch, and each finished work unit is committed automatically (Conventional Commits, with its tests and docs). Push, PR, and merge stay your decisions. Reviews never run per commit during the work loop (high-risk units get `brigadev-verify`). Before opening a PR the agent asks whether to review the branch (full 4R, the lenses that fit, or skip) and saves the ledger to `reviews/`; the PR body follows the repository template (else Summary / Changes / Test plan / Risk), and no issue link is added unless you mention one.
 
 ## Customize
 
-- **Agents**: override any package agent by name in `~/.pi/agent/agents/<name>.md` or `.pi/agents/<name>.md` (trusted projects). Frontmatter: `name`, `description`, `tools`, `model`, `thinking`, `writer: true`, `admission: risk`, `output: <file>.schema.json` (a JSON Schema next to the agent file: the agent must return its result through a `structured_output` tool, the parent validates it, and a run without a valid result fails after one reminder).
+- **Agents**: override any package agent by name in `~/.pi/agent/agents/<name>.md` or `.pi/agents/<name>.md` (trusted projects). Frontmatter: `name`, `description`, `tools`, `model`, `thinking`, `writer: true`, `admission: risk`, `output: <file>.schema.json` (a JSON Schema next to the agent file: the agent must return its result through a `structured_output` tool, the parent validates it, and a run without a valid result fails after one reminder), `budgetMinutes: <n>` (wall-clock budget: once it is spent the child is told to wrap up and return what it has, and a child with no result `BRIGADEV_WRAP_UP_GRACE_MS` later, 3 min by default, is stopped as an `over budget` failure that does not fall back to another model; `brigadev-verify` has 10; `BRIGADEV_RUN_BUDGET=off` disables every budget).
 - **Orchestrator rules**: edit `assets/orchestrator.md` and the lazy files next to it.
 - **Skills**: edit `skills/*/SKILL.md`, then `/reload`.
 - **Default mode**: `/brigadev:mode default yolo` (or `normal`, `dsp`) writes `~/.pi/agent/brigadev.json`.

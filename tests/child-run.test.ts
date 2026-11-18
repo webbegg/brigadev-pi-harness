@@ -832,6 +832,257 @@ describe("runChild: stall watchdog", () => {
 	});
 });
 
+describe("runChild: run budget", () => {
+	const budgeted = { agent: { budgetMinutes: 1 }, env: { BRIGADEV_WRAP_UP_GRACE_MS: "10000" } };
+	const sentOf = (proc: FakeChild, type: string) => proc.stdin.records().filter((r) => r.type === type);
+
+	it("asks a streaming child to wrap up once the budget is spent, and keeps the result it then returns", async () => {
+		const h = harness(budgeted);
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		h.time.advance(59_999);
+		assert.deepEqual(sentOf(proc, "steer"), []);
+		h.time.advance(1);
+		const [steer] = sentOf(proc, "steer");
+		assert.match(steer.message, /structured_output/);
+		assert.deepEqual(proc.kills, []);
+		proc.line({ type: "response", id: steer.id, command: "steer", success: true, data: { disposition: "queued" } });
+		proc.line(assistant("partial answer"));
+		proc.line({ type: "agent_end", messages: [], willRetry: false });
+		proc.line(settled());
+		assert.equal(h.time.pending(), 1, "settling cancels the wrap-up grace: only the exit grace is left");
+		proc.close(0);
+		h.time.advance(10_000);
+		assert.deepEqual(proc.kills, [], "a run that settled inside the grace is not killed");
+		const result = await promise;
+		assert.equal(result.exitCode, 0);
+		assert.equal(failed(result), false);
+		assert.equal(output(result), "partial answer");
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("queues the wrap-up as a follow-up when the child is between turns", async () => {
+		const h = harness(budgeted);
+		const promise = h.start();
+		const proc = await h.ready();
+		h.time.advance(60_000);
+		assert.equal(sentOf(proc, "steer").length, 0);
+		assert.equal(sentOf(proc, "follow_up").length, 1);
+		proc.line(settled());
+		proc.close(0);
+		await promise;
+	});
+
+	it("terminates a child with no result after the wrap-up grace, as a failure that does not fall back", async () => {
+		const h = harness(budgeted);
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		h.time.advance(60_000);
+		h.time.advance(9_999);
+		assert.deepEqual(proc.kills, []);
+		h.time.advance(1);
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		proc.line(assistant("", { stopReason: "aborted" }));
+		proc.close(143);
+		const result = await promise;
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.stopReason, "error");
+		assert.match(result.errorMessage ?? "", /^over budget: /);
+		assert.ok(failed(result));
+	});
+
+	it("a run that settles inside its budget gets no wrap-up and leaves no timer", async () => {
+		const h = harness(budgeted);
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line(assistant("done"));
+		proc.line(settled());
+		proc.close(0);
+		await promise;
+		h.time.advance(120_000);
+		assert.deepEqual(sentOf(proc, "steer"), []);
+		assert.deepEqual(sentOf(proc, "follow_up"), []);
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("an agent without budgetMinutes is never asked to wrap up", async () => {
+		const h = harness({ env: { BRIGADEV_STALL_TIMEOUT_MS: "999999999" } });
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		h.time.advance(60 * 60_000);
+		assert.deepEqual(sentOf(proc, "steer"), []);
+		assert.deepEqual(proc.kills, []);
+		proc.line(settled());
+		proc.close(0);
+		await promise;
+	});
+
+	it("a user abort in progress gets no wrap-up and stays the cause", async () => {
+		let control: ChildControl | undefined;
+		const h = harness({ ...budgeted, onControl: (c) => void (c && (control = c)) });
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		h.time.advance(59_000);
+		control!.abort();
+		h.time.advance(1_000);
+		assert.deepEqual([...sentOf(proc, "steer"), ...sentOf(proc, "follow_up")], []);
+		proc.close(143);
+		assert.equal((await promise).errorMessage, "Aborted by the user");
+
+		let late: ChildControl | undefined;
+		const h2 = harness({ ...budgeted, onControl: (c) => void (c && (late = c)) });
+		const promise2 = h2.start();
+		const proc2 = await h2.ready();
+		proc2.line({ type: "agent_start" });
+		h2.time.advance(68_000);
+		late!.abort();
+		h2.time.advance(2_000);
+		proc2.close(143);
+		const result2 = await promise2;
+		assert.equal(result2.stopReason, "aborted");
+		assert.equal(result2.errorMessage, "Aborted by the user");
+	});
+
+	it("a stall that already terminated the child keeps the stall as the cause", async () => {
+		const h = harness({ agent: { budgetMinutes: 1 }, env: { BRIGADEV_WRAP_UP_GRACE_MS: "10000", BRIGADEV_STALL_TIMEOUT_MS: "65000" } });
+		const promise = h.start();
+		const proc = await h.ready();
+		h.time.advance(65_000);
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		h.time.advance(10_000);
+		proc.close(143);
+		const result = await promise;
+		assert.match(result.errorMessage ?? "", /^stalled for /);
+	});
+});
+
+describe("runChild: run budget races", () => {
+	const B = { agent: { budgetMinutes: 1 }, env: { BRIGADEV_WRAP_UP_GRACE_MS: "10000", BRIGADEV_STALL_TIMEOUT_MS: "999999999" } };
+	const wraps = (proc: FakeChild) => proc.stdin.records().filter((r) => r.type === "steer" || r.type === "follow_up");
+
+	it("sends exactly one wrap-up across later turns", async () => {
+		const h = harness(B);
+		const p = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		h.time.advance(60_000);
+		proc.line({ type: "agent_end", messages: [] });
+		proc.line({ type: "agent_start" });
+		h.time.advance(5_000);
+		assert.deepEqual(wraps(proc).map((r) => r.type), ["steer"]);
+		assert.deepEqual(proc.kills, []);
+		proc.line(assistant("ok"));
+		proc.line(settled());
+		proc.close(0);
+		const r = await p;
+		assert.equal(r.exitCode, 0);
+		assert.ok(!failed(r));
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("a child that exits inside the grace without settling keeps its result", async () => {
+		const h = harness(B);
+		const p = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		h.time.advance(60_000);
+		proc.line(assistant("partial"));
+		proc.close(0);
+		const r = await p;
+		assert.equal(r.exitCode, 0);
+		assert.ok(!failed(r));
+		assert.equal(output(r), "partial");
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("an exit inside the grace wins over a wrap-up expiry that fires before close", async () => {
+		const h = harness(B);
+		const p = h.start();
+		const proc = await h.ready();
+		h.time.advance(60_000);
+		proc.line(assistant("partial"));
+		h.time.advance(9_500);
+		proc.emit("exit", 0);
+		h.time.advance(600);
+		assert.deepEqual(proc.kills, []);
+		proc.close(0);
+		const r = await p;
+		assert.equal(r.exitCode, 0);
+		assert.ok(!failed(r));
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("over budget escalates to SIGKILL and stays the cause over a later stall", async () => {
+		const h = harness({ agent: { budgetMinutes: 1 }, env: { BRIGADEV_WRAP_UP_GRACE_MS: "10000", BRIGADEV_STALL_TIMEOUT_MS: "72000" } });
+		const p = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		h.time.advance(60_000);
+		h.time.advance(10_000);
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		h.time.advance(2_000);
+		assert.deepEqual(proc.kills, ["SIGTERM"], "the stall does not terminate again");
+		h.time.advance(3_000);
+		assert.deepEqual(proc.kills, ["SIGTERM", "SIGKILL"]);
+		proc.line(assistant("", { stopReason: "aborted" }));
+		proc.close(null);
+		const r = await p;
+		assert.equal(r.exitCode, 1);
+		assert.equal(r.stopReason, "error");
+		assert.match(r.errorMessage ?? "", /^over budget: /);
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("no wrap-up is written to a broken pipe or after a rejected prompt", async () => {
+		const h = harness(B);
+		const p = h.start();
+		const proc = await h.ready();
+		proc.stdin.emit("error", new Error("EPIPE"));
+		h.time.advance(60_000);
+		assert.equal(proc.stdin.late, 0);
+		assert.equal(wraps(proc).length, 0);
+		proc.close(1);
+		await p;
+
+		const h2 = harness(B);
+		const p2 = h2.start();
+		const proc2 = await h2.ready();
+		proc2.line({ type: "response", command: "prompt", success: false, error: "nope" });
+		h2.time.advance(60_000);
+		h2.time.advance(10_000);
+		assert.equal(wraps(proc2).length, 0);
+		assert.equal(proc2.stdin.late, 0);
+		proc2.close(0);
+		assert.match((await p2).errorMessage ?? "", /Pi rejected/);
+	});
+
+	it("BRIGADEV_RUN_BUDGET=off (any case) arms no budget timer", async () => {
+		const base = harness({ env: { BRIGADEV_STALL_TIMEOUT_MS: "999999999" } });
+		const pb = base.start();
+		const procB = await base.ready();
+		const timers = base.time.pending();
+		procB.line(settled());
+		procB.close(0);
+		await pb;
+		for (const off of ["off", " OFF "]) {
+			const h = harness({ agent: { budgetMinutes: 1 }, env: { BRIGADEV_RUN_BUDGET: off, BRIGADEV_STALL_TIMEOUT_MS: "999999999" } });
+			const p = h.start();
+			const proc = await h.ready();
+			assert.equal(h.time.pending(), timers);
+			h.time.advance(60 * 60_000);
+			assert.equal(wraps(proc).length, 0);
+			assert.deepEqual(proc.kills, []);
+			proc.line(settled());
+			proc.close(0);
+			await p;
+		}
+	});
+});
+
 describe("runChild: structured output", () => {
 	const schema = { type: "object", required: ["verdict"], properties: { verdict: { type: "string" } } };
 	const call = { type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "structured_output", arguments: { verdict: "ok" } }], stopReason: "toolUse" } };
