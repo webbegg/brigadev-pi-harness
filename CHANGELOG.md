@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.20.0] - 2026-11-18
 
 - Subagent run budget: a new optional agent frontmatter field, `budgetMinutes: <n>`. Once the budget is spent the child is asked once to wrap up (steer during a turn, follow-up between turns) and return what it has. A child still without a result `BRIGADEV_WRAP_UP_GRACE_MS` later (3 min by default) is stopped and fails with `over budget: ...`; that failure never falls back to another model. `BRIGADEV_RUN_BUDGET=off` disables every budget. Agents without the field are unchanged.
 - `brigadev-verify` has a 10 min budget and a scoped probe plan: it reads files with the file tools, sets up the scratch copy once and reuses one probe script, writes about one probe per `S#` and per risk item, and returns at once when it is asked to wrap up, listing the checks it did not run as unverified. Recent verify runs took 3.5–38 min with 38–63 `bash` calls.
