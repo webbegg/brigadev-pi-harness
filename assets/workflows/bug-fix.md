@@ -2,8 +2,6 @@
 name: "Bug fix"
 description: "Reproduce, fix at the root cause, and prove it with a test"
 order: 50
-key: "b"
-group: "other"
 questions:
   - id: where
     label: "Where does it happen?"
@@ -28,7 +26,7 @@ questions:
     label: "Ticket or link"
     kind: text
 ---
-Bug fix request, started from the workflow menu. Follow the normal ODD flow: reproduce the problem first, add a failing regression test when a deterministic one applies, fix the root cause, then run the tests.
+Bug fix request, started from the workflow menu. Reproduce the problem first, add a failing regression test when a deterministic one applies, then fix the root cause.
 
 - Where it happens: {{where}}
 - Environment: {{environment}}
@@ -37,6 +35,6 @@ Bug fix request, started from the workflow menu. Follow the normal ODD flow: rep
 - Actual (errors or logs): {{actual}}
 - Ticket or link: {{ticket}}
 
-Run the diagnosis loop in `diagnosis.md` in the assets root named in the orchestrator prompt: a command that fails because of the bug comes before any hypothesis.
+Follow the diagnosis loop in `diagnosis.md` in the assets root named in the orchestrator prompt.
 
 If the problem cannot be reproduced from the details above, report what was tried instead of guessing at a fix.

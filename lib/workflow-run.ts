@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { readBranchFacts } from "./commit-branch.ts";
-import { workflowGroup, type Workflow, type WorkflowQuestion } from "./workflows.ts";
+import { type Workflow, type WorkflowQuestion } from "./workflows.ts";
 import type { ExecFn } from "./worktree-snapshot.ts";
 
 /** Answers by question id; skipped questions are absent. */
@@ -90,8 +90,8 @@ function composeLine(line: string, values: Map<string, string | undefined>): str
 	return out;
 }
 
-/** One line of the workflow list (`alt+w`): the name, the description, and the dashboard group it sits in. */
-export const workflowListLabel = (workflow: Workflow): string => `${workflow.name} — ${workflow.description} [${workflowGroup(workflow).label}]`;
+/** One line of the workflow list (`alt+w`): the name and the description. */
+export const workflowListLabel = (workflow: Workflow): string => `${workflow.name} — ${workflow.description}`;
 
 /**
  * The request text: the workflow body with each `{{id}}` replaced by the

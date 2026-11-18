@@ -1,4 +1,4 @@
-// Workflow files: markdown with frontmatter (name, description, questions) and
+// Workflow files: markdown with frontmatter (name, description, order, questions) and
 // a prompt body with `{{question-id}}` placeholders. Package defaults live in
 // `assets/workflows/`; the user's own sit in `<brigadev home>/workflows/`
 // (global) and `<repo docs folder>/workflows/` (per repo) and override by name
@@ -19,52 +19,6 @@ const QUESTION_KINDS: readonly string[] = ["text", "long", "choice"];
 const PLACEHOLDER = /\{\{([^{}]*)\}\}/g;
 const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
 const UNORDERED = 1_000;
-const KEY_PATTERN = /^[a-z]$/;
-
-/** Dashboard keys the tools and the New feature submenu use (Changes, Agents history, Cost, Usage, Status, Panel, Model profile, Permission mode, Launch dashboard, Doctor, Commands, Quit, New feature); a workflow cannot take them. */
-export const RESERVED_KEYS: readonly string[] = ["g", "a", "c", "s", "t", "o", "m", "e", "h", "y", "k", "q", "n"];
-
-export interface WorkflowGroup {
-	id: string;
-	label: string;
-}
-
-/** A group the dashboard ships, with what it needs to show it. */
-export interface ShippedGroup extends WorkflowGroup {
-	/** Display position among the groups; the groups a workflow file adds sit at `CUSTOM_GROUP_ORDER`. */
-	order: number;
-	/** The key that opens the group: a letter (New feature) or a digit. Absent for an inline group. */
-	key?: string;
-	/** Absent for an inline group, which has no row of its own. */
-	icon?: string;
-	/** True when the group has no submenu: its workflows are rows on the top level, at the group's position. */
-	inline?: boolean;
-}
-
-/** Where the groups a workflow file adds are shown: after Other workflows, before Tools. */
-export const CUSTOM_GROUP_ORDER = 50;
-
-/** The one table of the dashboard's own groups. Plain BMP symbols, no Nerd Font glyphs. */
-export const SHIPPED_GROUPS: readonly ShippedGroup[] = [
-	{ id: "feature", label: "New feature", order: 10, key: "n", icon: "✦" },
-	{ id: "main", label: "Top level", order: 20, inline: true },
-	{ id: "other", label: "Other workflows", order: 30, key: "1", icon: "⋯" },
-	{ id: "tools", label: "Tools", order: 90, key: "2", icon: "⚙" },
-];
-
-/** The dashboard's own groups, in display order. A workflow's `group:` matches one by id or label, ignoring case. */
-export const KNOWN_GROUPS: readonly WorkflowGroup[] = SHIPPED_GROUPS.map(({ id, label }) => ({ id, label }));
-
-/** Group names of earlier versions (ids and labels, lowercase) and the group each now belongs to. */
-const GROUP_ALIASES: Readonly<Record<string, string>> = {
-	build: "other",
-	ship: "other",
-	"review & ship": "other",
-	inspect: "tools",
-	settings: "tools",
-};
-
-const DEFAULT_GROUP = KNOWN_GROUPS.find((group) => group.id === "other")!;
 
 export interface WorkflowQuestion {
 	id: string;
@@ -82,10 +36,6 @@ export interface Workflow {
 	description: string;
 	/** Menu position: lower first, then by name. */
 	order: number;
-	/** Dashboard key: one lowercase letter, unique among workflows and not reserved; dropped (with a warning) when it is not. An override without one inherits the key of the workflow it replaces. */
-	key?: string;
-	/** Dashboard category: a shipped group's id or label, or a new category's name. Absent means Other workflows. An override without one inherits the group of the workflow it replaces. */
-	group?: string;
 	questions: WorkflowQuestion[];
 	/** Prompt body with `{{question-id}}` placeholders. */
 	body: string;
@@ -128,13 +78,6 @@ export function parseWorkflow(content: string, filePath: string, source: Workflo
 	if (typeof frontmatter.name !== "string" || !frontmatter.name.trim()) throw new Error("missing name");
 	if (typeof frontmatter.description !== "string" || !frontmatter.description.trim()) throw new Error("missing description");
 	if (!body.trim()) throw new Error("missing prompt body");
-	// An empty `key:` line is null in YAML: no key, not an invalid one.
-	const key = frontmatter.key ?? undefined;
-	if (key !== undefined && (typeof key !== "string" || !KEY_PATTERN.test(key))) throw new Error("key must be one lowercase letter");
-	// Same for an empty `group:` line.
-	const rawGroup = frontmatter.group ?? undefined;
-	if (rawGroup !== undefined && (typeof rawGroup !== "string" || !rawGroup.trim())) throw new Error("group must be a non-empty name");
-	const group = rawGroup?.trim();
 	const rawQuestions = frontmatter.questions ?? [];
 	if (!Array.isArray(rawQuestions)) throw new Error("questions must be a list");
 	const questions = rawQuestions.map(parseQuestion);
@@ -150,8 +93,6 @@ export function parseWorkflow(content: string, filePath: string, source: Workflo
 		name: frontmatter.name.trim(),
 		description: frontmatter.description.trim(),
 		order: typeof frontmatter.order === "number" ? frontmatter.order : UNORDERED,
-		...(key !== undefined ? { key } : {}),
-		...(group !== undefined ? { group } : {}),
 		questions,
 		body: body.trim(),
 		source,
@@ -188,10 +129,7 @@ export interface WorkflowDiscoveryOptions {
 	parse: FrontmatterParser;
 }
 
-/**
- * Later layers override earlier ones by name (ignoring case): package < user < repo. An invalid override leaves the lower layer's workflow in place.
- * An override without a `key` or a `group` keeps the one of the workflow it replaces.
- */
+/** Later layers override earlier ones by name (ignoring case): package < user < repo. An invalid override leaves the lower layer's workflow in place. */
 export function discoverWorkflows(options: WorkflowDiscoveryOptions): WorkflowDiscovery {
 	const warnings: string[] = [];
 	const byName = new Map<string, Workflow>();
@@ -201,47 +139,10 @@ export function discoverWorkflows(options: WorkflowDiscoveryOptions): WorkflowDi
 		[options.repoDir, "repo"],
 	];
 	for (const [dir, source] of layers) {
-		for (const workflow of loadDir(dir, source, options.parse, warnings)) {
-			const id = workflow.name.toLowerCase();
-			const replaced = byName.get(id);
-			byName.set(id, {
-				...workflow,
-				...(workflow.key === undefined && replaced?.key !== undefined ? { key: replaced.key } : {}),
-				...(workflow.group === undefined && replaced?.group !== undefined ? { group: replaced.group } : {}),
-			});
-		}
+		for (const workflow of loadDir(dir, source, options.parse, warnings)) byName.set(workflow.name.toLowerCase(), workflow);
 	}
 	const workflows = [...byName.values()].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
-	return { workflows: assignKeys(workflows, warnings), warnings };
-}
-
-const LAYER_RANK: Record<WorkflowSource, number> = { package: 0, user: 1, repo: 2 };
-
-/**
- * A key goes to the highest layer that claims it (repo, then user, then package), and within a layer to the first
- * workflow in menu order. A reserved or already used key is dropped with a warning, and the workflow stays.
- */
-function assignKeys(workflows: Workflow[], warnings: string[]): Workflow[] {
-	const owners = new Map<string, Workflow>();
-	const dropped = new Set<Workflow>();
-	// Array.prototype.sort is stable, so menu order breaks ties within a layer.
-	const claims = workflows.filter((workflow) => workflow.key !== undefined).sort((a, b) => LAYER_RANK[b.source] - LAYER_RANK[a.source]);
-	for (const workflow of claims) {
-		const key = workflow.key!;
-		const owner = owners.get(key);
-		if (RESERVED_KEYS.includes(key)) warnings.push(`${workflow.filePath}: key "${key}" is reserved by the dashboard; "${workflow.name}" has no key`);
-		else if (owner) warnings.push(`${workflow.filePath}: key "${key}" is already used by "${owner.name}"; "${workflow.name}" has no key`);
-		else {
-			owners.set(key, workflow);
-			continue;
-		}
-		dropped.add(workflow);
-	}
-	return workflows.map((workflow) => {
-		if (!dropped.has(workflow)) return workflow;
-		const { key: _dropped, ...keyless } = workflow;
-		return keyless;
-	});
+	return { workflows, warnings };
 }
 
 export interface LoadedWorkflows extends WorkflowDiscovery {
@@ -257,26 +158,15 @@ export function loadWorkflows(parse: FrontmatterParser, dirs: Omit<WorkflowDisco
 	return found.warnings.length ? { ...found, warning: `${SKIPPED_WORKFLOWS_TITLE}\n${found.warnings.join("\n")}` } : found;
 }
 
-/** The category a workflow sits in on the dashboard: Other workflows when it names none, a shipped group when the name matches one (an earlier version's name maps to its new group), else its own category labelled as written. */
-export function workflowGroup(workflow: Workflow): WorkflowGroup {
-	const name = workflow.group?.trim();
-	if (!name) return DEFAULT_GROUP;
-	const wanted = name.toLowerCase();
-	const known = KNOWN_GROUPS.find((group) => group.id === wanted || group.label.toLowerCase() === wanted);
-	if (known) return known;
-	const aliased = Object.hasOwn(GROUP_ALIASES, wanted) ? KNOWN_GROUPS.find((group) => group.id === GROUP_ALIASES[wanted]) : undefined;
-	return aliased ?? { id: wanted, label: name };
-}
-
 /** The workflow's file name without `.md`, the id `/brigadev:start` also accepts. */
 export const workflowId = (workflow: Workflow): string => basename(workflow.filePath, ".md");
 
-/** Finds a workflow by name (ignoring case), file id, or key. Throws an Error listing the names when none matches. */
+/** Finds a workflow by name (ignoring case) or file id. Throws an Error listing the names when none matches. */
 export function resolveWorkflow(workflows: readonly Workflow[], query: string): Workflow {
 	const wanted = query.trim().toLowerCase();
-	const found = workflows.find((w) => w.name.toLowerCase() === wanted) ?? workflows.find((w) => workflowId(w).toLowerCase() === wanted) ?? workflows.find((w) => w.key !== undefined && w.key === wanted);
+	const found = workflows.find((w) => w.name.toLowerCase() === wanted) ?? workflows.find((w) => workflowId(w).toLowerCase() === wanted);
 	if (found) return found;
-	throw new Error(`Unknown workflow "${query.trim()}". Workflows: ${workflows.map((w) => (w.key ? `${w.name} (${w.key})` : w.name)).join(", ")}`);
+	throw new Error(`Unknown workflow "${query.trim()}". Workflows: ${workflows.map((w) => w.name).join(", ")}`);
 }
 
 /** The user's global and per-repo workflow folders, under the same root as the repo docs. */

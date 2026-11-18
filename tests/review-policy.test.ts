@@ -67,19 +67,6 @@ function branchPrProblems(text: string): string[] {
 	return problems;
 }
 
-/** The Open a PR workflow points at ask_user_choice and never orders the review before that question or unconditionally. */
-function openPrProblems(text: string): string[] {
-	const problems: string[] = [];
-	const body = text.replace(/^---\n[\s\S]*?\n---\n/, "");
-	const ask = body.indexOf("ask_user_choice");
-	if (ask < 0) problems.push("the workflow does not reference ask_user_choice");
-	const order = /\b(run|do|start|launch|perform)\b[^.;\n]*\breview\b/i.exec(body);
-	if (order && (ask < 0 || order.index < ask)) problems.push(`the workflow orders the review before asking the scope: "${order[0]}"`);
-	const always = /\b(always|unconditionally|every time|whatever the answer)\b[^.\n]*\breview|\breview\b[^.\n]*\b(always|unconditionally|every time|whatever the answer)\b/i.exec(body);
-	if (always) problems.push(`the workflow reviews unconditionally: "${always[0]}"`);
-	return problems;
-}
-
 describe("review policy", () => {
 	it("the orchestrator names brigadev-review without a per-commit or high-risk trigger, and brigadev-verify for high risk", () => {
 		assert.deepEqual(orchestratorReviewProblems(read("assets", "orchestrator.md")), []);
@@ -91,10 +78,6 @@ describe("review policy", () => {
 
 	it("branch-pr asks the review scope (full, fitting, skip) before reviewing", () => {
 		assert.deepEqual(branchPrProblems(read("skills", "brigadev-branch-pr", "SKILL.md")), []);
-	});
-
-	it("the Open a PR workflow defers to that question instead of always reviewing", () => {
-		assert.deepEqual(openPrProblems(read("assets", "workflows", "open-pr.md")), []);
 	});
 });
 
@@ -184,29 +167,6 @@ describe("review policy checks catch a regression (mutated copies of the asset t
 		it("rewording that keeps the structure still passes", () => {
 			const mutated = text.replace("(recommended: only the lenses the change's risk needs)", "(the default pick)").replace("Show the ledger.", "Share the ledger.");
 			assert.deepEqual(branchPrProblems(mutated), []);
-		});
-	});
-
-	describe("open-pr workflow", () => {
-		const text = read("assets", "workflows", "open-pr.md");
-
-		it("ask_user_choice removed", () => {
-			assert.match(openPrProblems(text.replaceAll("ask_user_choice", "a question")).join("\n"), /ask_user_choice/);
-		});
-
-		it("the review is ordered first, unconditionally", () => {
-			const mutated = mutate(text, /Before the PR, ask the review scope/, "Run the pre-PR review first. Then ask the review scope");
-			assert.match(openPrProblems(mutated).join("\n"), /review/i);
-		});
-
-		it("the review is always run", () => {
-			const mutated = mutate(text, /Open the PR only after/, "Always review the branch, whatever the answer. Open the PR only after");
-			assert.notDeepEqual(openPrProblems(mutated), []);
-		});
-
-		it("the review ordered after the question is fine", () => {
-			const mutated = mutate(text, /; a `brigadev-review` of the branch/, "; then run the review: a `brigadev-review` of the branch");
-			assert.deepEqual(openPrProblems(mutated), []);
 		});
 	});
 });

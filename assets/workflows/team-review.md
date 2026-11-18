@@ -2,8 +2,6 @@
 name: "Review a team PR"
 description: "Review a teammate's PR read-only and draft the review comments"
 order: 30
-key: "r"
-group: "main"
 questions:
   - id: pr
     label: "PR number or URL (empty: pick from a list)"
