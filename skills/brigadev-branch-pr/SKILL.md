@@ -68,7 +68,7 @@ Use the repository template when present. Otherwise build the body from the evid
 - Forced commits: <disclosure, only when the log has any>
 
 ## Risk
-none | item N (reason)
+none | <data|security|contract|concurrency|delivery|untested> (reason)
 ```
 
 Add `Closes #N` or `Refs #N` only when the user named an issue. Record only commands you actually ran. Leave unverified checklist items unchecked.

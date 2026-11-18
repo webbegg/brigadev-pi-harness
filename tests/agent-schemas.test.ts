@@ -37,6 +37,23 @@ describe("review schema", () => {
 	}
 });
 
+describe("brigadev-verify agent", () => {
+	const text = readFileSync(join(PACKAGE_AGENTS_DIR, "brigadev-verify.md"), "utf8");
+
+	it("works without a feature document: the spec is the document's S# or the task's own numbered criteria (A1..An)", () => {
+		assert.match(text, /A1/);
+		assert.match(text, /acceptance criteria/i);
+		assert.doesNotMatch(text, /Read the whole feature document/);
+		assert.match(text, /no feature document|without a feature document|when (?:one is|a feature document is) (?:given|named|passed)/i);
+	});
+
+	it("asks for quiet test output and has no run budget field", () => {
+		assert.match(text, /summary reporter/i);
+		assert.match(text, /tail/i);
+		assert.doesNotMatch(text, /budgetMinutes/);
+	});
+});
+
 describe("brigadev-verify schema", () => {
 	const report = {
 		verdicts: [{ spec: "S1", verdict: "met", evidence: "probe" }],
@@ -49,6 +66,21 @@ describe("brigadev-verify schema", () => {
 
 	it("accepts the verifier's return contract", () => {
 		assert.deepEqual(validateAgainstSchema(schemaOf("brigadev-verify"), report), []);
+	});
+
+	it("takes verdicts against the task's numbered acceptance criteria (A1..An) as well as S#", () => {
+		const schema = schemaOf("brigadev-verify");
+		assert.deepEqual(validateAgainstSchema(schema, { ...report, verdicts: [{ spec: "A1", verdict: "met", evidence: "probe" }, { spec: "A2", verdict: "unmet", evidence: "probe" }] }), []);
+		const verdicts = ((schema.properties as any).verdicts ?? {}) as { description?: string; items?: { properties?: { spec?: { description?: string } } } };
+		assert.match(verdicts.description ?? "", /\bA\d|acceptance criteri/i);
+		assert.match(verdicts.items?.properties?.spec?.description ?? "", /A1/);
+		assert.doesNotMatch(verdicts.description ?? "", /in the feature document/i);
+	});
+
+	it("keeps the result small: a regression test is a path, what it covers, and a short reproduction", () => {
+		const schema = schemaOf("brigadev-verify");
+		const compact = { ...report, regressionTests: [{ path: "tests/a.test.ts", covers: "A1", reproduction: "node --test tests/a.test.ts fails: expected 1, got 2" }] };
+		assert.deepEqual(validateAgainstSchema(schema, compact), []);
 	});
 
 	it("allows only the documented verdicts", () => {

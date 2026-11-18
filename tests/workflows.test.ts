@@ -119,7 +119,7 @@ describe("package workflows composed", () => {
 	const facts = { currentBranch: "feat/x", defaultBranch: "main", testScript: "package.json test script: npm run check" };
 	// Names the skill or command each workflow must hand to the orchestrator.
 	const NEEDS: Record<string, string[]> = {
-		Feature: ["Quick change", "no feature document", "odd-tracking.md", "verbatim as L1", "stop for the user's approval before the first source write", "usual size rules"],
+		Feature: ["Quick change", "no feature document", "odd-tracking.md", "verbatim as L1", "stop for the user's approval before the first source write", "usual tracking rule"],
 		"Work on a ticket": ["Refs:", "short-slug", "failing test that reproduces it"],
 		"Review a team PR": ["brigadev-review", "brigadev-comment-writer", 'gh pr list --search "review-requested:@me" --state open', "gh pr view", "gh pr diff", "path:line", "Post nothing unless the user asks"],
 		"My PRs: feedback": ["brigadev-comment-writer", "brigadev-branch-pr", "gh pr list --author @me --state open", "Draft replies only"],
@@ -154,7 +154,7 @@ describe("package workflows composed", () => {
 		for (const size of ["Let the agent decide", "Quick change", "Plan first"]) {
 			const text = compose("feature", { what: "w", size });
 			assert.ok(text.includes(`- Size: ${size}`), size);
-			for (const needle of ["inline, test first", "one work unit and its commit", "stop and say so instead of growing it", "odd-tracking.md", "verbatim as L1", "stop for the user's approval before the first source write", "usual size rules"]) assert.ok(text.includes(needle), `${size}: ${needle}`);
+			for (const needle of ["inline, test first", "one work unit and its commit", "stop and say so instead of growing it", "odd-tracking.md", "verbatim as L1", "stop for the user's approval before the first source write", "usual tracking rule"]) assert.ok(text.includes(needle), `${size}: ${needle}`);
 		}
 		assert.ok(!compose("feature", { what: "w" }).includes("never create a plan"));
 	});
@@ -184,7 +184,7 @@ describe("package workflows composed", () => {
 		for (const size of ["Let the agent decide", "Quick change", "Plan first"]) {
 			const text = compose("ticket", { key: "PROJ-1", text: "t", size });
 			assert.ok(text.includes(`- Size: ${size}`), size);
-			for (const needle of ["one work unit", "no feature document", "odd-tracking.md", "stop for the user's approval before the first source write", "usual size rules"]) assert.ok(text.includes(needle), `${size}: ${needle}`);
+			for (const needle of ["one work unit", "no feature document", "odd-tracking.md", "stop for the user's approval before the first source write", "usual tracking rule"]) assert.ok(text.includes(needle), `${size}: ${needle}`);
 		}
 	});
 

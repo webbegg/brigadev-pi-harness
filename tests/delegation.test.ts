@@ -55,6 +55,26 @@ describe("admitLaunch", () => {
 		assert.deepEqual(admitLaunch({ agent: "brigadev-verify", task: "t", reason: "Risk: item 2 (auth guard)" }, verify, all), []);
 	});
 
+	it("admits the verifier for a named risk category, and rejects an unknown one", () => {
+		for (const category of ["data", "security", "contract", "concurrency", "delivery", "untested"]) {
+			assert.deepEqual(admitLaunch({ agent: "brigadev-verify", task: "t", reason: `Risk: ${category} (why)` }, verify, all), [], category);
+		}
+		assert.deepEqual(admitLaunch({ agent: "brigadev-verify", task: "t", reason: "risk: Security (x)" }, verify, all), []);
+		assert.ok(admitLaunch({ agent: "brigadev-verify", task: "t", reason: "Risk: none" }, verify, all).length > 0);
+		assert.ok(admitLaunch({ agent: "brigadev-verify", task: "t", reason: "Risk: vibes (x)" }, verify, all).length > 0);
+		assert.ok(admitLaunch({ agent: "brigadev-verify", task: "t", reason: "security review please" }, verify, all).length > 0);
+	});
+
+	it("names the real delegation triggers when the reason is missing", () => {
+		const [problem] = admitLaunch({ agent: "brigadev-explore", task: "t", reason: "" }, explore, all);
+		assert.match(problem, /exploration/);
+		assert.match(problem, /risk/);
+		assert.match(problem, /parallel writers/);
+		assert.match(problem, /context handoff/);
+		assert.match(problem, /review/);
+		assert.doesNotMatch(problem, /evidence budget|backstop|item N/);
+	});
+
 	it("requires valid surfaces for writers and forbids them for readers", () => {
 		assert.ok(admitLaunch({ agent: "brigadev-worker", task: "t", reason: "independent units" }, worker, all).length > 0);
 		assert.deepEqual(admitLaunch({ agent: "brigadev-worker", task: "t", reason: "independent units", allowedEditSurfaces: ["src/a"] }, worker, all), []);

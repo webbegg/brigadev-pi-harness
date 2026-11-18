@@ -30,4 +30,4 @@ Feature request, started from the workflow menu. Explore first, then implement.
 - Ticket or link: {{ticket}}
 - Size: {{size}}
 
-"Quick change" means work inline, test first, in one work unit and its commit, with no feature document; if it needs more than that, stop and say so instead of growing it. "Plan first" means track it per `odd-tracking.md` with this request quoted verbatim as L1, then show the plan and stop for the user's approval before the first source write. "Let the agent decide" means apply the usual size rules.
+"Quick change" means work inline, test first, in one work unit and its commit, with no feature document; if it needs more than that, stop and say so instead of growing it. "Plan first" means track it per `odd-tracking.md` with this request quoted verbatim as L1, then show the plan and stop for the user's approval before the first source write. "Let the agent decide" means apply the usual tracking rule: only multi-session work gets a feature document.

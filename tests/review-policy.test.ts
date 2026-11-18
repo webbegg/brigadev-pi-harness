@@ -93,17 +93,17 @@ describe("review policy checks catch a regression (mutated copies of the asset t
 		const text = read("assets", "orchestrator.md");
 
 		it("review per work-unit commit that carries a high-risk item", () => {
-			const mutated = mutate(text, /never per commit \(high risk gets `brigadev-verify`\)/, "after each work-unit commit that carries a high-risk item");
+			const mutated = mutate(text, /high risk gets `brigadev-verify` instead/, "after each work-unit commit that carries a high-risk item");
 			assert.match(orchestratorReviewProblems(mutated).join("\n"), /commit/i);
 		});
 
 		it("review on every commit, with verify still named", () => {
-			const mutated = mutate(text, /never per commit/, "on every commit");
+			const mutated = mutate(text, /only when the user asks, or once before the PR/, "on every commit, or once before the PR");
 			assert.notDeepEqual(orchestratorReviewProblems(mutated), []);
 		});
 
 		it("brigadev-verify no longer named for high risk", () => {
-			const mutated = mutate(text, /\(high risk gets `brigadev-verify`\)/, "(high risk gets extra care)");
+			const mutated = mutate(text, /high risk gets `brigadev-verify` instead/, "high risk gets extra care");
 			assert.match(orchestratorReviewProblems(mutated).join("\n"), /brigadev-verify/);
 		});
 

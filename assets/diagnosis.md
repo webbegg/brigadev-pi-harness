@@ -1,6 +1,6 @@
 # Diagnosis loop
 
-Read this when fixing a bug. It sharpens the ODD rules; it does not replace them: a Bug always starts with a failing test, and RED and GREEN are observed, never assumed.
+Read this when fixing a bug. A bug starts with a failing test (test-first as in the orchestrator prompt); RED and GREEN are observed, never assumed.
 
 Redact secrets in every command, output, and log you show or record: write `<REDACTED>`.
 
@@ -10,7 +10,7 @@ Before any hypothesis, run one command that fails because of this bug, and show 
 
 - Best seam first: a failing test, then a script or CLI call with a fixture, a request against a dev server, a replayed captured input, a throwaway harness, and bisection or old-vs-new diffing when the bug appeared between two states.
 - It must assert the user's exact symptom, not "runs without error", and be fast, deterministic, and runnable unattended. For a flaky bug, loop it until the failure rate is debuggable.
-- The failing run is recorded as evidence automatically by the evidence log (README "Evidence gate"), provided it is a recognised test or check command. The PR body later quotes it as the RED. Run it through bash as the command itself; do not wrap it in a pipe, `||`, or `;`, which would record it as unknown.
+- A recognised test or check command is recorded in the evidence log automatically, and the PR body quotes the failing run as the RED. Run it as the command itself; a pipe is fine, but `||` or `;` after it records the run as unknown.
 - No loop possible: stop, list what you tried, and ask for access, a redacted artifact, or permission for temporary instrumentation. Do not guess.
 
 ## 2. Minimise
@@ -19,7 +19,7 @@ Cut inputs, callers, config, data, and steps one at a time, re-running after eac
 
 ## 3. Rank hypotheses before testing
 
-Write 3 to 5 hypotheses, ranked. Each states a prediction: "If X is the cause, changing Y makes the bug disappear (or Z makes it worse)". Discard what cannot be falsified. Show the ranked list to the user before testing any of them, and go on with your ranking if they do not answer.
+Write 3 to 5 hypotheses, ranked. Each states a prediction: "If X is the cause, changing Y makes the bug disappear (or Z makes it worse)". Discard what cannot be falsified. State the ranked list, then test in that order without waiting.
 
 ## 4. Probe one variable at a time
 
