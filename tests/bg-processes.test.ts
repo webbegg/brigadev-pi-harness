@@ -532,6 +532,9 @@ describe("shell environment", () => {
 
 // ---- real processes (POSIX only) ----
 
+/** Extra time a loaded machine may need on top of a bound the code itself guarantees. */
+const LOAD_SLACK_MS = 6000;
+
 const alive = (pid: number): boolean => {
 	try {
 		process.kill(pid, 0);
@@ -551,8 +554,10 @@ async function until(check: () => boolean, ms = 4000): Promise<boolean> {
 }
 
 describe("real processes", { skip: process.platform === "win32" }, () => {
+	/** SIGTERM-to-SIGKILL grace the real-process tests give the manager (the production default is BG_KILL_GRACE_MS). */
+	const REAL_GRACE_MS = 300;
 	async function withManager(body: (manager: ReturnType<typeof createBgProcesses>, track: (pid: number) => void) => Promise<void>) {
-		const manager = createBgProcesses({ graceMs: 300, tracker: createChildTracker() });
+		const manager = createBgProcesses({ graceMs: REAL_GRACE_MS, tracker: createChildTracker() });
 		const strays: number[] = [];
 		try {
 			await body(manager, (pid) => strays.push(pid));
@@ -655,8 +660,14 @@ describe("real processes", { skip: process.platform === "win32" }, () => {
 			}
 			const started = Date.now();
 			await manager.shutdown();
-			assert.ok(Date.now() - started < 3000);
-			assert.ok(await until(() => pids.every((pid) => !alive(pid)), 2000));
+			const elapsed = Date.now() - started;
+			// The manager's own ceiling: it gives up on a process that outlives SIGKILL after grace + CLOSE_DRAIN_MS + 1 s (FORCE_SETTLE_SLACK_MS in
+			// lib/bg-processes.ts), and the three processes are stopped in parallel. The slack is for a loaded machine, where `ps`, signals
+			// and timers are late (the old fixed 3 s bound failed in a full-suite run). A shutdown that waited
+			// the production grace (BG_KILL_GRACE_MS) once per process, or never settled, is still far over it.
+			const ceiling = REAL_GRACE_MS + CLOSE_DRAIN_MS + 1000 + LOAD_SLACK_MS;
+			assert.ok(elapsed < ceiling, `shutdown took ${elapsed} ms, ceiling ${ceiling} ms`);
+			assert.ok(await until(() => pids.every((pid) => !alive(pid)), LOAD_SLACK_MS), "every process is gone");
 			assert.equal(manager.runningCount(), 0);
 		});
 	});

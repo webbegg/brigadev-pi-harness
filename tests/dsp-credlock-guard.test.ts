@@ -6,11 +6,23 @@ import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { isLockedVariable, lockPlaces, markCredLock, takeCredLock } from "../lib/dsp-credlock.ts";
+import { isLockedVariable, lockPlaces, markCredLock, OVERRIDDEN_VARIABLES, takeCredLock } from "../lib/dsp-credlock.ts";
 import { readDspAudit } from "../lib/dsp-audit.ts";
 import { DSP_REMOTE_TITLE } from "../lib/dsp-policy.ts";
 import { createFakeCtx, createFakePi } from "./helpers/fake-pi.ts";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
+
+/**
+ * Variables the lock reads, replaces or removes. If the shell that runs the tests is itself locked or has credentials, these change
+ * what the tests observe (`GIT_CONFIG_COUNT` inherited as 2 makes the lock count 4 and the unlocked probe print 2; `BASH_ENV`, `ENV` or
+ * a lower-case `npm_config_userconfig` add an `unset -v` the "no lockable variable" test forbids). Every test starts without them.
+ */
+const isLockRelevantVariable = (name: string): boolean =>
+	name.startsWith("BRIGADEV_") ||
+	isLockedVariable(name) ||
+	OVERRIDDEN_VARIABLES.includes(name.toUpperCase()) ||
+	["BASH_ENV", "ENV", "ZDOTDIR", "GIT_CONFIG_COUNT"].includes(name.toUpperCase()) ||
+	/^GIT_CONFIG_(KEY|VALUE)_\d+$/i.test(name);
 
 describe("S10 guard wiring of the credential lock", () => {
 	const saved = { ...process.env };
@@ -29,7 +41,7 @@ describe("S10 guard wiring of the credential lock", () => {
 		home = join(dir, "home");
 		mkdirSync(repo, { recursive: true });
 		mkdirSync(join(home, ".pi", "agent"), { recursive: true });
-		for (const key of Object.keys(process.env)) if (key.startsWith("BRIGADEV_")) delete process.env[key];
+		for (const key of Object.keys(process.env)) if (isLockRelevantVariable(key)) delete process.env[key]; // restored in after()
 		process.env.HOME = home;
 		process.env.BRIGADEV_HOME = join(home, ".brigadev");
 		process.env.PI_CODING_AGENT_DIR = join(home, ".pi", "agent");
