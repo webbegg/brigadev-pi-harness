@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.20.1] - 2026-11-18
 
 - Run budget wrap-up: the request is now steered into a running turn. A child that is between turns (before its first turn, or during a retry or compaction) gets it when its next turn starts, instead of as a follow-up it would only read once the whole run ended. A steer the child rejects falls back to one follow-up. When the request never reached the child, the `over budget` failure says why: no turn started, no answer, input closed, or the child's rejection. A run that is already stopping because of its abort signal gets no wrap-up and no second terminate.
 
