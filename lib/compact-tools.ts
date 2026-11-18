@@ -4,7 +4,6 @@
 //
 // Presentation only. Nothing here changes what a tool returns to the model.
 
-import { stripLockPrelude } from "./dsp-credlock.ts";
 import type { Tone } from "./shell-bar.ts";
 
 export const COMPACT_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write"] as const;
@@ -135,8 +134,7 @@ const join = (...parts: Array<string | undefined>) => parts.filter((p) => p !== 
 function target(tool: string, args: Record<string, unknown>, cwd: string | undefined): string {
 	switch (tool) {
 		case "bash":
-			// DSP's inline credential-lock line is the guard's, not the agent's: the row shows what the agent wrote.
-			return clip(oneLine(stripLockPrelude(asString(args.command) ?? "")), MAX_COMMAND);
+			return clip(oneLine(asString(args.command) ?? ""), MAX_COMMAND);
 		case "grep":
 			return join(quoted(asString(args.pattern)), pathOf(args, cwd));
 		case "find":

@@ -12,7 +12,6 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { basename as executableName, blankHeredocs, tokenize, unwrap, type Segment } from "./command-classifier.ts";
-import { stripLockPrelude } from "./dsp-credlock.ts";
 import { canonicalPath, isInside } from "./paths.ts";
 
 const MAX_COMMAND_CHARS = 500;
@@ -304,8 +303,7 @@ export function outputTail(output: string, lines = TAIL_LINES): string {
 }
 
 export function buildRunRecord(raw: { ts: string; branch: string | null; tree?: string; cwd: string; agent: string; command: string; exitCode?: number; output: string; topLevel?: string; note?: string }): RunRecord {
-	// What the agent ran, not the guard's DSP credential-lock line in front of it.
-	const input = { ...raw, command: stripLockPrelude(raw.command) };
+	const input = raw;
 	const record: RunRecord = {
 		v: 1,
 		type: "run",
@@ -444,7 +442,7 @@ export function runRecordFromResult(event: ToolResultLike | undefined, context: 
 		// A note stands in for the tree when it could not be trusted; with neither there is no git to key the run to.
 		if (!event || event.toolName !== "bash" || (context.tree === undefined && !context.note)) return undefined;
 		const written = asObject(event.input)?.command;
-		const command = typeof written === "string" ? stripLockPrelude(written) : undefined;
+		const command = typeof written === "string" ? written : undefined;
 		if (command === undefined || checkKind(command) === undefined) return undefined;
 		const structured = asObject(event.structuredContent);
 		const exitCode = typeof structured?.exit_code === "number" ? structured.exit_code : undefined;

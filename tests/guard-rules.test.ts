@@ -6,8 +6,9 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import type { BranchFacts } from "../lib/commit-branch.ts";
 import { canonicalPath } from "../lib/paths.ts";
-import { bashWritesEvidence, decideBashCommand, decideFileAccess, shellCallOf, type FileAccessInput } from "../lib/guard-rules.ts";
+import { bashWritesEvidence, checkSecureDir, decideBashCommand, decideFileAccess, isGitConfigOrHooksPath, runYoloDirCommand, secureYoloDirs, shellCallOf, tempRoots, trustedTempRoots, type FileAccessInput } from "../lib/guard-rules.ts";
 import { PERMISSION_MODE } from "../lib/permission-policy.ts";
+import type { BrigadevSettings } from "../lib/runtime.ts";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
 
 describe("file access decision", () => {
@@ -279,6 +280,107 @@ describe("shellCallOf", () => {
 	});
 });
 
+describe("secure-yolo folders", () => {
+	let scratch: string;
+	let home: string;
+	let agentDir: string;
+
+	before(() => {
+		scratch = realpathSync(mkdtempSync(join(tmpdir(), "secure-dirs-")));
+		home = join(scratch, "home");
+		agentDir = join(home, ".pi", "agent");
+		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(join(home, "scratch"), { recursive: true });
+	});
+	after(() => rmSync(scratch, { recursive: true, force: true }));
+
+	const guard = () => ({ home, agentDir });
+
+	it("accepts an absolute folder and returns it canonical", () => {
+		assert.deepEqual(checkSecureDir(join(home, "scratch"), guard()), { ok: true, path: join(home, "scratch") });
+		assert.deepEqual(checkSecureDir(`${join(home, "scratch")}/`, guard()), { ok: true, path: join(home, "scratch") });
+	});
+
+	it("refuses relative paths, the root, the home folder and its ancestors", () => {
+		for (const raw of ["", "  ", "relative/dir", "/", home, scratch]) {
+			assert.equal(checkSecureDir(raw, guard()).ok, false, raw);
+		}
+	});
+
+	it("refuses a folder that holds or sits inside the agent settings folder", () => {
+		assert.equal(checkSecureDir(join(home, ".pi"), guard()).ok, false);
+		assert.equal(checkSecureDir(join(agentDir, "extensions"), guard()).ok, false);
+	});
+
+	for (const rel of [".ssh", ".aws", ".docker", ".gnupg", ".kube", join(".config", "gh"), join(".config", "git"), join(".config", "fish"), ".config", join(".aws", "sso")]) {
+		it(`refuses ~/${rel}: it is, holds, or sits in a credential or config folder`, () => {
+			assert.equal(checkSecureDir(join(home, rel), guard()).ok, false, rel);
+		});
+	}
+
+	it("refuses a differently-cased credential or agent folder on a case-insensitive platform", { skip: process.platform !== "darwin" && process.platform !== "win32" }, () => {
+		for (const rel of [".AWS", ".SSH", ".Config", join(".config", "GH"), ".Docker", ".PI"]) assert.equal(checkSecureDir(join(home, rel), guard()).ok, false, rel);
+		assert.equal(checkSecureDir(home.toUpperCase(), guard()).ok, false);
+	});
+
+	it("refuses a folder that overlaps the harness docs home or the install root", () => {
+		const g = { ...guard(), protectedDirs: [join(home, ".brigadev"), join(scratch, "lib", "brigadev")] };
+		for (const raw of [join(home, ".brigadev"), join(home, ".brigadev", "other-repo"), join(scratch, "lib"), join(scratch, "lib", "brigadev", "extensions")]) {
+			assert.equal(checkSecureDir(raw, g).ok, false, raw);
+		}
+		assert.equal(checkSecureDir(join(home, "scratch"), g).ok, true);
+	});
+
+	it("drops a system temp root that is the root, the home folder, or holds it", () => {
+		assert.deepEqual(trustedTempRoots([join(home, "tmp-ok"), home, scratch, "/"], home), [join(home, "tmp-ok")]);
+		assert.ok(tempRoots().every((root) => root === realpathSync(root)));
+	});
+
+	it("keeps only valid configured folders, deduplicated", () => {
+		const dirs = secureYoloDirs([join(home, "scratch"), `${join(home, "scratch")}/`, "/", 42, "rel", join(home, ".ssh")], guard());
+		assert.deepEqual(dirs, [join(home, "scratch")]);
+		assert.deepEqual(secureYoloDirs(undefined, guard()), []);
+		assert.deepEqual(secureYoloDirs("not-an-array", guard()), []);
+	});
+
+	it("names git config and hook files, in any repository, and nothing else", () => {
+		for (const path of ["/x/repo/.git/config", "/x/repo/.git/config.worktree", "/x/repo/.git/hooks", "/x/repo/.git/hooks/pre-commit"]) assert.equal(isGitConfigOrHooksPath(path), true, path);
+		for (const path of ["/x/repo/.git/HEAD", "/x/repo/docs/config", "/x/repo/.github/hooks/a"]) assert.equal(isGitConfigOrHooksPath(path), false, path);
+	});
+
+	describe("/brigadev:yolo-dir", () => {
+		const store = () => {
+			let settings: BrigadevSettings = {};
+			return { read: () => settings, write: (update: BrigadevSettings) => (settings = { ...settings, ...update }), get: () => settings };
+		};
+		const env = () => ({ ...guard(), tempRoots: [join(scratch, "tmp")] });
+
+		it("adds, lists, and removes folders", () => {
+			const s = store();
+			assert.match(runYoloDirCommand(`add ${join(home, "scratch")}`, s, env()), /added/);
+			assert.deepEqual(s.get().secureYoloDirs, [join(home, "scratch")]);
+			assert.match(runYoloDirCommand(`add ${join(home, "scratch")}/`, s, env()), /already/);
+			assert.deepEqual(s.get().secureYoloDirs, [join(home, "scratch")]);
+			const listed = runYoloDirCommand("list", s, env());
+			assert.match(listed, new RegExp(join(scratch, "tmp")));
+			assert.match(listed, new RegExp(join(home, "scratch")));
+			assert.match(runYoloDirCommand(`remove ${join(home, "scratch")}`, s, env()), /removed/);
+			assert.deepEqual(s.get().secureYoloDirs, []);
+			assert.match(runYoloDirCommand(`remove ${join(home, "scratch")}`, s, env()), /not a secure-yolo folder/);
+		});
+
+		it("refuses an unsafe folder and writes nothing", () => {
+			const s = store();
+			assert.match(runYoloDirCommand(`add ${home}`, s, env()), /refused/);
+			assert.equal(s.get().secureYoloDirs, undefined);
+		});
+
+		it("answers usage for anything else", () => {
+			assert.match(runYoloDirCommand("frobnicate", store(), env()), /Usage: \/brigadev:yolo-dir/);
+		});
+	});
+});
+
 // extensions/guard.ts loaded for real (Pi's packages stubbed): a `bg_start` call must get the decision `bash` gets.
 describe("bg_start is guarded exactly like bash (S1a)", () => {
 	const saved = { ...process.env };
@@ -322,6 +424,8 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 		/** What the user answers every dialog. */
 		answer?: boolean;
 		yolo?: boolean;
+		/** A stored mode entry, as `/brigadev:mode` once appended it (overrides `yolo`). */
+		storedMode?: string;
 	}
 
 	async function session(setup: Setup) {
@@ -341,7 +445,8 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 		};
 		guard(pi);
 		const asked: string[] = [];
-		const entries = setup.yolo ? [{ type: "custom", customType: "brigadev-mode", data: { mode: "yolo" } }] : [];
+		const storedMode = setup.storedMode ?? (setup.yolo ? "yolo" : undefined);
+		const entries = storedMode ? [{ type: "custom", customType: "brigadev-mode", data: { mode: storedMode } }] : [];
 		const ctx: any = { cwd: repo, hasUI: setup.hasUI, sessionManager: { getBranch: () => entries }, ui: { confirm: async (title: string) => (asked.push(title), setup.answer ?? false), notify: () => {}, setStatus: () => {} } };
 		for (const handler of handlers.session_start ?? []) await handler({}, ctx);
 		let id = 0;
@@ -409,6 +514,12 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 		assert.deepEqual((await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true })).asked, ["brigadev: git push"]);
 		assert.deepEqual(await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true, yolo: true }), { reason: undefined, asked: [] });
 		assert.deepEqual((await outcome("bg_start", { command: "rm -rf build" }, { hasUI: true, answer: true, yolo: true })).asked.length, 1, "destructive still asks in yolo");
+	});
+
+	it("a stored dsp mode (a removed mode) loads as normal: it still asks", async () => {
+		const stored = await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true, storedMode: "dsp" });
+		assert.deepEqual(stored.asked, ["brigadev: git push"]);
+		assert.deepEqual((await outcome("bg_start", { command: "npm install left-pad" }, { hasUI: false, storedMode: "dsp" })).reason, "User declined: npm install changes installed dependencies");
 	});
 
 	it("a command that reads the evidence log is not blocked", async () => {

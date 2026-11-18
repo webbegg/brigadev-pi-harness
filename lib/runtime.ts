@@ -56,7 +56,7 @@ export function appendSystemPromptOnce(options: { appendSystemPrompt?: string } 
 
 export interface BrigadevSettings {
 	defaultMode?: string;
-	/** Folders outside the project where the parent's write/edit run without asking (lib/outside-writes.ts). */
+	/** Folders outside the project where the parent's write/edit run without asking (lib/guard-rules.ts). */
 	secureYoloDirs?: string[];
 	/** Price zero-cost claude-bridge turns at the Anthropic list price (default true). */
 	bridgePricing?: boolean;

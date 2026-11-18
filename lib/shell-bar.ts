@@ -49,7 +49,6 @@ export function statusSegment(key: string, text: string): Segment | undefined {
 	switch (key) {
 		case "brigadev-mode":
 			// Normal mode is the default and stays out of the way.
-			if (/\bdsp\b/i.test(text)) return { id: key, text: "⚠ DSP", tone: "warning", priority: 90 };
 			return /yolo/i.test(text) ? { id: key, text: "🚀 yolo", tone: "warning", priority: 90 } : undefined;
 		case "brigadev-cost":
 			return { id: key, text, tone: "muted", priority: 60 };
