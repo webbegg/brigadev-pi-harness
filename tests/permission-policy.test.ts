@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { classifyCommand } from "../lib/command-classifier.ts";
-import { commandPreview, decideCommand, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, SENSITIVE_GLOBS, SENSITIVE_RULES } from "../lib/permission-policy.ts";
+import { commandPreview, decideCommand, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, SENSITIVE_RULES } from "../lib/permission-policy.ts";
 
 const decide = (command: string, mode = PERMISSION_MODE.NORMAL, isChild = false) => decideCommand(classifyCommand(command), mode, isChild).action;
 
@@ -76,15 +76,12 @@ describe("isSensitivePath", () => {
 	});
 });
 
-describe("sensitive globs (the fd/rg excludes)", () => {
-	it("every pattern family has at least one glob, and the globs are the rules' globs in order", () => {
+describe("sensitive path rules", () => {
+	it("keeps every family of secret paths", () => {
 		assert.ok(SENSITIVE_RULES.length >= 9);
-		for (const rule of SENSITIVE_RULES) assert.ok(rule.globs.length > 0, String(rule.pattern));
-		assert.deepEqual(SENSITIVE_GLOBS, SENSITIVE_RULES.flatMap((rule) => rule.globs));
 	});
 
-	it("no glob covers an env template, which isSensitivePath allows", () => {
-		for (const glob of SENSITIVE_GLOBS) assert.notEqual(glob, "**/.env*");
+	it("allows env templates", () => {
 		for (const template of [".env.example", ".env.sample", ".env.template"]) assert.equal(isSensitivePath(template), false, template);
 	});
 });

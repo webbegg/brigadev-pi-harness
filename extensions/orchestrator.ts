@@ -14,6 +14,8 @@ import { appendSystemPromptOnce, ASSETS_ROOT, isChildSession, PACKAGE_ROOT, sett
 
 const HARNESS_ENTRY = "brigadev-harness";
 const STATUS_KEY = "brigadev-harness";
+/** Pi built-ins the parent searches with; Pi enables only read, bash, edit, and write by default. */
+const SEARCH_TOOLS = ["grep", "find", "ls"];
 
 /** The orchestrator prompt with the assets root and this session's repo docs folder filled in. */
 export function loadOrchestratorPrompt(cwd: string): string {
@@ -46,7 +48,17 @@ export default function (pi: ExtensionAPI) {
 		publishStatus(ctx);
 	};
 
-	pi.on("session_start", async (_event, ctx) => restore(ctx));
+	/** Adds grep, find, and ls to the active tools once per session start, keeping every other active tool; changes nothing when all are active. */
+	const activateSearchTools = () => {
+		const active = pi.getActiveTools();
+		if (SEARCH_TOOLS.every((name) => active.includes(name))) return;
+		pi.setActiveTools([...new Set([...active, ...SEARCH_TOOLS])]);
+	};
+
+	pi.on("session_start", async (_event, ctx) => {
+		activateSearchTools();
+		restore(ctx);
+	});
 	pi.on("session_tree", async (_event, ctx) => restore(ctx));
 
 	pi.on("before_agent_start", async (event, ctx) => {

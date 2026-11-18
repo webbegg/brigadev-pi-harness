@@ -17,12 +17,16 @@ import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
-import { agentDir, appendSystemPromptOnce, CHILD_ENV, childAllowedSurfaces, isChildSession, PACKAGE_ROOT, readSettings, writeSettings } from "../lib/runtime.ts";
+import { agentDir, CHILD_ENV, childAllowedSurfaces, isChildSession, PACKAGE_ROOT, readSettings, writeSettings } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
 import { worktreeTreeResult } from "../lib/worktree-tree.ts";
 
 const MODE_ENTRY = "brigadev-mode";
 const STATUS_KEY = "brigadev-mode";
+/** Custom message that tells the model the permission mode (not in the system prompt, so a switch never changes it). */
+const MODE_NOTICE = "brigadev-mode-notice";
+/** Tools that search under a `path` argument; the guard decides that path like a read. */
+const SEARCH_TOOLS = new Set(["grep", "find", "ls"]);
 
 export default function (pi: ExtensionAPI) {
 	const isChild = isChildSession();
@@ -46,6 +50,9 @@ export default function (pi: ExtensionAPI) {
 	const secureDirs = (): string[] => secureYoloDirs(readSettings().secureYoloDirs, secureGuard());
 	const tempDirs = (): string[] => trustedTempRoots(tempRoots(), homedir());
 
+	// The mode the model was last told about: from the session's own messages on restore, then from each announcement.
+	let announcedMode: PermissionMode | undefined;
+
 	const publishStatus = (ctx: ExtensionContext) => {
 		if (isChild || !ctx.hasUI) return;
 		ctx.ui.setStatus(STATUS_KEY, mode === PERMISSION_MODE.YOLO ? "🚀 brigadev: yolo" : "brigadev: normal");
@@ -55,10 +62,15 @@ export default function (pi: ExtensionAPI) {
 	const restoreMode = (ctx: ExtensionContext) => {
 		const saved = readSettings().defaultMode;
 		mode = isPermissionMode(saved) ? saved : PERMISSION_MODE.NORMAL;
+		announcedMode = undefined;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === MODE_ENTRY) {
 				const value = (entry.data as { mode?: unknown } | undefined)?.mode;
 				mode = isPermissionMode(value) ? value : PERMISSION_MODE.NORMAL;
+			}
+			if (entry.type === "custom_message" && entry.customType === MODE_NOTICE) {
+				const value = (entry.details as { mode?: unknown } | undefined)?.mode;
+				announcedMode = isPermissionMode(value) ? value : undefined;
 			}
 		}
 		outsideGrants.clear();
@@ -137,7 +149,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * One file-access decision for a path a tool call touches (read, write, edit, or the working directory a background
+	 * One file-access decision for a path a tool call touches (read, write, edit, the `path` of grep/find/ls, or the working directory a background
 	 * process starts in): sensitive-path question, outside-project grant. Returns a block, or undefined to let it run.
 	 * `isDirectory`: the path is a working directory, so a sensitive folder (`.ssh`) counts as sensitive and an outside
 	 * directory is granted as itself, not as its parent (the folder of a file).
@@ -154,7 +166,7 @@ export default function (pi: ExtensionAPI) {
 			absolutePath: absolute,
 			projectRoot: root,
 			docsDir: () => repoDocsDir(ctx.cwd),
-			sensitive: isSensitivePath(isDirectory ? `${absolute}/` : absolute),
+			sensitive: isSensitivePath(absolute) || (isDirectory && isSensitivePath(`${absolute}/`)),
 			readOnly: process.env[CHILD_ENV.READ_ONLY] === "1",
 			surfaces: isChild ? childAllowedSurfaces() : undefined,
 			agent: process.env[CHILD_ENV.AGENT],
@@ -183,9 +195,13 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => restoreMode(ctx));
 	pi.on("session_tree", async (_event, ctx) => restoreMode(ctx));
 
-	pi.on("before_agent_start", async (event) => {
-		if (isChild) return;
-		appendSystemPromptOnce(event.systemPromptOptions, MODE_PROMPT[mode]);
+	// The mode reaches the model as a context message, not as system text: a switch never changes the system prompt
+	// (which would rebuild the cached prefix). The message is added at the start of the first turn after a session start
+	// or a mode change, once per mode; the session keeps it, so a resumed session does not repeat it.
+	pi.on("before_agent_start", async () => {
+		if (isChild || announcedMode === mode) return undefined;
+		announcedMode = mode;
+		return { message: { customType: MODE_NOTICE, content: MODE_PROMPT[mode], display: false, details: { mode } } };
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
@@ -236,13 +252,15 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const isWrite = isToolCallEventType("write", event) || isToolCallEventType("edit", event);
+		// grep, find, and ls take a `path` that may be a folder or a file; it is decided like a read (without a path they search the working directory).
+		const isSearch = SEARCH_TOOLS.has(event.toolName);
 		const isRead = isToolCallEventType("read", event);
-		if (!isWrite && !isRead) return undefined;
+		if (!isWrite && !isRead && !isSearch) return undefined;
 
 		const rawPath = String((event.input as { path?: unknown }).path ?? "");
 		if (!rawPath) return undefined;
 		const absolute = canonicalPath(resolve(ctx.cwd, expandHome(rawPath)));
-		return checkPath(event.toolName, rawPath, absolute, isWrite, ctx);
+		return checkPath(event.toolName, rawPath, absolute, isWrite, ctx, isSearch);
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
