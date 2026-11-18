@@ -1,4 +1,4 @@
-// Regression probes from brigadev-verify (S3/S4): forged passes and gate blind spots.
+// Evidence gate blind spots: forged passes, flags that run no tests, and commits the gate must still judge.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -12,7 +12,7 @@ import { checkOutcome } from "../lib/evidence.ts";
 const STUB = `data:text/javascript,export const isToolCallEventType=(n,e)=>e.toolName===n;export const getAgentDir=()=>"/nonexistent";export const parseFrontmatter=()=>({});export const getMarkdownTheme=()=>({});`;
 registerHooks({ resolve: (spec, ctx, next) => (spec === "@earendil-works/pi-coding-agent" ? { url: STUB, shortCircuit: true } : next(spec, ctx)) });
 
-describe("checkOutcome: exit 0 must belong to the test (S4)", () => {
+describe("checkOutcome: exit 0 must belong to the test", () => {
 	for (const command of [`echo npm test`, `grep -n "node --test" package.json`, `true # npm test`, `: npm test`, `! npm test`, `true || npm test`, `exit 0 && npm test`, `echo pipefail; npm test | cat`]) {
 		it(`is not a pass: ${command}`, () => assert.notEqual(checkOutcome(command, 0), "pass"));
 	}
@@ -22,7 +22,7 @@ describe("checkOutcome: exit 0 must belong to the test (S4)", () => {
 	});
 });
 
-describe("checkOutcome: help and version flags run no tests (S4)", () => {
+describe("checkOutcome: help and version flags run no tests", () => {
 	for (const command of [
 		"npm test --help", "npm test -h", "npm run test --help", "yarn test --help", "pnpm test --help",
 		"node --test --help", "node --test --version", "node --test -v",
@@ -62,7 +62,29 @@ describe("checkOutcome: help and version flags run no tests (S4)", () => {
 	});
 });
 
-describe("commit gate wiring (S4)", () => {
+describe("checkOutcome: package-manager option values and npm config env never vouch for a pass", () => {
+	// npm prints help or its version, exits 0, and runs no script for each of these.
+	for (const command of [
+		// `-F` / `--filter` are pnpm options; npm does not take a value for them, so the next word is read as an option.
+		"npm test -F --help", "npm test --filter --help", "npm test -F -v", "npm run test -F --help", "npm test --filter --usage",
+		// npm reads `--color=<value>` and still acts on a flag-like value.
+		"npm test --color=-v", "npm test --color=--help", "npm test --color=--usage",
+		// npm reads its config from the environment: `usage` prints the usage and skips the script.
+		"npm_config_usage=true npm test", "NPM_CONFIG_USAGE=true npm test", "npm_config_usage=1 npm test",
+		"export npm_config_usage=true && npm test",
+		// Options before `--` are not trusted, by user decision: only `-s` / `--silent` pass.
+		"npm test --color=always", "npm test -w pkg", "npm test --workspace=pkg", "npm test --loglevel warn", "pnpm test --filter pkg",
+		// Other ways to set npm config in an earlier segment.
+		"npm_config_usage=true true && npm test", "pnpm_config_x=1 pnpm test", "yarn_config_x=1 yarn test",
+	]) {
+		it(`is not a pass: ${command}`, () => assert.notEqual(checkOutcome(command, 0), "pass"));
+	}
+	for (const command of ["NODE_ENV=test npm test", "npm -s test", "export NODE_ENV=test && npm test"]) {
+		it(`still passes: ${command}`, () => assert.equal(checkOutcome(command, 0), "pass"));
+	}
+});
+
+describe("commit gate wiring", () => {
 	let dir: string;
 	let repo: string;
 	const saved = { ...process.env };
@@ -135,7 +157,7 @@ describe("commit gate wiring (S4)", () => {
 	});
 });
 
-describe("commit gate in nested repositories and subdirectories (S8b)", () => {
+describe("commit gate in nested repositories and subdirectories", () => {
 	let dir: string;
 	let parent: string;
 	let nested: string;

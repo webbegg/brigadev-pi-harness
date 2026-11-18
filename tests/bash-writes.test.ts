@@ -177,3 +177,83 @@ describe("bash write targets: working directory", () => {
 		assert.deepEqual(targets("cd && touch a"), []);
 	});
 });
+
+describe("bash write targets: shell syntax that is not a redirection", () => {
+	it("ignores > inside arithmetic and [[ ]] comparisons", () => {
+		assert.deepEqual(targets("if (( $# > 1 )); then echo many; fi"), []);
+		assert.deepEqual(targets("n=3; (( n > 100 )) && echo long"), []);
+		assert.deepEqual(targets("echo $(( 3 > 2 ))"), []);
+		assert.deepEqual(targets("[[ a > b ]] && echo yes"), []);
+	});
+});
+
+describe("bash write targets: cd scope", () => {
+	it("does not carry a cd out of a subshell", () => {
+		assert.deepEqual(targets("(cd src && npm test) > test.log 2>&1"), ["/proj/test.log"]);
+		assert.deepEqual(targets("(cd src && touch a) && touch README.md"), ["/proj/src/a", "/proj/README.md"]);
+	});
+
+	it("does not carry a cd out of a sh -c script", () => {
+		assert.deepEqual(targets("sh -c 'cd src && touch a'; touch README.md"), ["/proj/src/a", "/proj/README.md"]);
+	});
+});
+
+describe("bash write targets: conditionals and cd scope", () => {
+	it("keeps a real redirect after an arithmetic or [[ ]] test", () => {
+		assert.deepEqual(targets("(( x > 1 )) && echo y > README.md"), ["/proj/README.md"]);
+		assert.deepEqual(targets("[[ a > b ]] && echo y > README.md"), ["/proj/README.md"]);
+	});
+
+	it("still finds writes in command substitutions inside conditionals", () => {
+		assert.deepEqual(targets("[[ -n $(echo x > README.md) ]]"), ["/proj/README.md"]);
+		assert.deepEqual(targets("echo $(( $(touch README.md) + 1 ))"), ["/proj/README.md"]);
+	});
+
+	it("does not treat a case pattern ) as the end of a subshell", () => {
+		assert.deepEqual(targets("(cd other; case x in a) ;; esac; touch ../README.md)"), ["/proj/README.md"]);
+		assert.deepEqual(targets("(cd src; case x in a) touch b;; esac; touch c)"), ["/proj/src/b", "/proj/src/c"]);
+	});
+});
+
+describe("bash write targets: case patterns and substitutions in conditionals", () => {
+	it("keeps subshell cd scope across (a) patterns, multiple arms and newlines", () => {
+		assert.deepEqual(targets("(cd src; case x in (a) touch b;; (b|c) touch d;; esac; touch c); touch e"), ["/proj/src/b", "/proj/src/d", "/proj/src/c", "/proj/e"]);
+		assert.deepEqual(targets("(cd src; case x in a) touch b;; b) touch c;; *) touch d;; esac; touch e); touch f"), ["/proj/src/b", "/proj/src/c", "/proj/src/d", "/proj/src/e", "/proj/f"]);
+		assert.deepEqual(targets("(cd src\ncase x in\na) touch b;;\nesac\ntouch c\n); touch d"), ["/proj/src/b", "/proj/src/c", "/proj/d"]);
+	});
+
+	it("closes the subshell right after esac", () => {
+		assert.deepEqual(targets("(cd src; case x in a) touch b;; esac); touch README.md"), ["/proj/src/b", "/proj/README.md"]);
+		assert.deepEqual(targets("(cd src; case x in a) touch b;; esac > ../README.md); touch d"), ["/proj/src/b", "/proj/README.md", "/proj/d"]);
+	});
+
+	it("tracks a case nested in a subshell inside a case arm", () => {
+		assert.deepEqual(
+			targets("(cd other; case x in a) (cd ../src; case y in b) touch q;; esac; touch r); touch s;; esac; touch t); touch u"),
+			["/proj/src/q", "/proj/src/r", "/proj/other/s", "/proj/other/t", "/proj/u"],
+		);
+		assert.deepEqual(targets("(cd src; case x in a) case y in b) touch q;; esac; touch r;; esac; touch s); touch t"), ["/proj/src/q", "/proj/src/r", "/proj/src/s", "/proj/t"]);
+	});
+
+	it("treats case and esac as plain words when they are arguments", () => {
+		assert.deepEqual(targets("echo esac > README.md"), ["/proj/README.md"]);
+		assert.deepEqual(targets("(cd src; case x in a) echo esac;; esac; touch c); touch d"), ["/proj/src/c", "/proj/d"]);
+		assert.deepEqual(targets("(cd src; echo case; touch c); touch d"), ["/proj/src/c", "/proj/d"]);
+	});
+
+	it("handles a case statement inside a command substitution", () => {
+		assert.deepEqual(targets("(cd src; echo $(case x in a) echo;; esac); touch c); touch d"), ["/proj/src/c", "/proj/d"]);
+		assert.deepEqual(targets("cd src; x=$(case y in a) cd ..;; esac); touch c"), ["/proj/src/c"]);
+	});
+
+	it("finds writes in substitutions inside conditionals, but not in quoted or escaped text", () => {
+		assert.deepEqual(targets("[[ $(echo ']]') ]] > README.md"), ["/proj/README.md"]);
+		assert.deepEqual(targets("[[ \"$(touch README.md)\" ]]"), ["/proj/README.md"]);
+		assert.deepEqual(targets("[[ $(echo a > b) > c ]]"), ["/proj/b"]);
+		assert.deepEqual(targets("[[ $(cd other; touch q) ]]; touch r"), ["/proj/other/q", "/proj/r"]);
+		assert.deepEqual(targets("[[ $(echo $(touch README.md)) ]]"), ["/proj/README.md"]);
+		assert.deepEqual(targets("[[ '$(touch README.md)' ]]"), []);
+		assert.deepEqual(targets("[[ \\$(touch README.md) ]]"), []);
+		assert.deepEqual(targets("[[ $(echo ']] > other/q') ]]"), []);
+	});
+});

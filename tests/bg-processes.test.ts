@@ -672,3 +672,51 @@ describe("real processes", { skip: process.platform === "win32" }, () => {
 		});
 	});
 });
+
+// Real processes: grandchildren that take a process group of their own survive neither bg_kill nor shutdown, whether the shell
+// dies on SIGTERM (job control, perl setpgrp, a chain of shells) or ignores it until the SIGKILL.
+const OWN_GROUP_COMMANDS: Record<string, { command: string; pids: number; graceMs?: number }> = {
+	"job control (`set -m`) under a shell that dies on SIGTERM": { command: "set -m; sleep 600 & echo $!; wait", pids: 1 },
+	"perl setpgrp": { command: `perl -e 'setpgrp(0,0); exec "sleep","600"' & echo $!; wait`, pids: 1, graceMs: 300 },
+	"a shell chain": { command: `sh -c 'perl -e "setpgrp(0,0); exec q(sleep), q(600)" & echo $!; wait' & echo $!; wait`, pids: 2, graceMs: 300 },
+	"a TERM-ignoring shell": { command: `trap '' TERM; perl -e '$SIG{TERM}="IGNORE"; setpgrp(0,0); exec "sleep","600"' & echo $!; set -m; sleep 600 & echo $!; wait`, pids: 2, graceMs: 300 },
+};
+
+describe("real processes: grandchildren in a process group of their own", { skip: process.platform === "win32" }, () => {
+	const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+	const aliveStrict = (pid: number) => {
+		if (!(pid > 1)) throw new Error(`not a pid: ${pid}`);
+		return alive(pid);
+	};
+
+	async function startWithGrandchildren(manager: ReturnType<typeof createBgProcesses>, command: string, count: number) {
+		const started = manager.start({ command, cwd: process.cwd() });
+		let pids: number[] = [];
+		for (let i = 0; i < 100 && pids.length < count; i++) {
+			await pause(50);
+			pids = manager.get(started.id)!.output.trim().split(/\s+/).filter(Boolean).map(Number);
+			assert.ok(pids.every((pid) => pid > 1), `pids: ${pids}`);
+		}
+		assert.equal(pids.length, count, "the grandchildren started");
+		assert.ok(pids.every(aliveStrict), "the grandchildren are running");
+		await pause(200); // let `perl` exec into `sleep` in its own group
+		return { id: started.id, pids };
+	}
+
+	for (const [label, { command, pids: count, graceMs }] of Object.entries(OWN_GROUP_COMMANDS)) {
+		for (const how of ["bg_kill", "shutdown"] as const) {
+			it(`${label}: ${how} leaves nothing alive`, async () => {
+				const manager = createBgProcesses(graceMs === undefined ? {} : { graceMs });
+				const { id, pids } = await startWithGrandchildren(manager, command, count);
+				try {
+					if (how === "bg_kill") assert.equal((await manager.kill(id))?.state, "killed");
+					else await manager.shutdown();
+					await pause(300);
+					assert.deepEqual(pids.filter(aliveStrict), [], `survivors after ${how}`);
+				} finally {
+					for (const pid of pids) if (pid > 1 && alive(pid)) process.kill(pid, "SIGKILL");
+				}
+			});
+		}
+	}
+});

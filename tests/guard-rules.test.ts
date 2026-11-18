@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { after, before, describe, it } from "node:test";
 import type { BranchFacts } from "../lib/commit-branch.ts";
 import { canonicalPath } from "../lib/paths.ts";
@@ -392,15 +393,40 @@ describe("secure-yolo folders", () => {
 });
 
 // extensions/guard.ts loaded for real (Pi's packages stubbed): a `bg_start` call must get the decision `bash` gets.
-describe("bg_start is guarded exactly like bash (S1a)", () => {
+describe("bg_start is guarded exactly like bash", () => {
+	const run = promisify(execFile);
 	const saved = { ...process.env };
 	// Outside the project and outside the system temp dir (where the parent now writes without asking); never created.
 	const OUTSIDE = "/brigadev-test-not-temp";
 	let dir: string;
 	let repo: string;
 	let home: string;
+	// Sessions for the commit-gate tests: `clean` and `dirty` are repositories with a nested repository (ignored, with an untested change),
+	// a symlink into it, and (dirty only) an untested source change of their own; `outside` is another repository with an untested change.
+	let clean: string;
+	let dirty: string;
+	let outside: string;
 	let uninstall: () => void;
 	let guard: (pi: any) => void;
+
+	const gitIn = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+	const makeRepo = (path: string, branch: string, file: string) => {
+		mkdirSync(path, { recursive: true });
+		gitIn(path, "init", "-q", "-b", "main");
+		writeFileSync(join(path, file), "1\n");
+		gitIn(path, "add", "-A");
+		gitIn(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init");
+		gitIn(path, "checkout", "-qb", branch);
+	};
+	const makeSession = (path: string) => {
+		mkdirSync(join(path, "src"), { recursive: true });
+		writeFileSync(join(path, ".gitignore"), "nested/\nlnk\n");
+		writeFileSync(join(path, "src", "a.ts"), "1\n");
+		makeRepo(path, "feat/x", "src.ts"); // the session's repository is clean: the gate alone would allow a commit of it
+		makeRepo(join(path, "nested"), "feat/n", "n.ts");
+		appendFileSync(join(path, "nested", "n.ts"), "2\n"); // untested source change in another repository
+		symlinkSync("nested", join(path, "lnk"));
+	};
 
 	before(async () => {
 		dir = realpathSync(mkdtempSync(join(tmpdir(), "brigadev-bg-guard-")));
@@ -418,6 +444,14 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 		git("add", "-A");
 		git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init");
 		appendFileSync(join(repo, "src.ts"), "export const b = 2;\n"); // a source change with no recorded test: the commit gate applies
+		clean = join(dir, "clean");
+		dirty = join(dir, "dirty");
+		outside = join(dir, "outrepo");
+		makeSession(clean);
+		makeSession(dirty);
+		appendFileSync(join(dirty, "src", "a.ts"), "2\n");
+		makeRepo(outside, "feat/o", "o.ts");
+		appendFileSync(join(outside, "o.ts"), "2\n");
 		uninstall = installPiStubs();
 		guard = (await import("../extensions/guard.ts")).default;
 	});
@@ -438,7 +472,7 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 		storedMode?: string;
 	}
 
-	async function session(setup: Setup) {
+	async function session(setup: Setup, cwd: string = repo) {
 		const handlers: Record<string, Function[]> = {};
 		const pi: any = {
 			on: (event: string, handler: Function) => (handlers[event] ??= []).push(handler),
@@ -447,9 +481,9 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 			appendEntry: () => {},
 			exec: async (command: string, args: string[], options: { cwd: string }) => {
 				try {
-					return { stdout: execFileSync(command, args, { cwd: options.cwd, encoding: "utf8" }), stderr: "", code: 0 };
+					return { stdout: (await run(command, args, { cwd: options.cwd, encoding: "utf8" })).stdout, stderr: "", code: 0 };
 				} catch (error: any) {
-					return { stdout: String(error.stdout ?? ""), stderr: "", code: typeof error.status === "number" ? error.status : 1 };
+					return { stdout: String(error.stdout ?? ""), stderr: "", code: typeof error.code === "number" ? error.code : 1 };
 				}
 			},
 		};
@@ -457,7 +491,7 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 		const asked: string[] = [];
 		const storedMode = setup.storedMode ?? (setup.yolo ? "yolo" : undefined);
 		const entries = storedMode ? [{ type: "custom", customType: "brigadev-mode", data: { mode: storedMode } }] : [];
-		const ctx: any = { cwd: repo, hasUI: setup.hasUI, sessionManager: { getBranch: () => entries }, ui: { confirm: async (title: string) => (asked.push(title), setup.answer ?? false), notify: () => {}, setStatus: () => {} } };
+		const ctx: any = { cwd, hasUI: setup.hasUI, sessionManager: { getBranch: () => entries }, ui: { confirm: async (title: string) => (asked.push(title), setup.answer ?? false), notify: () => {}, setStatus: () => {} } };
 		for (const handler of handlers.session_start ?? []) await handler({}, ctx);
 		let id = 0;
 		return {
@@ -473,8 +507,8 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 		};
 	}
 
-	const outcome = async (toolName: "bash" | "bg_start", input: Record<string, unknown>, setup: Setup) => {
-		const s = await session(setup);
+	const outcome = async (toolName: "bash" | "bg_start", input: Record<string, unknown>, setup: Setup, cwd: string = repo) => {
+		const s = await session(setup, cwd);
 		const reason = await s.call(toolName, input);
 		return { reason, asked: s.asked };
 	};
@@ -504,8 +538,7 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 		it(`${label}: same decision, same dialogs as bash in every mode`, async () => {
 			const text = command();
 			for (const [name, setup] of setups) {
-				const viaBash = await outcome("bash", { command: text }, setup);
-				const viaBg = await outcome("bg_start", { command: text, name: "x" }, setup);
+				const [viaBash, viaBg] = await Promise.all([outcome("bash", { command: text }, setup), outcome("bg_start", { command: text, name: "x" }, setup)]);
 				assert.deepEqual(viaBg, viaBash, `${label} (${name})`);
 			}
 			const plain = await outcome("bg_start", { command: text }, { hasUI: false });
@@ -604,6 +637,68 @@ describe("bg_start is guarded exactly like bash (S1a)", () => {
 			assert.deepEqual(s.asked, ["brigadev: write outside project"]);
 			assert.equal(await s.call("read", { path: join(repo, ".ssh", "id_rsa") }), undefined);
 			assert.deepEqual(s.asked, ["brigadev: write outside project", "brigadev: sensitive file"]);
+		});
+	});
+
+	describe("a commit through the working directory is judged by the repository it runs in", () => {
+		const COMMIT = "git commit -am x";
+		const GATE_QUESTION = "brigadev: evidence gate blocked this commit";
+		// The bash side is the same call for every `sub`: evaluate it once.
+		const once = <T>(make: () => Promise<T>) => {
+			let cached: Promise<T> | undefined;
+			return () => (cached ??= make());
+		};
+		const cleanViaBash = once(() => outcome("bash", { command: COMMIT }, { hasUI: false }, clean));
+		const dirtyViaBash = once(() => outcome("bash", { command: COMMIT }, { hasUI: false }, dirty));
+
+		// A bg_start `cwd` is decided like `cd <cwd> && <command>`: a nested repository (or a symlink into one) is another repository whose
+		// runs the gate judges, while a subdirectory of the session's own repository is not "elsewhere".
+		it("yolo without a UI: a commit in a nested repository is blocked as bash blocks `cd nested && git commit`", async () => {
+			const [viaBash, viaBg] = await Promise.all([
+				outcome("bash", { command: `cd nested && ${COMMIT}` }, { hasUI: false, yolo: true }, clean),
+				outcome("bg_start", { command: COMMIT, cwd: "nested" }, { hasUI: false, yolo: true }, clean),
+			]);
+			assert.match(String(viaBash.reason), /evidence gate/);
+			assert.match(String(viaBg.reason), /evidence gate/);
+		});
+
+		it("with a UI the user sees the evidence-gate question for a bg_start commit elsewhere, as for bash", async () => {
+			const [viaBash, viaBg] = await Promise.all([
+				outcome("bash", { command: `cd nested && ${COMMIT}` }, { hasUI: true, answer: true, yolo: true }, clean),
+				outcome("bg_start", { command: COMMIT, cwd: "nested" }, { hasUI: true, answer: true, yolo: true }, clean),
+			]);
+			assert.ok(viaBash.asked.includes(GATE_QUESTION));
+			assert.ok(viaBg.asked.includes(GATE_QUESTION), JSON.stringify(viaBg));
+		});
+
+		it("an outside repository the user granted as a working directory still goes through the gate", async () => {
+			const viaBg = await outcome("bg_start", { command: COMMIT, cwd: outside }, { hasUI: true, answer: true, yolo: true }, clean);
+			assert.ok(viaBg.asked.includes(GATE_QUESTION), JSON.stringify(viaBg));
+		});
+
+		for (const sub of ["src", ".", "src/"]) {
+			it(`a clean session repository: bg_start cwd "${sub}" commits like a plain git commit (not "another directory")`, async () => {
+				assert.equal((await cleanViaBash()).reason, undefined);
+				assert.equal((await outcome("bg_start", { command: COMMIT, cwd: sub }, { hasUI: false }, clean)).reason, undefined);
+			});
+
+			it(`an untested change: bg_start cwd "${sub}" gets the same gate reason as a plain git commit`, async () => {
+				const viaBash = (await dirtyViaBash()).reason;
+				const viaBg = (await outcome("bg_start", { command: COMMIT, cwd: sub }, { hasUI: false }, dirty)).reason;
+				assert.match(String(viaBash), /no passing test is recorded/);
+				assert.equal(viaBg, viaBash);
+			});
+		}
+
+		it("a symlink cwd into a nested repository is judged by that repository's runs (its own untested change), as `cd lnk && git commit` is", async () => {
+			for (const yolo of [false, true]) {
+				const [viaBash, viaBg] = await Promise.all([
+					outcome("bash", { command: `cd lnk && ${COMMIT}` }, { hasUI: false, yolo }, clean),
+					outcome("bg_start", { command: COMMIT, cwd: "lnk" }, { hasUI: false, yolo }, clean),
+				]);
+				assert.match(String(viaBash.reason), /no passing test is recorded/);
+				assert.equal(viaBg.reason, viaBash.reason);
+			}
 		});
 	});
 

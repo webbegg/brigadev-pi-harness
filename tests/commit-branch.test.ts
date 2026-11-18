@@ -120,6 +120,37 @@ describe("commits on feature branches", () => {
 		}
 	});
 
+	it("still ask when a git-location variable sits in front of a shell wrapper", async () => {
+		for (const command of [
+			"GIT_DIR=../other/.git bash -c 'git commit -m x'",
+			"env GIT_DIR=../other/.git bash -c 'git commit -m x'",
+			"GIT_WORK_TREE=../other sh -c 'git commit -m x'",
+			"GIT_DIR=../other/.git eval 'git commit -m x'",
+		]) {
+			assert.equal((await decide(command)).action, "confirm", command);
+		}
+	});
+
+	it("still ask when a git-location variable reaches the commit through runner wrappers and nested shells", async () => {
+		for (const command of [
+			"GIT_DIR=../other/.git nice bash -c 'git commit -m x'",
+			"GIT_DIR=../other/.git exec bash -c 'git commit -m x'",
+			"command env GIT_DIR=../other/.git sh -c 'git commit -m x'",
+			"env -i GIT_DIR=../other/.git bash -c 'git commit -m x'",
+			"GIT_DIR=../other/.git bash -c 'bash -c \"git commit -m x\"'",
+			"(GIT_DIR=../other/.git bash -c 'git commit -m x')",
+			"GIT_DIR=\"../other/.git\" zsh -c 'git commit -m x'",
+		]) {
+			assert.equal((await decide(command)).action, "confirm", command);
+		}
+	});
+
+	it("do not ask when a git-location variable name only appears in the commit message", async () => {
+		for (const command of ['git commit -m "GIT_DIR=x"', 'git add . && git commit -m "docs: explain GIT_DIR=path usage"']) {
+			assert.equal((await decide(command)).action, "allow", command);
+		}
+	});
+
 	it("still ask when an earlier step can switch the branch", async () => {
 		for (const command of [
 			"git checkout main && git commit -m x",

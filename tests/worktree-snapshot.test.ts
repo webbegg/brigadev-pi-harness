@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
-import { execFile } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { after, before, describe, it } from "node:test";
+import { execFile, execFileSync } from "node:child_process";
+import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { diffSnapshots, outsideSurfaces, parsePorcelain, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
@@ -112,6 +112,53 @@ describe("takeSnapshot", () => {
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("takeSnapshot with outsideSurfaces against one shared repository", () => {
+	let repo: string;
+
+	before(() => {
+		repo = mkdtempSync(join(tmpdir(), "brigadev-snap-"));
+		const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: repo });
+		mkdirSync(join(repo, "sub/src"), { recursive: true });
+		for (const file of ["dirty.txt", "stay.txt", "gone.txt", "sub/x.txt"]) writeFileSync(join(repo, file), `${file}\n`);
+		git("init", "-q");
+		git("add", "-A");
+		git("commit", "-qm", "init");
+		appendFileSync(join(repo, "dirty.txt"), "pre\n");
+		appendFileSync(join(repo, "stay.txt"), "pre\n");
+	});
+	after(() => rmSync(repo, { recursive: true, force: true }));
+
+	const changed = async (root: string, mutate: () => void) => {
+		const before = await takeSnapshot(realExec, root);
+		mutate();
+		const after = await takeSnapshot(realExec, root);
+		assert.ok(before && after);
+		return outsideSurfaces(diffSnapshots(before, after), ["src/**"]);
+	};
+
+	it("ignores files that were already dirty and did not change", async () => {
+		assert.deepEqual(await changed(repo, () => {}), []);
+	});
+
+	it("reports a further change to a dirty file, a deletion and an odd file name", async () => {
+		const result = await changed(repo, () => {
+			appendFileSync(join(repo, "dirty.txt"), "more\n");
+			rmSync(join(repo, "gone.txt"));
+			writeFileSync(join(repo, "a b\nc.txt"), "x");
+		});
+		assert.deepEqual(result, ["a b\nc.txt", "dirty.txt", "gone.txt"]);
+	});
+
+	it("reports paths relative to a project root below the repository root", async () => {
+		const result = await changed(join(repo, "sub"), () => {
+			writeFileSync(join(repo, "sub/src/in.txt"), "x");
+			appendFileSync(join(repo, "sub/x.txt"), "x");
+			writeFileSync(join(repo, "above.txt"), "x");
+		});
+		assert.deepEqual(result, ["x.txt"]);
 	});
 });
 
