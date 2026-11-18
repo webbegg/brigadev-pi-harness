@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Run budget wrap-up: the request is now steered into a running turn. A child that is between turns (before its first turn, or during a retry or compaction) gets it when its next turn starts, instead of as a follow-up it would only read once the whole run ended. A steer the child rejects falls back to one follow-up. When the request never reached the child, the `over budget` failure says why: no turn started, no answer, input closed, or the child's rejection. A run that is already stopping because of its abort signal gets no wrap-up and no second terminate.
+
 ## [0.20.0] - 2026-11-18
 
 - Subagent run budget: a new optional agent frontmatter field, `budgetMinutes: <n>`. Once the budget is spent the child is asked once to wrap up (steer during a turn, follow-up between turns) and return what it has. A child still without a result `BRIGADEV_WRAP_UP_GRACE_MS` later (3 min by default) is stopped and fails with `over budget: ...`; that failure never falls back to another model. `BRIGADEV_RUN_BUDGET=off` disables every budget. Agents without the field are unchanged.
