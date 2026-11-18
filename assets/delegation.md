@@ -9,8 +9,7 @@ Parent session only. Load when a writer is about to launch, a writer returns, or
 | `brigadev-explore` | Read-only mapping, ≤ ~2k token handoff | read, grep, find, ls | evidence budget |
 | `brigadev-worker` | Bounded writer, no commits | read, grep, find, ls, edit, write, bash | allowed edit surfaces |
 | `brigadev-verify` | Independent spec-derived verification | read, grep, find, ls, bash | `Risk: item N` in reason |
-| `review-*` | 4R lenses (via `brigadev-review`) | read, grep, find, ls | review request |
-| `jd-*` | Judgment Day (via `brigadev-judgment-day`) | see skill | explicit request |
+| `review-4r` | 4R review, one pass (via `brigadev-review`) | read, grep, find, ls | review request |
 
 Run `/brigadev:agents` to see the effective list, including user (`~/.pi/agent/agents`) and trusted project (`.pi/agents`) overrides.
 

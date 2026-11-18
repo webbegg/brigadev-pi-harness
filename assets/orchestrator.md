@@ -38,7 +38,7 @@ Handoffs pass requirements by reference (`featureDoc`) or verbatim, never paraph
 
 ## Review and language
 
-- `brigadev-review` when the user asks, or once before the PR after asking (scope via `brigadev-branch-pr`); never per commit (high risk gets `brigadev-verify`). Judgment Day only on explicit request (`/skill:brigadev-judgment-day`). Reviews never replace checks or authorize delivery.
+- `brigadev-review` when the user asks, or once before the PR after asking (scope via `brigadev-branch-pr`); never per commit (high risk gets `brigadev-verify`). Reviews never replace checks or authorize delivery.
 - Reply in the user's language. Code, comments, commits, PRs, docs, tests, and handoffs default to English unless the user or project says otherwise; human-facing comments follow the thread.
 
 ## Safety

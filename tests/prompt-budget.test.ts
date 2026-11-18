@@ -39,12 +39,8 @@ describe("prompt budget", () => {
 		}
 	});
 
-	it(`lists at most ${MODEL_VISIBLE_SKILLS_MAX} skills to the model; explicit-only skills stay hidden`, () => {
-		const all = skills();
-		assert.ok(all.filter((s) => !s.hidden).length <= MODEL_VISIBLE_SKILLS_MAX);
-		for (const name of ["brigadev-judgment-day", "brigadev-skill-creator"]) {
-			assert.equal(all.find((s) => s.name === name)?.hidden, true, `${name} should be explicit-only`);
-		}
+	it(`lists at most ${MODEL_VISIBLE_SKILLS_MAX} skills to the model`, () => {
+		assert.ok(skills().filter((s) => !s.hidden).length <= MODEL_VISIBLE_SKILLS_MAX);
 	});
 
 	it("asks for no narration between tool calls and a fixed closing shape", () => {

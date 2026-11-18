@@ -1,6 +1,6 @@
 ---
 name: brigadev-branch-pr
-description: "Trigger: create PR, open pull request. Prepare branches and PRs from evidence, following the repo's policy."
+description: "Trigger: commit, create PR, split a large change. Work-unit commits, branches, and PRs from evidence."
 metadata:
   author: brigadev
   version: "0.1"
@@ -8,7 +8,7 @@ metadata:
 
 ## When to use
 
-Creating or preparing a pull request, or preparing a branch for submission.
+Deciding what goes into each commit, creating or preparing a pull request, or splitting a change over ~400 lines.
 
 ## Target and authorization
 
@@ -19,9 +19,9 @@ Creating or preparing a pull request, or preparing a branch for submission.
 ## Workflow
 
 1. No issue is required. Link one only when the user mentions it, and ask whether it closes (`Closes #N`) or only references (`Refs #N`) it.
-2. Work on a `type/description` branch from the verified default branch (normally already started by the work-unit flow).
-3. Implement in work units (`brigadev-work-unit-commits`), test-first where applicable, running the applicable checks.
-4. If the change exceeds ~400 changed lines, load `brigadev-chained-pr` before opening anything.
+2. Work on a `type/description` branch from the verified default branch (normally already started).
+3. Implement in work units (see Commits), test-first where applicable, running the applicable checks.
+4. If the change exceeds ~400 changed lines, follow Oversized changes before opening anything.
 5. **Review before the PR**, once the work units are done: first ask the scope with one `ask_user_choice`: **Full 4R** (all four lenses, slowest), **Fitting lenses** (recommended: only the lenses the change's risk needs), or **Skip the review** (then say so in the PR body's Risk line). Without a UI, ask in your reply and stop. Then run `brigadev-review` on `<default>...HEAD` with the chosen scope and write the ledger to `reviews/<branch with / as ->.md` in the repo docs folder named in the orchestrator prompt. Show the ledger. If it has blockers, ask the user before opening the PR.
 6. Draft the PR body from the repository template (or, with none, the evidence-based body below) and observed evidence. Show it to the user.
 7. On explicit authorization: push, then open the PR with explicit `--repo` and `--base`.
@@ -30,6 +30,20 @@ Creating or preparing a pull request, or preparing a branch for submission.
 ## Branch naming
 
 `^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)\/[a-z0-9._-]+$`, for example `feat/user-login`, `fix/null-session-crash`.
+
+## Commits
+
+- One commit = one deliverable behavior, fix, migration, or docs unit, with its tests and docs. Never split by file type (models, then services, then tests). A high-risk unit gets its own commit.
+- Commit each finished unit unasked; the guard lets a feature-branch commit run without a dialog.
+- Before each commit: one clear purpose; builds and tests pass with only this commit; reverting it reverts nothing unrelated.
+- Conventional Commits: `type(scope): description` (`!` for breaking), describing the outcome, not the file list. No `Co-Authored-By` trailers unless asked. Match `git log --oneline -5`.
+- In tracked work, record each task's commit in the feature document's `## Tasks`.
+
+## Oversized changes
+
+Above ~400 changed lines (additions + deletions, generated files excluded), slice by work unit; the budget shapes slicing, never the code: never delete comments, docs, or tests, or compress code, to fit. One honest slicing pass; if no cohesive split fits, report the count and why. Wide mechanical refactors slice as expand–contract.
+
+Unless the feature document already records a strategy, ask once with `ask_user_choice`, in this order: **Feature branch chain** (draft tracker PR; children target the tracker or their parent; nothing lands until the chain completes), **Stacked to the default branch** (each slice lands in order), **One single PR** (least recommended). Record the choice as the delivery strategy; it does not authorize push or PR creation. Branch mechanics and the Chain Context block: `references/chaining-details.md`. A polluted diff (another slice's changes) is a base bug: retarget or rebase.
 
 ## PR body
 

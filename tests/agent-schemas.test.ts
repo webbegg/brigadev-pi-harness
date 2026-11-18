@@ -18,8 +18,8 @@ function schemaOf(agent: string): JsonSchema {
 
 const finding = { id: "R1-001", severity: "BLOCKER", location: "lib/a.ts:3", claim: "c", evidence: "e", cause: "introduced" };
 
-describe("review lens schemas", () => {
-	for (const lens of ["review-risk", "review-readability", "review-reliability", "review-resilience"]) {
+describe("review schema", () => {
+	for (const lens of ["review-4r"]) {
 		it(`${lens} accepts its findings contract`, () => {
 			const schema = schemaOf(lens);
 			assert.deepEqual(validateAgainstSchema(schema, { findings: [finding], reviewed: "patch + 3 files" }), []);
@@ -33,25 +33,6 @@ describe("review lens schemas", () => {
 
 		it(`${lens} requires evidence of what was reviewed`, () => {
 			assert.deepEqual(validateAgainstSchema(schemaOf(lens), { findings: [] }), ["$.reviewed: required"]);
-		});
-	}
-});
-
-describe("Judgment Day judge schemas", () => {
-	for (const judge of ["jd-judge-a", "jd-judge-b"]) {
-		it(`${judge} accepts discovery and re-judgment payloads`, () => {
-			const schema = schemaOf(judge);
-			assert.deepEqual(validateAgainstSchema(schema, { findings: [{ id: "JD-A-001", severity: "CRITICAL", location: "a.ts:1", claim: "c", evidence: "e" }] }), []);
-			assert.deepEqual(validateAgainstSchema(schema, { resolutions: [{ id: "JD-A-001", outcome: "verified", evidence: "e" }] }), []);
-		});
-
-		it(`${judge} rejects an empty payload, which must not read as clean`, () => {
-			assert.deepEqual(validateAgainstSchema(schemaOf(judge), {}), ["$: expected at least 1 property"]);
-			assert.deepEqual(validateAgainstSchema(schemaOf(judge), { findings: [] }), []);
-		});
-
-		it(`${judge} rejects an unknown outcome`, () => {
-			assert.equal(validateAgainstSchema(schemaOf(judge), { resolutions: [{ id: "x", outcome: "fixed", evidence: "e" }] }).length, 1);
 		});
 	}
 });

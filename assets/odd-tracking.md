@@ -49,7 +49,7 @@ Before the final answer, if any tracked task is still pending, continue it or qu
 
 ## Delivery
 
-- Work on a `type/description` feature branch (start one first when on the default branch). Commit each finished work unit automatically (load `brigadev-work-unit-commits`): one deliverable behavior with its tests and docs per commit. A high-risk unit gets its own commit.
+- Work on a `type/description` feature branch (start one first when on the default branch). Commit each finished work unit automatically (`brigadev-branch-pr`, Commits): one deliverable behavior with its tests and docs per commit. A high-risk unit gets its own commit.
 - Use ~400 authored changed lines per PR slice as a planning heuristic, never a hard cap. Never shrink code, delete comments, or drop tests to fit it.
-- When the forecast or running count exceeds ~400 lines, load `brigadev-chained-pr` and apply the feature's delivery strategy (`ask-on-risk` by default). Record slice boundaries in the document.
+- When the forecast or running count exceeds ~400 lines, follow `brigadev-branch-pr` (Oversized changes) and apply the feature's delivery strategy (`ask-on-risk` by default). Record slice boundaries in the document.
 - Push, PR creation, and merge remain human decisions.
