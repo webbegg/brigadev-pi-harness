@@ -10,6 +10,7 @@ const input = (over: Partial<ChildLaunchInput> = {}): ChildLaunchInput => ({
 	route: { model: undefined, thinking: undefined },
 	cwd: "/work/repo",
 	parentEnv: { PATH: "/usr/bin" },
+	taskText: "## Task\nmap the code",
 	...over,
 });
 
@@ -25,38 +26,43 @@ describe("childLaunch: a child can never ask for permission and hang (S0)", () =
 		["parent env says it is not a child", { parentEnv: { [CHILD_ENV.CHILD]: "0" } }],
 	];
 	for (const [name, over] of variants) {
-		// RPC mode keeps stdin open so a running child can be steered. A child extension's UI request is then answered by the
-		// parent with a cancellation (lib/child-rpc.ts), so nothing a child asks can wait for a person.
-		it(`RPC mode without a session, guard + evidence, stdin piped, no positional task, child env: ${name}`, () => {
+		// JSON mode runs the supplied prompt and exits; stdin is not connected, and a child extension's UI request has no UI
+		// to go to (the child's guard denies instead of confirming), so nothing a child asks can wait for a person.
+		it(`JSON mode without a session, guard + evidence, no stdin, child env: ${name}`, () => {
 			const { args, env, stdio } = childLaunch(input(over));
-			assert.deepEqual(args.slice(0, 3), ["--mode", "rpc", "--no-session"]);
-			assert.ok(!args.includes("json") && !args.includes("-p") && !args.includes("--print"));
+			assert.deepEqual(args.slice(0, 3), ["--mode", "json", "--no-session"]);
+			assert.ok(!args.includes("rpc") && !args.includes("-p") && !args.includes("--print"));
 			assert.ok(!args.includes("--no-extensions"), "the user's own extensions still load");
 			assert.deepEqual(pairs(args, "-e").slice(0, 2), [GUARD_EXTENSION_PATH, EVIDENCE_EXTENSION_PATH]);
-			assert.deepEqual(stdio, ["pipe", "pipe", "pipe"]);
+			assert.deepEqual(stdio, ["ignore", "pipe", "pipe"]);
 			assert.equal(env[CHILD_ENV.CHILD], "1");
 		});
 
-		it(`sends the task as an RPC prompt, never in argv (rpc.md:20): ${name}`, () => {
+		it(`the task is the only positional argument, after the option terminator: ${name}`, () => {
 			const { args } = childLaunch(input(over));
-			// Every argument is a flag or the value of a value-taking flag: no bare positional remains.
+			assert.deepEqual(args.slice(-2), ["--", "## Task\nmap the code"]);
+			// Before `--`, every argument is a flag or the value of a value-taking flag: no bare positional.
+			const options = args.slice(0, -2);
 			const valueFlags = new Set(["--mode", "-e", "--model", "--thinking", "--tools", "--append-system-prompt"]);
-			const positional = args.filter((a, i) => !a.startsWith("-") && !valueFlags.has(args[i - 1]));
-			assert.deepEqual(positional, []);
+			assert.deepEqual(options.filter((a, i) => !a.startsWith("-") && !valueFlags.has(options[i - 1])), []);
 		});
 	}
 });
 
 describe("childLaunch: arguments", () => {
-	it("ends with the system prompt flag; the task is not an argument", () => {
+	it("puts the system prompt flag before the task", () => {
 		const { args } = childLaunch(input({ systemPromptPath: "/tmp/system.md" }));
-		assert.deepEqual(args.slice(-2), ["--append-system-prompt", "/tmp/system.md"]);
+		assert.deepEqual(args.slice(-4), ["--append-system-prompt", "/tmp/system.md", "--", "## Task\nmap the code"]);
+	});
+
+	it("a task that starts with a dash or an @ is still just the message", () => {
+		assert.deepEqual(childLaunch(input({ taskText: "-p @file" })).args.slice(-2), ["--", "-p @file"]);
 	});
 
 	it("omits the system prompt flag without a prompt file", () => {
 		const { args } = childLaunch(input());
 		assert.ok(!args.includes("--append-system-prompt"));
-		assert.deepEqual(args.slice(0, 3), ["--mode", "rpc", "--no-session"]);
+		assert.deepEqual(args.slice(0, 3), ["--mode", "json", "--no-session"]);
 	});
 
 	it("passes model, thinking and agent tools", () => {

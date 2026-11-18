@@ -25,8 +25,6 @@ export interface RunResult {
 	queued?: boolean;
 	/** Settled without ever starting (aborted while queued). */
 	cancelled?: boolean;
-	/** Models that failed before this one, with the failure category. */
-	fallbacks?: string[];
 	/** Epoch ms when the run was launched (first attempt); drives the row's elapsed time. */
 	startedAt?: number;
 	/** Epoch ms when the run settled; set for aborted placeholders too. */

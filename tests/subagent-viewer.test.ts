@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { RunResult } from "../lib/child-run.ts";
 import { emptyTally } from "../lib/cost.ts";
-import { ABORT_CONFIRM_MS, ABORT_PROMPT, abortArmFor, autoScroll, buildEntries, canTakeOver, pressAbort, takeoverNotice, entryDetail, listRow, moveSelection, openTakeover, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, viewerFooter, viewerTitle, type RecordedRun, type TrackedRun, type ViewerEntry } from "../lib/subagent-viewer.ts";
+import * as viewer from "../lib/subagent-viewer.ts";
+import { autoScroll, buildEntries, entryDetail, listRow, moveSelection, resolveSelection, scrollView, VIEWER_FOOTER, viewerTitle, type RecordedRun, type TrackedRun } from "../lib/subagent-viewer.ts";
 
 const NOW = 1_000_000;
 const result = (over: Partial<RunResult> = {}): RunResult => ({ agent: "scout", task: "map the code", exitCode: 0, messages: [], stderr: "", usage: emptyTally(), stopReason: "stop", ...over });
@@ -207,7 +208,7 @@ describe("selection survives live updates", () => {
 	});
 });
 
-describe("entryDetail: messages sent to the child show once in the transcript (S4)", () => {
+describe("entryDetail: user messages after the task show once in the transcript", () => {
 	const entry = (r: RunResult) => buildEntries({ tracked: [tracked("x", r)], recorded: [], now: NOW })[0];
 	const said = (text: string) => ({ role: "assistant", content: [{ type: "text", text }] });
 	const texts = (r: RunResult, width = 60) => entryDetail(entry(r), width).map((row) => row.text);
@@ -239,126 +240,10 @@ describe("entryDetail: messages sent to the child show once in the transcript (S
 	});
 });
 
-describe("takeover: steer, follow up, abort (pure state)", () => {
-	const entryOf = (r: RunResult): ViewerEntry => buildEntries({ tracked: [tracked("x", r)], recorded: [], now: NOW })[0];
-
-	it("only a running run with a live handle can be taken over", () => {
-		assert.equal(canTakeOver(entryOf(runningRun()), true), true);
-		assert.equal(canTakeOver(entryOf(runningRun()), false), false, "no handle: the child is finished or not started");
-		assert.equal(canTakeOver(entryOf(queuedRun()), true), false);
-		assert.equal(canTakeOver(entryOf(doneRun()), true), false, "finished runs are not restarted");
-		assert.equal(canTakeOver(entryOf(doneRun({ exitCode: 1 })), true), false);
-		assert.equal(canTakeOver(undefined, true), false);
-	});
-
-	it("opening starts an empty input for that run; nothing opens for a run that cannot be taken over", () => {
-		assert.deepEqual(openTakeover(entryOf(runningRun()), true), { key: "x", text: "" });
-		assert.equal(openTakeover(entryOf(doneRun()), true), undefined);
-		assert.equal(openTakeover(entryOf(runningRun()), false), undefined);
-	});
-
-	it("a streaming child is steered, an idle one is followed up", () => {
-		assert.equal(takeoverKind(true), "steer");
-		assert.equal(takeoverKind(false), "follow_up");
-	});
-
-	it("typing appends, backspace removes one character, ctrl+u clears", () => {
-		let state = { key: "x", text: "" };
-		state = takeoverKey(state, { kind: "text", text: "hel" }).state!;
-		state = takeoverKey(state, { kind: "text", text: "lo" }).state!;
-		assert.equal(state.text, "hello");
-		assert.equal(takeoverKey(state, { kind: "backspace" }).state!.text, "hell");
-		assert.equal(takeoverKey({ key: "x", text: "" }, { kind: "backspace" }).state!.text, "");
-		assert.equal(takeoverKey({ key: "x", text: "a😀" }, { kind: "backspace" }).state!.text, "a", "one character, not half a surrogate pair");
-		assert.equal(takeoverKey(state, { kind: "clear" }).state!.text, "");
-	});
-
-	it("the input is bounded", () => {
-		const long = takeoverKey({ key: "x", text: "a".repeat(1990) }, { kind: "text", text: "b".repeat(50) }).state!;
-		assert.equal(long.text.length, 2000);
-	});
-
-	it("submit hands the trimmed text out and closes the input; blank text stays open", () => {
-		assert.deepEqual(takeoverKey({ key: "x", text: "  go left " }, { kind: "submit" }), { submit: "go left" });
-		assert.deepEqual(takeoverKey({ key: "x", text: "   " }, { kind: "submit" }), { state: { key: "x", text: "   " } });
-	});
-
-	it("cancel closes the input without sending anything", () => {
-		assert.deepEqual(takeoverKey({ key: "x", text: "draft" }, { kind: "cancel" }), {});
-	});
-
-	it("printableText accepts typed and pasted text, and rejects control sequences", () => {
-		assert.equal(printableText("a"), "a");
-		assert.equal(printableText("héllo wörld"), "héllo wörld");
-		assert.equal(printableText("line one\nline two"), "line one line two", "a pasted newline does not send");
-		assert.equal(printableText("a\r\nb"), "a b");
-		assert.equal(printableText("\x1b[A"), undefined, "an arrow key");
-		assert.equal(printableText("\x03"), undefined, "ctrl+c");
-		assert.equal(printableText("\t"), undefined);
-		assert.equal(printableText(""), undefined);
-	});
-
-	it("the footer shows the input line with what it will send, keeping the end of long text visible", () => {
-		assert.equal(takeoverFooter({ key: "x", text: "go left" }, "steer", 80), "steer › go left▍ · enter send · esc back");
-		assert.equal(takeoverFooter({ key: "x", text: "" }, "follow_up", 80), "follow-up › ▍ · enter send · esc back");
-		const narrow = takeoverFooter({ key: "x", text: "0123456789abcdefghij" }, "steer", 40);
-		assert.ok(narrow.length <= 39, "one column is left for the footer's indent");
-		assert.ok(narrow.includes("…fghij▍"), narrow);
-	});
-
-	it("the notice reports what Pi answered, not that the write succeeded", () => {
-		assert.equal(takeoverNotice("steer", { status: "accepted", disposition: "queued" }), "Steering message accepted by Pi (queued)");
-		assert.equal(takeoverNotice("follow_up", { status: "accepted", disposition: "queued" }), "Follow-up accepted by Pi (queued)");
-		assert.equal(takeoverNotice("steer", { status: "accepted", disposition: "handled" }), "Steering message accepted by Pi (handled)");
-		assert.equal(takeoverNotice("follow_up", { status: "accepted" }), "Follow-up accepted by Pi");
-		assert.equal(takeoverNotice("steer", { status: "rejected", error: "Agent is not running" }), "Pi rejected the steering message: Agent is not running");
-		assert.equal(takeoverNotice("follow_up", { status: "rejected", error: "nope" }), "Pi rejected the follow-up: nope");
-		assert.equal(takeoverNotice("steer", { status: "not_delivered" }), "Not delivered: the run ended before Pi answered");
-	});
-
-	it("the key hints list steering and abort only where they work", () => {
-		assert.ok(!viewerFooter(false).includes("steer"));
-		assert.ok(viewerFooter(true).includes("enter steer") && viewerFooter(true).includes("x abort"));
-		assert.ok(viewerFooter(false).includes("q close") && viewerFooter(true).includes("q close"));
-	});
-});
-
-describe("abort needs `x` twice on the same run within 3 s (pure state, injected clock)", () => {
-	it("the first x arms and does not abort; the footer asks for a second", () => {
-		assert.equal(ABORT_CONFIRM_MS, 3000);
-		assert.equal(ABORT_PROMPT, "press x again to abort");
-		assert.deepEqual(pressAbort(undefined, "L1:0", 100), { abort: false, armed: { key: "L1:0", at: 100 } });
-	});
-
-	it("a second x on the same run within 3 s aborts and disarms", () => {
-		const armed = pressAbort(undefined, "L1:0", 100).armed;
-		assert.deepEqual(pressAbort(armed, "L1:0", 100 + 3000), { abort: true }, "3 s exactly is still within");
-		assert.deepEqual(pressAbort(armed, "L1:0", 101), { abort: true });
-	});
-
-	it("a second x after the timeout only re-arms", () => {
-		const armed = pressAbort(undefined, "L1:0", 100).armed;
-		assert.deepEqual(pressAbort(armed, "L1:0", 100 + 3001), { abort: false, armed: { key: "L1:0", at: 3101 } });
-	});
-
-	it("an x on another run arms that run instead of aborting", () => {
-		const armed = pressAbort(undefined, "L1:0", 100).armed;
-		assert.deepEqual(pressAbort(armed, "L1:1", 200), { abort: false, armed: { key: "L1:1", at: 200 } });
-	});
-
-	it("abortArmFor shows the arm only for the selected run and only until the timeout (selection change or timeout disarm)", () => {
-		const armed = { key: "L1:0", at: 100 };
-		assert.deepEqual(abortArmFor(armed, "L1:0", 100 + 3000), armed);
-		assert.equal(abortArmFor(armed, "L1:0", 100 + 3001), undefined, "timeout");
-		assert.equal(abortArmFor(armed, "L1:1", 200), undefined, "selection changed");
-		assert.equal(abortArmFor(armed, undefined, 200), undefined, "nothing selected");
-		assert.equal(abortArmFor(undefined, "L1:0", 200), undefined);
-	});
-
-	it("a selection change disarms for good: coming back to the run needs the first x again", () => {
-		let armed: ReturnType<typeof pressAbort>["armed"] = pressAbort(undefined, "L1:0", 100).armed;
-		// the viewer re-reads the arm for the selected run on every key and keeps what it returns
-		armed = abortArmFor(armed, "L1:1", 200);
-		assert.equal(pressAbort(abortArmFor(armed, "L1:0", 300), "L1:0", 300).abort, false);
+describe("the viewer is read-only", () => {
+	it("its key hints name no steering or abort control, and the module exports none", () => {
+		assert.equal(VIEWER_FOOTER, "j/k run · space/J/K scroll · g/G top/end · F thread only · q close");
+		assert.ok(!/steer|abort|follow/i.test(VIEWER_FOOTER));
+		assert.deepEqual(Object.keys(viewer).filter((name) => /takeover|abort|steer/i.test(name)), []);
 	});
 });

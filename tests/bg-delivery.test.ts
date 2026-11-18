@@ -1,11 +1,10 @@
 // lib/bg-delivery.ts: the exit notice of a background process reaches the session once, when idle, batched,
-// and never after the model already saw the exit (same rule as async subagent results, lib/result-delivery.ts).
+// and never after the model already saw the exit.
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { BgSnapshot } from "../lib/bg-processes.ts";
-import { BG_EXIT_MESSAGE_TYPE, bgExitMessage, createBgDelivery } from "../lib/bg-delivery.ts";
-import { DELIVERY_ATTEMPTS } from "../lib/result-delivery.ts";
+import { BG_EXIT_MESSAGE_TYPE, bgExitMessage, createBgDelivery, DELIVERY_ATTEMPTS } from "../lib/bg-delivery.ts";
 
 const snap = (id: string, overrides: Partial<BgSnapshot> = {}): BgSnapshot => ({
 	id,

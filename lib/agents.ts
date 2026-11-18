@@ -1,6 +1,5 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { budgetMinutesOf } from "./run-budget.ts";
 
 export type AgentSource = "package" | "user" | "project";
 
@@ -16,8 +15,6 @@ export interface AgentDefinition {
 	admission?: "risk";
 	/** Absolute path of the JSON Schema the agent's result must match (frontmatter `output`, relative to the agent file). */
 	outputSchema?: string;
-	/** Wall-clock minutes before the run is asked to wrap up (frontmatter `budgetMinutes`; see lib/run-budget.ts). */
-	budgetMinutes?: number;
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
@@ -52,7 +49,6 @@ export function parseAgent(content: string, filePath: string, source: AgentSourc
 		writer: frontmatter.writer === true,
 		admission: frontmatter.admission === "risk" ? "risk" : undefined,
 		outputSchema: outputSchemaPath(frontmatter.output, filePath),
-		budgetMinutes: budgetMinutesOf(frontmatter.budgetMinutes),
 		systemPrompt: body,
 		source,
 		filePath,

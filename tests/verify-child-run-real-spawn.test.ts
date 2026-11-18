@@ -5,10 +5,9 @@ import * as path from "node:path";
 import { it } from "node:test";
 import { output, runChild, type RunOptions } from "../lib/child-run.ts";
 
-// A fake `pi --mode rpc`: reads JSONL commands from stdin, answers the prompt, streams events, and exits when stdin closes.
-//  - ok:      answers the prompt, then settles (the parent must close stdin for the child to exit)
-//  - hang:    accepts the prompt and never finishes (abort test)
-//  - confirm: sends an extension UI confirm request and blocks until it is answered; the answer is logged to FAKE_LOG
+// A fake `pi --mode json`: the task is the last argv entry, events stream on stdout, and it exits when the run is over.
+//  - ok:      answers the task, settles, and exits on its own
+//  - hang:    starts the run and never finishes (abort test)
 //  - stubborn: like hang, but ignores SIGTERM and starts a `sleep` in a process group of its own (as a bash tool does); its pid goes to FAKE_LOG
 const FAKE_PI = `import * as fs from "node:fs";
 import { spawn } from "node:child_process";
@@ -20,37 +19,17 @@ const finish = (text) => {
 	line({ type: "agent_end", messages: [], willRetry: false });
 	line({ type: "agent_settled", aborted: false });
 };
-const onCommand = (command) => {
-	if (command.type === "prompt") {
-		line({ type: "response", command: "prompt", success: true, data: { disposition: "started" } });
-		if (mode === "hang") return setInterval(() => {}, 1000);
-		if (mode === "stubborn") {
-			process.on("SIGTERM", () => {});
-			const tool = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
-			tool.unref();
-			fs.writeFileSync(process.env.FAKE_LOG, String(tool.pid));
-			return setInterval(() => {}, 1000);
-		}
-		if (mode === "confirm") return line({ type: "extension_ui_request", id: "ui-1", method: "confirm", title: "Allow rm -rf?", message: "really" });
-		return finish("real child answer");
-	}
-	if (command.type === "extension_ui_response") {
-		fs.writeFileSync(process.env.FAKE_LOG, JSON.stringify(command));
-		return finish(command.cancelled === true ? "cancelled, carried on" : "was answered by someone");
-	}
-};
-let buffer = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => {
-	buffer += chunk;
-	let at;
-	while ((at = buffer.indexOf("\\n")) >= 0) {
-		const text = buffer.slice(0, at);
-		buffer = buffer.slice(at + 1);
-		if (text.trim()) onCommand(JSON.parse(text));
-	}
-});
-process.stdin.on("end", () => process.exit(0));
+line({ type: "session", version: 3, id: "s", timestamp: "t", cwd: process.cwd() });
+const task = process.argv.at(-1);
+if (process.argv.at(-2) !== "--" || !task.startsWith("## Task")) process.exit(3);
+if (mode === "hang") setInterval(() => {}, 1000);
+else if (mode === "stubborn") {
+	process.on("SIGTERM", () => {});
+	const tool = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+	tool.unref();
+	fs.writeFileSync(process.env.FAKE_LOG, String(tool.pid));
+	setInterval(() => {}, 1000);
+} else finish("real child answer");
 `;
 
 function setup(mode: string, signal?: AbortSignal, spawn?: any, extraEnv: Record<string, string> = {}) {
@@ -73,7 +52,7 @@ function setup(mode: string, signal?: AbortSignal, spawn?: any, extraEnv: Record
 		signal,
 		onUpdate: () => {},
 	};
-	const p = runChild(options, { ...(spawn ? { spawn } : {}), piInvocation: (args) => ({ command: process.execPath, args: [fakePi, ...args] }), env: { PATH: process.env.PATH, FAKE_MODE: mode, FAKE_LOG: path.join(root, "ui-response.json"), ...extraEnv }, tmpRoot, docsDir: () => docs });
+	const p = runChild(options, { ...(spawn ? { spawn } : {}), piInvocation: (args) => ({ command: process.execPath, args: [fakePi, ...args] }), env: { PATH: process.env.PATH, FAKE_MODE: mode, FAKE_LOG: path.join(root, "tool-pid"), ...extraEnv }, tmpRoot, docsDir: () => docs });
 	p.catch(() => undefined);
 	return { p, tmpRoot, docs, root };
 }
@@ -104,7 +83,7 @@ it("default node spawn: aborting a running child rejects after SIGTERM and still
 it("S5, default node spawn: a child that ignores SIGTERM is SIGKILLed after the grace and so is its tool command in another process group", { timeout: 20_000, skip: process.platform === "win32" }, async () => {
 	const ac = new AbortController();
 	const { p, root } = setup("stubborn", ac.signal);
-	const pidFile = path.join(root, "ui-response.json");
+	const pidFile = path.join(root, "tool-pid");
 	let toolPid = 0;
 	try {
 		for (let i = 0; i < 100 && !toolPid; i++) {
@@ -136,15 +115,12 @@ it("S5, default node spawn: a child that ignores SIGTERM is SIGKILLed after the 
 	}
 });
 
-it("S0, default node spawn: a child that blocks on an extension UI confirm is answered with a cancellation and the run completes", { timeout: 15_000 }, async () => {
-	// The stall watchdog is the backstop: if the parent did not answer, the run would end as an error, not hang the suite.
-	const { p, root } = setup("confirm", undefined, undefined, { BRIGADEV_STALL_TIMEOUT_MS: "8000" });
+it("a silent real child is stopped by the stall watchdog, the only timer", { timeout: 15_000 }, async () => {
+	const { p, root } = setup("hang", undefined, undefined, { BRIGADEV_STALL_TIMEOUT_MS: "600" });
 	const r = await p;
-	assert.equal(r.exitCode, 0);
-	assert.equal(r.stopReason, "stop");
-	assert.equal(output(r), "cancelled, carried on");
-	assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, "ui-response.json"), "utf8")), { type: "extension_ui_response", id: "ui-1", cancelled: true });
-	assert.equal(r.messages.length, 1, "the request and its answer are not transcript messages");
+	assert.equal(r.stopReason, "error");
+	assert.match(r.errorMessage ?? "", /^stalled for /);
+	assert.ok(r.exitCode > 0);
 	fs.rmSync(root, { recursive: true, force: true });
 });
 

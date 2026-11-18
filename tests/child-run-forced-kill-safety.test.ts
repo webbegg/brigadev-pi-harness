@@ -66,16 +66,11 @@ describe("descendantTargets safety (S5)", () => {
 const STUBBORN = `import * as fs from "node:fs";
 import { spawn } from "node:child_process";
 process.on("SIGTERM", () => {});
-let buf = "";
-process.stdin.on("data", (c) => {
-	buf += c;
-	if (!buf.includes('"prompt"')) return;
-	const a = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
-	const b = spawn("sh", ["-c", "sleep 61 & echo $! > \\"$1\\"; wait", "sh", process.env.FAKE_LOG + ".nested"], { detached: true, stdio: "ignore" });
-	a.unref(); b.unref();
-	setTimeout(() => fs.writeFileSync(process.env.FAKE_LOG, JSON.stringify([process.pid, a.pid, b.pid])), 300);
-	setInterval(() => {}, 1000);
-});
+const a = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+const b = spawn("sh", ["-c", "sleep 61 & echo $! > \\"$1\\"; wait", "sh", process.env.FAKE_LOG + ".nested"], { detached: true, stdio: "ignore" });
+a.unref(); b.unref();
+setTimeout(() => fs.writeFileSync(process.env.FAKE_LOG, JSON.stringify([process.pid, a.pid, b.pid])), 300);
+setInterval(() => {}, 1000);
 `;
 const PARENT = (lib: string, fake: string, log: string, out: string) => `import * as fs from "node:fs";
 const { runChild, installParentExitGuard, liveChildren } = await import(${JSON.stringify(lib)});

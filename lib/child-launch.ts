@@ -1,12 +1,10 @@
 // How a subagent child process is launched: argv, environment, and stdio.
-// One pure function for every launch (sync and async), so the no-prompt rule is
-// stated in one place: a child never asks for permission and hangs. It runs
-// Pi's RPC mode (`--mode rpc --no-session`, stdin piped so a running child can be
-// steered), with the guard extension (which denies instead of confirming for
-// children) and the evidence extension. RPC lets a child's extensions send UI
-// requests and wait for an answer; lib/child-run.ts answers every one with the
-// cancellation response (lib/child-rpc.ts), so no child waits for a person.
-// The task is not an argument: the run loop sends it as the RPC `prompt` command.
+// One pure function for every launch, so the no-prompt rule is stated in one
+// place: a child never asks for permission and hangs. It runs Pi's JSON event
+// stream mode (`--mode json --no-session`; docs/json.md, docs/cli.md): the task is
+// the message, stdin is not connected, and Pi exits after the run, so nothing can
+// wait for a person. The guard extension (which denies instead of confirming for
+// children) and the evidence extension load with it.
 
 import { DSP_LOCK_ENV, parentDspLock } from "./dsp-credlock.ts";
 import { CHILD_ENV, EVIDENCE_EXTENSION_PATH, GUARD_EXTENSION_PATH, STRUCTURED_OUTPUT_EXTENSION_PATH } from "./runtime.ts";
@@ -22,25 +20,28 @@ export interface ChildLaunchInput {
 	cwd: string;
 	/** Temp file holding the agent's system prompt, when it has one. */
 	systemPromptPath?: string;
+	/** The task: the message of the run, passed after `--` so it can start with a dash. */
+	taskText: string;
 	parentEnv: NodeJS.ProcessEnv;
 }
 
 export interface ChildLaunch {
 	args: string[];
 	env: NodeJS.ProcessEnv;
-	stdio: ["pipe", "pipe", "pipe"];
+	stdio: ["ignore", "pipe", "pipe"];
 }
 
 export function childLaunch(input: ChildLaunchInput): ChildLaunch {
 	const { agent, route } = input;
 	const structured = Boolean(input.structured && agent.outputSchema);
 
-	const args = ["--mode", "rpc", "--no-session", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
+	const args = ["--mode", "json", "--no-session", "-e", GUARD_EXTENSION_PATH, "-e", EVIDENCE_EXTENSION_PATH];
 	if (structured) args.push("-e", STRUCTURED_OUTPUT_EXTENSION_PATH);
 	if (route.model) args.push("--model", route.model);
 	if (route.thinking) args.push("--thinking", route.thinking);
 	if (agent.tools?.length) args.push("--tools", [...agent.tools, ...(structured ? [STRUCTURED_OUTPUT_TOOL] : [])].join(","));
 	if (input.systemPromptPath) args.push("--append-system-prompt", input.systemPromptPath);
+	args.push("--", input.taskText);
 
 	const env: NodeJS.ProcessEnv = {
 		...input.parentEnv,
@@ -58,5 +59,5 @@ export function childLaunch(input: ChildLaunchInput): ChildLaunch {
 	// environment keeps the provider keys it needs; see lib/dsp-credlock.ts). A marker the parent itself carries (a nested child) stays.
 	if (parentDspLock()) env[DSP_LOCK_ENV] = "1";
 
-	return { args, env, stdio: ["pipe", "pipe", "pipe"] };
+	return { args, env, stdio: ["ignore", "pipe", "pipe"] };
 }
