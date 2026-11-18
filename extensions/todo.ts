@@ -15,7 +15,6 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { panelState } from "../lib/panel-state.ts";
 import { isChildSession } from "../lib/runtime.ts";
 import { changedIds, isOpen, TODO_GLYPH as GLYPH, TODO_STATUSES as STATUSES, todoCard, todoDeltaLine, type Todo, type TodoStatus as Status } from "../lib/todo-card.ts";
 
@@ -62,7 +61,6 @@ export default function (pi: ExtensionAPI) {
 	let updatedThisRun = false;
 
 	const refreshWidget = (ctx: ExtensionContext) => {
-		panelState().publish("todos", todos.map((t) => ({ ...t })));
 		if (!ctx.hasUI) return;
 		const card = todoCard(todos, { collapsed, staleRuns });
 		if (!card) {

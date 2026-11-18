@@ -90,9 +90,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_end", async () => requestRender?.());
 
 	pi.registerCommand("brigadev:ui", {
-		description: "Toggle brigadev UI: footer on|off, phase on|off, dashboard on|off",
+		description: "Toggle the brigadev footer: footer on|off",
 		getArgumentCompletions: (prefix) => {
-			const items = ["footer on", "footer off", "phase on", "phase off", "dashboard on", "dashboard off"].filter((v) => v.startsWith(prefix)).map((value) => ({ value, label: value }));
+			const items = ["footer on", "footer off"].filter((v) => v.startsWith(prefix)).map((value) => ({ value, label: value }));
 			return items.length ? items : null;
 		},
 		handler: async (args, ctx) => {
