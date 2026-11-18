@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+- Subagent run budget: a new optional agent frontmatter field, `budgetMinutes: <n>`. Once the budget is spent the child is asked once to wrap up (steer during a turn, follow-up between turns) and return what it has. A child still without a result `BRIGADEV_WRAP_UP_GRACE_MS` later (3 min by default) is stopped and fails with `over budget: ...`; that failure never falls back to another model. `BRIGADEV_RUN_BUDGET=off` disables every budget. Agents without the field are unchanged.
+- `brigadev-verify` has a 10 min budget and a scoped probe plan: it reads files with the file tools, sets up the scratch copy once and reuses one probe script, writes about one probe per `S#` and per risk item, and returns at once when it is asked to wrap up, listing the checks it did not run as unverified. Recent verify runs took 3.5–38 min with 38–63 `bash` calls.
+
 ## [0.19.0] - 2026-11-17
 
 - DSP: a test runner (`node --test`, `vitest`, `jest`, `mocha`, `ava`, `tap`, `pytest`/`python -m pytest`, `go test`, `cargo test`, as a bare name or `node_modules/.bin/<runner>`) no longer asks when its remote findings come only from the files it loads (test files and their imports that mention `git push`, `gh` or credential files as fixtures); it runs without credentials and is recorded in the audit log as `test-runner-locked`. A package script (`npm test`, ...) is read like a command line: its own text and non-runner segments (`"pretest": "git push"`, `"test": "node deploy.js"`) still ask, and only the files its runner segments load are exempt. A push typed in the command line, a file named like a runner (`./jest`), the runner's own head file, `python deploy.py -m pytest` (the flag belongs to the script), or a script that is not a test runner still asks. Known gap: the text layer does not ask about files a test runner loads, so a loaded file that reads credentials the lock does not hide (`~/.netrc`, an `ssh -i` key, a project `.env`) is not caught.

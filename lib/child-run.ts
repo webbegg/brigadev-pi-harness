@@ -31,6 +31,7 @@ import { repoDocsDir } from "./repo-docs.ts";
 import { newRunId, writeRunArtifacts } from "./run-artifacts.ts";
 import { failed, output, type RunResult } from "./run-status.ts";
 import { createStallWatchdog, resolveStallTimeouts, stallMessage } from "./stall-watchdog.ts";
+import { overBudgetMessage, resolveRunBudget, wrapUpMessage } from "./run-budget.ts";
 import { checkStructuredRun, type JsonSchema } from "./structured-output.ts";
 
 /** Grace between SIGTERM and SIGKILL when a child ignores the terminate request. */
@@ -469,6 +470,9 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 		let lastPartialUpdate = Number.NEGATIVE_INFINITY;
 		let aborted = false;
 		let stalled = false;
+		// The run budget ran out and the child returned nothing within the wrap-up grace.
+		let overBudget = false;
+		const budget = resolveRunBudget(agent.budgetMinutes, env);
 		// The user aborted this child from the viewer (the RPC `abort`); the run settles as aborted instead of throwing.
 		let userAborted = false;
 		let controlGiven = false;
@@ -494,6 +498,9 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			let done = false;
 			let closeTimer: unknown;
 			let stallError = "";
+			let budgetError = "";
+			let budgetTimer: unknown;
+			let wrapUpTimer: unknown;
 			let killTimer: unknown;
 			let abortTimer: unknown;
 			let exitTimer: unknown;
@@ -534,6 +541,12 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				commands.settleAll();
 			});
 
+			const stopBudget = () => {
+				if (budgetTimer !== undefined) clearTimer(budgetTimer);
+				if (wrapUpTimer !== undefined) clearTimer(wrapUpTimer);
+				budgetTimer = wrapUpTimer = undefined;
+			};
+
 			// SIGTERM now, SIGKILL after the grace period if the child has not exited by then.
 			const terminate = () => {
 				signalChild("SIGTERM");
@@ -545,6 +558,8 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				setTimer,
 				clearTimer,
 				onStall: (info) => {
+					// The budget already stopped this child: that stays the cause.
+					if (overBudget) return;
 					stalled = true;
 					result.stopReason = "error";
 					stallError = stallMessage(info);
@@ -561,6 +576,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				finished = { stopReason: result.stopReason, errorMessage: result.errorMessage, messages: result.messages.length };
 				endInput();
 				watchdog.stop();
+				stopBudget();
 				exitTimer = setTimer(() => {
 					if (exited) return;
 					forcedExit = true;
@@ -582,6 +598,25 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			send({ type: "prompt", message: options.taskText });
 			controlGiven = true;
 			hook(() => options.onControl?.(control));
+
+			// Budget spent: one wrap-up request (steer mid-turn, follow-up between turns), then a bounded wait for the result.
+			if (budget) {
+				budgetTimer = setTimer(() => {
+					budgetTimer = undefined;
+					// Already stopping for another cause (settled, exited, stalled, aborted by the user): that cause stands.
+					if (finished || exited || stalled || userAborted) return;
+					const text = wrapUpMessage(agent.budgetMinutes!);
+					void (streaming ? control.steer(text) : control.followUp(text)).catch(() => undefined);
+					wrapUpTimer = setTimer(() => {
+						wrapUpTimer = undefined;
+						if (finished || exited || stalled || userAborted) return;
+						overBudget = true;
+						budgetError = overBudgetMessage(agent.budgetMinutes!, budget.graceMs);
+						Object.assign(result, { stopReason: "error", errorMessage: budgetError });
+						terminate();
+					}, budget.graceMs);
+				}, budget.budgetMs);
+			}
 
 			const processLine = (line: string) => {
 				for (const event of parseChildLine(line)) {
@@ -638,6 +673,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				inputOpen = false;
 				commands.settleAll();
 				watchdog.stop();
+				stopBudget();
 				if (killTimer !== undefined) clearTimer(killTimer);
 				if (abortTimer !== undefined) clearTimer(abortTimer);
 				if (exitTimer !== undefined) clearTimer(exitTimer);
@@ -661,13 +697,14 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				if (userAborted) Object.assign(result, { stopReason: "aborted", errorMessage: "Aborted by the user" });
 				// The child may report its own "aborted" on SIGTERM; the stall is the real cause.
 				if (stalled) Object.assign(result, { stopReason: "error", errorMessage: stallError });
+				if (overBudget) Object.assign(result, { stopReason: "error", errorMessage: budgetError });
 				// Our own shutdown of a finished child is not its outcome: drop what it said on the way out and its exit code.
 				if (forcedExit && finished) {
 					result.messages.length = finished.messages;
 					Object.assign(result, { stopReason: finished.stopReason, errorMessage: finished.errorMessage });
 				}
 				release();
-				resolveExit(stalled ? 1 : forcedExit ? 0 : (code ?? 0));
+				resolveExit(stalled || overBudget ? 1 : forcedExit ? 0 : (code ?? 0));
 			};
 			proc.on("close", settle);
 			// The child exited: it needs no more signals. Its output normally follows in `close`, but a grandchild that

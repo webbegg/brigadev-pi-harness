@@ -5,7 +5,8 @@
 
 export type FailureCategory = "quota" | "auth" | "rate_limit" | "provider_unavailable" | "timeout" | "network";
 
-const NO_FALLBACK = [/context (length|window)|too many tokens|prompt is too long|maximum context/i, /invalid_request|invalid request/i];
+// An over-budget stop (lib/run-budget.ts) carries minute counts that could read as a status code: it never falls back.
+const NO_FALLBACK = [/^over budget: /, /context (length|window)|too many tokens|prompt is too long|maximum context/i, /invalid_request|invalid request/i];
 const CATEGORIES: Array<[FailureCategory, RegExp]> = [
 	["quota", /quota exceeded|usage limit|exceeded your (current )?quota|credit balance|insufficient_quota|billing|subscription rate limit|rate limit \((five_hour|seven_day)/i],
 	["auth", /\b401\b|\b403\b|unauthori[sz]ed|authentication|invalid (api )?key|oauth|not logged in|please (log|sign) in/i],
