@@ -1,0 +1,8 @@
+{"v":1,"type":"run","ts":"2026-11-01T08:00:00.000Z","branch":"main","cwd":"/work/demo","agent":"parent","command":"npm test","kind":"test","exitCode":1,"outcome":"fail","tail":""}
+{"v":1,"type":"run","ts":"2026-11-10T10:00:31.000Z","branch":"main","cwd":"/work/demo","agent":"parent","command":"npm test","kind":"test","exitCode":0,"outcome":"pass","tail":""}
+{"v":1,"type":"run","ts":"2026-11-10T10:05:00.000Z","branch":"main","cwd":"/work/demo","agent":"parent","command":"npm test","kind":"test","exitCode":1,"outcome":"fail","tail":""}
+{"v":1,"type":"run","ts":"2026-11-10T10:06:00.000Z","branch":"main","cwd":"/work/demo","agent":"parent","command":"npm test | tee","kind":"test","outcome":"unknown","tail":""}
+{"v":1,"type":"run","ts":"2026-11-12T09:00:20.000Z","branch":"main","cwd":"/work/demo","agent":"parent","command":"npm test","kind":"test","exitCode":0,"outcome":"pass","tail":""}
+{"v":1,"type":"force","ts":"2026-11-10T11:30:15.000Z","branch":"main","via":"dialog","command":"git commit -m fix"}
+{"v":1,"type":"force","ts":"2026-11-01T08:30:00.000Z","branch":"main","via":"command","command":"git commit -m old"}
+not json
