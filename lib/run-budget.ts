@@ -34,6 +34,33 @@ const minutes = (ms: number) => Math.round((ms / 60_000) * 10) / 10;
 export const wrapUpMessage = (budgetMinutes: number): string =>
 	`[brigadev runtime] Your ${budgetMinutes} min run budget is spent. Start no new work. In your next turn, return your result now (through structured_output when your instructions require it) with what you have established, and list everything you did not get to as unverified or not done.`;
 
+/** What became of the wrap-up request: the over-budget failure says whether the child ever got it. */
+export type WrapUpDelivery =
+	| { state: "accepted" }
+	| { state: "held" }
+	| { state: "sent" }
+	| { state: "not_delivered" }
+	| { state: "rejected"; error: string };
+
+const undelivered = (delivery: WrapUpDelivery): string | undefined => {
+	switch (delivery.state) {
+		case "accepted":
+			return undefined;
+		case "held":
+			return "the wrap-up request was never sent: the child started no turn";
+		case "sent":
+			return "the child never acknowledged the wrap-up request";
+		case "not_delivered":
+			return "the wrap-up request was not delivered: the child's input was closed";
+		case "rejected":
+			return `the child rejected the wrap-up request: ${delivery.error}`;
+	}
+};
+
 /** Never retried on another model (lib/fallback.ts): a second model would run just as long. */
-export const overBudgetMessage = (budgetMinutes: number, graceMs: number): string =>
-	`${OVER_BUDGET_PREFIX}no result ${minutes(graceMs)} min after the ${budgetMinutes} min wrap-up request`;
+export const overBudgetMessage = (budgetMinutes: number, graceMs: number, delivery: WrapUpDelivery = { state: "accepted" }): string => {
+	const reason = undelivered(delivery);
+	return reason
+		? `${OVER_BUDGET_PREFIX}no result ${minutes(graceMs)} min after the ${budgetMinutes} min budget; ${reason}`
+		: `${OVER_BUDGET_PREFIX}no result ${minutes(graceMs)} min after the ${budgetMinutes} min wrap-up request`;
+};

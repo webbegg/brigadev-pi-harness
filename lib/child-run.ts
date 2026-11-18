@@ -22,7 +22,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import type { AgentDefinition } from "./agents.ts";
 import { foldChildEvent, parseChildLine } from "./child-events.ts";
 import { childLaunch } from "./child-launch.ts";
-import { answerUiRequest, createChildControl, createCommandTracker, encodeCommand, type ChildControl, type RpcCommand, type UiResponse } from "./child-rpc.ts";
+import { answerUiRequest, createChildControl, createCommandTracker, encodeCommand, type ChildControl, type CommandOutcome, type RpcCommand, type UiResponse } from "./child-rpc.ts";
 import { emptyTally, priceBridgeMessage, type CostCalculator } from "./cost.ts";
 import type { LaunchRequest } from "./delegation.ts";
 import type { ResolvedRoute } from "./model-routing.ts";
@@ -31,7 +31,7 @@ import { repoDocsDir } from "./repo-docs.ts";
 import { newRunId, writeRunArtifacts } from "./run-artifacts.ts";
 import { failed, output, type RunResult } from "./run-status.ts";
 import { createStallWatchdog, resolveStallTimeouts, stallMessage } from "./stall-watchdog.ts";
-import { overBudgetMessage, resolveRunBudget, wrapUpMessage } from "./run-budget.ts";
+import { overBudgetMessage, resolveRunBudget, wrapUpMessage, type WrapUpDelivery } from "./run-budget.ts";
 import { checkStructuredRun, type JsonSchema } from "./structured-output.ts";
 
 /** Grace between SIGTERM and SIGKILL when a child ignores the terminate request. */
@@ -501,6 +501,8 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			let budgetError = "";
 			let budgetTimer: unknown;
 			let wrapUpTimer: unknown;
+			// Set once the budget is spent: what became of the wrap-up request.
+			let wrapUp: WrapUpDelivery | undefined;
 			let killTimer: unknown;
 			let abortTimer: unknown;
 			let exitTimer: unknown;
@@ -599,19 +601,37 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			controlGiven = true;
 			hook(() => options.onControl?.(control));
 
-			// Budget spent: one wrap-up request (steer mid-turn, follow-up between turns), then a bounded wait for the result.
+			// Already stopping (settled, exited, stalled, over budget, aborted by the user or the signal): no wrap-up, no second stop.
+			const stopping = () => Boolean(finished) || exited || stalled || overBudget || userAborted || aborted;
+			// The wrap-up is steered into a running turn. Between turns it is held for the next one: a follow-up would only be
+			// read once the whole run ends (rpc-commands.md, `follow_up`). A steer the child rejects falls back to one follow-up.
+			const sendWrapUp = () => {
+				const text = wrapUpMessage(agent.budgetMinutes!);
+				wrapUp = { state: "sent" };
+				const record = (outcome: CommandOutcome) => {
+					wrapUp = outcome.status === "accepted" ? { state: "accepted" } : outcome.status === "rejected" ? { state: "rejected", error: outcome.error } : { state: "not_delivered" };
+				};
+				void control
+					.steer(text)
+					.then((outcome) => (outcome.status === "rejected" && !stopping() ? control.followUp(text) : outcome))
+					.then(record, () => undefined);
+			};
+			const onTurnStart = () => {
+				if (wrapUp?.state === "held" && !stopping()) sendWrapUp();
+			};
+
+			// Budget spent: one wrap-up request, then a bounded wait for the result.
 			if (budget) {
 				budgetTimer = setTimer(() => {
 					budgetTimer = undefined;
-					// Already stopping for another cause (settled, exited, stalled, aborted by the user): that cause stands.
-					if (finished || exited || stalled || userAborted) return;
-					const text = wrapUpMessage(agent.budgetMinutes!);
-					void (streaming ? control.steer(text) : control.followUp(text)).catch(() => undefined);
+					if (stopping()) return;
+					if (streaming) sendWrapUp();
+					else wrapUp = { state: "held" };
 					wrapUpTimer = setTimer(() => {
 						wrapUpTimer = undefined;
-						if (finished || exited || stalled || userAborted) return;
+						if (stopping()) return;
 						overBudget = true;
-						budgetError = overBudgetMessage(agent.budgetMinutes!, budget.graceMs);
+						budgetError = overBudgetMessage(agent.budgetMinutes!, budget.graceMs, wrapUp);
 						Object.assign(result, { stopReason: "error", errorMessage: budgetError });
 						terminate();
 					}, budget.graceMs);
@@ -625,6 +645,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					else if (event.type === "activity") watchdog.activity(event.label);
 					else if (event.type === "run") {
 						streaming = event.phase === "start";
+						if (streaming) onTurnStart();
 						// `agent_end` can be followed by retries, compaction, or queued messages; `agent_settled` is the end (rpc.md, "Run lifecycle").
 						if (event.phase === "settled") finishInput();
 					} else if (event.type === "response") {

@@ -54,6 +54,7 @@ describe("budget messages", () => {
 
 	it("an over-budget failure never triggers a model fallback (another model would run as long)", () => {
 		assert.match(overBudgetMessage(10, 180_000), /^over budget: /);
+		assert.equal(classifyFailure("error", overBudgetMessage(10, 180_000, { state: "rejected", error: "429 rate limit, network timeout" })), undefined, "a rejection reason never makes it fall back");
 		for (const [minutes, graceMs] of [[10, 180_000], [401, 180_000], [403, 180_000], [429, 180_000], [500, 180_000], [10, 30_000_000], [10, 24_060_000]] as const) {
 			assert.equal(classifyFailure("error", overBudgetMessage(minutes, graceMs)), undefined, `${minutes} min / ${graceMs} ms`);
 		}

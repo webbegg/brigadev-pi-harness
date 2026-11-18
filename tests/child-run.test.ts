@@ -862,16 +862,108 @@ describe("runChild: run budget", () => {
 		assert.equal(h.time.pending(), 0);
 	});
 
-	it("queues the wrap-up as a follow-up when the child is between turns", async () => {
+	it("between turns, holds the wrap-up and steers it into the next turn (a follow-up would wait for the run's end)", async () => {
 		const h = harness(budgeted);
 		const promise = h.start();
 		const proc = await h.ready();
 		h.time.advance(60_000);
 		assert.equal(sentOf(proc, "steer").length, 0);
-		assert.equal(sentOf(proc, "follow_up").length, 1);
+		assert.equal(sentOf(proc, "follow_up").length, 0);
+		proc.line({ type: "agent_start" });
+		assert.equal(sentOf(proc, "steer").length, 1);
+		proc.line({ type: "agent_end", messages: [] });
+		proc.line({ type: "agent_start" });
+		assert.equal(sentOf(proc, "steer").length, 1, "sent once");
+		assert.equal(sentOf(proc, "follow_up").length, 0);
 		proc.line(settled());
 		proc.close(0);
-		await promise;
+		assert.equal(failed(await promise), false);
+	});
+
+	it("a held wrap-up is dropped when the run settles before another turn", async () => {
+		const h = harness(budgeted);
+		const promise = h.start();
+		const proc = await h.ready();
+		h.time.advance(60_000);
+		proc.line(assistant("done"));
+		proc.line(settled());
+		proc.close(0);
+		const result = await promise;
+		assert.equal(failed(result), false);
+		assert.equal(proc.stdin.records().filter((r) => r.type === "steer" || r.type === "follow_up").length, 0);
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("a steer the child rejects falls back to one follow-up", async () => {
+		const h = harness(budgeted);
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		h.time.advance(60_000);
+		const [steer] = sentOf(proc, "steer");
+		proc.line({ type: "response", id: steer.id, command: "steer", success: false, error: "not streaming" });
+		await tick();
+		const followUps = sentOf(proc, "follow_up");
+		assert.equal(followUps.length, 1);
+		assert.match(followUps[0].message, /structured_output/);
+		proc.line({ type: "response", id: followUps[0].id, command: "follow_up", success: true });
+		await tick();
+		h.time.advance(10_000);
+		proc.close(143);
+		assert.equal((await promise).errorMessage, "over budget: no result 0.2 min after the 1 min wrap-up request");
+	});
+
+	it("the over-budget failure says when the wrap-up never reached the child", async () => {
+		const cases: Array<[string, (proc: FakeChild) => Promise<void>, RegExp]> = [
+			["no turn started", async () => undefined, /; the wrap-up request was never sent: the child started no turn$/],
+			[
+				"no answer",
+				async (proc) => void proc.line({ type: "agent_start" }),
+				/; the child never acknowledged the wrap-up request$/,
+			],
+			[
+				"rejected twice",
+				async (proc) => {
+					proc.line({ type: "agent_start" });
+					h!.time.advance(60_000);
+					proc.line({ type: "response", id: sentOf(proc, "steer")[0].id, command: "steer", success: false, error: "busy" });
+					await tick();
+					proc.line({ type: "response", id: sentOf(proc, "follow_up")[0].id, command: "follow_up", success: false, error: "Agent is shutting down" });
+					await tick();
+				},
+				/; the child rejected the wrap-up request: Agent is shutting down$/,
+			],
+		];
+		let h: ReturnType<typeof harness> | undefined;
+		for (const [label, act, expected] of cases) {
+			h = harness(budgeted);
+			const promise = h.start();
+			const proc = await h.ready();
+			await act(proc);
+			if (label !== "rejected twice") h.time.advance(60_000);
+			h.time.advance(10_000);
+			assert.deepEqual(proc.kills, ["SIGTERM"], label);
+			proc.close(143);
+			const result = await promise;
+			assert.match(result.errorMessage ?? "", /^over budget: no result 0\.2 min after the 1 min budget/, label);
+			assert.match(result.errorMessage ?? "", expected, label);
+		}
+	});
+
+	it("an AbortSignal abort in progress gets no wrap-up and no second terminate", async () => {
+		const controller = new AbortController();
+		const h = harness({ ...budgeted, signal: controller.signal });
+		const promise = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		h.time.advance(59_000);
+		controller.abort();
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		h.time.advance(1_000);
+		assert.equal(proc.stdin.records().filter((r) => r.type === "steer" || r.type === "follow_up").length, 0);
+		proc.close(143);
+		await assert.rejects(promise, /Subagent was aborted/);
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
 	});
 
 	it("terminates a child with no result after the wrap-up grace, as a failure that does not fall back", async () => {
@@ -957,6 +1049,44 @@ describe("runChild: run budget", () => {
 		proc.close(143);
 		const result = await promise;
 		assert.match(result.errorMessage ?? "", /^stalled for /);
+	});
+});
+
+describe("runChild: no wrap-up write once over budget has terminated the child", () => {
+	const B = { agent: { budgetMinutes: 1 }, env: { BRIGADEV_WRAP_UP_GRACE_MS: "10000", BRIGADEV_STALL_TIMEOUT_MS: "999999999" } };
+	const wraps = (proc: FakeChild) => proc.stdin.records().filter((r) => r.type === "steer" || r.type === "follow_up").map((r) => r.type);
+
+	it("a held wrap-up is not steered into a turn that starts after the over-budget terminate", async () => {
+		const h = harness(B);
+		const p = h.start();
+		const proc = await h.ready();
+		h.time.advance(60_000);
+		h.time.advance(10_000);
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		proc.line({ type: "agent_start" });
+		assert.deepEqual(wraps(proc), []);
+		proc.close(143);
+		const r = await p;
+		assert.equal(r.errorMessage, "over budget: no result 0.2 min after the 1 min budget; the wrap-up request was never sent: the child started no turn");
+		assert.equal(h.time.pending(), 0);
+	});
+
+	it("a steer rejected after the over-budget terminate gets no follow-up", async () => {
+		const h = harness(B);
+		const p = h.start();
+		const proc = await h.ready();
+		proc.line({ type: "agent_start" });
+		h.time.advance(60_000);
+		const [steer] = proc.stdin.records().filter((r) => r.type === "steer");
+		h.time.advance(10_000);
+		assert.deepEqual(proc.kills, ["SIGTERM"]);
+		proc.line({ type: "response", id: steer.id, command: "steer", success: false, error: "Agent is shutting down" });
+		await tick();
+		assert.deepEqual(wraps(proc), ["steer"]);
+		proc.close(143);
+		const r = await p;
+		assert.equal(r.errorMessage, "over budget: no result 0.2 min after the 1 min budget; the child never acknowledged the wrap-up request");
+		assert.equal(h.time.pending(), 0);
 	});
 });
 
