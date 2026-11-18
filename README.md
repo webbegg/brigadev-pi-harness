@@ -334,7 +334,7 @@ It opens by itself only on a fresh start: not on `/reload`, `/new`, `--continue`
 
 ## Delivery flow
 
-An authorized change on the default branch starts a `type/description` branch, and each finished work unit is committed automatically (Conventional Commits, with its tests and docs). Push, PR, and merge stay your decisions. Opening a PR first runs `brigadev-review` on the branch and saves the ledger to `reviews/`; the PR body follows the repository template (else Summary / Changes / Test plan / Risk), and no issue link is added unless you mention one.
+An authorized change on the default branch starts a `type/description` branch, and each finished work unit is committed automatically (Conventional Commits, with its tests and docs). Push, PR, and merge stay your decisions. Reviews never run per commit during the work loop (high-risk units get `brigadev-verify`). Before opening a PR the agent asks whether to review the branch (full 4R, the lenses that fit, or skip) and saves the ledger to `reviews/`; the PR body follows the repository template (else Summary / Changes / Test plan / Risk), and no issue link is added unless you mention one.
 
 ## Customize
 

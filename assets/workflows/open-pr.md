@@ -16,7 +16,7 @@ questions:
     label: "Notes for reviewers"
     kind: long
 ---
-Open-a-PR request, started from the workflow menu. Use the `brigadev-branch-pr` skill. Run the pre-PR review first: `brigadev-review` on the branch, with the ledger saved to the `reviews/` folder of the repo docs folder. Open the PR only after the review's findings are handled or reported; pushing and opening it still go through the guard.
+Open-a-PR request, started from the workflow menu. Use the `brigadev-branch-pr` skill. Before the PR, ask the review scope with `ask_user_choice` (its step 5: full 4R, fitting lenses, or skip); a `brigadev-review` of the branch saves its ledger to the `reviews/` folder of the repo docs folder. Open the PR only after the review's findings are handled or reported, or the user skipped the review; pushing and opening it still go through the guard.
 
 - Base branch: {{base}}
 - Ticket or link: {{ticket}}
