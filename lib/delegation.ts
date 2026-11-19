@@ -21,7 +21,12 @@ export interface ActiveWriter {
 	surfaces: string[];
 }
 
-const RISK_ITEM = /\b(risk\s*:?\s*)?item\s*[1-6]\b/i;
+/**
+ * A named high-risk category (`Risk: security (why)`); the legacy numbered form (`Risk: item 2`) is still admitted. The literal
+ * `Risk:` (colon required) must come right before the category or item, and not after a word that negates or lowers it
+ * (`no risk: security`, `low risk data`, `explore item 3` do not admit).
+ */
+const RISK_REASON = /(?<![\w-])(?<!\b(?:no|not|low|without|zero|minimal|any|little|non|never)\s+)risk\s*:\s*(?:(?:data|security|contract|concurrency|delivery|untested)\b|item\s*[1-6]\b)/i;
 
 /**
  * Checks one launch against the delegation rules. Returns the list of
@@ -32,10 +37,10 @@ export function admitLaunch(request: LaunchRequest, agent: AgentDefinition | und
 	const problems: string[] = [];
 	if (!request.task?.trim()) problems.push("task must not be empty");
 	if (!request.reason?.trim()) {
-		problems.push("reason must name the delegation trigger (evidence budget, risk item N, independent units, or context backstop)");
+		problems.push("reason must name the delegation trigger (exploration, risk, parallel writers, context handoff, or review)");
 	}
-	if (agent.admission === "risk" && !RISK_ITEM.test(request.reason ?? "")) {
-		problems.push(`${agent.name} runs only for a named high-risk item: put "Risk: item N (why)" in reason`);
+	if (agent.admission === "risk" && !RISK_REASON.test(request.reason ?? "")) {
+		problems.push(`${agent.name} runs only for a named high-risk category: put "Risk: <data|security|contract|concurrency|delivery|untested> (why)" in reason`);
 	}
 	if (agent.writer) {
 		problems.push(...validateSurfaces(request.allowedEditSurfaces).map((p) => `${agent.name}: ${p}`));

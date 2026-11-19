@@ -1,5 +1,5 @@
 // extensions/subagents.ts loaded for real, against recording fakes of Pi's API (tests/helpers). Pi's runtime packages are
-// stubbed by a test-only module loader; children are a fake `pi --mode rpc` script, never real Pi.
+// stubbed by a test-only module loader; children are a fake `pi --mode json` script, never real Pi.
 
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -12,7 +12,7 @@ import { createFakeCtx, createFakePi, type FakeCtx, type FakePi } from "./helper
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
 
 const DAY = 86_400_000;
-const FAKE_CHILD = path.join(import.meta.dirname, "helpers", "fake-pi-rpc.mjs");
+const FAKE_CHILD = path.join(import.meta.dirname, "helpers", "fake-pi-json.mjs");
 
 let root: string;
 let cwd: string;
@@ -44,11 +44,6 @@ after(() => {
 
 const load = (options: { hasUI?: boolean; idle?: boolean } = {}): { pi: FakePi; ctx: FakeCtx } => {
 	const pi = createFakePi();
-	// Pi 1.5.2's `registerEntryRenderer`, which the shared fake may not have: recorded on the fake, so a test can read it back.
-	if (!("registerEntryRenderer" in pi)) {
-		const entryRenderers = new Map<string, unknown>();
-		Object.assign(pi, { entryRenderers, registerEntryRenderer: (type: string, renderer: unknown) => void entryRenderers.set(type, renderer) });
-	}
 	extension(pi);
 	return { pi, ctx: createFakeCtx({ cwd, ...options }) };
 };
@@ -56,14 +51,16 @@ const docsRuns = () => runsDir(repoDocsDir(cwd));
 const text = (result: { content: Array<{ text: string }> }) => result.content.map((c) => c.text).join("\n");
 
 describe("registration", () => {
-	it("registers the tools, the viewer commands, shortcuts, and the result renderer", () => {
+	it("registers the subagent tool and the read-only viewer, nothing async", () => {
 		const { pi } = load();
-		assert.deepEqual([...pi.tools.keys()].sort(), ["subagent", "subagent_cancel", "subagent_wait"]);
+		assert.deepEqual([...pi.tools.keys()], ["subagent"]);
 		assert.ok(pi.commands.has("brigadev:runs"));
 		assert.ok(pi.commands.has("brigadev:agents"));
+		assert.ok(!pi.commands.has("btw"));
 		assert.deepEqual([...pi.shortcuts.keys()].sort(), ["alt+a", "ctrl+shift+a"]);
-		assert.deepEqual([...pi.renderers.keys()], ["brigadev-subagent-result"]);
-		for (const event of ["session_start", "session_shutdown", "agent_settled", "before_agent_start"]) assert.ok(pi.handlers.has(event), event);
+		assert.equal(pi.renderers.size, 0, "no result message is ever injected into the conversation");
+		for (const event of ["session_start", "session_shutdown", "before_agent_start"]) assert.ok(pi.handlers.has(event), event);
+		assert.ok(!pi.handlers.has("agent_settled"), "no idle delivery");
 	});
 
 	it("registers nothing in a child session", () => {
@@ -78,61 +75,90 @@ describe("registration", () => {
 	});
 });
 
-describe("tool schemas", () => {
-	it("subagent_wait: launchId documented, runId a deprecated alias, both optional, timeoutSeconds optional", () => {
-		const schema = load().pi.tool("subagent_wait").parameters;
-		assert.deepEqual(Object.keys(schema.properties).sort(), ["launchId", "runId", "timeoutSeconds"]);
-		assert.equal(schema.properties.launchId.type, "string");
-		assert.match(schema.properties.launchId.description, /launch id/i);
-		assert.match(schema.properties.runId.description, /deprecated alias of launchId/i);
-		assert.equal(schema.properties.timeoutSeconds.type, "number");
-		assert.match(schema.properties.timeoutSeconds.description, /Default 60, max 300/);
-		assert.equal(schema.required, undefined, "nothing is required: the tool itself demands exactly one id");
-	});
-
-	it("subagent_cancel: launchId and runId only, both optional", () => {
-		const schema = load().pi.tool("subagent_cancel").parameters;
-		assert.deepEqual(Object.keys(schema.properties).sort(), ["launchId", "runId"]);
-		assert.match(schema.properties.launchId.description, /launch id/i);
-		assert.match(schema.properties.runId.description, /deprecated alias of launchId/i);
-		assert.equal(schema.required, undefined);
-	});
-
-	it("subagent: the optional async flag is a boolean next to the launch fields", () => {
+describe("tool schema", () => {
+	it("subagent: the launch fields and parallel tasks, no async flag, every field optional", () => {
 		const schema = load().pi.tool("subagent").parameters;
-		assert.equal(schema.properties.async.type, "boolean");
-		assert.match(schema.properties.async.description, /subagent_wait/);
-		assert.equal(schema.required, undefined, "single, parallel and async calls share one schema; every field is optional");
-		for (const field of ["agent", "task", "reason", "allowedEditSurfaces", "featureDoc", "skills", "tasks"]) assert.ok(field in schema.properties, field);
+		assert.deepEqual(Object.keys(schema.properties).sort(), ["agent", "allowedEditSurfaces", "featureDoc", "reason", "skills", "task", "tasks"]);
+		assert.equal(schema.required, undefined, "single and parallel calls share one schema; every field is optional");
 	});
 });
 
-describe("subagent_wait / subagent_cancel answers", () => {
-	const MISSING = 'Missing launchId: pass the id from the async subagent call, as {"launchId":"…"}.';
-	const BOTH = "Pass launchId only; runId is its deprecated alias, not a second id.";
+describe("sync launches end to end (fake JSON child)", () => {
+	const withFakeChild = async (body: (h: { pi: FakePi; ctx: FakeCtx }) => Promise<void>) => {
+		fs.rmSync(repoDocsDir(cwd), { recursive: true, force: true });
+		// The extension's own `piInvocation` runs process.argv[1] with node: that script is the fake child.
+		savedArgv1 = process.argv[1];
+		process.argv[1] = FAKE_CHILD;
+		const h = load({ hasUI: true, idle: true });
+		try {
+			await h.pi.fire("session_start", { reason: "startup" }, h.ctx);
+			await body(h);
+		} finally {
+			await h.pi.fire("session_shutdown", {}, h.ctx);
+			process.argv[1] = savedArgv1;
+		}
+	};
 
-	for (const name of ["subagent_wait", "subagent_cancel"]) {
-		it(`${name}: neither id is an error naming launchId`, async () => {
-			const result = await load().pi.tool(name).execute("t", {});
+	it("a single launch returns the child's answer when it ends, and saves its run folder", { timeout: 60_000 }, async () => {
+		await withFakeChild(async ({ pi, ctx }) => {
+			const result = await pi.tool("subagent").execute("t", { agent: "brigadev-explore", task: "alpha", reason: "independent units" }, undefined, undefined, ctx);
+			assert.notEqual(result.isError, true, text(result));
+			const [folder] = fs.readdirSync(docsRuns());
+			assert.equal(text(result), `alpha\nsmall result\n\nFull result: ${path.join(docsRuns(), folder, "result.json")}`);
+			assert.equal(result.details.results[0].exitCode, 0);
+			assert.equal(fs.readdirSync(docsRuns()).length, 1, "one run folder");
+			assert.equal(pi.messages.length, 0, "nothing is delivered later: the call itself returned the result");
+		});
+	});
+
+	it("S12: a long answer reaches the parent compacted, names the saved result, and the full text is in the run folder", { timeout: 60_000 }, async () => {
+		await withFakeChild(async ({ pi, ctx }) => {
+			// The fake child answers with the first line of the task, then "small result".
+			const long = `HEAD${"a".repeat(40_000)}`;
+			const result = await pi.tool("subagent").execute("t", { agent: "brigadev-explore", task: long, reason: "independent units" }, undefined, undefined, ctx);
+			const [folder] = fs.readdirSync(docsRuns());
+			const full = path.join(docsRuns(), folder, "result.json");
+			assert.ok(text(result).length < 9_000, `tool result is ${text(result).length} chars`);
+			assert.match(text(result), /^HEAD/);
+			assert.match(text(result), /small result/);
+			assert.match(text(result), /chars omitted/);
+			assert.ok(text(result).endsWith(`Full result: ${full}`));
+			const saved = JSON.parse(fs.readFileSync(full, "utf8"));
+			assert.ok(saved.output.length > 40_000, "the full text is saved");
+			assert.ok(saved.finalText.length > 40_000);
+			assert.ok(result.details.results[0].messages.length > 0, "details keep the full run for the viewer");
+		});
+	});
+
+	it("parallel tasks run together and come back in one result", { timeout: 60_000 }, async () => {
+		await withFakeChild(async ({ pi, ctx }) => {
+			const tasks = ["alpha", "beta"].map((task) => ({ agent: "brigadev-explore", task, reason: "independent units" }));
+			const result = await pi.tool("subagent").execute("t", { tasks }, undefined, undefined, ctx);
+			assert.match(text(result), /^Parallel: 2\/2 succeeded/);
+			assert.match(text(result), /alpha\nsmall result/);
+			assert.match(text(result), /beta\nsmall result/);
+			assert.equal(fs.readdirSync(docsRuns()).length, 2);
+			assert.equal(text(result).split("Full result: ").length, 3, "each section names its saved result");
+		});
+	});
+
+	it("a rate-limited model is reported as a failure that names the limit, with no retry on another model", { timeout: 60_000 }, async () => {
+		await withFakeChild(async ({ pi, ctx }) => {
+			const result = await pi.tool("subagent").execute("t", { agent: "brigadev-explore", task: "LIMIT please", reason: "independent units" }, undefined, undefined, ctx);
 			assert.equal(result.isError, true);
-			assert.equal(text(result), MISSING);
+			assert.match(text(result), /^Agent error: 429 rate limit exceeded/);
+			assert.match(text(result), /Warnings: brigadev-explore: .* hit a quota or rate limit\. No other model was tried/);
+			assert.equal(fs.readdirSync(docsRuns()).length, 1, "a single run, not a chain");
+			assert.deepEqual(pi.entries, [], "no fallback record");
 		});
+	});
 
-		it(`${name}: both ids is an error`, async () => {
-			const result = await load().pi.tool(name).execute("t", { launchId: "a", runId: "a" });
-			assert.equal(result.isError, true);
-			assert.equal(text(result), BOTH);
-		});
-
-		it(`${name}: an unknown id is an error, by launchId and by the runId alias`, async () => {
-			const { pi } = load();
-			for (const params of [{ launchId: "nope" }, { runId: "nope" }]) {
-				const result = await pi.tool(name).execute("t", params);
-				assert.equal(result.isError, true);
-				assert.equal(text(result), 'Unknown launch id "nope" (not started in this session, or pruned).');
-			}
-		});
-	}
+	it("an unknown agent is rejected before anything starts", async () => {
+		const { pi, ctx } = load();
+		const result = await pi.tool("subagent").execute("t", { agent: "nope", task: "x", reason: "independent units" }, undefined, undefined, ctx);
+		assert.equal(result.isError, true);
+		assert.match(text(result), /Launch rejected/);
+	});
 });
 
 describe("session_start run-folder pruning", () => {
@@ -215,238 +241,5 @@ describe("session_start run-folder pruning", () => {
 		} finally {
 			fs.chmodSync(docsRuns(), 0o755);
 		}
-	});
-});
-
-describe("async launches: delivered-omitted wiring end to end", () => {
-	const finishedStatus = (ctx: FakeCtx) => ctx.statuses.at(-1)?.text ?? "";
-	const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-	it("a launch left out of the combined delivery is told to read its saved folders, not 'in the conversation above'", { timeout: 60_000 }, async () => {
-		fs.rmSync(repoDocsDir(cwd), { recursive: true, force: true });
-		// The extension's own `piInvocation` runs process.argv[1] with node: that script is the fake child.
-		savedArgv1 = process.argv[1];
-		process.argv[1] = FAKE_CHILD;
-		const { pi, ctx } = load({ hasUI: true, idle: false });
-		// The extension asks `ctx.isIdle()` exactly once per settled launch it holds (and per idle flush, none before the signal below),
-		// so the count is the number of launches whose registry settle reached the delivery.
-		let idleChecks = 0;
-		ctx.isIdle = () => {
-			idleChecks++;
-			return ctx.idle;
-		};
-		try {
-			await pi.fire("session_start", { reason: "startup" }, ctx);
-			const start = async (task: string) => {
-				const result = await pi.tool("subagent").execute("t", { agent: "brigadev-explore", task, reason: "independent units", async: true }, undefined, undefined, ctx);
-				assert.notEqual(result.isError, true, text(result));
-				assert.match(text(result), /^Started async launch /);
-				return result.details.launchId as string;
-			};
-			// Two launches settle while the parent is busy, so both are held and go out as one batch at the idle signal.
-			const ids = [await start("alpha BIG"), await start("beta tiny")];
-			assert.notEqual(ids[0], ids[1]);
-			for (let i = 0; i < 400 && !/2 done/.test(finishedStatus(ctx)); i++) await sleep(50);
-			assert.match(finishedStatus(ctx), /2 done/, "both children finished");
-			// The card update comes first; the registry settle (which the delivery holds) follows. Wait for both, observed through the idle checks.
-			for (let i = 0; i < 200 && idleChecks < 2; i++) await sleep(50);
-			assert.equal(idleChecks, 2, "both launches settled in the registry and are held");
-			assert.equal(pi.messages.length, 0, "nothing is delivered while the parent is busy");
-
-			ctx.idle = true;
-			await pi.fire("agent_settled", {}, ctx);
-			assert.equal(pi.messages.length, 1, "one combined message");
-			const { message, options } = pi.messages[0];
-			assert.equal(message.customType, "brigadev-subagent-result");
-			assert.deepEqual(options, { triggerTurn: true, deliverAs: "steer" });
-			assert.deepEqual(message.details.launches.map((l: { id: string }) => l.id).sort(), [...ids].sort());
-
-			// The size guard keeps the first launch whole and leaves the next one as a pointer, whatever the settle order.
-			const content: string = message.content;
-			const pointerLaunches = ids.filter((id) => new RegExp(`Launch ${id}: its full result was left out of this message`).test(content));
-			assert.equal(pointerLaunches.length, 1, "exactly one launch was left out");
-			const omitted = pointerLaunches[0];
-			const whole = ids.find((id) => id !== omitted)!;
-			assert.match(content, /Saved folders \(the full text is in result\.json\):/);
-
-			const omittedAnswer = await pi.tool("subagent_wait").execute("t", { launchId: omitted });
-			assert.doesNotMatch(text(omittedAnswer), /in the conversation above/);
-			assert.match(text(omittedAnswer), new RegExp(`Launch ${omitted} was delivered to this session, but its result was too large to include`));
-			assert.match(text(omittedAnswer), /Saved folders/);
-			assert.ok(text(omittedAnswer).includes(docsRuns()), "points at the saved run folder");
-
-			const wholeAnswer = await pi.tool("subagent_wait").execute("t", { launchId: whole });
-			assert.match(text(wholeAnswer), new RegExp(`Launch ${whole} was already delivered to this session: its result is in the conversation above`));
-
-			// Cancel answers the same way for the omitted launch.
-			const cancelAnswer = await pi.tool("subagent_cancel").execute("t", { launchId: omitted });
-			assert.doesNotMatch(text(cancelAnswer), /in the conversation above/);
-			assert.match(text(cancelAnswer), /too large to include/);
-			assert.deepEqual(ctx.notifications.filter((n) => /could not deliver/.test(n.message)), []);
-		} finally {
-			await pi.fire("session_shutdown", {}, ctx);
-			process.argv[1] = savedArgv1;
-		}
-	});
-});
-
-describe("/btw: a side question that never enters the model's context", () => {
-	const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-	const UNKNOWN = (id: string) => `Unknown launch id "${id}" (not started in this session, or pruned).`;
-
-	const withFakeChild = async (body: () => Promise<void>) => {
-		savedArgv1 = process.argv[1];
-		process.argv[1] = FAKE_CHILD;
-		try {
-			await body();
-		} finally {
-			process.argv[1] = savedArgv1!;
-		}
-	};
-	const until = async (done: () => boolean, ms = 10_000) => {
-		for (let i = 0; i < ms / 50 && !done(); i++) await sleep(50);
-		assert.ok(done(), "timed out waiting");
-	};
-	const startedId = (ctx: FakeCtx) => /launch (\S+)/.exec(ctx.notifications[0]?.message ?? "")?.[1] as string;
-
-	it("registers /btw and an entry renderer for its answer", () => {
-		const { pi } = load();
-		assert.ok(pi.commands.has("btw"));
-		assert.deepEqual([...(pi as any).entryRenderers.keys()], ["brigadev-btw"]);
-	});
-
-	it("shows the answer as a custom entry (not a message), never sends it to the model, and hides its launch from subagent_wait/cancel", { timeout: 60_000 }, async () => {
-		fs.rmSync(repoDocsDir(cwd), { recursive: true, force: true });
-		await withFakeChild(async () => {
-			const { pi, ctx } = load({ hasUI: true, idle: true });
-			try {
-				await pi.fire("session_start", { reason: "startup" }, ctx);
-				await pi.commands.get("btw").handler("  where is the delivery buffer?  ", ctx);
-				const id = startedId(ctx);
-				assert.ok(id, `the start notice names the launch: ${JSON.stringify(ctx.notifications)}`);
-				assert.equal(ctx.notifications[0].type, "info");
-
-				// While it runs it already answers like an unknown id, and it cannot be cancelled by the model.
-				for (const name of ["subagent_wait", "subagent_cancel"]) {
-					const running = await pi.tool(name).execute("t", { launchId: id, timeoutSeconds: 1 });
-					assert.equal(running.isError, true, name);
-					assert.equal(text(running), UNKNOWN(id));
-				}
-				assert.ok(ctx.statuses.some((s) => /1 running/.test(s.text ?? "")), "it takes a slot and shows in the footer like any launch");
-
-				await until(() => pi.entries.length > 0);
-				assert.equal(pi.entries.length, 1);
-				assert.equal(pi.entries[0].type, "brigadev-btw");
-				const data = pi.entries[0].data as { id: string; status: string; question: string; answer: string };
-				assert.equal(data.id, id);
-				assert.equal(data.status, "answered");
-				assert.equal(data.question, "where is the delivery buffer?");
-				assert.match(data.answer, /small result/);
-				assert.ok(ctx.notifications.some((n) => /answered/.test(n.message) && n.message.includes(id)), "the user is told it answered");
-
-				// The parent is idle and the launch is settled: any idle delivery would have fired by now.
-				await pi.fire("agent_settled", {}, ctx);
-				assert.equal(pi.messages.length, 0, "sendMessage is never called for an aside");
-
-				for (const name of ["subagent_wait", "subagent_cancel"]) {
-					const settled = await pi.tool(name).execute("t", { launchId: id });
-					assert.equal(settled.isError, true, name);
-					assert.equal(text(settled), UNKNOWN(id), `${name} answers exactly like an unknown id`);
-					assert.equal(text(settled), text(await pi.tool(name).execute("t", { launchId: "nope-nope" })).replace("nope-nope", id));
-				}
-				assert.equal(pi.messages.length, 0);
-			} finally {
-				await pi.fire("session_shutdown", {}, ctx);
-			}
-		});
-	});
-
-	it("a model async launch is still delivered while an aside is not", { timeout: 60_000 }, async () => {
-		fs.rmSync(repoDocsDir(cwd), { recursive: true, force: true });
-		await withFakeChild(async () => {
-			const { pi, ctx } = load({ hasUI: true, idle: true });
-			try {
-				await pi.fire("session_start", { reason: "startup" }, ctx);
-				await pi.commands.get("btw").handler("aside question", ctx);
-				const started = await pi.tool("subagent").execute("t", { agent: "brigadev-explore", task: "model task", reason: "independent units", async: true }, undefined, undefined, ctx);
-				assert.notEqual(started.isError, true, text(started));
-				await until(() => pi.entries.length > 0 && pi.messages.length > 0);
-				assert.equal(pi.messages.length, 1);
-				assert.equal(pi.messages[0].message.details.launchId, started.details.launchId, "only the model's launch was delivered");
-				assert.doesNotMatch(pi.messages[0].message.content, /aside question/);
-			} finally {
-				await pi.fire("session_shutdown", {}, ctx);
-			}
-		});
-	});
-
-	it("a failing aside is recorded as a failed entry with an error notice, and never sent to the model", { timeout: 60_000 }, async () => {
-		fs.rmSync(repoDocsDir(cwd), { recursive: true, force: true });
-		const failing = path.join(root, "failing-child.mjs");
-		fs.writeFileSync(failing, 'process.stderr.write("boom: the child could not run\\n");\nprocess.exit(3);\n');
-		savedArgv1 = process.argv[1];
-		process.argv[1] = failing;
-		const { pi, ctx } = load({ hasUI: true, idle: true });
-		try {
-			await pi.fire("session_start", { reason: "startup" }, ctx);
-			await pi.commands.get("btw").handler("will this fail?", ctx);
-			const id = startedId(ctx);
-			assert.ok(id, JSON.stringify(ctx.notifications));
-			await until(() => pi.entries.length > 0);
-			assert.equal(pi.entries.length, 1);
-			assert.equal(pi.entries[0].type, "brigadev-btw");
-			const data = pi.entries[0].data as { id: string; status: string; question: string; error?: string };
-			assert.deepEqual({ id: data.id, status: data.status, question: data.question }, { id, status: "failed", question: "will this fail?" });
-			assert.ok(data.error, "the entry says why it failed");
-			const notice = ctx.notifications.find((n) => /failed/.test(n.message) && n.message.includes(id));
-			assert.equal(notice?.type, "error", JSON.stringify(ctx.notifications));
-			await pi.fire("agent_settled", {}, ctx);
-			assert.equal(pi.messages.length, 0, "sendMessage is never called for a failed aside");
-		} finally {
-			await pi.fire("session_shutdown", {}, ctx);
-			process.argv[1] = savedArgv1!;
-		}
-	});
-
-	it("a rejected launch tells the user with an error notice and records nothing", async () => {
-		const agentsDir = path.join(process.env.PI_CODING_AGENT_DIR!, "agents");
-		const broken = path.join(agentsDir, "brigadev-explore.md");
-		fs.mkdirSync(agentsDir, { recursive: true });
-		// A user definition overrides the package one by name; its output schema does not exist, so the launch is rejected before any child starts.
-		fs.writeFileSync(broken, "---\nname: brigadev-explore\ndescription: broken on purpose\noutput: missing-schema.json\n---\nYou answer questions.\n");
-		const { pi, ctx } = load({ hasUI: true, idle: true });
-		try {
-			await pi.fire("session_start", { reason: "startup" }, ctx);
-			await pi.commands.get("btw").handler("anything", ctx);
-			assert.equal(ctx.notifications.length, 1, JSON.stringify(ctx.notifications));
-			assert.equal(ctx.notifications[0].type, "error");
-			assert.match(ctx.notifications[0].message, /rejected|output schema/i);
-			assert.deepEqual(pi.entries, []);
-			assert.equal(pi.messages.length, 0);
-		} finally {
-			fs.rmSync(broken, { force: true });
-			await pi.fire("session_shutdown", {}, ctx);
-		}
-	});
-
-	it("without a question it says how to use it and starts nothing", async () => {
-		const { pi, ctx } = load({ hasUI: true });
-		await pi.fire("session_start", { reason: "startup" }, ctx);
-		await pi.commands.get("btw").handler("   ", ctx);
-		assert.deepEqual(ctx.notifications, [{ message: "Usage: /btw <question>", type: "info" }]);
-		assert.equal(pi.entries.length, 0);
-	});
-
-	it("an answer that arrives after the session shut down is not recorded", { timeout: 60_000 }, async () => {
-		fs.rmSync(repoDocsDir(cwd), { recursive: true, force: true });
-		await withFakeChild(async () => {
-			const { pi, ctx } = load({ hasUI: true, idle: true });
-			await pi.fire("session_start", { reason: "startup" }, ctx);
-			await pi.commands.get("btw").handler("slow one", ctx);
-			await pi.fire("session_shutdown", {}, ctx);
-			await sleep(500);
-			assert.deepEqual(pi.entries, []);
-			assert.equal(pi.messages.length, 0);
-		});
 	});
 });

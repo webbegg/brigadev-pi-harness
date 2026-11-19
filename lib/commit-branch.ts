@@ -74,6 +74,16 @@ export function pickProtectedBranches(found: { originHead: string | null; hasMai
 	return [...new Set(names)];
 }
 
+/** The branch HEAD points to at `cwd`, from one git call; null when detached or git cannot answer. */
+export async function readCurrentBranch(exec: ExecFn, cwd: string): Promise<string | null> {
+	try {
+		const head = await exec("git", ["symbolic-ref", "--short", "-q", "HEAD"], { cwd, timeout: GIT_TIMEOUT_MS });
+		return head.code === 0 && head.stdout.trim() ? head.stdout.trim() : null;
+	} catch {
+		return null;
+	}
+}
+
 /** Branch facts for the repository at `cwd`; anything git cannot answer comes back null. */
 export async function readBranchFacts(exec: ExecFn, cwd: string): Promise<BranchFacts> {
 	const git = async (...args: string[]): Promise<{ stdout: string; code: number } | null> => {
@@ -89,8 +99,7 @@ export async function readBranchFacts(exec: ExecFn, cwd: string): Promise<Branch
 		return result && (result.code === 0 || result.code === 1) ? result.code === 0 : null;
 	};
 
-	const head = await git("symbolic-ref", "--short", "-q", "HEAD");
-	const currentBranch = head?.code === 0 && head.stdout.trim() ? head.stdout.trim() : null;
+	const currentBranch = await readCurrentBranch(exec, cwd);
 
 	const origin = await git("symbolic-ref", "--short", "refs/remotes/origin/HEAD");
 	const originHead = origin?.code === 0 ? parseOriginHead(origin.stdout) : null;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -49,6 +49,15 @@ describe("repo docs folder", () => {
 		assert.equal(repoName(worktree), "my-repo");
 		assert.equal(repoDocsDir(worktree, { BRIGADEV_HOME: home }), repoDocsDir(main, { BRIGADEV_HOME: home }));
 		assert.equal(repoDocsDir(worktree, { BRIGADEV_HOME: home }), join(home, "my-repo"));
+	});
+
+	it("shares one folder between a symlinked checkout, its worktrees, and the real path", () => {
+		const link = join(scratch, "my-repo-link");
+		symlinkSync(main, link);
+		git(link, "worktree", "add", "-q", ".worktrees/feature", "-b", "feat/linked");
+		const env = { BRIGADEV_HOME: home };
+		assert.equal(repoDocsDir(link, env), repoDocsDir(join(link, ".worktrees/feature"), env));
+		assert.equal(repoDocsDir(link, env), repoDocsDir(main, env));
 	});
 
 	it("falls back to the directory name outside git", () => {

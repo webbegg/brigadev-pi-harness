@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"bbbb2222","timestamp":"2026-11-12T09:00:00.000Z","cwd":"/work/demo"}
+{"type":"message","id":"f01","timestamp":"2026-11-12T09:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"look around"}]}}
+this line is not json and must be skipped
+{"type":"message","id":"f02","timestamp":"2026-11-12T09:00:10.000Z","message":{"role":"assistant","provider":"anthropic","model":"m","content":[{"type":"toolCall","id":"d1","name":"bash","arguments":{"command":"cat README.md | head -5"}}],"usage":{"input":1000,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":1010,"cost":{"total":0.5}}}}
+{"type":"message","id":"f03","timestamp":"2026-11-12T09:00:11.000Z","message":{"role":"assistant","provider":"anthropic","model":"m","content":[],"usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"total":0}},"stopReason":"aborted"}}

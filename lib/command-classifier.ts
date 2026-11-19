@@ -2,7 +2,9 @@
 // best-effort guard, not a sandbox: it does not expand variables, load
 // scripts, or follow aliases. Unknown shapes are allowed, never guessed.
 
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { canonicalPath } from "./paths.ts";
 
 export const COMMAND_KIND = {
 	DESTRUCTIVE: "destructive",
@@ -27,57 +29,11 @@ export interface CommandMatch {
 	 * `--work-tree` style redirection.
 	 */
 	elsewhere?: boolean;
-	/** Facts DSP mode decides on (lib/dsp-classify.ts). Only set when classifying with `ClassifyOptions`; normal and yolo never read it. */
-	dsp?: DspTag[];
-}
-
-/** What a DSP-mode classification knows about one command, beyond its `kind`. */
-export type DspTag =
-	/** Writes to origin or a forge, publishes, or reshapes remotes and credentials: always asks. */
-	| { type: "remote"; label: string; remote?: string; branch?: string; base?: string; pr?: string; repo?: string; ref?: string }
-	/** Moves or rewrites the current branch (commit, merge, rebase, ...): asks on the default branch. */
-	| { type: "history"; label: string }
-	/** Names refs the command rewrites or deletes; asks when one is the default branch (`current`: HEAD's branch is also touched). */
-	| { type: "default-ref"; label: string; names: string[]; current?: boolean }
-	/** A local discard that runs after an automatic backup: `branches` and `refs` are lost refs to keep, `stash` a dropped stash entry. */
-	| { type: "discard"; slug: string; branches?: string[]; refs?: string[]; stash?: { ref: string } | "all" }
-	/** Deletes or overwrites files: allowed inside the project or the system temp dir (`dir`: where relative targets start, undefined when unknown). */
-	| { type: "files"; label: string; targets: string[]; dir?: string; unknown?: boolean; rootOk?: boolean }
-	/** An unknown git subcommand that may be an alias (resolved by `analyzeDsp`). */
-	| { type: "alias"; name: string; prefix: string[]; rest: string[]; value?: string }
-	/** The classifier cannot decide what this does: DSP asks. `scan`: found while scanning a script's text. */
-	| { type: "unknown"; reason: string; scan?: boolean }
-	/** Running this (a script, recipe or package script) may switch the branch: what follows in the same command acts on another branch. */
-	| { type: "branch-move" };
-
-/** What one command segment looks like to a `ClassifyOptions.refine` hook. */
-export interface SegmentInfo {
-	/** The words as written (wrappers included). */
-	rawArgv: string[];
-	/** The words after wrappers and assignments are stripped. */
-	argv: string[];
-	privileged: boolean;
-	before: string;
-}
-
-/**
- * Hooks that let DSP mode look deeper than the normal classifier without changing what it reports.
- * Without options `classifyCommand` behaves exactly as it always has.
- */
-export interface ClassifyOptions {
-	/** Replaces the wrapper stripper. `chdir`: a wrapper (`env -C dir`) runs the command in another directory. */
-	unwrap?: (argv: string[]) => { argv: string[]; privileged: boolean; chdir?: string };
-	/** Called for each segment with what the normal rules found; returns the matches to keep. */
-	refine?: (segment: SegmentInfo, found: CommandMatch[]) => CommandMatch[];
-	/** Command texts run by `$( )` and backticks in a command. */
-	inner?: (command: string) => string[];
-	/** Options for a nested shell (`sh -c`, a substitution): changes there must not leak back. */
-	fork?: () => ClassifyOptions;
 }
 
 const SEPARATORS = new Set([";", "&&", "||", "|", "&", "\n", "(", ")"]);
 // Syntax words that can lead a segment (`then rm -rf x`, `{ git push; }`); the command follows them. `time` is a wrapper.
-export const RESERVED_WORDS = new Set(["{", "}", "!", "if", "then", "elif", "else", "fi", "while", "until", "do", "done"]);
+const RESERVED_WORDS = new Set(["{", "}", "!", "if", "then", "elif", "else", "fi", "while", "until", "do", "done"]);
 const WRAPPERS = new Set(["sudo", "doas", "env", "command", "builtin", "nohup", "time", "nice", "exec", "xargs", "timeout", "caffeinate"]);
 export const SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "ksh"]);
 // Commands whose arguments are data (search patterns, text), not actions.
@@ -138,7 +94,7 @@ function conditionalEnd(text: string, from: number): number {
 }
 
 /** Index just past the `)` closing a `$(` whose opening ends at `from`, or -1. */
-export function substitutionEnd(text: string, from: number): number {
+function substitutionEnd(text: string, from: number): number {
 	let depth = 1;
 	let quote: "'" | '"' | null = null;
 	for (let j = from; j < text.length; j++) {
@@ -377,7 +333,7 @@ function isScratchPath(target: string, root: string = tmpdir().replace(/\/+$/, "
 // Options that take a separate value, per manager, so the value is not
 // mistaken for the subcommand. The same flag can differ: npm -w takes a
 // workspace name, pnpm -w means --workspace-root and takes none.
-export const VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
+const VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
 	npm: new Set(["--prefix", "-w", "--workspace", "--registry", "-C"]),
 	pnpm: new Set(["--filter", "-F", "-C", "--dir", "--registry"]),
 	yarn: new Set(["--cwd", "--registry"]),
@@ -431,7 +387,8 @@ function classifyRm(args: string[], viaXargs: boolean): CommandMatch | undefined
 const STAYS_ON_BRANCH_GIT = new Set(["add", "rm", "mv", "status", "diff", "log", "show", "apply", "fetch", "pull", "push", "commit", "stash", "tag", "blame", "ls-files", "rev-parse", "remote", "describe"]);
 
 // Variables that point git at another repository, work tree, ref store, or index.
-const GIT_LOCATION_ASSIGNMENT = /^(GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_INDEX_FILE)=/;
+// GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT/KEY_n/VALUE_n and GIT_CONFIG_GLOBAL can set `core.worktree` or `core.bare` from the environment, like `-c`.
+const GIT_LOCATION_ASSIGNMENT = /^(GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_INDEX_FILE|GIT_CONFIG(?:_[A-Z0-9_]+)?)=/;
 
 /** Any word of the segment assigns a git-location variable (prefix, `env`, `export`, `declare -x`, ...). */
 function setsGitLocation(rawArgv: string[]): boolean {
@@ -439,9 +396,9 @@ function setsGitLocation(rawArgv: string[]): boolean {
 }
 
 /** Directory or branch changes by the segment, which make a later `git commit` land somewhere the guard did not inspect. */
-function changesCommitTarget(rawArgv: string[], unwrapFn: (argv: string[]) => { argv: string[] } = unwrap): boolean {
+function changesCommitTarget(rawArgv: string[]): boolean {
 	if (setsGitLocation(rawArgv)) return true;
-	const { argv } = unwrapFn(rawArgv);
+	const { argv } = unwrap(rawArgv);
 	if (argv.length === 0) return false;
 	const name = basename(argv[0]);
 	const args = argv.slice(1);
@@ -454,7 +411,7 @@ function changesCommitTarget(rawArgv: string[], unwrapFn: (argv: string[]) => { 
 	if (SHELLS.has(name) || name === "eval") {
 		const scriptIndex = name === "eval" ? 0 : args.findIndex((a) => /^-[a-z]*c[a-z]*$/.test(a));
 		const script = name === "eval" ? args.join(" ") : scriptIndex >= 0 ? args[scriptIndex + 1] : undefined;
-		return script !== undefined && tokenize(blankHeredocs(script)).some((segment) => changesCommitTarget(segment.argv, unwrapFn));
+		return script !== undefined && tokenize(blankHeredocs(script)).some((segment) => changesCommitTarget(segment.argv));
 	}
 	return false;
 }
@@ -464,11 +421,11 @@ function gitTargetsElsewhere(args: string[], rawArgv: string[]): boolean {
 	const gitAt = rawArgv.findIndex((a) => basename(a) === "git");
 	if (setsGitLocation(rawArgv.slice(0, Math.max(gitAt, 0)))) return true;
 	const index = gitSubcommand(args);
-	return args.slice(0, Math.max(index, 0)).some((a, i) => a === "-C" || a.startsWith("--git-dir") || a.startsWith("--work-tree") || (a === "-c" && /^core\.(worktree|bare)\b/i.test(args[i + 1] ?? "")));
+	return args.slice(0, Math.max(index, 0)).some((a, i) => a === "-C" || a.startsWith("--git-dir") || a.startsWith("--work-tree") || a.startsWith("--config-env") || (a === "-c" && /^core\.(worktree|bare)\b/i.test(args[i + 1] ?? "")));
 }
 
 /** Returns the git subcommand index, skipping global options such as -C <dir>. */
-export function gitSubcommand(args: string[]): number {
+function gitSubcommand(args: string[]): number {
 	for (let i = 0; i < args.length; i++) {
 		const a = args[i];
 		if (a === "-C" || a === "-c" || a === "--git-dir" || a === "--work-tree" || a === "--namespace") {
@@ -577,15 +534,8 @@ const SQL_PATTERNS: Array<[RegExp, string]> = [
 	[/\bFLUSH(ALL|DB)\b/i, "Redis flush"],
 ];
 
-function classifySegment(rawArgv: string[], before: string, options?: ClassifyOptions): CommandMatch[] {
-	const found = classifySegmentRules(rawArgv, before, options);
-	if (!options?.refine) return found;
-	const { argv, privileged } = (options.unwrap ?? unwrap)(rawArgv);
-	return options.refine({ rawArgv, argv, privileged, before }, found);
-}
-
-function classifySegmentRules(rawArgv: string[], before: string, options?: ClassifyOptions): CommandMatch[] {
-	const { argv, privileged } = (options?.unwrap ?? unwrap)(rawArgv);
+function classifySegment(rawArgv: string[], before: string): CommandMatch[] {
+	const { argv, privileged } = unwrap(rawArgv);
 	const matches: CommandMatch[] = [];
 	if (privileged) matches.push({ kind: COMMAND_KIND.PRIVILEGED, reason: "elevated privileges (sudo)" });
 	if (argv.length === 0) return matches;
@@ -597,8 +547,7 @@ function classifySegmentRules(rawArgv: string[], before: string, options?: Class
 		const scriptIndex = name === "eval" ? 0 : args.findIndex((a) => /^-[a-z]*c[a-z]*$/.test(a));
 		const script = name === "eval" ? args.join(" ") : scriptIndex >= 0 ? args[scriptIndex + 1] : undefined;
 		if (script) {
-			// A new shell gets its own scope; `eval` runs in this one.
-			const nested = classifyCommand(script, name === "eval" ? options : (options?.fork?.() ?? options));
+			const nested = classifyCommand(script);
 			// A location variable set on the wrapper applies to every git call inside its script.
 			if (setsGitLocation(rawArgv)) for (const match of nested) if (match.commit) match.elsewhere = true;
 			matches.push(...nested);
@@ -709,31 +658,89 @@ function classifySegmentRules(rawArgv: string[], before: string, options?: Class
 	return matches;
 }
 
-/** Classifies every recognizable risky segment of a shell command. `options` (DSP mode) look deeper; without them the result is the normal one. */
-export function classifyCommand(command: string, options?: ClassifyOptions): CommandMatch[] {
-	return classifyFrom(command, options, { moved: false });
+/**
+ * Classifies every recognizable risky segment of a shell command. A directory or branch change earlier in the same
+ * command (`cd dir && git commit`) marks a later commit as `elsewhere`.
+ */
+export function classifyCommand(command: string): CommandMatch[] {
+	const matches: CommandMatch[] = [];
+	let moved = false;
+	for (const segment of tokenize(blankHeredocs(command))) {
+		const found = classifySegment(segment.argv, segment.before);
+		if (moved) for (const match of found) if (match.commit) match.elsewhere = true;
+		matches.push(...found);
+		moved ||= changesCommitTarget(segment.argv);
+	}
+	return matches;
 }
 
-/** A match that moves or rewrites the current branch (`commit`, or a DSP `history` tag such as merge, rebase, cherry-pick). */
-const touchesBranch = (match: CommandMatch) => match.commit === true || (match.dsp?.some((tag) => tag.type === "history") ?? false);
+/** `dir` moved by a literal `cd`/`-C` word (`~` and `~/x` expand); undefined for a variable, glob, `-`, or other expansion. */
+function moveDirectory(dir: string, word: string | undefined, home: string): string | undefined {
+	const raw = word ?? "~";
+	if (/[$`*?[{]/.test(raw) || raw === "-" || (raw.startsWith("~") && raw !== "~" && !raw.startsWith("~/"))) return undefined;
+	return canonicalPath(resolve(dir, raw === "~" ? home : raw.startsWith("~/") ? join(home, raw.slice(2)) : raw));
+}
 
-/** `state.moved`: an earlier part of the same command switched branch or directory, so what follows may act on another branch (a merge after `git switch main`). */
-function classifyFrom(command: string, options: ClassifyOptions | undefined, state: { moved: boolean }): CommandMatch[] {
-	const matches: CommandMatch[] = [];
-	for (const segment of tokenize(blankHeredocs(command))) {
-		const found = classifySegment(segment.argv, segment.before, options);
-		if (state.moved) for (const match of found) if (touchesBranch(match)) match.elsewhere = true;
-		if (options?.refine) {
-			// `git -C other merge x` and `env -C other git merge x` act on another repository's branch.
-			const { argv, chdir } = (options.unwrap ?? unwrap)(segment.argv) as { argv: string[]; chdir?: string };
-			const elsewhere = chdir !== undefined || (argv.length > 0 && basename(argv[0]) === "git" && gitTargetsElsewhere(argv.slice(1), segment.argv));
-			if (elsewhere) for (const match of found) if (touchesBranch(match)) match.elsewhere = true;
+/**
+ * The directory in effect when each segment starts (canonical), or undefined
+ * where it cannot be known. Only a literal `cd` that starts an `&&` chain
+ * moves it; after a `cd`, a `;`, `||`, `|`, `&`, or any group makes the rest
+ * unknown, since the `cd` may not have run in this shell or may have failed.
+ */
+export function segmentDirectories(segments: readonly Segment[], cwd: string, home: string = homedir()): Array<string | undefined> {
+	const dirs: Array<string | undefined> = [];
+	let dir: string | undefined = canonicalPath(cwd);
+	let moved = false;
+	segments.forEach((segment, index) => {
+		const chained = segment.before === "" || segment.before === "&&";
+		if (!chained && (moved || segment.before === "(" || segment.before === ")")) dir = undefined;
+		dirs.push(dir);
+		if (dir === undefined) return;
+		const { argv } = unwrap(segment.argv);
+		const name = basename(argv[0] ?? "");
+		if (name === "pushd" || name === "popd") dir = undefined;
+		if (name !== "cd") return;
+		const words = argv.slice(1).filter((word) => word === "-" || !word.startsWith("-"));
+		const next = segments[index + 1];
+		const starts = chained || segment.before === ";" || segment.before === "\n";
+		dir = starts && (!next || next.before === "&&") && words.length <= 1 ? moveDirectory(dir, words[0], home) : undefined;
+		moved = true;
+	});
+	return dirs;
+}
+
+/**
+ * The one directory every `git commit` in the command runs in, resolved from
+ * the session's `cwd`, a leading `cd <dir> &&` chain, and `git -C <dir>`; so a
+ * commit through them is judged against that repository. Undefined when there
+ * is no commit, when the commit is not a plain top-level `git` call, when the
+ * commits land in different directories, or when anything else moves a commit
+ * (a branch switch, `GIT_DIR`, `--git-dir`, `--work-tree`, a non-literal path).
+ */
+export function commitDirectory(command: string, cwd: string, home: string = homedir()): string | undefined {
+	const total = classifyCommand(command).filter((match) => match.commit).length;
+	if (total === 0) return undefined;
+	const segments = tokenize(blankHeredocs(command), { redirections: true });
+	const dirs = segmentDirectories(segments, cwd, home);
+	let found: string | undefined;
+	let count = 0;
+	for (let i = 0; i < segments.length; i++) {
+		const { argv } = unwrap(segments[i].argv);
+		const name = basename(argv[0] ?? "");
+		if (name === "cd") continue;
+		if (changesCommitTarget(segments[i].argv)) return undefined;
+		const args = argv.slice(1);
+		const index = gitSubcommand(args);
+		if (name !== "git" || args[index] !== "commit") continue;
+		let dir = dirs[i];
+		for (let j = 0; j < index && dir !== undefined; j++) {
+			if (args[j] === "-C") dir = moveDirectory(dir, args[++j], home);
+			else if (args[j].startsWith("--git-dir") || args[j].startsWith("--work-tree") || args[j].startsWith("--config-env") || (args[j] === "-c" && /^core\.(worktree|bare)\b/i.test(args[j + 1] ?? ""))) return undefined;
+			else if (args[j] === "-c" || args[j] === "--namespace") j++;
 		}
-		matches.push(...found);
-		// A script, recipe or package script that switches branch moves what follows (DSP's `branch-move` tag).
-		state.moved ||= changesCommitTarget(segment.argv, options?.unwrap) || found.some((match) => match.dsp?.some((tag) => tag.type === "branch-move"));
+		if (dir === undefined || (found !== undefined && dir !== found)) return undefined;
+		found = dir;
+		count++;
 	}
-	// Substitutions run in the same shell: they start where the command ended up.
-	if (options?.inner) for (const inner of options.inner(command)) matches.push(...classifyFrom(inner, options.fork?.() ?? options, state));
-	return matches;
+	return count === total ? found : undefined;
 }

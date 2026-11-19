@@ -1,6 +1,6 @@
 ---
 name: brigadev-branch-pr
-description: "Trigger: create PR, open pull request. Prepare branches and PRs from evidence, following the repo's policy."
+description: "Trigger: commit, create PR, split a large change. Work-unit commits, branches, and PRs from evidence."
 metadata:
   author: brigadev
   version: "0.1"
@@ -8,7 +8,7 @@ metadata:
 
 ## When to use
 
-Creating or preparing a pull request, or preparing a branch for submission.
+Deciding what goes into each commit, creating or preparing a pull request, or splitting a change over ~400 lines.
 
 ## Target and authorization
 
@@ -19,10 +19,10 @@ Creating or preparing a pull request, or preparing a branch for submission.
 ## Workflow
 
 1. No issue is required. Link one only when the user mentions it, and ask whether it closes (`Closes #N`) or only references (`Refs #N`) it.
-2. Work on a `type/description` branch from the verified default branch (normally already started by the work-unit flow).
-3. Implement in work units (`brigadev-work-unit-commits`), test-first where applicable, running the applicable checks.
-4. If the change exceeds ~400 changed lines, load `brigadev-chained-pr` before opening anything.
-5. **Review before the PR**, once the work units are done: first ask the scope with one `ask_user_choice`: **Full 4R** (all four lenses, slowest), **Fitting lenses** (recommended: only the lenses the change's risk needs), or **Skip the review** (then say so in the PR body's Risk line). Without a UI, ask in your reply and stop. Then run `brigadev-review` on `<default>...HEAD` with the chosen scope and write the ledger to `reviews/<branch with / as ->.md` in the repo docs folder named in the orchestrator prompt. Show the ledger. If it has blockers, ask the user before opening the PR.
+2. Work on a `type/description` branch from the verified default branch (normally already started).
+3. Implement in work units (see Commits), test-first where applicable, running the applicable checks.
+4. If the change exceeds ~400 changed lines, follow Oversized changes before opening anything.
+5. **Review before the PR**, once the work units are done: first ask the scope with one `ask_user_choice`: **Full 4R** (all four lenses), **Fitting lenses** (recommended: only the lenses the change's risk needs), or **Skip the review** (then say so in the PR body's Risk line). Without a UI, ask in your reply and stop. Then run `brigadev-review` on `<default>...HEAD` with the chosen scope and write the ledger to `reviews/<branch with / as ->.md` in the repo docs folder named in the orchestrator prompt. Show the ledger. If it has blockers, ask the user before opening the PR.
 6. Draft the PR body from the repository template (or, with none, the evidence-based body below) and observed evidence. Show it to the user.
 7. On explicit authorization: push, then open the PR with explicit `--repo` and `--base`.
 8. Report required CI status; never call a PR merge-ready on an unverified green claim.
@@ -30,6 +30,20 @@ Creating or preparing a pull request, or preparing a branch for submission.
 ## Branch naming
 
 `^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)\/[a-z0-9._-]+$`, for example `feat/user-login`, `fix/null-session-crash`.
+
+## Commits
+
+- One commit = one deliverable behavior, fix, migration, or docs unit, with its tests and docs. Never split by file type (models, then services, then tests). A high-risk unit gets its own commit.
+- Commit each finished unit unasked; the guard lets a feature-branch commit run without a dialog.
+- Before each commit: one clear purpose; builds and tests pass with only this commit; reverting it reverts nothing unrelated.
+- Conventional Commits: `type(scope): description` (`!` for breaking), describing the outcome, not the file list. No `Co-Authored-By` trailers unless asked. Match `git log --oneline -5`.
+- In tracked work, record each task's commit in the feature document's `## Tasks`.
+
+## Oversized changes
+
+Above ~400 changed lines (additions + deletions, generated files excluded), slice by work unit; the budget shapes slicing, never the code: never delete comments, docs, or tests, or compress code, to fit. One honest slicing pass; if no cohesive split fits, report the count and why. Wide mechanical refactors slice as expand–contract.
+
+Unless the feature document already records a strategy, ask once with `ask_user_choice`, in this order: **Feature branch chain** (draft tracker PR; children target the tracker or their parent; nothing lands until the chain completes), **Stacked to the default branch** (each slice lands in order), **One single PR** (least recommended). Record the choice as the delivery strategy; it does not authorize push or PR creation. Branch mechanics and the Chain Context block: `references/chaining-details.md`. A polluted diff (another slice's changes) is a base bug: retarget or rebase.
 
 ## PR body
 
@@ -54,7 +68,7 @@ Use the repository template when present. Otherwise build the body from the evid
 - Forced commits: <disclosure, only when the log has any>
 
 ## Risk
-none | item N (reason)
+none | <data|security|contract|concurrency|delivery|untested> (reason)
 ```
 
 Add `Closes #N` or `Refs #N` only when the user named an issue. Record only commands you actually ran. Leave unverified checklist items unchecked.
@@ -63,11 +77,11 @@ Add `Closes #N` or `Refs #N` only when the user named an issue. Record only comm
 
 The log is `<repo docs>/evidence/<branch with / as ->.jsonl`, in the repo docs folder named in the orchestrator prompt. Read it with `read` or `grep`; it is JSON lines, and the guard blocks writing it, so never edit it.
 
-- `type:"run"` records: `command`, `kind` (`test` or `check`), `exitCode`, `outcome` (`pass`, `fail`, or `unknown`), `ts`, `tree`, `agent`, and `tail` (the end of the output).
+- `type:"run"` records: `command`, `kind` (`test` or `check`), `exitCode`, `outcome` (`pass`, `fail`, or `unknown`), `ts`, `tree`, `srcTree` (the tree without doc paths), `root` (the repository the run belongs to; a nested repository's own, not the session's), `agent`, and `tail` (the end of the output).
 - `type:"force"` records: the user forced a commit past the evidence gate. State this in the body under Forced commits, with its time; never leave it out.
 - Before: the earliest `fail` run for the bug or the RED test, quoting its `command` and what `tail` shows. Without one (no bug, or nothing was recorded), write `none recorded` instead of inventing it.
-- After: the latest `pass` run, quoting `command` and `outcome`. Prefer a `test` run whose `tree` is the final one; if the last edit came after it, say so.
-- Quote commands and outcomes as logged. Treat `unknown` as not verified. Never claim a check that is not in the log; a check you ran outside the log may be listed as run without a log record.
+- After: the latest `pass` run, quoting `command` and `outcome`. Prefer a `test` run whose `tree` is the final one. A run is also valid for the final tree when its `srcTree` equals the final tree's source tree (only docs changed after it); if a source edit came after it, say so.
+- Quote commands as the model ran them, without the `set -o pipefail; ` the harness puts in front of a piped test run (it is not part of the command), and outcomes as logged. Treat `unknown` as not verified. Never claim a check that is not in the log; a check you ran outside the log may be listed as run without a log record.
 - Secrets: the log stores commands and output tails in plaintext. Before showing the draft, check every command and output tail quoted from it for secrets, tokens, and credentials, and replace them with `<REDACTED>`.
 - No log file: say the PR has no recorded evidence, and list only what you observed yourself.
 

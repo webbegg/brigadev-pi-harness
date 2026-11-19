@@ -68,3 +68,28 @@ export function spentUntil(snapshot: UsageSnapshot | undefined, now: number): nu
 	if (resetMs !== undefined && resetMs <= now) return undefined;
 	return resetMs ?? now + 30 * 60_000;
 }
+
+function when(unixSeconds: number | undefined, now: number): string {
+	if (!unixSeconds) return "unknown";
+	const date = new Date(unixSeconds * 1000);
+	const sameDay = date.toDateString() === new Date(now).toDateString();
+	return sameDay ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : date.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+/** The `/brigadev:cost` usage section: one line per provider, one bar per window, and when a spent provider is usable again. */
+export function usageReportLines(entries: ReadonlyArray<readonly [string, UsageSnapshot]>, now: number): string[] {
+	if (entries.length === 0) return ["No usage reported yet. It appears after the first response from a provider that sends rate-limit headers (claude-bridge, Anthropic)."];
+	const lines: string[] = [];
+	for (const [provider, s] of entries) {
+		const age = Math.round((now - s.observedAt) / 60_000);
+		const spent = spentUntil(s, now);
+		lines.push(`${provider}: ${spent ? "LIMIT REACHED" : (s.status ?? "unknown")}${s.claim ? ` · binding: ${s.claim}` : ""}${s.overageStatus ? ` · extra usage: ${s.overageStatus}` : ""} · seen ${age} min ago`);
+		for (const w of s.windows) {
+			const percent = Math.round(w.utilization * 100);
+			const bar = "▰".repeat(Math.round(percent / 10)) + "▱".repeat(10 - Math.round(Math.min(100, percent) / 10));
+			lines.push(`  ${windowLabel(w.name).padEnd(10)} ${bar} ${String(percent).padStart(3)}%  resets ${when(w.resetsAt, now)}`);
+		}
+		if (spent) lines.push(`  limit reached until ${new Date(spent).toLocaleTimeString()}`);
+	}
+	return lines;
+}

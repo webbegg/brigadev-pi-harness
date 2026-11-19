@@ -67,19 +67,6 @@ function branchPrProblems(text: string): string[] {
 	return problems;
 }
 
-/** The Open a PR workflow points at ask_user_choice and never orders the review before that question or unconditionally. */
-function openPrProblems(text: string): string[] {
-	const problems: string[] = [];
-	const body = text.replace(/^---\n[\s\S]*?\n---\n/, "");
-	const ask = body.indexOf("ask_user_choice");
-	if (ask < 0) problems.push("the workflow does not reference ask_user_choice");
-	const order = /\b(run|do|start|launch|perform)\b[^.;\n]*\breview\b/i.exec(body);
-	if (order && (ask < 0 || order.index < ask)) problems.push(`the workflow orders the review before asking the scope: "${order[0]}"`);
-	const always = /\b(always|unconditionally|every time|whatever the answer)\b[^.\n]*\breview|\breview\b[^.\n]*\b(always|unconditionally|every time|whatever the answer)\b/i.exec(body);
-	if (always) problems.push(`the workflow reviews unconditionally: "${always[0]}"`);
-	return problems;
-}
-
 describe("review policy", () => {
 	it("the orchestrator names brigadev-review without a per-commit or high-risk trigger, and brigadev-verify for high risk", () => {
 		assert.deepEqual(orchestratorReviewProblems(read("assets", "orchestrator.md")), []);
@@ -91,10 +78,6 @@ describe("review policy", () => {
 
 	it("branch-pr asks the review scope (full, fitting, skip) before reviewing", () => {
 		assert.deepEqual(branchPrProblems(read("skills", "brigadev-branch-pr", "SKILL.md")), []);
-	});
-
-	it("the Open a PR workflow defers to that question instead of always reviewing", () => {
-		assert.deepEqual(openPrProblems(read("assets", "workflows", "open-pr.md")), []);
 	});
 });
 
@@ -110,17 +93,17 @@ describe("review policy checks catch a regression (mutated copies of the asset t
 		const text = read("assets", "orchestrator.md");
 
 		it("review per work-unit commit that carries a high-risk item", () => {
-			const mutated = mutate(text, /never per commit \(high risk gets `brigadev-verify`\)/, "after each work-unit commit that carries a high-risk item");
+			const mutated = mutate(text, /high risk gets `brigadev-verify` instead/, "after each work-unit commit that carries a high-risk item");
 			assert.match(orchestratorReviewProblems(mutated).join("\n"), /commit/i);
 		});
 
 		it("review on every commit, with verify still named", () => {
-			const mutated = mutate(text, /never per commit/, "on every commit");
+			const mutated = mutate(text, /only when the user asks, or once before the PR/, "on every commit, or once before the PR");
 			assert.notDeepEqual(orchestratorReviewProblems(mutated), []);
 		});
 
 		it("brigadev-verify no longer named for high risk", () => {
-			const mutated = mutate(text, /\(high risk gets `brigadev-verify`\)/, "(high risk gets extra care)");
+			const mutated = mutate(text, /high risk gets `brigadev-verify` instead/, "high risk gets extra care");
 			assert.match(orchestratorReviewProblems(mutated).join("\n"), /brigadev-verify/);
 		});
 
@@ -173,8 +156,18 @@ describe("review policy checks catch a regression (mutated copies of the asset t
 		});
 
 		it("an option is only named after the invocation", () => {
-			const mutated = mutate(mutate(text, "**Full 4R** (all four lenses, slowest), ", ""), "with the chosen scope", "with the chosen scope (full)");
+			const mutated = mutate(mutate(text, "**Full 4R** (all four lenses), ", ""), "with the chosen scope", "with the chosen scope (full)");
 			assert.match(branchPrProblems(mutated).join("\n"), /full option only after/);
+		});
+
+		it("LOOP R3-007: the options carry no stale timing claim (one reviewer pass now)", () => {
+			assert.doesNotMatch(text, /slowest/);
+		});
+
+		it("GATE R3-002: the evidence section names srcTree and root and the injected pipefail prefix", () => {
+			assert.match(text, /`srcTree`/);
+			assert.match(text, /`root`/);
+			assert.match(text, /without the `set -o pipefail; `/);
 		});
 
 		it("step 5 missing", () => {
@@ -186,27 +179,14 @@ describe("review policy checks catch a regression (mutated copies of the asset t
 			assert.deepEqual(branchPrProblems(mutated), []);
 		});
 	});
+});
 
-	describe("open-pr workflow", () => {
-		const text = read("assets", "workflows", "open-pr.md");
+describe("team review focus (LOOP R3-007)", () => {
+	const text = read("assets", "workflows", "team-review.md");
 
-		it("ask_user_choice removed", () => {
-			assert.match(openPrProblems(text.replaceAll("ask_user_choice", "a question")).join("\n"), /ask_user_choice/);
-		});
-
-		it("the review is ordered first, unconditionally", () => {
-			const mutated = mutate(text, /Before the PR, ask the review scope/, "Run the pre-PR review first. Then ask the review scope");
-			assert.match(openPrProblems(mutated).join("\n"), /review/i);
-		});
-
-		it("the review is always run", () => {
-			const mutated = mutate(text, /Open the PR only after/, "Always review the branch, whatever the answer. Open the PR only after");
-			assert.notDeepEqual(openPrProblems(mutated), []);
-		});
-
-		it("the review ordered after the question is fine", () => {
-			const mutated = mutate(text, /; a `brigadev-review` of the branch/, "; then run the review: a `brigadev-review` of the branch");
-			assert.deepEqual(openPrProblems(mutated), []);
-		});
+	it("names the chosen lens first and adds the lens of any high-risk category, without the legacy item wording", () => {
+		assert.doesNotMatch(text, /that lens only/);
+		assert.doesNotMatch(text, /high-risk item/);
+		assert.match(text, /name the chosen lens first, then add the lens that covers any high-risk category/);
 	});
 });

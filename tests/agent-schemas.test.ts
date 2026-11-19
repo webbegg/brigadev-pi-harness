@@ -18,8 +18,8 @@ function schemaOf(agent: string): JsonSchema {
 
 const finding = { id: "R1-001", severity: "BLOCKER", location: "lib/a.ts:3", claim: "c", evidence: "e", cause: "introduced" };
 
-describe("review lens schemas", () => {
-	for (const lens of ["review-risk", "review-readability", "review-reliability", "review-resilience"]) {
+describe("review schema", () => {
+	for (const lens of ["review-4r"]) {
 		it(`${lens} accepts its findings contract`, () => {
 			const schema = schemaOf(lens);
 			assert.deepEqual(validateAgainstSchema(schema, { findings: [finding], reviewed: "patch + 3 files" }), []);
@@ -37,23 +37,21 @@ describe("review lens schemas", () => {
 	}
 });
 
-describe("Judgment Day judge schemas", () => {
-	for (const judge of ["jd-judge-a", "jd-judge-b"]) {
-		it(`${judge} accepts discovery and re-judgment payloads`, () => {
-			const schema = schemaOf(judge);
-			assert.deepEqual(validateAgainstSchema(schema, { findings: [{ id: "JD-A-001", severity: "CRITICAL", location: "a.ts:1", claim: "c", evidence: "e" }] }), []);
-			assert.deepEqual(validateAgainstSchema(schema, { resolutions: [{ id: "JD-A-001", outcome: "verified", evidence: "e" }] }), []);
-		});
+describe("brigadev-verify agent", () => {
+	const text = readFileSync(join(PACKAGE_AGENTS_DIR, "brigadev-verify.md"), "utf8");
 
-		it(`${judge} rejects an empty payload, which must not read as clean`, () => {
-			assert.deepEqual(validateAgainstSchema(schemaOf(judge), {}), ["$: expected at least 1 property"]);
-			assert.deepEqual(validateAgainstSchema(schemaOf(judge), { findings: [] }), []);
-		});
+	it("works without a feature document: the spec is the document's S# or the task's own numbered criteria (A1..An)", () => {
+		assert.match(text, /A1/);
+		assert.match(text, /acceptance criteria/i);
+		assert.doesNotMatch(text, /Read the whole feature document/);
+		assert.match(text, /no feature document|without a feature document|when (?:one is|a feature document is) (?:given|named|passed)/i);
+	});
 
-		it(`${judge} rejects an unknown outcome`, () => {
-			assert.equal(validateAgainstSchema(schemaOf(judge), { resolutions: [{ id: "x", outcome: "fixed", evidence: "e" }] }).length, 1);
-		});
-	}
+	it("asks for quiet test output and has no run budget field", () => {
+		assert.match(text, /summary reporter/i);
+		assert.match(text, /tail/i);
+		assert.doesNotMatch(text, /budgetMinutes/);
+	});
 });
 
 describe("brigadev-verify schema", () => {
@@ -68,6 +66,21 @@ describe("brigadev-verify schema", () => {
 
 	it("accepts the verifier's return contract", () => {
 		assert.deepEqual(validateAgainstSchema(schemaOf("brigadev-verify"), report), []);
+	});
+
+	it("takes verdicts against the task's numbered acceptance criteria (A1..An) as well as S#", () => {
+		const schema = schemaOf("brigadev-verify");
+		assert.deepEqual(validateAgainstSchema(schema, { ...report, verdicts: [{ spec: "A1", verdict: "met", evidence: "probe" }, { spec: "A2", verdict: "unmet", evidence: "probe" }] }), []);
+		const verdicts = ((schema.properties as any).verdicts ?? {}) as { description?: string; items?: { properties?: { spec?: { description?: string } } } };
+		assert.match(verdicts.description ?? "", /\bA\d|acceptance criteri/i);
+		assert.match(verdicts.items?.properties?.spec?.description ?? "", /A1/);
+		assert.doesNotMatch(verdicts.description ?? "", /in the feature document/i);
+	});
+
+	it("keeps the result small: a regression test is a path, what it covers, and a short reproduction", () => {
+		const schema = schemaOf("brigadev-verify");
+		const compact = { ...report, regressionTests: [{ path: "tests/a.test.ts", covers: "A1", reproduction: "node --test tests/a.test.ts fails: expected 1, got 2" }] };
+		assert.deepEqual(validateAgainstSchema(schema, compact), []);
 	});
 
 	it("allows only the documented verdicts", () => {

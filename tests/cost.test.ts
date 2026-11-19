@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { addUsage, cacheHitRate, emptyTally, formatCost, priceBridgeMessage, type CostCalculator, type UsageLike } from "../lib/cost.ts";
+import { usageReportLines, type UsageSnapshot } from "../lib/usage-windows.ts";
 
 const usage = (overrides: Partial<UsageLike> = {}): UsageLike => ({
 	input: 1000,
@@ -58,5 +59,39 @@ describe("tally", () => {
 
 	it("formats zero cost without decimals", () => {
 		assert.equal(formatCost(0), "$0");
+	});
+});
+
+describe("usageReportLines", () => {
+	const NOW = 1_794_000_000_000;
+	const snapshot = (overrides: Partial<UsageSnapshot> = {}): UsageSnapshot => ({
+		status: "allowed",
+		claim: "seven_day",
+		overageStatus: "rejected",
+		resetsAt: 1_794_060_000,
+		windows: [
+			{ name: "5h", utilization: 0.92, resetsAt: 1_794_010_000 },
+			{ name: "7d", utilization: 0.55, resetsAt: 1_794_060_000 },
+		],
+		observedAt: NOW - 3 * 60_000,
+		...overrides,
+	});
+
+	it("says nothing was reported yet when there are no snapshots", () => {
+		assert.match(usageReportLines([], NOW)[0], /^No usage reported yet/);
+	});
+
+	it("lists a provider with its binding window, age, and one bar per window", () => {
+		const lines = usageReportLines([["claude-bridge", snapshot()]], NOW);
+		assert.equal(lines[0], "claude-bridge: allowed · binding: seven_day · extra usage: rejected · seen 3 min ago");
+		assert.match(lines[1], /^ {2}5h {9}▰▰▰▰▰▰▰▰▰▱ {2}92%  resets /);
+		assert.match(lines[2], /^ {2}week {7}▰▰▰▰▰▰▱▱▱▱ {2}55%  resets /);
+		assert.equal(lines.length, 3);
+	});
+
+	it("flags a spent provider and tells when it is usable again", () => {
+		const lines = usageReportLines([["claude-bridge", snapshot({ status: "rejected" })]], NOW);
+		assert.match(lines[0], /^claude-bridge: LIMIT REACHED/);
+		assert.match(lines[lines.length - 1], /^ {2}limit reached until /);
 	});
 });

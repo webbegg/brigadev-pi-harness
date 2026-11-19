@@ -1,7 +1,7 @@
 /**
- * brigadev subagents: focused agents with isolated context, each in its own
- * `pi --mode rpc` process (the task is sent as an RPC prompt, so a running child can
- * be steered or aborted from the Agents viewer). Adapted from Pi's official subagent example.
+ * brigadev subagents: focused agents with isolated context, each in its own `pi --mode json`
+ * process (the task is the message, the call returns when every task has ended). Adapted from Pi's
+ * official subagent example.
  *
  * Adds the brigadev delegation contract on top: every launch names its
  * reason, the verifier needs a named risk item, writers need disjoint
@@ -13,11 +13,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { agentsCard, FINISHED_TTL_MS, visibleRuns, type AgentRun, type RunState } from "../lib/agents-card.ts";
-import { ABORT_PROMPT, abortArmFor, autoScroll, buildEntries, canTakeOver, entryDetail, listRow, moveSelection, openTakeover, pressAbort, printableText, resolveSelection, scrollView, takeoverFooter, takeoverKey, takeoverKind, takeoverNotice, viewerFooter, viewerTitle, type AbortArm, type RecordedRun, type Selection, type TakeoverKey, type TakeoverState, type TrackedRun } from "../lib/subagent-viewer.ts";
-import type { ChildControl } from "../lib/child-rpc.ts";
+import { autoScroll, buildEntries, entryDetail, listRow, moveSelection, resolveSelection, scrollView, VIEWER_FOOTER, viewerTitle, type RecordedRun, type Selection, type TrackedRun } from "../lib/subagent-viewer.ts";
 import { formatStatus, statusCounts } from "../lib/subagent-status.ts";
 import { queuedFields, subagentRow, syncRowTimer, type RowInput, type RowTimerState } from "../lib/subagent-row.ts";
 import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
@@ -25,21 +24,14 @@ import { listWidth, renderTwoPane } from "../lib/two-pane.ts";
 import { emptyTally, formatCost, formatTokens } from "../lib/cost.ts";
 import { installParentExitGuard, KILL_GRACE_MS, liveChildren, runChild } from "../lib/child-run.ts";
 import { output, runStatus, toRunState, type RunResult } from "../lib/run-status.ts";
-import { newRunId, pruneRunFolders, pruneWarning } from "../lib/run-artifacts.ts";
+import { pruneRunFolders, pruneWarning } from "../lib/run-artifacts.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
-import { runLaunch, toResult, type Details, type FallbackStep, type LaunchHooks, type LaunchResult, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
-import { createResultDelivery, omittedLaunchIds, omittedResultText, resultBatchMessage, resultCard, RESULT_MESSAGE_TYPE, type BatchEntry, type ResultMessageDetails } from "../lib/result-delivery.ts";
-import { createSubagentRegistry } from "../lib/subagent-registry.ts";
-import { BTW_AGENT, BTW_ENTRY_TYPE, BTW_REASON, btwCard, btwEntry, btwTask, createAsideTracker, hideAsides, type BtwEntryData } from "../lib/btw.ts";
-import { cancelLaunch, collectedResult, collectHint, startedText, waitForLaunch, WAIT_DEFAULT_SECONDS, WAIT_MAX_SECONDS } from "../lib/subagent-tools.ts";
+import { runLaunch, toResult, type Details, type LaunchHooks, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
 import { admitLaunch, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
-import { cooldownMs, launchOrder, priceNote } from "../lib/fallback.ts";
-import { blockedReason, fallbackState } from "../lib/fallback-state.ts";
-import { resolveAgentRoute, resolveModelRef, routeFor, type ResolvedRoute } from "../lib/model-routing.ts";
-import { costCalculator, currentModelRef, listPrice, loadAgents, modelCatalog } from "../lib/pi-adapters.ts";
+import { resolveAgentRoute, resolveModelRef, type ResolvedRoute } from "../lib/model-routing.ts";
+import { costCalculator, currentModelRef, loadAgents, modelCatalog } from "../lib/pi-adapters.ts";
 import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
-import { panelState } from "../lib/panel-state.ts";
 import { canonicalPath } from "../lib/paths.ts";
 import { isChildSession } from "../lib/runtime.ts";
 import { loadOutputSchema } from "../lib/structured-output.ts";
@@ -53,10 +45,10 @@ const STATUS_KEY = "brigadev-agents";
 const CARD_KEY = "brigadev-agents-card";
 const CARD_COLLAPSE_KEY = "ctrl+shift+a";
 const VIEWER_KEY = "alt+a";
-/** Settled runs this process remembers for the viewer (older ones are still on the session branch when collected). */
+/** Settled runs this process remembers for the viewer (older ones are still on the session branch). */
 const MAX_SETTLED_VIEW_RUNS = 100;
-/** Tool results that carry finished runs: a sync call, or an async launch collected by wait/cancel. */
-const VIEWER_TOOLS = new Set(["subagent", "subagent_wait", "subagent_cancel"]);
+/** Tool results that carry finished runs. */
+const VIEWER_TOOLS = new Set(["subagent"]);
 
 function piInvocation(args: string[]): { command: string; args: string[] } {
 	const script = process.argv[1];
@@ -72,7 +64,7 @@ const launchFields = (described: boolean) => {
 	return {
 		agent: Type.String(d("Agent name")),
 		task: Type.String(d("Task; requirements by reference or verbatim")),
-		reason: Type.String(d('Delegation trigger, or "Risk: item N (why)" for brigadev-verify')),
+		reason: Type.String(d('Delegation trigger, or "Risk: <category> (why)" for brigadev-verify')),
 		allowedEditSurfaces: Type.Optional(Type.Array(Type.String(), d("Writers: narrow repo-relative paths/globs"))),
 		featureDoc: Type.Optional(Type.String(d("Feature document path (read until ## Log)"))),
 		skills: Type.Optional(Type.Array(Type.String(), d("Skill names to read first"))),
@@ -88,19 +80,7 @@ const Params = Type.Object({
 	featureDoc: described.featureDoc,
 	skills: described.skills,
 	tasks: Type.Optional(Type.Array(Type.Object(launchFields(false)), { description: `Parallel independent units (max ${MAX_PARALLEL_TASKS}), same fields` })),
-	async: Type.Optional(Type.Boolean({ description: "Return a launch id now; collect it with subagent_wait" })),
 });
-
-// `runId` is the old name of `launchId` (it collides with the per-attempt run id): still accepted, exactly one is required (lib/subagent-tools.ts).
-const launchRef = {
-	launchId: Type.Optional(Type.String({ description: "Launch id from an async subagent call" })),
-	runId: Type.Optional(Type.String({ description: "Deprecated alias of launchId" })),
-};
-const WaitParams = Type.Object({
-	...launchRef,
-	timeoutSeconds: Type.Optional(Type.Number({ description: `Default ${WAIT_DEFAULT_SECONDS}, max ${WAIT_MAX_SECONDS}` })),
-});
-const CancelParams = Type.Object(launchRef);
 
 function formatUsage(r: RunResult): string {
 	const u = r.usage;
@@ -133,7 +113,6 @@ function rowInput(r: RunResult): RowInput {
 		inherited: r.inherited,
 		queued: r.queued,
 		cancelled: r.cancelled,
-		fallbacks: r.fallbacks,
 		startedAt: r.startedAt,
 		endedAt: r.endedAt,
 		cost: r.usage.cost,
@@ -157,93 +136,19 @@ export default function (pi: ExtensionAPI) {
 
 	let skills: SkillRef[] = [];
 	const activeWriters: ActiveWriter[] = [];
-	// Async launches record the writers other launches register while they run (the writer backstop's exclusion of other launches' writers).
-	const writerListeners = new Set<(writers: readonly ActiveWriter[]) => void>();
-	// Launches in flight, sync or async, by id: their result placeholders are the one source of the footer's running count
+	// Launches in flight by id: their result placeholders are the one source of the footer's running count
 	// and of the viewer's live rows, so nothing is counted by hand and no exit path can leave a count behind.
 	const launches = new Map<RunResult[], number>();
 	let launchSeq = 0;
-	// Steering handles of the running children, by viewer entry key (`<launch>:<task>`). A finished run has none.
-	const controls = new Map<string, ChildControl>();
-	// Runs of launches that ended in this session, for the viewer (async launches stay visible before they are collected).
+	// Runs of launches that ended in this session, for the viewer.
 	let settled: TrackedRun[] = [];
 	// Bumped on session start: a launch left from the previous session must not add to the new one.
 	let epoch = 0;
 	// Repaint hook of the open Agents viewer.
 	let repaintViewer: (() => void) | undefined;
 
-	// One concurrency cap for every launch in this process, sync or async.
+	// One concurrency cap for every launch in this process.
 	const slots = createSemaphore(MAX_CONCURRENCY);
-	// `/btw` asides: launches through the same path as any async one, but never delivered to the model nor reachable from its tools (lib/btw.ts).
-	const asides = createAsideTracker();
-	// False from session shutdown to the next session start: an aside that settles then (aborted) is not recorded into a closing session.
-	let asidesOpen = true;
-	// Async launches: each runs under its own AbortController, collected by subagent_wait / subagent_cancel.
-	const registry = createSubagentRegistry<LaunchResult>({
-		setTimer: (fn, ms) => setTimeout(fn, ms),
-		clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
-		newId: () => newRunId("launch"),
-		// A result held for the idle parent is never pruned before it is delivered or collected.
-		isPinned: (id) => delivery.isHeld(id),
-	});
-	// What the model's subagent_wait / subagent_cancel see: an aside answers like an unknown id.
-	const modelRegistry = hideAsides(registry, asides);
-
-	// Idle delivery of async results the model did not collect: injected as a custom message that starts a parent turn.
-	// Pi API (docs/extensions.md in the installed pi-coding-agent): `pi.sendMessage(..., { triggerTurn: true, deliverAs: "steer" })`
-	// starts a turn when idle and joins the run when busy ("pi.sendMessage(message, options?)"); `ctx.isIdle()` ("ExtensionContext");
-	// `agent_settled` is the final-idle signal, `agent_end` is not ("agent_start / agent_end / agent_before_settle / agent_settled");
-	// a renderer is registered per customType ("pi.registerMessageRenderer(customType, renderer)").
-	let parentCtx: ExtensionContext | undefined;
-	const delivery = createResultDelivery<LaunchResult>({
-		isIdle: () => {
-			try {
-				return parentCtx?.isIdle() ?? false;
-			} catch {
-				return false; // a stale context (session replaced): treat as busy; session_start resets the buffer
-			}
-		},
-		isConsumed: (id) => registry.get(id)?.consumed ?? true,
-		markConsumed: (id, by) => void registry.markConsumed(id, by),
-		// One message per flush: every ready launch in one combined message, so one parent turn starts and its model sees all of them.
-		deliver: (batch) => {
-			const entries = batch.map(({ id, launch, result }): BatchEntry => {
-				const collected = collectedResult(id, launch.error === undefined ? { status: "settled", launch, result } : { status: "settled", launch, error: launch.error });
-				const tasks = (result?.details.results ?? []).map((r) => ({ agent: r.agent, artifactsDir: r.artifactsDir }));
-				return { id, text: collected.content.map((c) => c.text).join("\n"), failed: collected.isError === true || launch.error !== undefined, pointer: omittedResultText(id, tasks) };
-			});
-			const message = resultBatchMessage(entries);
-			pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
-			// The launches the size guard left as a pointer: recorded as such once the delivery succeeded.
-			return { omitted: omittedLaunchIds(entries) };
-		},
-		// Retried at each idle flush; when the bound is spent the result is still collectable with subagent_wait.
-		onDeliveryFailed: ({ id }) => {
-			try {
-				if (parentCtx?.hasUI) parentCtx.ui.notify(`brigadev: could not deliver the result of async subagent launch ${id}; collect it with ${collectHint(id)}`, "warning");
-			} catch {
-				// A stale context: nobody to tell.
-			}
-		},
-	});
-	// An aside's answer is a custom entry: `pi.appendEntry` (docs/extensions.md, "pi.appendEntry(customType, data?)") "do[es] NOT participate in LLM context",
-	// and is drawn by the entry renderer below ("pi.registerEntryRenderer(customType, renderer)"). Never `sendMessage`, which does reach the model.
-	const recordAside = (id: string, result: LaunchResult | undefined, error: string | undefined) => {
-		if (!asidesOpen) return;
-		const data = btwEntry({ id, question: asides.question(id) ?? "", launch: { error }, result });
-		try {
-			pi.appendEntry(BTW_ENTRY_TYPE, data);
-			registry.markConsumed(id, "delivered");
-			if (parentCtx?.hasUI) parentCtx.ui.notify(`by the way “${data.title}” ${data.status === "failed" ? "failed" : "answered"} (launch ${id})`, data.status === "failed" ? "error" : "info");
-		} catch {
-			// A stale context (session replaced): nobody to show it to.
-		}
-	};
-	registry.subscribe((event) => {
-		if (event.type !== "settle") return;
-		if (asides.has(event.launch.id)) recordAside(event.launch.id, event.result, event.launch.error);
-		else delivery.settled(event);
-	});
 
 	// Agents card: live rows above the editor while subagents run.
 	let runs: AgentRun[] = [];
@@ -258,7 +163,7 @@ export default function (pi: ExtensionAPI) {
 		ticker = expiry = undefined;
 	};
 
-	// Footer: `agents: 2 running · 3 done · alt+a`, counted across sync and async launches. Done follows the card's lifetime.
+	// Footer: `agents: 2 running · 3 done · alt+a`. Done follows the card's lifetime.
 	const syncStatus = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
 		try {
@@ -269,8 +174,6 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const showCard = (ctx: ExtensionContext) => {
-		// The side panel reads copies; the runs below keep mutating while they work.
-		panelState().publish("agents", runs.map((r) => ({ ...r })));
 		if (!ctx.hasUI) return;
 		if (visibleRuns(runs, Date.now()).length === 0) {
 			stopTimers();
@@ -315,15 +218,8 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		parentCtx = ctx;
-		// Launches left from a previous session in this process are stopped and forgotten, with any result held for them.
-		delivery.reset();
-		registry.clear();
-		asides.clear();
-		asidesOpen = true;
 		runs = [];
 		launches.clear();
-		controls.clear();
 		settled = [];
 		epoch++;
 		showCard(ctx);
@@ -335,13 +231,9 @@ export default function (pi: ExtensionAPI) {
 			// Retention is housekeeping, not part of starting a session.
 		}
 	});
-	// Children (async and sync) get SIGTERM, and are given KILL_GRACE_MS + 1 s to settle; a group still alive then is
+	// Children get SIGTERM, and are given KILL_GRACE_MS + 1 s to settle; a group still alive then is
 	// SIGKILLed before this returns, so no child or grandchild outlives the parent. The wait is bounded: shutdown cannot hang.
 	pi.on("session_shutdown", async () => {
-		// Aborted children settle after this; their results must not be sent to a session that is going away.
-		delivery.stop();
-		asidesOpen = false;
-		registry.abortAll();
 		stopTimers();
 		await liveChildren.shutdown({ graceMs: KILL_GRACE_MS + SHUTDOWN_SLACK_MS, setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout) });
 	});
@@ -354,173 +246,121 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// The parent is idle for good (not between retries or queued continuations): deliver what settled meanwhile.
-	pi.on("agent_settled", async (_event, ctx) => {
-		parentCtx = ctx;
-		delivery.flush();
-	});
-
-	pi.registerMessageRenderer<ResultMessageDetails>(RESULT_MESSAGE_TYPE, (message, { expanded, outputPad, keyHint }, theme) => {
-		const content = typeof message.content === "string" ? message.content : message.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
-		const card = resultCard(content, message.details, expanded);
-		const box = new Box(outputPad, 1, (t) => theme.bg("customMessageBg", t));
-		card.lines.forEach((line, i) => {
-			box.addChild({ render: (width: number) => [theme.fg(line.tone, i === 0 ? theme.bold(truncateToWidth(line.text, Math.max(1, width), "…")) : truncateToWidth(line.text, Math.max(1, width), "…"))], invalidate: () => {} });
-		});
-		if (expanded) box.addChild(new Markdown(card.body, 0, 0, getMarkdownTheme()));
-		else if (card.hidden > 0) box.addChild(new Text(theme.fg("muted", `  (${keyHint("app.tools.expand", "to expand")})`), 0, 0));
-		return box;
-	});
-
-	pi.registerEntryRenderer<BtwEntryData>(BTW_ENTRY_TYPE, (entry, { expanded, keyHint }, theme) => {
-		const card = btwCard(entry.data, expanded);
-		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
-		card.lines.forEach((line, i) => {
-			box.addChild({ render: (width: number) => [theme.fg(line.tone, i === 0 ? theme.bold(truncateToWidth(line.text, Math.max(1, width), "…")) : truncateToWidth(line.text, Math.max(1, width), "…"))], invalidate: () => {} });
-		});
-		if (expanded) box.addChild(new Markdown(card.body, 0, 0, getMarkdownTheme()));
-		else if (card.hidden > 0) box.addChild(new Text(theme.fg("muted", `  (${keyHint("app.tools.expand", "to expand")})`), 0, 0));
-		return box;
-	});
-
 	pi.on("before_agent_start", async (event) => {
 		skills = (event.systemPromptOptions.skills ?? []).map((s) => ({ name: s.name, filePath: s.filePath }));
 	});
 
-	// The launch behind the `subagent` tool. `/btw` uses it too, with origin "btw": same admission, slots, guard, run folder and viewer row,
-	// but the async launch is recorded as an aside (see `asides`) so the model's tools and the idle delivery never see it.
-	const subagentLauncher = {
-		async launch(params: Static<typeof Params>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: ExtensionContext, origin: "model" | "btw" = "model", question = "") {
-			parentCtx = ctx;
-			const agents = loadAgents(ctx);
-			const requests: LaunchRequest[] = params.tasks?.length
-				? params.tasks
-				: params.agent
-					? [{ agent: params.agent, task: params.task ?? "", reason: params.reason ?? "", allowedEditSurfaces: params.allowedEditSurfaces, featureDoc: params.featureDoc, skills: params.skills }]
-					: [];
-			const mode: Details["mode"] = params.tasks?.length ? "parallel" : "single";
-			const reject = (text: string) => ({ content: [{ type: "text" as const, text }], details: { mode, results: [] } as Details, isError: true });
+	// The launch behind the `subagent` tool: always synchronous, it returns when every task has ended.
+	async function launch(params: Static<typeof Params>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: ExtensionContext) {
+		const agents = loadAgents(ctx);
+		const requests: LaunchRequest[] = params.tasks?.length
+			? params.tasks
+			: params.agent
+				? [{ agent: params.agent, task: params.task ?? "", reason: params.reason ?? "", allowedEditSurfaces: params.allowedEditSurfaces, featureDoc: params.featureDoc, skills: params.skills }]
+				: [];
+		const mode: Details["mode"] = params.tasks?.length ? "parallel" : "single";
+		const reject = (text: string) => ({ content: [{ type: "text" as const, text }], details: { mode, results: [] } as Details, isError: true });
 
-			if (requests.length === 0) return reject(`Provide {agent, task, reason} or tasks[]. Agents: ${agents.map((a) => a.name).join(", ")}`);
-			if (requests.length > MAX_PARALLEL_TASKS) return reject(`Too many parallel tasks (${requests.length}); max ${MAX_PARALLEL_TASKS}.`);
+		if (requests.length === 0) return reject(`Provide {agent, task, reason} or tasks[]. Agents: ${agents.map((a) => a.name).join(", ")}`);
+		if (requests.length > MAX_PARALLEL_TASKS) return reject(`Too many parallel tasks (${requests.length}); max ${MAX_PARALLEL_TASKS}.`);
 
-			const resolved = requests.map((request) => ({ request, agent: agents.find((a) => a.name === request.agent) }));
-			const problems = resolved.flatMap(({ request, agent }, i) => admitLaunch(request, agent, agents).map((p) => (requests.length > 1 ? `task ${i + 1}: ${p}` : p)));
-			problems.push(...writerConflicts(resolved.filter((r) => r.agent).map((r) => ({ agent: r.agent!, surfaces: r.request.allowedEditSurfaces ?? [] })), activeWriters));
+		const resolved = requests.map((request) => ({ request, agent: agents.find((a) => a.name === request.agent) }));
+		const problems = resolved.flatMap(({ request, agent }, i) => admitLaunch(request, agent, agents).map((p) => (requests.length > 1 ? `task ${i + 1}: ${p}` : p)));
+		problems.push(...writerConflicts(resolved.filter((r) => r.agent).map((r) => ({ agent: r.agent!, surfaces: r.request.allowedEditSurfaces ?? [] })), activeWriters));
 
-			// Model routing: session profile > default profile > agent definition > this session's model.
-			const { file } = readProfiles();
-			const profile = effectiveProfile(file, ctx.sessionManager.getBranch());
-			const parent = { model: currentModelRef(ctx), thinking: ctx.thinkingLevel };
-			const catalog = modelCatalog(ctx);
-			const routes = resolved.map(({ agent }) => (agent ? resolveAgentRoute({ profile: profile.profile, agent, parent }) : undefined));
-			routes.forEach((route, i) => {
-				if (route?.model && route.modelSource !== "parent" && "error" in resolveModelRef(route.model, catalog, ctx.model?.provider)) {
-					problems.push(`${requests.length > 1 ? `task ${i + 1}: ` : ""}${resolved[i].request.agent} routes to unknown model "${route.model}" (${routeLabel(route, profile.name)}); fix it with /brigadev:profile set`);
-				}
-			});
-			// Output schemas are read once here; a broken one rejects the launch instead of failing the child.
-			const schemas = resolved.map(({ agent }, i) => {
-				if (!agent?.outputSchema) return undefined;
-				const loaded = loadOutputSchema(agent.outputSchema);
-				if ("schema" in loaded) return loaded.schema;
-				problems.push(`${requests.length > 1 ? `task ${i + 1}: ` : ""}${agent.name}: ${loaded.error}`);
-				return undefined;
-			});
-			if (problems.length > 0) return reject(`Launch rejected by brigadev delegation rules:\n- ${problems.join("\n- ")}`);
+		// Model routing: session profile > default profile > agent definition > this session's model. One model per agent.
+		const { file } = readProfiles();
+		const profile = effectiveProfile(file, ctx.sessionManager.getBranch());
+		const parent = { model: currentModelRef(ctx), thinking: ctx.thinkingLevel };
+		const catalog = modelCatalog(ctx);
+		const routes = resolved.map(({ agent }) => (agent ? resolveAgentRoute({ profile: profile.profile, agent, parent }) : undefined));
+		routes.forEach((route, i) => {
+			if (route?.model && route.modelSource !== "parent" && "error" in resolveModelRef(route.model, catalog, ctx.model?.provider)) {
+				problems.push(`${requests.length > 1 ? `task ${i + 1}: ` : ""}${resolved[i].request.agent} routes to unknown model "${route.model}" (${routeLabel(route, profile.name)}); fix it with /brigadev:profile set`);
+			}
+		});
+		// Output schemas are read once here; a broken one rejects the launch instead of failing the child.
+		const schemas = resolved.map(({ agent }, i) => {
+			if (!agent?.outputSchema) return undefined;
+			const loaded = loadOutputSchema(agent.outputSchema);
+			if ("schema" in loaded) return loaded.schema;
+			problems.push(`${requests.length > 1 ? `task ${i + 1}: ` : ""}${agent.name}: ${loaded.error}`);
+			return undefined;
+		});
+		if (problems.length > 0) return reject(`Launch rejected by brigadev delegation rules:\n- ${problems.join("\n- ")}`);
 
-			// Placeholders carry the routed model so a queued task (beyond MAX_CONCURRENCY) already shows it.
-			const results: RunResult[] = resolved.map(({ request }, i) => ({
-				agent: request.agent,
-				task: request.task,
-				exitCode: -1,
-				messages: [],
-				stderr: "",
-				usage: emptyTally(),
-				...(routes[i] ? queuedFields(routes[i]!, routeLabel(routes[i]!, profile.name)) : { queued: true }),
-			}));
-			// The launch body, shared by both modes: validation is done, so everything from here on runs the children.
-			const tasks: LaunchTask[] = resolved.map(({ request, agent }, i) => ({ request, agent: agent!, route: routes[i]!, routeLabel: routeLabel(routes[i]!, profile.name) }));
-			const launch = (signal: AbortSignal | undefined, hooks: LaunchHooks) => {
-				const price = costCalculator(ctx);
-				const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);
+		// Placeholders carry the routed model so a queued task (beyond MAX_CONCURRENCY) already shows it.
+		const results: RunResult[] = resolved.map(({ request }, i) => ({
+			agent: request.agent,
+			task: request.task,
+			exitCode: -1,
+			messages: [],
+			stderr: "",
+			usage: emptyTally(),
+			...(routes[i] ? queuedFields(routes[i]!, routeLabel(routes[i]!, profile.name)) : { queued: true }),
+		}));
+		const tasks: LaunchTask[] = resolved.map(({ request, agent }, i) => ({ request, agent: agent!, route: routes[i]!, routeLabel: routeLabel(routes[i]!, profile.name) }));
+		const hooks: LaunchHooks = { onUpdate: onUpdate as LaunchHooks["onUpdate"] };
 
-				// Agents card rows, one per task that got a slot.
-				const cards = new Map<number, AgentRun>();
-				const id = launchSeq++;
-				const syncCard = (cardRun: AgentRun, r: RunResult) => {
-					cardRun.tokens = r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output;
-					cardRun.cost = r.usage.cost;
-					if (r.model) cardRun.model = r.model;
-				};
-				const view: TaskView = {
-					start(index, info) {
-						const cardRun: AgentRun = { id: randomUUID().slice(0, 8), agent: info.agent, task: info.task, state: "running", model: info.model, thinking: info.thinking, tokens: 0, cost: 0, startedAt: info.startedAt };
-						cards.set(index, cardRun);
-						runs.push(cardRun);
-						showCard(ctx);
-						repaintViewer?.();
-					},
-					attempt(index, result) {
-						const cardRun = cards.get(index)!;
-						Object.assign(cardRun, { model: result.model, thinking: result.thinking });
-						repaintViewer?.();
-					},
-					update(index, partial) {
-						const cardRun = cards.get(index)!;
-						syncCard(cardRun, partial);
-						repaintViewer?.();
-					},
-					finish(index, result) {
-						const cardRun = cards.get(index)!;
-						syncCard(cardRun, result);
-						cardRun.state = runStatus(result) === "done" ? "done" : "failed";
-						cardRun.endedAt = Date.now();
-						showCard(ctx);
-						repaintViewer?.();
-					},
-					control(index, control) {
-						const key = `${id}:${index}`;
-						if (control) controls.set(key, control);
-						else controls.delete(key);
-						repaintViewer?.();
-					},
-				};
+		const price = costCalculator(ctx);
+		const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);
 
-				const launchEpoch = epoch;
-				launches.set(results, id);
-				syncStatus(ctx);
+		// Agents card rows, one per task that got a slot.
+		const cards = new Map<number, AgentRun>();
+		const id = launchSeq++;
+		const syncCard = (cardRun: AgentRun, r: RunResult) => {
+			cardRun.tokens = r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output;
+			cardRun.cost = r.usage.cost;
+			if (r.model) cardRun.model = r.model;
+		};
+		const view: TaskView = {
+			start(index, info) {
+				const cardRun: AgentRun = { id: randomUUID().slice(0, 8), agent: info.agent, task: info.task, state: "running", model: info.model, thinking: info.thinking, tokens: 0, cost: 0, startedAt: info.startedAt };
+				cards.set(index, cardRun);
+				runs.push(cardRun);
+				showCard(ctx);
 				repaintViewer?.();
+			},
+			attempt(index, result) {
+				const cardRun = cards.get(index)!;
+				Object.assign(cardRun, { model: result.model, thinking: result.thinking });
+				repaintViewer?.();
+			},
+			update(index, partial) {
+				const cardRun = cards.get(index)!;
+				syncCard(cardRun, partial);
+				repaintViewer?.();
+			},
+			finish(index, result) {
+				const cardRun = cards.get(index)!;
+				syncCard(cardRun, result);
+				cardRun.state = runStatus(result) === "done" ? "done" : "failed";
+				cardRun.endedAt = Date.now();
+				showCard(ctx);
+				repaintViewer?.();
+			},
+		};
 
-				return runLaunch(
+		const launchEpoch = epoch;
+		launches.set(results, id);
+		syncStatus(ctx);
+		repaintViewer?.();
+
+		try {
+			return toResult(
+				mode,
+				await runLaunch(
 					{ mode, tasks, results, signal, hooks },
 					{
 						slots,
 						runAgent: (call) =>
 							runChild(
-								{ cwd: ctx.cwd, agent: tasks[call.index].agent, request: tasks[call.index].request, taskText: call.taskText, route: call.route, routeLabel: call.routeLabel, schema: schemas[call.index], price, signal: call.signal, onUpdate: call.onUpdate, onControl: call.onControl },
+								{ cwd: ctx.cwd, agent: tasks[call.index].agent, request: tasks[call.index].request, taskText: call.taskText, route: call.route, routeLabel: call.routeLabel, schema: schemas[call.index], price, signal: call.signal, onUpdate: call.onUpdate },
 								{ piInvocation },
 							),
 						skills: () => skills,
-						// The primary, then the profile's fallbacks, with cooling or out-of-quota models moved behind usable ones.
-						chain: (index): FallbackStep[] => {
-							const { route, agent } = tasks[index];
-							return route.model
-								? launchOrder({ model: route.model, thinking: route.thinking }, routeFor(profile.profile, agent.name)?.entry.fallbacks ?? [], (m) => blockedReason(m, Date.now()) !== undefined)
-								: [{ model: route.model, thinking: route.thinking }];
-						},
-						coolModel: (model, category) => fallbackState().cooldowns.cool(model, Date.now() + cooldownMs(category)),
-						fallbackNotice: ({ agent, from, to, category }) => {
-							pi.appendEntry("brigadev-fallback", { agent, from, to, category });
-							if (ctx.hasUI) ctx.ui.notify(`brigadev: ${agent} hit ${category} on ${from} → retrying on ${to}${priceNote(listPrice(ctx, from), listPrice(ctx, to))}`, "warning");
-						},
 						writers: {
-							list: () => activeWriters,
-							onAdd: (listener) => (writerListeners.add(listener), () => void writerListeners.delete(listener)),
-							add: (writers) => {
-								activeWriters.push(...writers);
-								writerListeners.forEach((listener) => listener(writers));
-							},
+							add: (writers) => void activeWriters.push(...writers),
 							remove: (writer) => {
 								const at = activeWriters.indexOf(writer);
 								if (at >= 0) activeWriters.splice(at, 1);
@@ -529,39 +369,26 @@ export default function (pi: ExtensionAPI) {
 						view,
 						snapshot: () => takeSnapshot(exec, canonicalPath(ctx.cwd)),
 					},
-				).finally(() => {
-					// Whatever way the launch ended: no child of it can be steered any more.
-					results.forEach((_, i) => controls.delete(`${id}:${i}`));
-					// It no longer counts as running, its rows settle, and its runs stay viewable.
-					if (launchEpoch !== epoch) return;
-					launches.delete(results);
-					for (const cardRun of cards.values()) if (cardRun.state === "running") Object.assign(cardRun, { state: "failed", endedAt: Date.now() });
-					results.forEach((result, i) => {
-						if (result.exitCode !== -1 || result.endedAt !== undefined) settled.push({ id: `${id}:${i}`, result });
-					});
-					settled = settled.slice(-MAX_SETTLED_VIEW_RUNS);
-					try {
-						showCard(ctx);
-					} catch {
-						// A stale context: the launch's outcome matters more than its card.
-					}
-					repaintViewer?.();
+				),
+			);
+		} finally {
+			// It no longer counts as running, its rows settle, and its runs stay viewable.
+			if (launchEpoch === epoch) {
+				launches.delete(results);
+				for (const cardRun of cards.values()) if (cardRun.state === "running") Object.assign(cardRun, { state: "failed", endedAt: Date.now() });
+				results.forEach((result, i) => {
+					if (result.exitCode !== -1 || result.endedAt !== undefined) settled.push({ id: `${id}:${i}`, result });
 				});
-			};
-
-			if (!params.async) return toResult(mode, await launch(signal, { onUpdate: onUpdate as LaunchHooks["onUpdate"], tolerateAbort: false }));
-
-			// Async: the launch runs under the registry's own AbortController (the tool call's signal ends with the call).
-			// Admission errors were already returned above, before anything started.
-			const id = registry.start({ total: results.length, run: async (runSignal, control) => toResult(mode, await launch(runSignal, { onProgress: control.progress, tolerateAbort: true, async: true })) });
-			// Marked before the body can settle (it settles on a later tick), so the settle listener already sees it as an aside.
-			if (origin === "btw") asides.mark(id, question);
-			return {
-				content: [{ type: "text", text: startedText(id, results.length, [...new Set(requests.map((r) => r.agent))]) }],
-				details: { mode, results: results.map((r) => ({ ...r })), launchId: id, pending: true } as Details,
-			};
-		},
-	};
+				settled = settled.slice(-MAX_SETTLED_VIEW_RUNS);
+				try {
+					showCard(ctx);
+				} catch {
+					// A stale context: the launch's outcome matters more than its card.
+				}
+				repaintViewer?.();
+			}
+		}
+	}
 
 	pi.registerTool({
 		name: "subagent",
@@ -569,11 +396,11 @@ export default function (pi: ExtensionAPI) {
 		description: "Run a focused brigadev agent in its own context, only for a named delegation trigger. Single: agent, task, reason. Parallel: tasks[]. Writers need allowedEditSurfaces.",
 		parameters: Params,
 
-		execute: async (_id, params, signal, onUpdate, ctx) => subagentLauncher.launch(params, signal, onUpdate, ctx),
+		execute: async (_id, params, signal, onUpdate, ctx) => launch(params, signal, onUpdate, ctx),
 
 		renderCall(args, theme) {
 			const shown = args.tasks?.length ? args.tasks : [{ agent: args.agent ?? "...", task: args.task ?? "", reason: args.reason ?? "" }];
-			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", shown.length > 1 ? `parallel (${shown.length})` : shown[0].agent) + (args.async ? theme.fg("muted", " async") : "");
+			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", shown.length > 1 ? `parallel (${shown.length})` : shown[0].agent);
 			for (const l of shown.slice(0, 4)) {
 				const preview = l.task.length > 60 ? `${l.task.slice(0, 60)}…` : l.task;
 				text += `\n  ${shown.length > 1 ? `${theme.fg("accent", l.agent)} ` : ""}${theme.fg("dim", preview)}`;
@@ -584,8 +411,7 @@ export default function (pi: ExtensionAPI) {
 
 		renderResult(result, { expanded }, theme, context) {
 			const details = result.details as Details | undefined;
-			// An async launch's immediate return shows its text (launch id, how to collect), not rows that would never update.
-			if (!details?.results.length || details.pending) {
+			if (!details?.results.length) {
 				const first = result.content[0];
 				return new Text(first?.type === "text" ? first.text : "(no output)", 0, 0);
 			}
@@ -619,38 +445,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
-		name: "subagent_wait",
-		label: "Subagent wait",
-		description: `Wait for an async subagent launch (default ${WAIT_DEFAULT_SECONDS}s, max ${WAIT_MAX_SECONDS}s). Returns its result, or its progress if still running.`,
-		parameters: WaitParams,
-		execute: async (_id, params, signal) => waitForLaunch(modelRegistry, params, signal),
-	});
-
-	pi.registerTool({
-		name: "subagent_cancel",
-		label: "Subagent cancel",
-		description: "Cancel an async subagent launch; returns the partial results.",
-		parameters: CancelParams,
-		execute: async (_id, params) => cancelLaunch(modelRegistry, params),
-	});
-
-	pi.registerCommand("btw", {
-		description: "Ask a side question: a read-only agent answers in the background; the answer is shown to you and never reaches the model",
-		handler: async (args, ctx) => {
-			const tell = (message: string, type: "info" | "error") => {
-				if (ctx.hasUI) ctx.ui.notify(message, type);
-			};
-			const question = args.trim();
-			if (!question) return tell("Usage: /btw <question>", "info");
-			const started = await subagentLauncher.launch({ agent: BTW_AGENT, task: btwTask(question), reason: BTW_REASON, async: true }, undefined, undefined, ctx, "btw", question);
-			const id = started.details.launchId;
-			if (started.isError || !id) return tell(started.content.map((c) => c.text).join("\n"), "error");
-			tell(`by the way: launch ${id} started; its answer will appear in the conversation but never reaches the model`, "info");
-		},
-	});
-
-	/** Every run: those this process tracks (queued, running, and settled since the session started, async ones included) plus the finished ones recorded on this branch. */
+	/** Every run: those this process tracks (queued, running, and settled since the session started) plus the finished ones recorded on this branch. */
 	const viewerEntries = (ctx: ExtensionContext) => {
 		const tracked: TrackedRun[] = [...settled];
 		for (const [results, id] of launches) results.forEach((result, i) => tracked.push({ id: `${id}:${i}`, result }));
@@ -658,14 +453,13 @@ export default function (pi: ExtensionAPI) {
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "message" || entry.message.role !== "toolResult" || !VIEWER_TOOLS.has(entry.message.toolName)) continue;
 			const details = entry.message.details as Details | undefined;
-			// An async launch's immediate return (and a timed-out wait) holds placeholders, not final results.
-			if (details?.pending) continue;
 			const at = Date.parse(entry.timestamp);
 			for (const result of details?.results ?? []) recorded.push({ result, at });
 		}
 		return buildEntries({ tracked, recorded, now: Date.now() });
 	};
 
+	// Read-only: browse the runs and their threads. Nothing here steers or stops a child.
 	const openViewer = async (ctx: ExtensionContext) => {
 		if (ctx.mode !== "tui") return ctx.ui.notify("The Agents viewer needs the interactive UI", "error");
 		await ctx.ui.custom<void>((tui, theme, _kb, done) => {
@@ -673,31 +467,10 @@ export default function (pi: ExtensionAPI) {
 			let selection: Selection = { key: undefined, index: 0 };
 			let view = scrollView.initial();
 			let detailOnly = false;
-			// Takeover: the open input line (steer / follow up), and a one-line result shown in the footer until the next key.
-			let takeover: TakeoverState | undefined;
-			let notice: string | undefined;
-			// `x` pressed once on a run: a second one within 3 s aborts it (pure state in lib/subagent-viewer.ts).
-			let armed: AbortArm | undefined;
-			let closed = false;
-			// What the user typed goes to the child as an RPC steer while it is streaming, as a follow_up between turns.
-			const sendTakeover = (key: string, text: string): string => {
-				const control = controls.get(key);
-				if (!control) return "Not sent: the run has finished";
-				const kind = takeoverKind(control.isStreaming());
-				// The notice reports Pi's answer to this command (matched by id), not that the write succeeded.
-				const answer = kind === "steer" ? control.steer(text) : control.followUp(text);
-				void answer.then((outcome) => {
-					if (closed) return;
-					notice = takeoverNotice(kind, outcome);
-					tui.requestRender();
-				});
-				return kind === "steer" ? "Steering message sent, waiting for Pi…" : "Follow-up sent, waiting for Pi…";
-			};
 			// The list changes while the viewer is open: repaint on every progress update, and once a second so elapsed times tick.
 			repaintViewer = () => tui.requestRender();
 			const timer = setInterval(() => tui.requestRender(), 1000);
 			const close = () => {
-				closed = true;
 				clearInterval(timer);
 				repaintViewer = undefined;
 				done();
@@ -711,32 +484,6 @@ export default function (pi: ExtensionAPI) {
 					const entries = viewerEntries(ctx);
 					selection = resolveSelection(entries, selection);
 					const entry = entries[selection.index];
-					notice = undefined;
-					if (takeover && !controls.has(takeover.key)) [takeover, notice] = [undefined, "The run finished"];
-					// Only an `x` on the same run, within the timeout, completes an abort; any other key disarms it.
-					armed = takeover || data !== "x" ? undefined : abortArmFor(armed, entry?.key, Date.now());
-					if (takeover) {
-						// The input line owns every key until Enter or Esc, so j/k/q/x are typed, not commands.
-						const typed = printableText(data);
-						const key: TakeoverKey | undefined = matchesKey(data, Key.enter)
-							? { kind: "submit" }
-							: matchesKey(data, Key.escape)
-								? { kind: "cancel" }
-								: matchesKey(data, Key.backspace)
-									? { kind: "backspace" }
-									: matchesKey(data, "ctrl+u")
-										? { kind: "clear" }
-										: typed !== undefined
-											? { kind: "text", text: typed }
-											: undefined;
-						if (key) {
-							const open = takeover;
-							const step = takeoverKey(open, key);
-							takeover = step.state;
-							if (step.submit !== undefined) notice = sendTakeover(open.key, step.submit);
-						}
-						return tui.requestRender();
-					}
 					const bodyHeight = Math.max(1, tui.terminal.rows - 3);
 					const total = entryDetail(entry, detailWidth(tui.terminal.columns), home).length;
 					// Scroll keys act on what is on screen (a pinned thread is at its end).
@@ -749,18 +496,6 @@ export default function (pi: ExtensionAPI) {
 					else if (data === "g") view = scrollView.to(shown, "top", total, bodyHeight);
 					else if (data === "G") view = scrollView.to(shown, "bottom", total, bodyHeight);
 					else if (data === "F") detailOnly = !detailOnly;
-					else if (matchesKey(data, Key.enter)) {
-						takeover = openTakeover(entry, entry !== undefined && controls.has(entry.key));
-						if (!takeover) notice = "Only a running agent can be steered";
-					} else if (data === "x") {
-						const control = entry && controls.get(entry.key);
-						if (!canTakeOver(entry, control !== undefined)) notice = "Only a running agent can be aborted";
-						else {
-							const press = pressAbort(armed, entry.key, Date.now());
-							armed = press.armed;
-							if (press.abort) notice = control?.abort() ? "Abort sent" : "Only a running agent can be aborted";
-						}
-					}
 					tui.requestRender();
 				},
 				render(width: number): string[] {
@@ -768,7 +503,6 @@ export default function (pi: ExtensionAPI) {
 					selection = resolveSelection(entries, selection);
 					const entry = entries[selection.index];
 					const detail = entryDetail(entry, detailWidth(width), home);
-					if (takeover && !controls.has(takeover.key)) [takeover, notice] = [undefined, "The run finished"];
 					const bodyHeight = Math.max(1, tui.terminal.rows - 3);
 					// A queued or running thread follows its newest lines until the user scrolls up.
 					view = { scroll: autoScroll(view, detail.length, bodyHeight, entry?.active ?? false), follow: view.follow };
@@ -783,7 +517,7 @@ export default function (pi: ExtensionAPI) {
 							detailScroll: view.scroll,
 							detailOnly,
 							empty: "No subagent runs in this session yet",
-							footer: takeover ? takeoverFooter(takeover, takeoverKind(controls.get(takeover.key)?.isStreaming() ?? false), width) : (notice ?? (abortArmFor(armed, entry?.key, Date.now()) ? ABORT_PROMPT : viewerFooter(canTakeOver(entry, entry !== undefined && controls.has(entry.key))))),
+							footer: VIEWER_FOOTER,
 						},
 						painter,
 					);
@@ -792,7 +526,7 @@ export default function (pi: ExtensionAPI) {
 		}, FULLSCREEN_OVERLAY);
 	};
 
-	pi.registerCommand("brigadev:runs", { description: "Agents viewer: every subagent run in this session with its thread", handler: async (_args, ctx) => openViewer(ctx) });
+	pi.registerCommand("brigadev:runs", { description: "Agents viewer: every subagent run in this session with its thread (read-only)", handler: async (_args, ctx) => openViewer(ctx) });
 	pi.registerShortcut(VIEWER_KEY, { description: "Open the brigadev Agents viewer", handler: async (ctx) => openViewer(ctx) });
 
 	pi.registerCommand("brigadev:agents", {

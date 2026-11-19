@@ -1,51 +1,30 @@
-# brigadev — Delegation and verification (lazy-loaded)
+# brigadev — Delegation (lazy-loaded)
 
-Parent session only. Load when a writer is about to launch, a writer returns, or the Verification rule fires.
+Parent session only. Load before launching a writer or verifier, or when one returns. Subagents run synchronously: the call returns their result.
 
-## Agents
-
-| Agent | Role | Tools | Admission |
+| Agent | Role | Tools | Admission `reason` |
 | --- | --- | --- | --- |
-| `brigadev-explore` | Read-only mapping, ≤ ~2k token handoff | read, grep, find, ls | evidence budget |
-| `brigadev-worker` | Bounded writer, no commits | read, grep, find, ls, edit, write, bash | allowed edit surfaces |
-| `brigadev-verify` | Independent spec-derived verification | read, grep, find, ls, bash | `Risk: item N` in reason |
-| `review-*` | 4R lenses (via `brigadev-review`) | read, grep, find, ls | review request |
-| `jd-*` | Judgment Day (via `brigadev-judgment-day`) | see skill | explicit request |
+| `brigadev-explore` | Read-only mapping, ≤ ~2k token handoff with `path:line` | read, grep, find, ls | exploration |
+| `brigadev-worker` | Bounded writer, no commits | read, grep, find, ls, edit, write, bash | parallel writers or context handoff, with `allowedEditSurfaces` |
+| `brigadev-verify` | Independent spec-derived verification | read, grep, find, ls, bash | `Risk: <category> (why)` |
+| `review-4r` | One-pass 4R review (via `brigadev-review`) | read, grep, find, ls | review request |
 
-Run `/brigadev:agents` to see the effective list, including user (`~/.pi/agent/agents`) and trusted project (`.pi/agents`) overrides.
+`/brigadev:agents` shows the effective list, including user and trusted project overrides.
 
-## Writer launch
+## Writers
 
-- A unit is one independent behavior with its code, tests, and docs. Never split one behavior into test, docs, and code writers. A unit that depends on another still in progress is not independent.
-- Units of ~100 changed lines or less run inline; starting a worker costs more than writing them.
-- Launch all independent units in ONE parallel `subagent` call. If they cannot launch together, work inline.
-- `async: true` only when you have other work meanwhile: collect with `subagent_wait` before acting on the result; an uncollected result arrives by itself when you are idle. Never edit a running writer's surfaces.
-- Each writer prompt names the existing helpers it must reuse for shared state (records, lists, settings other commands also touch) and the invariants they keep. Parallel writers cannot see each other; this is the only place they learn them.
-- Pass the test-first policy and the exact test commands under a `Verification` heading in the task.
-- Pass `featureDoc` as the absolute path of the document in the repo docs folder named in the orchestrator prompt. Writers read it; only the parent updates it.
+- A unit is one independent behavior with its code, tests, and docs; never split it by file type. A unit that depends on one still in progress is not independent. Units of ~100 changed lines or less run inline.
+- Launch every independent unit in ONE parallel `subagent` call, or work inline. Never edit a running writer's surfaces.
+- Each task names the helpers the writer must reuse for shared state and the invariants they keep (parallel writers cannot see each other), and the exact test commands under a `Verification` heading.
+- Pass `featureDoc` (absolute path in the repo docs folder) when one exists. Otherwise put the requirements verbatim in the task, numbered `A1..An`. Writers read it; only you update it.
+- `allowedEditSurfaces`: derive them yourself, never ask the human for paths. Narrow repository-relative paths or globs for the files to touch and directories where files may be created; never `.`, the root, absolute paths, or `..`. A surface wider than the task is a defect. The runtime blocks edits outside them and rejects overlapping parallel writers. On `interaction_required` for a path, offer its candidate paths as one approve/decline choice.
 
-## Allowed edit surfaces
+After a writer returns: read its report (covered `S#`/`A#`, commands with observed results, open items); re-run one reported command yourself; after parallel units, run one full-suite command to catch seams; set the Risk line from the actual diff, not the summary.
 
-Derive them yourself; never ask the human to author paths. List the files the unit must touch plus directories where it may create files, as narrow repository-relative paths or globs. Never `.`, the repository root, absolute paths, or `..`. A surface wider than the task is a defect. The runtime blocks edits outside them and rejects overlapping parallel writers, and reports files a writer changed outside them through `bash`.
+## Verification
 
-If a writer returns `interaction_required` for a path, present its derived candidate paths to the user as an approve/decline choice.
+Risk `none`: your checks and the spot check suffice. A named risk category: after your own checks, one `brigadev-verify` with `reason: "Risk: <category> (why)"`.
 
-## After a writer returns
+Handoff: `featureDoc` and the linked `S#`, or the task's numbered acceptance criteria `A1..An` when there is no feature document; the baseline commit; the exact test, CLI, and typecheck commands it may run. It probes in a `mktemp -d` scratch copy, never the workspace, and returns a compact result (verdicts, blockers, paths); its full result is in the run folder.
 
-1. Read its report: covered `S#`, commands run with observed results, open items.
-2. Spot-check: re-run one reported command yourself.
-3. After parallel units finish, run one inline full-suite command to catch seams between units.
-4. Decide the Risk line from the actual diff, not the writer's summary.
-
-## Verification rule
-
-| Risk | Verification |
-| --- | --- |
-| none | writer or parent self-verification plus the parent spot check |
-| named high-risk item | self-verification, then one `brigadev-verify` with `reason: "Risk: item N (why)"` |
-
-Verifier handoff: the feature document (`featureDoc`), the unit and linked `S#`, the baseline commit, and the exact test/CLI/typecheck command forms it may run. It probes in a `mktemp -d` scratch copy, never the workspace.
-
-Corrections are bounded: one correction batch that fixes every reported blocker, then one recheck limited to those blockers. The recheck is a new `brigadev-verify` launch with the blocker IDs and reproductions in its task; your own re-run of the tests is not a recheck. A second correction only when the recheck shows the same blocker still failing; never for a new finding. Anything still open becomes one **Needs your decision**. Advisories never start a correction.
-
-If verifier setup fails once, stop with **Needs your decision** naming the missing prerequisite and the unrun checks. Do not loop on repairing helpers.
+Corrections are bounded: one batch fixing every reported blocker, then one new `brigadev-verify` limited to those blockers (IDs and reproductions in its task; your own test re-run is not a recheck). A second correction only if the same blocker still fails, never for a new finding. Leftovers become one **Needs your decision**; advisories never start a correction. If verifier setup fails once, stop with **Needs your decision** naming the missing prerequisite and the unrun checks.

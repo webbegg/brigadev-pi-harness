@@ -3,7 +3,6 @@
 // each tool result, and the messages the user sent while taking over (steering
 // and follow-ups come back from the child as user messages). Pure.
 
-import { stripLockPrelude } from "./dsp-credlock.ts";
 import type { Row } from "./two-pane.ts";
 import { wrapText } from "./two-pane.ts";
 
@@ -25,8 +24,7 @@ const RESULT_PREVIEW_LINES = 3;
 
 export function argPreview(name: string, args: Record<string, unknown> | undefined): string {
 	if (!args) return "";
-	// A subagent of a DSP parent runs bash behind the credential-lock prelude line; show the agent's own command.
-	if (name === "bash" && typeof args.command === "string") return `$ ${stripLockPrelude(args.command).split("\n")[0]}`;
+	if (name === "bash" && typeof args.command === "string") return `$ ${args.command.split("\n")[0]}`;
 	if (typeof args.path === "string") return args.path;
 	if (typeof args.pattern === "string") return `/${args.pattern}/`;
 	const json = JSON.stringify(args);

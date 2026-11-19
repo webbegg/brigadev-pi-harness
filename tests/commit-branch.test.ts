@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { after, describe, it } from "node:test";
 import { classifyCommand } from "../lib/command-classifier.ts";
-import { type BranchFacts, decideWithBranchRule, parseOriginHead, pickDefaultBranch, readBranchFacts } from "../lib/commit-branch.ts";
+import { type BranchFacts, decideWithBranchRule, parseOriginHead, pickDefaultBranch, readBranchFacts, readCurrentBranch } from "../lib/commit-branch.ts";
 import { PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import type { ExecFn } from "../lib/worktree-snapshot.ts";
 
@@ -117,6 +117,37 @@ describe("commits on feature branches", () => {
 			"bash -c 'export GIT_DIR=../other/.git && git commit -m x'",
 		]) {
 			assert.equal((await decide(command)).action, "confirm", command);
+		}
+	});
+
+	it("still ask when a git-location variable sits in front of a shell wrapper", async () => {
+		for (const command of [
+			"GIT_DIR=../other/.git bash -c 'git commit -m x'",
+			"env GIT_DIR=../other/.git bash -c 'git commit -m x'",
+			"GIT_WORK_TREE=../other sh -c 'git commit -m x'",
+			"GIT_DIR=../other/.git eval 'git commit -m x'",
+		]) {
+			assert.equal((await decide(command)).action, "confirm", command);
+		}
+	});
+
+	it("still ask when a git-location variable reaches the commit through runner wrappers and nested shells", async () => {
+		for (const command of [
+			"GIT_DIR=../other/.git nice bash -c 'git commit -m x'",
+			"GIT_DIR=../other/.git exec bash -c 'git commit -m x'",
+			"command env GIT_DIR=../other/.git sh -c 'git commit -m x'",
+			"env -i GIT_DIR=../other/.git bash -c 'git commit -m x'",
+			"GIT_DIR=../other/.git bash -c 'bash -c \"git commit -m x\"'",
+			"(GIT_DIR=../other/.git bash -c 'git commit -m x')",
+			"GIT_DIR=\"../other/.git\" zsh -c 'git commit -m x'",
+		]) {
+			assert.equal((await decide(command)).action, "confirm", command);
+		}
+	});
+
+	it("do not ask when a git-location variable name only appears in the commit message", async () => {
+		for (const command of ['git commit -m "GIT_DIR=x"', 'git add . && git commit -m "docs: explain GIT_DIR=path usage"']) {
+			assert.equal((await decide(command)).action, "allow", command);
 		}
 	});
 
@@ -310,5 +341,22 @@ describe("readBranchFacts against real git", () => {
 		} finally {
 			rmSync(plain, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("readCurrentBranch (one git call, no default or protected branch lookups)", () => {
+	it("asks only for HEAD's branch", async () => {
+		const calls: string[] = [];
+		const exec: ExecFn = async (_command, args) => {
+			calls.push(args.join(" "));
+			return { stdout: "feat/x\n", stderr: "", code: 0 };
+		};
+		assert.equal(await readCurrentBranch(exec, "/repo"), "feat/x");
+		assert.deepEqual(calls, ["symbolic-ref --short -q HEAD"]);
+	});
+
+	it("is null when detached, failing, or throwing", async () => {
+		assert.equal(await readCurrentBranch(async () => ({ stdout: "", stderr: "", code: 1 }), "/repo"), null);
+		assert.equal(await readCurrentBranch(async () => { throw new Error("timeout"); }, "/repo"), null);
 	});
 });

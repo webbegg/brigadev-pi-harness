@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { promisify } from "node:util";
+import { after, describe, it } from "node:test";
+import { execFile } from "node:child_process";
+import { repoDocsDir } from "../lib/repo-docs.ts";
 import {
+	evaluateCommitGate,
+	pipefailCommand,
 	appendEvidence,
 	branchSlug,
 	buildRunRecord,
@@ -65,6 +70,28 @@ describe("checkOutcome", () => {
 		assert.equal(checkOutcome(`npm test -- --grep "a;b|c"`, 0), "pass");
 		assert.equal(checkOutcome("set -o pipefail; npm test 2>&1 | tail -5", 0), "pass");
 		assert.equal(checkOutcome("set -o pipefail; npm test 2>&1 | tail -5", 1), "fail");
+	});
+
+	it("GATE R1-002: a later `set` (turning pipefail or errexit off) makes the run untrusted", () => {
+		for (const command of [
+			"set -o pipefail && set +o pipefail && npm test | tail",
+			"set -o pipefail; set +o pipefail; npm test | tail",
+			"set -o pipefail; set +e; npm test | tail",
+			"set -o pipefail; npm test | tail && set +o pipefail",
+			"set -o pipefail; echo x && set +o pipefail && npm test | tail",
+		]) {
+			assert.equal(checkOutcome(command, 0), "unknown", command);
+			assert.equal(checkOutcome(command, 1), "unknown", command);
+		}
+		assert.equal(checkOutcome("set -o pipefail; npm test | tail", 0), "pass", "the leading setter still counts");
+	});
+
+	it("GATE R3-001: exit 141 (SIGPIPE from a consumer that closed early) under pipefail is unknown, not a failure", () => {
+		assert.equal(checkOutcome("set -o pipefail; node --test | head -5", 141), "unknown");
+		assert.equal(checkOutcome("set -o pipefail; npm test 2>&1 | head", 141), "unknown");
+		assert.equal(checkOutcome("set -o pipefail; node --test | head -5", 1), "fail");
+		assert.equal(checkOutcome("set -o pipefail; node --test | head -5", 0), "pass");
+		assert.equal(checkOutcome("node --test", 141), "fail", "without a pipe 141 is the runner's own code");
 	});
 
 	it("is unknown when a later command owns the exit code", () => {
@@ -168,8 +195,8 @@ describe("records", () => {
 
 describe("isSourcePath", () => {
 	it("treats prose files as docs and everything else as source", () => {
-		for (const path of ["README.md", "docs/guide.markdown", "CHANGELOG.md", "docs/a.rst", "docs/a.adoc", "LICENSE", "NOTICE", "COPYING", "AUTHORS", "sub/LICENSE"]) assert.equal(isSourcePath(path), false, path);
-		for (const path of ["lib/a.ts", "package.json", "tests/a.test.ts", "assets/agents/x.schema.json", "Makefile", "requirements.txt", "CMakeLists.txt", "docs/guide.mdx", "LICENSE.ts"]) assert.equal(isSourcePath(path), true, path);
+		for (const path of ["README.md", "docs/guide.markdown", "CHANGELOG.md", "CHANGELOG", "docs/a.rst", "docs/a.adoc", "LICENSE", "LICENSE.txt", "NOTICE", "COPYING", "AUTHORS", "sub/LICENSE"]) assert.equal(isSourcePath(path), false, path);
+		for (const path of ["lib/a.ts", "package.json", "tests/a.test.ts", "assets/agents/x.schema.json", "Makefile", "requirements.txt", "CMakeLists.txt", "src/component.mdx", "src/docs/a.ts", "docs/guide.mdx", "docs/conf.py", "docs/helper.js", "LICENSE-MIT"]) assert.equal(isSourcePath(path), true, path);
 	});
 });
 
@@ -232,6 +259,21 @@ describe("decideCommitGate", () => {
 
 	it("blocks a commit that runs in another directory, even with evidence here", () => {
 		assert.equal(decideCommitGate({ ...base, elsewhere: true }).action, "block");
+	});
+
+	it("S8c: a passing run still vouches when only docs changed since (same source tree)", () => {
+		const passed = run({ tree: "OLD", srcTree: "S" });
+		assert.equal(decideCommitGate({ ...base, sourceTree: "S", records: [passed] }).action, "allow");
+		assert.equal(decideCommitGate({ ...base, sourceTree: "S2", records: [passed] }).action, "block", "a source change invalidates it");
+		assert.equal(decideCommitGate({ ...base, records: [passed] }).action, "block", "without a source tree only the full tree counts");
+		assert.equal(decideCommitGate({ ...base, sourceTree: "S", records: [run({ tree: undefined, srcTree: "S", outcome: "fail", exitCode: 1 })] }).action, "block");
+	});
+
+	it("S8b: a run recorded in another repository does not vouch", () => {
+		const elsewhere = run({ root: "/other" });
+		assert.equal(decideCommitGate({ ...base, root: "/repo", records: [elsewhere] }).action, "block");
+		assert.equal(decideCommitGate({ ...base, root: "/other", records: [elsewhere] }).action, "allow");
+		assert.equal(decideCommitGate({ ...base, root: "/repo", records: [run({})] }).action, "allow", "a record without a root still matches by tree");
 	});
 
 	it("honours a user force bound to the same tree only", () => {
@@ -320,5 +362,149 @@ describe("worktreeTree", () => {
 		writeFileSync(join(repo, "untracked.ts"), "changed\n");
 		assert.notEqual(await worktreeTree(repo), first, "an edit changes the key");
 		assert.equal(objects(), before);
+	});
+});
+
+describe("pipefailCommand (S8a: a piped test run gets the runner's exit code)", () => {
+	const context = { cwd: "/repo", topLevel: "/repo" };
+
+	it("prefixes pipefail when that is all a recognized, piped test run lacked", () => {
+		for (const command of ["node --test tests/a.test.ts | tail -20", "npm test 2>&1 | tail -5", "cd sub && npm test | grep -v ok", "npm run build && npm test | tee out.log"]) {
+			const prefixed = pipefailCommand(command, context);
+			assert.equal(prefixed, `set -o pipefail; ${command}`, command);
+			assert.equal(checkOutcome(command, 0, context), "unknown", `${command} was untrusted`);
+			assert.equal(checkOutcome(prefixed ?? "", 0, context), "pass", `${command} is trusted once prefixed`);
+			assert.equal(checkOutcome(prefixed ?? "", 1, context), "fail");
+		}
+	});
+
+	it("leaves alone what is already trusted, not a test, or untrustworthy for another reason", () => {
+		for (const command of [
+			"npm test",
+			"set -o pipefail; npm test | tail",
+			"tsc --noEmit | head",
+			"echo hi | tail",
+			"npm test; echo done | tail",
+			"npm test | tail || true",
+			"npm test --help | tail",
+			"npm test | tail\necho done",
+			"cd .. && npm test | tail",
+		]) assert.equal(pipefailCommand(command, context), undefined, command);
+	});
+});
+
+describe("evaluateCommitGate (S8b/S8c: the gate judges the repository the commit runs in)", () => {
+	const run = promisify(execFile);
+	const exec = async (command: string, args: string[], options: { cwd: string }) => {
+		try {
+			const { stdout, stderr } = await run(command, args, { cwd: options.cwd });
+			return { stdout, stderr, code: 0 };
+		} catch (error) {
+			const failure = error as { stdout?: string; stderr?: string; code?: number };
+			return { stdout: failure.stdout ?? "", stderr: failure.stderr ?? "", code: typeof failure.code === "number" ? failure.code : 1 };
+		}
+	};
+	const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+
+	const base = realpathSync(mkdtempSync(join(tmpdir(), "brigadev-gate-")));
+	const saved = process.env.BRIGADEV_HOME;
+	process.env.BRIGADEV_HOME = join(base, "home");
+	after(() => {
+		if (saved === undefined) delete process.env.BRIGADEV_HOME;
+		else process.env.BRIGADEV_HOME = saved;
+		rmSync(base, { recursive: true, force: true });
+	});
+
+	// A session folder that is no repository, holding a nested repository on a feature branch.
+	const parent = join(base, "parent");
+	let count = 0;
+	function nestedRepo() {
+		const repo = join(parent, `repo${++count}`);
+		mkdirSync(repo, { recursive: true });
+		git(repo, "init", "-q", "-b", "feat/x");
+		writeFileSync(join(repo, "src.ts"), "1");
+		writeFileSync(join(repo, "README.md"), "# r\n");
+		git(repo, "add", "-A");
+		git(repo, "commit", "-qm", "init");
+		writeFileSync(join(repo, "src.ts"), "2");
+		return repo;
+	}
+	/** Records a test run the way the recorder does, against `repo`'s current tree. */
+	async function recordPass(repo: string, outcome: "pass" | "fail" = "pass") {
+		const result = await worktreeTreeResult(repo, { sourceTree: true });
+		assert.equal(result.kind, "tree");
+		if (result.kind !== "tree") return;
+		const record = buildRunRecord({ ts: "t", branch: "feat/x", tree: result.tree, srcTree: result.sourceTree, root: result.root, cwd: parent, agent: "parent", command: "npm test", exitCode: outcome === "pass" ? 0 : 1, output: "", topLevel: result.root });
+		appendEvidence(evidenceFile(repoDocsDir(repo), "feat/x"), record);
+	}
+	const gate = async (command: string, cwd: string, forcedTree?: string) => {
+		const evaluation = await evaluateCommitGate({ exec, command, cwd, forcedTree });
+		assert.ok(evaluation, command);
+		return evaluation;
+	};
+
+	it("has nothing to say about a command without a commit", async () => {
+		assert.equal(await evaluateCommitGate({ exec, command: "npm test", cwd: parent, forcedTree: undefined }), undefined);
+	});
+
+	it("allows `git -C <repo> commit` and `cd <repo> && git commit` from the parent folder when the repository has a passing run", async () => {
+		const repo = nestedRepo();
+		const name = repo.slice(parent.length + 1);
+		assert.equal((await gate(`git -C ${name} commit -am x`, parent)).decision.action, "block", "no run yet");
+		await recordPass(repo);
+		for (const command of [`git -C ${name} commit -am x`, `cd ${name} && git commit -am x`, `cd ${name} && git add -A && git commit -m x`, `git -C ${repo} commit -am x`]) {
+			const evaluation = await gate(command, parent);
+			assert.deepEqual(evaluation.decision, { action: "allow", why: "passing test on this tree" }, command);
+			assert.equal(evaluation.branch, "feat/x");
+		}
+	});
+
+	it("blocks the nested repository when its last run failed, or the source changed since", async () => {
+		const failing = nestedRepo();
+		await recordPass(failing, "fail");
+		assert.equal((await gate(`git -C ${failing} commit -am x`, parent)).decision.action, "block");
+
+		const edited = nestedRepo();
+		await recordPass(edited);
+		writeFileSync(join(edited, "src.ts"), "3");
+		assert.equal((await gate(`cd ${edited} && git commit -am x`, parent)).decision.action, "block");
+	});
+
+	it("S8c: edits to docs after a passing run do not invalidate it; a source edit does", async () => {
+		const repo = nestedRepo();
+		await recordPass(repo);
+		writeFileSync(join(repo, "README.md"), "# changed\n");
+		writeFileSync(join(repo, "CHANGELOG.md"), "new\n");
+		mkdirSync(join(repo, "docs"), { recursive: true });
+		writeFileSync(join(repo, "docs", "guide.md"), "g\n");
+		assert.deepEqual((await gate(`git -C ${repo} commit -am x`, parent)).decision, { action: "allow", why: "passing test on this tree" });
+		writeFileSync(join(repo, "src.ts"), "4");
+		assert.equal((await gate(`git -C ${repo} commit -am x`, parent)).decision.action, "block");
+	});
+
+	it("does not mix up repositories: a run recorded in one does not vouch for another", async () => {
+		const a = nestedRepo();
+		const b = nestedRepo();
+		await recordPass(a);
+		assert.equal((await gate(`git -C ${a} commit -am x`, parent)).decision.action, "allow");
+		assert.equal((await gate(`git -C ${b} commit -am x`, parent)).decision.action, "block");
+	});
+
+	it("still blocks as elsewhere when the target cannot be resolved", async () => {
+		const repo = nestedRepo();
+		await recordPass(repo);
+		for (const command of [`GIT_DIR=${repo}/.git git commit -am x`, `cd ${repo}; git commit -am x`, `git -C $REPO commit -am x`]) {
+			const decision = (await gate(command, parent)).decision;
+			assert.equal(decision.action, "block", command);
+			assert.match(decision.action === "block" ? decision.reason : "", /cannot be resolved/, command);
+		}
+	});
+
+	it("reads only the current branch, never the default or protected branches", async () => {
+		const repo = nestedRepo();
+		await recordPass(repo);
+		const calls: string[] = [];
+		await evaluateCommitGate({ exec: async (command, args, options) => (calls.push(args.join(" ")), exec(command, args, options)), command: `git -C ${repo} commit -am x`, cwd: parent, forcedTree: undefined });
+		assert.deepEqual(calls.filter((call) => call.startsWith("symbolic-ref") || call.includes("refs/heads")), ["symbolic-ref --short -q HEAD"]);
 	});
 });

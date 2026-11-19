@@ -5,16 +5,20 @@
  *   end, so Pi's own footer, session files, and this tally show real numbers.
  *   Disable with {"bridgePricing": false} in ~/.pi/agent/brigadev.json.
  * - Tallies the parent session and every subagent run on the current branch.
- * - /brigadev:cost shows the breakdown per model and per agent.
+ * - /brigadev:cost shows the breakdown per model and per agent, then the
+ *   Claude subscription windows (5h, weekly) recorded from each response's
+ *   rate-limit headers; the footer carries them as the brigadev-usage segment.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { addUsage, cacheHitRate, CLAUDE_BRIDGE_PROVIDER, emptyTally, formatCost, formatTokens, priceBridgeMessage, type Tally, type UsageLike } from "../lib/cost.ts";
-import { panelState } from "../lib/panel-state.ts";
+import { loadUsage, recordUsage, usagePath, usageState } from "../lib/usage-state.ts";
 import { costCalculator } from "../lib/pi-adapters.ts";
 import { isChildSession, readSettings } from "../lib/runtime.ts";
+import { formatUsage, parseUsageHeaders, usageReportLines, type UsageSnapshot } from "../lib/usage-windows.ts";
 
 const STATUS_KEY = "brigadev-cost";
+const USAGE_STATUS_KEY = "brigadev-usage";
 
 interface SubagentRunDetails {
 	agent: string;
@@ -76,10 +80,16 @@ export default function (pi: ExtensionAPI) {
 	const sessionTotal = () => total([...state.parentByModel.values(), ...state.agents.values()]);
 
 	const publishStatus = (ctx: ExtensionContext) => {
-		const sum = sessionTotal();
-		panelState().publish("cost", { cost: sum.cost, apiEquivalent: state.usesBridge });
 		if (!ctx.hasUI) return;
+		const sum = sessionTotal();
 		ctx.ui.setStatus(STATUS_KEY, sum.cost > 0 ? `${formatCost(sum.cost)}${state.usesBridge ? " API-eq" : ""}` : undefined);
+	};
+
+	const publishUsage = (ctx: ExtensionContext) => {
+		if (!ctx.hasUI) return;
+		const provider = ctx.model?.provider;
+		const snapshot = provider ? usageState().usage.get(provider) : undefined;
+		ctx.ui.setStatus(USAGE_STATUS_KEY, snapshot && snapshot.windows.length + (snapshot.status === "rejected" ? 1 : 0) > 0 ? formatUsage(snapshot) : undefined);
 	};
 
 	const reconstruct = (ctx: ExtensionContext) => {
@@ -94,8 +104,21 @@ export default function (pi: ExtensionAPI) {
 		publishStatus(ctx);
 	};
 
-	pi.on("session_start", async (_event, ctx) => reconstruct(ctx));
+	pi.on("session_start", async (_event, ctx) => {
+		loadUsage(Date.now());
+		reconstruct(ctx);
+		publishUsage(ctx);
+	});
 	pi.on("session_tree", async (_event, ctx) => reconstruct(ctx));
+	pi.on("model_select", async (_event, ctx) => publishUsage(ctx));
+
+	pi.on("after_provider_response", async (event, ctx) => {
+		const snapshot = parseUsageHeaders(event.headers as Record<string, string | undefined>, Date.now());
+		const provider = ctx.model?.provider;
+		if (!snapshot || !provider) return;
+		recordUsage(provider, snapshot);
+		publishUsage(ctx);
+	});
 
 	pi.on("message_end", async (event, ctx) => {
 		const message = event.message as { role: string; provider?: unknown; model?: unknown; usage?: UsageLike };
@@ -114,7 +137,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("brigadev:cost", {
-		description: "Session cost breakdown: orchestrator per model and subagents per agent",
+		description: "Session cost breakdown (orchestrator per model, subagents per agent) and subscription usage windows (5h, weekly)",
 		handler: async (_args, ctx) => {
 			const parent = total(state.parentByModel.values());
 			const agents = total(state.agents.values());
@@ -136,6 +159,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			lines.push(`Total         ${formatCost(all.cost)}${hit(all)}`);
 			if (!pricingEnabled()) lines.push('bridge pricing is off ({"bridgePricing": false} in brigadev.json)');
+			loadUsage(Date.now());
+			const usage = [...usageState().usage] as Array<[string, UsageSnapshot]>;
+			lines.push("", "Subscription usage", ...usageReportLines(usage, Date.now()), `(${usagePath()})`);
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});

@@ -2,14 +2,16 @@
 // tests without the Pi packages that extensions/guard.ts imports. The
 // extension reads the facts (paths, environment, git) and acts on the answer.
 
-import { homedir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { basename as executableName, blankHeredocs, classifyCommand, tokenize } from "./command-classifier.ts";
 import { type BranchFacts, decideWithBranchRule } from "./commit-branch.ts";
 import { isWithinSurfaces } from "./edit-surfaces.ts";
 import { canonicalPath, expandHome, isInside } from "./paths.ts";
-import { type Decision, type PermissionMode } from "./permission-policy.ts";
+import { type Decision, isSensitivePath, type PermissionMode } from "./permission-policy.ts";
 import { isRepoDocsPath } from "./repo-docs.ts";
+import type { BrigadevSettings } from "./runtime.ts";
 
 export interface FileAccessInput {
 	isChild: boolean;
@@ -159,6 +161,24 @@ export function shellCallOf(toolName: string, input: unknown): { command: string
 	return typeof fields.cwd === "string" && fields.cwd.trim() !== "" ? { command, cwd: fields.cwd } : { command };
 }
 
+/** The tool that runs a test command through the shell (extensions/check.ts); the guard decides its command like bash. */
+export const CHECK_TOOL = "check";
+
+/**
+ * Paths a shell command string names that commonly hold secrets (`cat ~/.ssh/id_rsa`, a `.env` focus, `< .env`), canonical,
+ * resolved against `cwd` (`~`, `$HOME`, and `${HOME}` expand). Textual and conservative: any word that looks like such a path counts.
+ */
+export function sensitiveWords(command: string, cwd: string, home: string = homedir()): Array<{ word: string; absolute: string }> {
+	const found: Array<{ word: string; absolute: string }> = [];
+	for (const word of command.split(/[\s'"`<>=;|&(){}]+/)) {
+		if (word === "") continue;
+		const expanded = word.replace(/^\$\{?HOME\}?(?=\/|$)/, home).replace(/^~(?=\/|$)/, home);
+		const absolute = canonicalPath(resolve(cwd, expanded));
+		if (isSensitivePath(absolute) || isSensitivePath(`${absolute}/`)) found.push({ word, absolute });
+	}
+	return found;
+}
+
 export interface BashDecisionInput {
 	command: string;
 	mode: PermissionMode;
@@ -176,4 +196,191 @@ export function decideBashCommand(input: BashDecisionInput): Promise<Decision> {
 	const matches = classifyCommand(input.command);
 	if (input.elsewhere) for (const match of matches) if (match.commit) match.elsewhere = true;
 	return decideWithBranchRule(matches, input.mode, input.isChild, () => input.readFacts(input.cwd));
+}
+
+// ---- Trusted folders outside the project: the system temp dir and the secure-yolo folders ----
+// A parent `write`/`edit` there runs without asking (subagents stay blocked). The list lives in brigadev.json (`secureYoloDirs`).
+
+/** The system temp directories (canonical). */
+export function tempRoots(): string[] {
+	return [...new Set([tmpdir(), "/tmp", "/private/tmp"].map((root) => canonicalPath(root)))];
+}
+
+/**
+ * The system temp roots minus the root folder, the home folder, and its ancestors (a `TMPDIR` set to the home folder would
+ * otherwise make every write in it silent). Other overlaps (an agent folder kept under /tmp) are the user's setup: /tmp is
+ * writable by every local process anyway.
+ */
+export function trustedTempRoots(roots: readonly string[], home: string): string[] {
+	const canonicalHome = canonicalPath(home);
+	return roots.filter((root) => root !== "/" && !isInside(root, canonicalHome));
+}
+
+// `.git/config` and everything under `.git/hooks`, in any repository: code that runs later, so never trusted folder content.
+const GIT_CONFIG_OR_HOOKS = /(^|\/)\.git\/(config|config\.worktree|hooks(\/|$))/;
+
+/** True for a git config or hook file: a secure-yolo or temp folder that holds repositories must not let the parent plant code there without asking. */
+export function isGitConfigOrHooksPath(absolute: string): boolean {
+	return GIT_CONFIG_OR_HOOKS.test(canonicalPath(absolute).replace(/\\/g, "/"));
+}
+
+/** Facts that decide which paths are protected, whatever the permission mode. */
+export interface ProtectedPathContext {
+	home: string;
+	/** Pi's agent folder (`~/.pi/agent` unless relocated); it holds brigadev.json. */
+	agentDir: string;
+	/** The installed harness (this package's root). */
+	installRoot: string;
+	projectRoot: string;
+}
+
+const PROTECTED_HOME_FOLDERS = [".pi", ".ssh", ".aws", ".docker", ".gnupg", ".kube", join(".config", "git"), join(".config", "gh"), join(".config", "fish")];
+const PROTECTED_HOME_FILES = [".gitconfig", ".netrc", ".npmrc", ".git-credentials", ".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".profile", ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout"];
+
+/**
+ * True for a path a parent write must always ask about, even under the system temp dir or a secure-yolo folder: the agent folder
+ * (brigadev.json holds the trusted folders and the default mode), `~/.pi`, the installed harness (unless it is the project),
+ * the home git, gh, fish and credential folders, `~/.gitconfig`, shell startup files, and `.git` config and hooks.
+ */
+export function isProtectedPath(absolute: string, ctx: ProtectedPathContext): boolean {
+	const path = canonicalPath(absolute);
+	const home = canonicalPath(ctx.home);
+	const folders = [canonicalPath(ctx.agentDir), ...PROTECTED_HOME_FOLDERS.map((folder) => join(home, folder))];
+	// A session working on the harness itself edits its own checkout: that is the project, not an installed copy.
+	const installRoot = canonicalPath(ctx.installRoot);
+	if (!isInside(installRoot, canonicalPath(ctx.projectRoot))) folders.push(installRoot);
+	if (folders.some((folder) => isInside(folder, path))) return true;
+	if (PROTECTED_HOME_FILES.some((name) => path === join(home, name))) return true;
+	return isGitConfigOrHooksPath(path);
+}
+
+/** Folders a secure-yolo folder must not overlap with. */
+export interface SecureDirGuard {
+	home: string;
+	/** Pi's agent folder: it holds brigadev.json, where this list lives. */
+	agentDir: string;
+	/** More folders a silent write must never reach: the harness docs home (every repo's evidence log), the install root. */
+	protectedDirs?: readonly string[];
+}
+
+// Folders in the home directory that hold credentials or tool config.
+const HOME_SECRET_FOLDERS = [".ssh", ".aws", ".docker", ".gnupg", ".kube", join(".config", "gh"), join(".config", "git"), join(".config", "fish")];
+
+// macOS and Windows disks ignore letter case by default, so `~/.AWS` is `~/.aws` there: fold case before comparing.
+const foldCase = process.platform === "darwin" || process.platform === "win32";
+const fold = (path: string) => (foldCase ? path.toLowerCase() : path);
+const overlaps = (a: string, b: string) => isInside(fold(a), fold(b)) || isInside(fold(b), fold(a));
+
+export type SecureDirCheck = { ok: true; path: string } | { ok: false; reason: string };
+
+/**
+ * A folder may become a secure-yolo folder when it is absolute (or `~/…`), not the root, not the home folder or
+ * one of its ancestors, does not overlap the agent folder (a folder inside it, or one holding it, would let a write
+ * change this very list), a credential folder of the home directory, or `protectedDirs`, and does not commonly hold secrets.
+ */
+export function checkSecureDir(raw: string, guard: SecureDirGuard): SecureDirCheck {
+	const trimmed = raw.trim();
+	if (trimmed === "") return { ok: false, reason: "no folder given" };
+	const expanded = expandHome(trimmed);
+	if (!isAbsolute(expanded)) return { ok: false, reason: `${trimmed} is not absolute (use /… or ~/…)` };
+	const path = canonicalPath(expanded);
+	const home = canonicalPath(guard.home);
+	const agent = canonicalPath(guard.agentDir);
+	if (path === "/" || isInside(fold(path), fold(home))) return { ok: false, reason: `${path} is the root, your home folder, or holds it: too broad` };
+	if (overlaps(path, agent)) return { ok: false, reason: `${path} overlaps the agent settings folder ${agent}` };
+	const secret = HOME_SECRET_FOLDERS.map((rel) => join(home, rel)).find((dir) => overlaps(path, dir));
+	if (secret || isSensitivePath(`${path}/`)) return { ok: false, reason: `${path} is, holds, or sits in a folder that holds credentials (${secret ?? path})` };
+	const guarded = (guard.protectedDirs ?? []).map((dir) => canonicalPath(dir)).find((dir) => overlaps(path, dir));
+	if (guarded) return { ok: false, reason: `${path} overlaps ${guarded}, which the harness protects` };
+	return { ok: true, path };
+}
+
+/** The configured secure-yolo folders that pass `checkSecureDir`, canonical and deduplicated; anything else is dropped. */
+export function secureYoloDirs(configured: unknown, guard: SecureDirGuard): string[] {
+	if (!Array.isArray(configured)) return [];
+	const dirs: string[] = [];
+	for (const entry of configured) {
+		if (typeof entry !== "string") continue;
+		const check = checkSecureDir(entry, guard);
+		if (check.ok && !dirs.includes(check.path)) dirs.push(check.path);
+	}
+	return dirs;
+}
+
+export interface YoloDirStore {
+	read: () => BrigadevSettings;
+	write: (update: BrigadevSettings) => void;
+}
+
+const YOLO_DIR_USAGE = "Usage: /brigadev:yolo-dir list | add <folder> | remove <folder>";
+
+/** `/brigadev:yolo-dir list|add|remove`: manages `secureYoloDirs` in brigadev.json and names the result. */
+export function runYoloDirCommand(args: string, store: YoloDirStore, env: SecureDirGuard & { tempRoots: readonly string[] }): string {
+	const trimmed = args.trim();
+	const [sub = ""] = trimmed.split(/\s+/);
+	const rest = trimmed.slice(sub.length).trim();
+	const raw = store.read().secureYoloDirs;
+	const configured = Array.isArray(raw) ? raw.filter((entry): entry is string => typeof entry === "string") : [];
+	const active = secureYoloDirs(configured, env);
+
+	if (sub === "" || sub === "list") {
+		const temp = env.tempRoots.map((root) => `  ${root}  (system temp, built in)`);
+		const mine = active.map((root) => `  ${root}`);
+		const dropped = configured.filter((entry) => !checkSecureDir(entry, env).ok).map((entry) => `  ${entry}  (ignored: ${(checkSecureDir(entry, env) as { reason: string }).reason})`);
+		return `Secure-yolo folders (parent write/edit run there without asking; subagents stay blocked):\n${[...temp, ...mine, ...dropped].join("\n")}\n${YOLO_DIR_USAGE}`;
+	}
+	if (sub === "add") {
+		const check = checkSecureDir(rest, env);
+		if (!check.ok) return `brigadev: refused, ${check.reason}`;
+		if (active.includes(check.path)) return `brigadev: ${check.path} is already a secure-yolo folder`;
+		store.write({ secureYoloDirs: [...configured, check.path] });
+		return `brigadev: added ${check.path}; write and edit there run without asking`;
+	}
+	if (sub === "remove") {
+		const expanded = expandHome(rest);
+		const target = rest === "" ? "" : canonicalPath(expanded);
+		const kept = configured.filter((entry) => entry !== rest && canonicalPath(expandHome(entry)) !== target);
+		if (rest === "" || kept.length === configured.length) return `brigadev: ${rest || "(none)"} is not a secure-yolo folder`;
+		store.write({ secureYoloDirs: kept });
+		return `brigadev: removed ${target}`;
+	}
+	return YOLO_DIR_USAGE;
+}
+
+// --- Search results ---------------------------------------------------------
+
+/** `path:12: text` (a match) or `path-12- text` (a context line), as Pi's grep prints them. */
+const GREP_LINE = /^(.+?)[:-]\d+[:-] /;
+/** The bracketed notice Pi appends after a blank line when a result list was cut. */
+const RESULT_NOTICE = /\n\n\[[^\n]*\]$/;
+
+/**
+ * Pi's grep, find, and ls list files under a folder (grep with `rg --hidden`), so a search rooted above a secret folder
+ * prints secret contents or names without a `read`. Drops the lines of `text` whose file is sensitive, resolved against
+ * `searchPath` (what the tool's `path` argument resolves to), and keeps the tool's own trailing notice. Returns
+ * undefined when nothing needs hiding: a search rooted at a file or in a sensitive folder was already decided at the
+ * call, so its results are left alone.
+ */
+export function hideSensitiveResults(toolName: string, text: string, searchPath: string): { text: string; hidden: number } | undefined {
+	if (toolName !== "grep" && toolName !== "find" && toolName !== "ls") return undefined;
+	if (isSensitivePath(searchPath) || isSensitivePath(`${searchPath}/`)) return undefined;
+	try {
+		if (!statSync(searchPath).isDirectory()) return undefined;
+	} catch {
+		return undefined;
+	}
+	const notice = RESULT_NOTICE.exec(text)?.[0] ?? "";
+	const body = notice ? text.slice(0, text.length - notice.length) : text;
+	let hidden = 0;
+	const kept = body.split("\n").filter((line) => {
+		const rel = toolName === "grep" ? GREP_LINE.exec(line)?.[1] : line;
+		if (!rel) return true;
+		const absolute = `${resolve(searchPath, rel)}${rel.endsWith("/") ? "/" : ""}`;
+		if (!isSensitivePath(absolute)) return true;
+		hidden++;
+		return false;
+	});
+	if (hidden === 0) return undefined;
+	const listing = kept.length > 0 ? `${kept.join("\n")}${notice}` : notice.trim();
+	return { text: `${listing}${listing ? "\n" : ""}(${hidden} ${hidden === 1 ? "result" : "results"} from sensitive files hidden)`, hidden };
 }

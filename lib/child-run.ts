@@ -1,17 +1,15 @@
-// The run loop of one subagent child process: spawn it in Pi's RPC mode (argv/env/stdio
-// come from lib/child-launch.ts), send the task as the RPC `prompt`, fold its JSON lines
-// into a run snapshot, answer its extension UI requests with a cancellation (nothing
-// waits for a person), close its stdin when the agent settles so it exits, expose a
-// steering handle while it runs, capture stderr, watch for stalls, terminate on abort
-// (SIGTERM, then SIGKILL after 5 s, which also reaches the descendants' own process groups), check structured output, and save the attempt's
-// folder. No Pi runtime imports: the spawn function, timers, Pi invocation, and cost calculator are injected, so a
-// test drives it with a fake child.
+// The run loop of one subagent child process: spawn it in Pi's JSON event stream mode (argv/env/stdio
+// come from lib/child-launch.ts; the task is the argv message, no stdin), fold its JSON lines into a run
+// snapshot, capture stderr, watch for stalls (the only timer that judges a run), terminate on abort or
+// stall (SIGTERM, then SIGKILL after 5 s, which also reaches the descendants' own process groups), check
+// structured output, and save the attempt's folder. No Pi runtime imports: the spawn function, timers, Pi
+// invocation, and cost calculator are injected, so a test drives it with a fake child.
 //
 // Process lifetime: a child runs in its own process group (so a signal reaches its grandchildren too),
 // the run settles on the child's `exit` even if `close` never comes (a grandchild can hold the pipes),
 // and every live child is registered with a tracker so a shutdown can terminate them all within a bound.
-// Caller hooks (`onUpdate`, `onControl`) are isolated: a throwing hook is swallowed, because a UI bug
-// is not the child's outcome and must never skip settlement or crash a stream handler.
+// The caller hook `onUpdate` is isolated: a throwing hook is swallowed, because a UI bug is not the
+// child's outcome and must never skip settlement or crash a stream handler.
 
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -22,23 +20,18 @@ import type { Message } from "@earendil-works/pi-ai";
 import type { AgentDefinition } from "./agents.ts";
 import { foldChildEvent, parseChildLine } from "./child-events.ts";
 import { childLaunch } from "./child-launch.ts";
-import { answerUiRequest, createChildControl, createCommandTracker, encodeCommand, type ChildControl, type CommandOutcome, type RpcCommand, type UiResponse } from "./child-rpc.ts";
 import { emptyTally, priceBridgeMessage, type CostCalculator } from "./cost.ts";
 import type { LaunchRequest } from "./delegation.ts";
 import type { ResolvedRoute } from "./model-routing.ts";
 import { canonicalPath } from "./paths.ts";
 import { repoDocsDir } from "./repo-docs.ts";
 import { newRunId, writeRunArtifacts } from "./run-artifacts.ts";
-import { failed, output, type RunResult } from "./run-status.ts";
+import { failed, finalText, output, type RunResult } from "./run-status.ts";
 import { createStallWatchdog, resolveStallTimeouts, stallMessage } from "./stall-watchdog.ts";
-import { overBudgetMessage, resolveRunBudget, wrapUpMessage, type WrapUpDelivery } from "./run-budget.ts";
 import { checkStructuredRun, type JsonSchema } from "./structured-output.ts";
 
 /** Grace between SIGTERM and SIGKILL when a child ignores the terminate request. */
 export const KILL_GRACE_MS = 5000;
-/** Time a child that finished its work (or will never start one) gets to exit on its own after stdin closes. */
-export const EXIT_GRACE_MS = 5000;
-
 /** After the child exits, how long the run waits for `close` (output fully drained) before settling without it. */
 export const CLOSE_DRAIN_MS = 1000;
 
@@ -208,8 +201,6 @@ export { failed, finalText, isUnfinished, output, runStatus, toRunState, type Ru
 
 /** The part of a child process the run loop touches (node's ChildProcess fits). */
 export interface ChildProcessLike {
-	/** The child's stdin (piped): RPC commands go in, one JSON record per line. */
-	stdin: { write(chunk: string): unknown; end(): unknown; on(event: "error", listener: (error: unknown) => void): unknown };
 	stdout: { on(event: "data", listener: (data: Buffer | string) => void): unknown };
 	stderr: { on(event: "data", listener: (data: Buffer | string) => void): unknown };
 	on(event: string, listener: (...args: any[]) => void): unknown;
@@ -218,10 +209,10 @@ export interface ChildProcessLike {
 	pid?: number;
 }
 
-export type SpawnFn = (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; shell: false; stdio: ["pipe", "pipe", "pipe"]; detached: boolean }) => ChildProcessLike;
+export type SpawnFn = (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; shell: false; stdio: ["ignore", "pipe", "pipe"]; detached: boolean }) => ChildProcessLike;
 
 /**
- * Every live child process in one place (sync and async launches alike): registered at spawn, released when its
+ * Every live child process in one place (subagent runs; background processes share it): registered at spawn, released when its
  * run settles. `shutdown` is the bounded stop for session end: terminate all, wait up to the grace, kill survivors.
  */
 export interface ChildTracker {
@@ -316,8 +307,8 @@ export interface ParentProcessLike {
 }
 
 // Children run in their own process group (`detached`), so a signal sent to the parent's group (terminal hangup, a
-// group kill) no longer reaches them; closing their stdin is the only other stop, and a child in the middle of a tool
-// call may not act on it. The guard SIGKILLs every tracked child group when the parent process exits and, when asked,
+// group kill) no longer reaches them, so nothing would stop one if the parent died without `session_shutdown`.
+// The guard SIGKILLs every tracked child group when the parent process exits and, when asked,
 // on the listed signals. It cannot help when the parent itself is SIGKILLed or the machine dies: no handler runs then.
 const GUARD_KEY = Symbol.for("brigadev.parentExitGuard");
 interface GuardState {
@@ -410,11 +401,6 @@ export interface RunOptions {
 	price: CostCalculator;
 	signal?: AbortSignal;
 	onUpdate: (result: RunResult) => void;
-	/**
-	 * Called with the steering handle once the child is spawned, and with `undefined` when the run has finished
-	 * (the agent settled, the child exited, or it never started). A finished run has no handle.
-	 */
-	onControl?: (control: ChildControl | undefined) => void;
 }
 
 export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise<RunResult> {
@@ -463,6 +449,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			structured,
 			cwd,
 			systemPromptPath,
+			taskText: options.taskText,
 			parentEnv: env,
 		});
 
@@ -470,19 +457,6 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 		let lastPartialUpdate = Number.NEGATIVE_INFINITY;
 		let aborted = false;
 		let stalled = false;
-		// The run budget ran out and the child returned nothing within the wrap-up grace.
-		let overBudget = false;
-		// The wrap-up grace ended a run that already had a valid structured result: that result is its outcome.
-		let keptResult = false;
-		const budget = resolveRunBudget(agent.budgetMinutes, env);
-		// The user aborted this child from the viewer (the RPC `abort`); the run settles as aborted instead of throwing.
-		let userAborted = false;
-		let controlGiven = false;
-		const withdraw = () => {
-			if (!controlGiven) return;
-			controlGiven = false;
-			hook(() => options.onControl?.(undefined));
-		};
 		result.exitCode = await new Promise<number>((resolveExit) => {
 			const invocation = deps.piInvocation(launch.args);
 			// Own process group (not on win32, where groups do not apply): a signal to the group reaches grandchildren too.
@@ -500,56 +474,11 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			let done = false;
 			let closeTimer: unknown;
 			let stallError = "";
-			let budgetError = "";
-			let budgetTimer: unknown;
-			let wrapUpTimer: unknown;
-			// Set once the budget is spent: what became of the wrap-up request.
-			let wrapUp: WrapUpDelivery | undefined;
 			let killTimer: unknown;
-			let abortTimer: unknown;
-			let exitTimer: unknown;
-			// The run's outcome when its input ended; a forced shutdown after that never rewrites it.
-			let finished: { stopReason?: string; errorMessage?: string; messages: number } | undefined;
-			let forcedExit = false;
-			let streaming = false;
-			let inputOpen = true;
-			// steer/follow_up commands wait here for Pi's response (matched by id); nothing is left waiting once input ends.
-			const commands = createCommandTracker();
-
-			// Commands and UI answers go to the child as one JSON record per line (rpc.md, "Framing"); false once the pipe is closed.
-			const send = (record: RpcCommand | UiResponse): boolean => {
-				if (!inputOpen) return false;
-				try {
-					proc.stdin.write(encodeCommand(record));
-					return true;
-				} catch {
-					return false;
-				}
-			};
-			// Closing stdin asks the child to shut down in order (rpc.md, "Shutdown"); a finished run takes no more input, so it has no handle.
-			const endInput = () => {
-				if (!inputOpen) return;
-				inputOpen = false;
-				withdraw();
-				commands.settleAll();
-				try {
-					proc.stdin.end();
-				} catch {
-					// The child is already gone.
-				}
-			};
-			// A child that exited early breaks the pipe; the close event settles the run.
-			proc.stdin.on("error", () => {
-				inputOpen = false;
-				withdraw();
-				commands.settleAll();
-			});
-
-			const stopBudget = () => {
-				if (budgetTimer !== undefined) clearTimer(budgetTimer);
-				if (wrapUpTimer !== undefined) clearTimer(wrapUpTimer);
-				budgetTimer = wrapUpTimer = undefined;
-			};
+			// Pi's `agent_settled` arrived: the run is finished and the child is only on its way out.
+			let agentSettled = false;
+			// We stopped a child whose run had already finished: its exit code and last words are not the outcome.
+			let stoppedAfterSettle = false;
 
 			// SIGTERM now, SIGKILL after the grace period if the child has not exited by then.
 			const terminate = () => {
@@ -562,8 +491,12 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				setTimer,
 				clearTimer,
 				onStall: (info) => {
-					// The budget already stopped this child: that stays the cause.
-					if (overBudget) return;
+					// A child that finished its run but does not exit is stopped, and its result stands.
+					if (agentSettled) {
+						stoppedAfterSettle = true;
+						terminate();
+						return;
+					}
 					stalled = true;
 					result.stopReason = "error";
 					stallError = stallMessage(info);
@@ -573,84 +506,8 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			});
 			watchdog.start();
 
-			// The run is over (settled, or a prompt that will never start one): the stall budget no longer applies.
-			// Closing stdin asks the child to exit; one that has not exited after the grace is terminated, keeping its result.
-			const finishInput = () => {
-				if (finished) return;
-				finished = { stopReason: result.stopReason, errorMessage: result.errorMessage, messages: result.messages.length };
-				endInput();
-				watchdog.stop();
-				stopBudget();
-				exitTimer = setTimer(() => {
-					if (exited) return;
-					forcedExit = true;
-					terminate();
-				}, EXIT_GRACE_MS);
-			};
-
-			const control = createChildControl({
-				send,
-				streaming: () => streaming,
-				onAbort: () => {
-					userAborted = true;
-					// A child that does not stop on its own is terminated like any other.
-					abortTimer ??= setTimer(() => !exited && terminate(), KILL_GRACE_MS);
-				},
-				commands,
-			});
-			// The task is the first command (rpc.md; the child has no positional prompt).
-			send({ type: "prompt", message: options.taskText });
-			controlGiven = true;
-			hook(() => options.onControl?.(control));
-
-			// Already stopping (settled, exited, stalled, over budget, aborted by the user or the signal): no wrap-up, no second stop.
-			const stopping = () => Boolean(finished) || exited || stalled || overBudget || userAborted || aborted;
-			// The wrap-up is steered into a running turn. Between turns it is held for the next one: a follow-up would only be
-			// read once the whole run ends (rpc-commands.md, `follow_up`). A steer the child rejects falls back to one follow-up.
-			const sendWrapUp = () => {
-				const text = wrapUpMessage(agent.budgetMinutes!);
-				wrapUp = { state: "sent" };
-				const record = (outcome: CommandOutcome) => {
-					wrapUp = outcome.status === "accepted" ? { state: "accepted" } : outcome.status === "rejected" ? { state: "rejected", error: outcome.error } : { state: "not_delivered" };
-				};
-				void control
-					.steer(text)
-					.then((outcome) => {
-						if (outcome.status !== "rejected" || stopping()) return outcome;
-						// Until the follow-up is answered, the steer's rejection is what the failure can say.
-						wrapUp = { state: "sent", steerError: outcome.error };
-						return control.followUp(text);
-					})
-					.then(record, () => undefined);
-			};
-			const onTurnStart = () => {
-				if (wrapUp?.state === "held" && !stopping()) sendWrapUp();
-			};
-
-			// Budget spent: one wrap-up request, then a bounded wait for the result.
-			if (budget) {
-				budgetTimer = setTimer(() => {
-					budgetTimer = undefined;
-					if (stopping()) return;
-					if (streaming) sendWrapUp();
-					else wrapUp = { state: "held" };
-					wrapUpTimer = setTimer(() => {
-						wrapUpTimer = undefined;
-						if (stopping()) return;
-						// A valid, accepted structured result is a finished run that did not settle: keep it, and still stop the child
-						// the way a finished run is stopped (stdin closed, then terminated after the exit grace; `forcedExit` restores the outcome).
-						if (structured && checkStructuredRun(result.messages, options.schema!).ok) {
-							keptResult = true;
-							finishInput();
-							return;
-						}
-						overBudget = true;
-						budgetError = overBudgetMessage(agent.budgetMinutes!, budget.graceMs, wrapUp);
-						Object.assign(result, { stopReason: "error", errorMessage: budgetError });
-						terminate();
-					}, budget.graceMs);
-				}, budget.budgetMs);
-			}
+			// Pi's outcome when its run settled: what a child that is then stopped on our side must not rewrite.
+			let finished: { stopReason?: string; errorMessage?: string; messages: number } | undefined;
 
 			const processLine = (line: string) => {
 				for (const event of parseChildLine(line)) {
@@ -658,22 +515,11 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 					else if (event.type === "tool_end") watchdog.toolFinished(event.id, `result of ${event.name}`);
 					else if (event.type === "activity") watchdog.activity(event.label);
 					else if (event.type === "run") {
-						streaming = event.phase === "start";
-						if (streaming) onTurnStart();
-						// `agent_end` can be followed by retries, compaction, or queued messages; `agent_settled` is the end (rpc.md, "Run lifecycle").
-						if (event.phase === "settled") finishInput();
-					} else if (event.type === "response") {
-						// The answer to a steer/follow_up settles that command's outcome (rpc.md, "Correlate commands and responses").
-						commands.respond(event);
-						// A rejected prompt starts no run, and a handled one starts none either (rpc.md, "Run lifecycle"): neither will ever settle.
-						if (event.command === "prompt" && !event.success) {
-							Object.assign(result, { stopReason: "error", errorMessage: `Pi rejected the task: ${event.error ?? "unknown error"}` });
-							finishInput();
-						} else if (event.command === "prompt" && event.disposition === "handled") finishInput();
-					} else if (event.type === "ui_request") {
-						// A child's dialog is cancelled on the spot, never shown to the user and never left pending.
-						const answer = answerUiRequest(event.request);
-						if (answer) send(answer);
+						// `agent_end` can be followed by retries, compaction, or queued messages; `agent_settled` is the end (json.md, "Event sequence").
+						if (event.phase === "settled" && !agentSettled) {
+							agentSettled = true;
+							finished = { stopReason: result.stopReason, errorMessage: result.errorMessage, messages: result.messages.length };
+						}
 					}
 					// Bridge turns report $0; price them at list price (see lib/cost.ts).
 					else if (event.type === "message") event.message = (priceBridgeMessage(event.message, options.price) ?? event.message) as Message;
@@ -705,14 +551,8 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 			});
 			const cleanup = () => {
 				exited = true;
-				inputOpen = false;
-				commands.settleAll();
 				watchdog.stop();
-				stopBudget();
 				if (killTimer !== undefined) clearTimer(killTimer);
-				if (abortTimer !== undefined) clearTimer(abortTimer);
-				if (exitTimer !== undefined) clearTimer(exitTimer);
-				withdraw();
 			};
 			// The run's one settlement, reached from `close` (all output read) or, if `close` never comes, from the drain timeout.
 			const settle = (code: number | null) => {
@@ -728,21 +568,16 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 				} catch {
 					// Whatever the last line did, the run still settles below.
 				}
-				// The user's abort is the cause, whatever the child reported on its way out.
-				if (userAborted) Object.assign(result, { stopReason: "aborted", errorMessage: "Aborted by the user" });
 				// The child may report its own "aborted" on SIGTERM; the stall is the real cause.
 				if (stalled) Object.assign(result, { stopReason: "error", errorMessage: stallError });
-				if (overBudget) Object.assign(result, { stopReason: "error", errorMessage: budgetError });
-				// Our own shutdown of a finished child is not its outcome: drop what it said on the way out and its exit code.
-				// A result the budget kept was cut off mid-turn by our stdin close, so the same holds however the child then exits,
-				// unless the user aborted it.
-				const ours = forcedExit || (keptResult && !userAborted);
+				// Our own stop of a child that had finished is not its outcome: drop what it said on the way out and its exit code.
+				const ours = stoppedAfterSettle && finished !== undefined;
 				if (ours && finished) {
 					result.messages.length = finished.messages;
 					Object.assign(result, { stopReason: finished.stopReason, errorMessage: finished.errorMessage });
 				}
 				release();
-				resolveExit(stalled || overBudget ? 1 : ours ? 0 : (code ?? 0));
+				resolveExit(stalled ? 1 : ours ? 0 : (code ?? 0));
 			};
 			proc.on("close", settle);
 			// The child exited: it needs no more signals. Its output normally follows in `close`, but a grandchild that
@@ -785,7 +620,11 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 		});
 		// A child that ended mid-message leaves no live text behind.
 		delete result.partial;
-		if (aborted) throw new Error("Subagent was aborted");
+		if (aborted) {
+			// The folder is written before the error leaves, so the parent can be told where the partial run is.
+			saveArtifacts(options, result, deps);
+			throw new Error(result.artifactsDir ? `Subagent was aborted (partial run saved in ${result.artifactsDir})` : "Subagent was aborted");
+		}
 		if (structured && !failed(result)) {
 			const check = checkStructuredRun(result.messages, options.schema!);
 			if (check.ok) result.structured = check.value;
@@ -800,7 +639,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 
 /** Saves the attempt's folder under the repo docs; a failed write never fails the run. */
 function saveArtifacts(options: RunOptions, result: RunResult, deps: ChildRunDeps): void {
-	if (!result.runId) return;
+	if (!result.runId || result.artifactsDir) return;
 	try {
 		result.artifactsDir = writeRunArtifacts((deps.docsDir ?? repoDocsDir)(options.cwd), {
 			runId: result.runId,
@@ -818,6 +657,8 @@ function saveArtifacts(options: RunOptions, result: RunResult, deps: ChildRunDep
 			endedAt: result.endedAt ?? (deps.now ?? Date.now)(),
 			usage: result.usage,
 			output: output(result),
+			structured: result.structured,
+			finalText: finalText(result.messages),
 			messages: result.messages,
 		});
 	} catch {

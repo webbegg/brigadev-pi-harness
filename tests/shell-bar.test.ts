@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { runUiCommand, type BrigadevSettings } from "../lib/runtime.ts";
 import { contextGauge, KNOWN_STATUS_ORDER, layoutSegments, statusSegment } from "../lib/shell-bar.ts";
 
 describe("shell bar", () => {
@@ -59,5 +60,28 @@ describe("shell bar", () => {
 		assert.deepEqual([statusSegment("brigadev-usage", "week 55%")?.text, statusSegment("brigadev-usage", "week 55%")?.tone], ["◷ week 55%", "dim"]);
 		assert.equal(statusSegment("brigadev-usage", "5h 91% · week 55%")?.tone, "warning");
 		assert.equal(statusSegment("brigadev-usage", "limit reached (five_hour)")?.tone, "error");
+	});
+});
+
+describe("runUiCommand", () => {
+	const store = (initial: BrigadevSettings = {}) => {
+		const writes: BrigadevSettings[] = [];
+		return { writes, read: () => initial, write: (update: BrigadevSettings) => void writes.push(update) };
+	};
+
+	it("writes the footer setting, keeping the other ui settings", () => {
+		const s = store({ ui: { compactTools: false } });
+		assert.deepEqual(runUiCommand("  footer   off ", s), { feature: "footer", message: "brigadev footer off" });
+		assert.deepEqual(s.writes, [{ ui: { compactTools: false, footer: false } }]);
+	});
+
+	it("shows the current state and the usage, and writes nothing, for anything else", () => {
+		for (const args of ["", "footer", "footer maybe", "dashboard off", "phase on"]) {
+			const s = store({ ui: { footer: false } });
+			const result = runUiCommand(args, s);
+			assert.equal(result.feature, undefined, args);
+			assert.equal(result.message, "footer: off\nUsage: /brigadev:ui footer on|off", args);
+			assert.deepEqual(s.writes, [], args);
+		}
 	});
 });

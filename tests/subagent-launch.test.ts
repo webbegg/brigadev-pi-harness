@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { ChildControl } from "../lib/child-rpc.ts";
 import type { RunResult } from "../lib/child-run.ts";
 import { emptyTally } from "../lib/cost.ts";
 import type { ActiveWriter } from "../lib/delegation.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
 import { activeTasks } from "../lib/subagent-status.ts";
-import { runLaunch, toResult, type AgentCall, type FallbackStep, type LaunchHooks, type LaunchTask } from "../lib/subagent-launch.ts";
+import { limitFailed, runLaunch, toResult, type AgentCall, type LaunchHooks, type LaunchTask } from "../lib/subagent-launch.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 const settle = async () => {
@@ -43,17 +42,13 @@ const killedOnAbort = (call: AgentCall) =>
 
 type Spec = { writer?: boolean; skills?: string[]; surfaces?: string[] };
 
-function rig(specs: Spec[], options: { limit?: number; chain?: (index: number) => FallbackStep[]; snapshots?: Array<Map<string, string> | undefined> } = {}) {
+function rig(specs: Spec[], options: { limit?: number; snapshots?: Array<Map<string, string> | undefined> } = {}) {
 	const slots = createSemaphore(options.limit ?? 4);
 	const active: ActiveWriter[] = [];
 	const events: string[] = [];
 	const started: number[] = [];
-	const cooled: string[] = [];
-	const notices: string[] = [];
 	const labels: string[] = [];
-	const controls: Array<[number, ChildControl | undefined]> = [];
 	const snapshots = [...(options.snapshots ?? [])];
-	const addListeners = new Set<(ws: ActiveWriter[]) => void>();
 	let run: (call: AgentCall) => Promise<RunResult> = async (call) => reply(`task ${call.index}`, `answer ${call.index}`);
 	const tasks: LaunchTask[] = specs.map((spec, i) => ({
 		request: { agent: spec.writer ? "builder" : "scout", task: `task ${i}`, reason: "Independent units", skills: spec.skills, allowedEditSurfaces: spec.surfaces ?? (spec.writer ? [`src/w${i}/**`] : undefined) },
@@ -67,48 +62,35 @@ function rig(specs: Spec[], options: { limit?: number; chain?: (index: number) =
 		active,
 		events,
 		started,
-		cooled,
-		notices,
 		labels,
-		controls,
 		tasks,
 		/** Fresh placeholders, as the extension builds them. */
 		placeholders: results,
 		/** Makes `view.start` throw for the given task (a stale context after /reload). */
 		startError: undefined as ((index: number) => Error | undefined) | undefined,
+		/** Makes `view.finish` / the snapshot throw. */
+		finishError: undefined as Error | undefined,
+		snapshotError: undefined as Error | undefined,
 		runner: (fn: typeof run) => void (run = fn),
 		/** Another launch's writer registers (as the extension's shared list would report it). */
-		registerOther(writer: ActiveWriter) {
-			active.push(writer);
-			addListeners.forEach((listener) => listener([writer]));
-		},
-		unregisterOther(writer: ActiveWriter) {
-			active.splice(active.indexOf(writer), 1);
-		},
-		launch(mode: "single" | "parallel", hooks: Partial<LaunchHooks> = {}, signal?: AbortSignal, placeholders = results()) {
+		registerOther: (writer: ActiveWriter) => void active.push(writer),
+		unregisterOther: (writer: ActiveWriter) => void active.splice(active.indexOf(writer), 1),
+		launch(mode: "single" | "parallel", hooks: LaunchHooks = {}, signal?: AbortSignal, placeholders = results()) {
 			return runLaunch(
-				{ mode, tasks, results: placeholders, signal, hooks: { tolerateAbort: false, ...hooks } },
+				{ mode, tasks, results: placeholders, signal, hooks },
 				{
 					slots,
 					runAgent: async (call) => {
 						started.push(call.index);
 						labels.push(call.routeLabel);
 						const result = await run(call);
-						// What the real runner stamps on every attempt.
+						// What the real runner stamps on every run.
 						return Object.assign(result, { agent: tasks[call.index].agent.name, model: call.route.model, thinking: call.route.thinking });
 					},
 					skills: () => [],
-					chain: options.chain ?? (() => [{ model: "m1" }]),
-					coolModel: (model, category) => void cooled.push(`${model}:${category}`),
-					fallbackNotice: (info) => void notices.push(`${info.from}->${info.to}:${info.category}`),
 					writers: {
-						add: (ws) => {
-							active.push(...ws);
-							addListeners.forEach((listener) => listener(ws));
-						},
+						add: (ws) => void active.push(...ws),
 						remove: (w) => void (active.includes(w) && active.splice(active.indexOf(w), 1)),
-						list: () => [...active],
-						onAdd: (listener) => (addListeners.add(listener), () => void addListeners.delete(listener)),
 					},
 					view: {
 						start: (i) => {
@@ -118,10 +100,15 @@ function rig(specs: Spec[], options: { limit?: number; chain?: (index: number) =
 						},
 						attempt: (i) => void events.push(`attempt:${i}`),
 						update: (i) => void events.push(`update:${i}`),
-						finish: (i) => void events.push(`finish:${i}`),
-						control: (i, control) => void controls.push([i, control]),
+						finish: (i) => {
+							events.push(`finish:${i}`);
+							if (h.finishError) throw h.finishError;
+						},
 					},
-					snapshot: async () => snapshots.shift(),
+					snapshot: async () => {
+						if (h.snapshotError) throw h.snapshotError;
+						return snapshots.shift();
+					},
 				},
 			);
 		},
@@ -146,6 +133,7 @@ describe("runLaunch: slots and writers on every exit path", () => {
 		});
 		const launched = await h.launch("single");
 		assert.equal(launched.details.results[0].exitCode, 0);
+		assert.deepEqual(h.labels, ["definition"], "one run per task: no fallback chain");
 		assertClean(h);
 	});
 
@@ -176,7 +164,7 @@ describe("runLaunch: slots and writers on every exit path", () => {
 		assertClean(h);
 	});
 
-	it("abort while running (sync): the launch throws and nothing is left held", async () => {
+	it("abort while running: the launch throws and nothing is left held", async () => {
 		const h = rig([{ writer: true }, {}]);
 		h.runner(killedOnAbort);
 		const abort = new AbortController();
@@ -188,45 +176,19 @@ describe("runLaunch: slots and writers on every exit path", () => {
 		assertClean(h);
 	});
 
-	it("abort while running (async): settles with aborted partial results", async () => {
-		const h = rig([{ writer: true }, {}]);
-		h.runner(killedOnAbort);
-		const abort = new AbortController();
-		const launch = h.launch("parallel", { tolerateAbort: true }, abort.signal);
-		await settle();
-		abort.abort();
-		const { details } = await launch;
-		assert.deepEqual(details.results.map((r) => r.stopReason), ["aborted", "aborted"]);
-		assert.ok(details.results.every((r) => r.endedAt !== undefined));
-		assertClean(h);
-	});
-
-	it("abort while queued (async): the queued task never starts and settles cancelled", async () => {
+	it("abort while queued: throws, the queued task never starts, and its writer is unregistered", async () => {
 		const h = rig([{}, { writer: true }], { limit: 1 });
 		h.runner(killedOnAbort);
 		const abort = new AbortController();
-		const launch = h.launch("parallel", { tolerateAbort: true }, abort.signal);
+		const placeholders = h.placeholders();
+		const launch = h.launch("parallel", {}, abort.signal, placeholders);
 		await settle();
 		assert.equal(h.slots.waiting, 1);
 		assert.deepEqual(h.active.map((w) => w.agent), ["builder"], "the queued writer is already registered");
 		abort.abort();
-		const { details } = await launch;
-		assert.deepEqual(h.started, [0], "the queued task never started");
-		assert.equal(details.results[1].cancelled, true);
-		assert.equal(details.results[1].queued, true);
-		assert.ok(details.results[1].endedAt !== undefined);
-		assertClean(h);
-	});
-
-	it("abort while queued (sync): throws, and the queued writer is unregistered", async () => {
-		const h = rig([{}, { writer: true }], { limit: 1 });
-		h.runner(killedOnAbort);
-		const abort = new AbortController();
-		const launch = h.launch("parallel", {}, abort.signal);
-		await settle();
-		abort.abort();
 		await assert.rejects(launch, /Subagent was aborted/);
 		assert.deepEqual(h.started, [0]);
+		assert.equal(placeholders[1].cancelled, true, "the viewer shows it as cancelled");
 		assertClean(h);
 	});
 
@@ -234,9 +196,8 @@ describe("runLaunch: slots and writers on every exit path", () => {
 		const h = rig([{ writer: true }]);
 		const abort = new AbortController();
 		abort.abort();
-		const { details } = await h.launch("single", { tolerateAbort: true }, abort.signal);
+		await assert.rejects(h.launch("single", {}, abort.signal), /Subagent was aborted/);
 		assert.deepEqual(h.started, []);
-		assert.equal(details.results[0].cancelled, true);
 		assertClean(h);
 	});
 
@@ -260,96 +221,33 @@ describe("runLaunch: slots and writers on every exit path", () => {
 		assert.equal(peak, 4);
 		assertClean(h);
 	});
-
-	it("fallback chain: the slot is held across attempts, the model is cooled, and it is released at the end", async () => {
-		const h = rig([{ writer: true }], { chain: () => [{ model: "m1" }, { model: "m2" }, { model: "m3", thinking: "high" }] });
-		const seen: Array<{ model?: string; active: number; writers: number }> = [];
-		h.runner(async (call) => {
-			seen.push({ model: call.route.model, active: h.slots.active, writers: h.active.length });
-			return call.route.model === "m3" ? reply("task 0", "third time lucky") : errored("task 0", "429 rate limit");
-		});
-		const { details } = await h.launch("single");
-		assert.deepEqual(seen, [
-			{ model: "m1", active: 1, writers: 1 },
-			{ model: "m2", active: 1, writers: 1 },
-			{ model: "m3", active: 1, writers: 1 },
-		]);
-		assert.deepEqual(h.labels, ["definition", "definition ↪ fallback", "definition ↪ fallback"]);
-		assert.deepEqual(h.cooled, ["m1:rate_limit", "m2:rate_limit"]);
-		assert.deepEqual(h.notices, ["m1->m2:rate_limit", "m2->m3:rate_limit"]);
-		assert.deepEqual(details.results[0].fallbacks, ["m1 (rate_limit)", "m2 (rate_limit)"]);
-		assert.equal(details.results[0].model, "m3");
-		assert.equal(details.results[0].thinking, "high");
-		assertClean(h);
-	});
-
-	it("fallback chain: an error that no other model fixes ends the chain, an exhausted chain ends it too", async () => {
-		const h = rig([{}, {}], { chain: () => [{ model: "m1" }, { model: "m2" }] });
-		h.runner(async (call) => errored(`task ${call.index}`, call.index === 0 ? "prompt is too long" : "429 rate limit"));
-		const { details } = await h.launch("parallel");
-		assert.equal(details.results[0].fallbacks, undefined);
-		assert.deepEqual(details.results[1].fallbacks, ["m1 (rate_limit)", "m2 (rate_limit)"]);
-		assert.equal(h.started.filter((i) => i === 0).length, 1);
-		assert.equal(h.started.filter((i) => i === 1).length, 2);
-		assertClean(h);
-	});
-
-	it("fallback chain: an abort during the second attempt releases everything", async () => {
-		const h = rig([{ writer: true }], { chain: () => [{ model: "m1" }, { model: "m2" }] });
-		const abort = new AbortController();
-		h.runner((call) => (call.route.model === "m1" ? Promise.resolve(errored("task 0", "overloaded")) : killedOnAbort(call)));
-		const launch = h.launch("single", { tolerateAbort: true }, abort.signal);
-		await settle();
-		assert.equal(h.slots.active, 1);
-		abort.abort();
-		const { details } = await launch;
-		assert.equal(details.results[0].stopReason, "aborted");
-		assert.deepEqual(details.results[0].fallbacks, ["m1 (provider_unavailable)"]);
-		assertClean(h);
-	});
 });
 
-describe("runLaunch: the steering handle reaches the viewer (S4)", () => {
-	const handle = (): ChildControl => ({ steer: () => true, followUp: () => true, abort: () => true, isStreaming: () => true });
-
-	it("hands each task's handle to the view under its own index, and withdraws it when the child is done", async () => {
-		const h = rig([{}, {}]);
-		const handles = [handle(), handle()];
-		h.runner(async (call) => {
-			call.onControl?.(handles[call.index]);
-			call.onControl?.(undefined);
-			return reply(`task ${call.index}`, `answer ${call.index}`);
-		});
-		await h.launch("parallel");
-		assert.deepEqual(h.controls, [[0, handles[0]], [0, undefined], [1, handles[1]], [1, undefined]]);
-	});
-
-	it("a task that throws before its child ends still leaves no handle behind", async () => {
+describe("runLaunch: one model per agent; a quota or limit failure is reported loudly", () => {
+	it("a rate-limited child is not retried, and the result names the failure", async () => {
 		const h = rig([{}]);
-		const given = handle();
-		h.runner(async (call) => {
-			call.onControl?.(given);
-			throw new Error("spawn exploded");
-		});
-		await assert.rejects(h.launch("single"), /spawn exploded/);
-		assert.deepEqual(h.controls.at(-1), [0, undefined], "the view is told the run no longer has a handle");
+		h.runner(async () => errored("task 0", "429 rate limit"));
+		const launched = await h.launch("single");
+		assert.deepEqual(h.started, [0], "no second run on another model");
+		assert.equal(launched.warnings.length, 1);
+		assert.match(launched.warnings[0], /^scout: m1 hit a quota or rate limit\. No other model was tried/);
+		const text = toResult("single", launched).content[0].text;
+		assert.match(text, /^Agent error: 429 rate limit\n\nWarnings: scout: m1 hit a quota or rate limit/);
+		assert.equal(toResult("single", launched).isError, true);
+		assertClean(h);
 	});
 
-	it("a fallback attempt gets its own handle after the first attempt's was withdrawn", async () => {
-		const h = rig([{}], { chain: () => [{ model: "m1" }, { model: "m2" }] });
-		const [first, second] = [handle(), handle()];
-		let attempt = 0;
-		h.runner(async (call) => {
-			call.onControl?.(attempt === 0 ? first : second);
-			call.onControl?.(undefined);
-			return attempt++ === 0 ? errored("task 0", "429 rate limit") : reply("task 0", "ok");
-		});
-		await h.launch("single");
-		assert.deepEqual(h.controls.map(([, c]) => c), [first, undefined, second, undefined]);
+	it("quota wording is recognised; an ordinary failure, a limit-less error and a success are not", () => {
+		const base = { exitCode: 0, stderr: "" };
+		assert.equal(limitFailed({ ...base, stopReason: "error", errorMessage: "You exceeded your current quota" }), true);
+		assert.equal(limitFailed({ ...base, stopReason: "error", errorMessage: "usage limit reached" }), true);
+		assert.equal(limitFailed({ ...base, stopReason: "error", errorMessage: "prompt is too long" }), false);
+		assert.equal(limitFailed({ ...base, stopReason: "aborted", errorMessage: "rate limit" }), false);
+		assert.equal(limitFailed({ ...base, stopReason: "stop", errorMessage: "rate limit" }), false);
 	});
 });
 
-describe("runLaunch: a throwing view.start leaks nothing (A6)", () => {
+describe("runLaunch: a throwing view.start leaks nothing", () => {
 	it("the task that could not start settles, so the running count (derived from launch state) returns to zero", async () => {
 		const h = rig([{ writer: true }, {}]);
 		h.startError = (i) => (i === 0 ? new Error("stale ctx") : undefined);
@@ -372,34 +270,36 @@ describe("runLaunch: a throwing view.start leaks nothing (A6)", () => {
 		assert.notEqual(placeholders[0].cancelled, true, "a start failure is not a cancellation");
 		assertClean(h);
 	});
+});
 
-	it("async mode (abort tolerated) rethrows too and leaves nothing running", async () => {
-		const h = rig([{}]);
-		h.startError = () => new Error("stale ctx");
-		const placeholders = h.placeholders();
-		await assert.rejects(h.launch("single", { tolerateAbort: true, async: true }, new AbortController().signal, placeholders), /stale ctx/);
-		assert.equal(activeTasks([placeholders]), 0);
+describe("runLaunch: a failing hook or snapshot leaks nothing", () => {
+	it("a snapshot that throws before any slot rejects, with the writer unregistered and no slot held", async () => {
+		const h = rig([{ writer: true }]);
+		h.snapshotError = new Error("git exploded");
+		await assert.rejects(h.launch("single"), /git exploded/);
+		assertClean(h);
+	});
+
+	it("a view.finish that throws still releases the slot and the writer", async () => {
+		const h = rig([{ writer: true }]);
+		h.finishError = new Error("finish boom");
+		await assert.rejects(h.launch("single"), /finish boom/);
 		assertClean(h);
 	});
 });
 
-describe("runLaunch: a rejection waits for every sibling (A3)", () => {
-	/** 5 tasks over a cap of 4: task 0 is the writer and runs, tasks 1-3 run, task 4 queues. */
-	function fiveTasks(tolerateAbort: boolean) {
+describe("runLaunch: a rejection waits for every sibling", () => {
+	it("an aborted launch keeps the writer registered until the writer's task settles, and settles only after all tasks", async () => {
+		// 5 tasks over a cap of 4: task 0 is the writer and runs, tasks 1-3 run, task 4 queues.
 		const h = rig([{ writer: true }, {}, {}, {}, {}]);
 		const writerTask = manual();
 		h.runner((call) => (call.index === 0 ? writerTask.promise : killedOnAbort(call)));
 		const abort = new AbortController();
 		const log: string[] = [];
-		const launch = h.launch("parallel", { tolerateAbort }, abort.signal).then(
+		const launch = h.launch("parallel", {}, abort.signal).then(
 			() => log.push("launch resolved"),
 			() => log.push("launch rejected"),
 		);
-		return { h, writerTask, abort, log, launch };
-	}
-
-	it("an aborted launch keeps the writer registered until the writer's task settles, and settles only after all tasks", async () => {
-		const { h, writerTask, abort, log, launch } = fiveTasks(false);
 		await settle();
 		assert.deepEqual(h.started, [0, 1, 2, 3]);
 		assert.equal(h.slots.waiting, 1);
@@ -412,19 +312,6 @@ describe("runLaunch: a rejection waits for every sibling (A3)", () => {
 		writerTask.resolve(reply("task 0", "writer done"));
 		await launch;
 		assert.deepEqual(log, ["launch rejected"]);
-		assertClean(h);
-	});
-
-	it("async mode (abort tolerated) also settles only after the writer's task", async () => {
-		const { h, writerTask, abort, log, launch } = fiveTasks(true);
-		await settle();
-		abort.abort();
-		await settle();
-		assert.equal(h.active.length, 1);
-		assert.deepEqual(log, []);
-		writerTask.reject(new Error("Subagent was aborted"));
-		await launch;
-		assert.deepEqual(log, ["launch resolved"]);
 		assertClean(h);
 	});
 
@@ -458,61 +345,10 @@ describe("runLaunch: a rejection waits for every sibling (A3)", () => {
 const WARNING = "files changed outside the writers' allowed edit surfaces";
 const before = new Map([["src/w0/a.ts", "1"]]);
 
-describe("runLaunch: the async writer backstop ignores other writers' surfaces (A1)", () => {
+describe("runLaunch: the writer backstop", () => {
 	const other: ActiveWriter = { id: "o1", agent: "builder", surfaces: ["docs/**"] };
 
-	it("a writer already active when the launch starts is excluded", async () => {
-		const after = new Map([["src/w0/a.ts", "2"], ["docs/guide.md", "x"], ["README.md", "y"]]);
-		const h = rig([{ writer: true }], { snapshots: [before, after] });
-		h.registerOther(other);
-		const launched = await h.launch("single", { async: true, tolerateAbort: true });
-		assert.deepEqual(launched.details.outsideSurfaces, ["README.md"]);
-		h.unregisterOther(other);
-		assertClean(h);
-	});
-
-	it("a writer that registers during the launch, even if it is gone before the end, is excluded", async () => {
-		const after = new Map([["src/w0/a.ts", "2"], ["docs/guide.md", "x"], ["README.md", "y"]]);
-		const h = rig([{ writer: true }], { snapshots: [before, after] });
-		const run = manual();
-		h.runner(() => run.promise);
-		const launch = h.launch("single", { async: true, tolerateAbort: true });
-		await settle();
-		h.registerOther(other);
-		h.unregisterOther(other);
-		run.resolve(reply("task 0", "done"));
-		assert.deepEqual((await launch).details.outsideSurfaces, ["README.md"]);
-		assertClean(h);
-	});
-
-	it("the launch's own surfaces and unrelated files are still handled as before", async () => {
-		const after = new Map([["src/w0/a.ts", "2"], ["src/other/b.ts", "x"]]);
-		const h = rig([{ writer: true }], { snapshots: [before, after] });
-		h.registerOther(other);
-		const launched = await h.launch("single", { async: true, tolerateAbort: true });
-		assert.deepEqual(launched.details.outsideSurfaces, ["src/other/b.ts"]);
-		h.unregisterOther(other);
-		assertClean(h);
-	});
-
-	it("a writer registered after the launch settled does not affect it", async () => {
-		const after = new Map([["src/w0/a.ts", "2"], ["docs/guide.md", "x"]]);
-		const h = rig([{ writer: true }], { snapshots: [before, after] });
-		const launched = await h.launch("single", { async: true, tolerateAbort: true });
-		h.registerOther(other);
-		assert.deepEqual(launched.details.outsideSurfaces, ["docs/guide.md"]);
-		h.unregisterOther(other);
-	});
-
-	it("the async warning says the list may include edits the parent made meanwhile", async () => {
-		const after = new Map([["src/w0/a.ts", "2"], ["README.md", "y"]]);
-		const h = rig([{ writer: true }], { snapshots: [before, after] });
-		const launched = await h.launch("single", { async: true, tolerateAbort: true });
-		assert.deepEqual(launched.warnings, [`${WARNING} (may include edits the parent made meanwhile): README.md`]);
-		assert.equal(toResult("single", launched).content[0].text, `answer 0\n\nWarnings: ${WARNING} (may include edits the parent made meanwhile): README.md`);
-	});
-
-	it("sync mode is unchanged: other writers' files are still reported, with the original wording", async () => {
+	it("reports files outside the writers' surfaces, other launches' writers' files included", async () => {
 		const after = new Map([["src/w0/a.ts", "2"], ["docs/guide.md", "x"], ["README.md", "y"]]);
 		const h = rig([{ writer: true }], { snapshots: [before, after] });
 		h.registerOther(other);
@@ -521,9 +357,26 @@ describe("runLaunch: the async writer backstop ignores other writers' surfaces (
 		assert.deepEqual(launched.warnings, [`${WARNING}: README.md, docs/guide.md`]);
 		h.unregisterOther(other);
 	});
+
+	it("the launch's own surfaces are not reported", async () => {
+		const after = new Map([["src/w0/a.ts", "2"]]);
+		const h = rig([{ writer: true }], { snapshots: [before, after] });
+		const launched = await h.launch("single");
+		assert.deepEqual(launched.details.outsideSurfaces, []);
+		assert.deepEqual(launched.warnings, []);
+		assertClean(h);
+	});
+
+	it("appears in the text the model reads", async () => {
+		const after = new Map([["src/w0/a.ts", "2"], ["README.md", "x"]]);
+		const h = rig([{ writer: true }], { snapshots: [before, after] });
+		const launched = await h.launch("single");
+		assert.equal(toResult("single", launched).content[0].text, `answer 0\n\nWarnings: ${WARNING}: README.md`);
+		assertClean(h);
+	});
 });
 
-describe("toResult: a task cancelled while queued (A5)", () => {
+describe("toResult: a task cancelled while queued", () => {
 	const cancelled = (agent: string): RunResult => ({ agent, task: "t", exitCode: -1, messages: [], stderr: "", usage: emptyTally(), queued: true, cancelled: true, endedAt: 5 });
 
 	it("parallel: counts as failed and renders as cancelled, not completed", () => {
@@ -537,27 +390,9 @@ describe("toResult: a task cancelled while queued (A5)", () => {
 		assert.equal(result.content[0].text, "Agent cancelled: Cancelled before it started.");
 		assert.equal(result.isError, true);
 	});
-
-	it("end to end: an async launch aborted while a task is queued", async () => {
-		const h = rig([{}, { writer: true }], { limit: 1 });
-		h.runner(killedOnAbort);
-		const abort = new AbortController();
-		const launch = h.launch("parallel", { async: true, tolerateAbort: true }, abort.signal);
-		await settle();
-		abort.abort();
-		const text = toResult("parallel", await launch).content[0].text;
-		assert.equal(text, "Parallel: 0/2 succeeded\n\n### [scout] failed\n\nSubagent was aborted\n\n---\n\n### [builder] cancelled\n\nCancelled before it started.");
-	});
-
-	it("sync text is unchanged: a placeholder-free result still says completed/failed", async () => {
-		const h = rig([{}, {}]);
-		h.runner(async (call) => (call.index === 1 ? errored("task 1", "no luck") : reply("task 0", "fine")));
-		const text = toResult("parallel", await h.launch("parallel")).content[0].text;
-		assert.equal(text, "Parallel: 1/2 succeeded\n\n### [scout] completed\n\nfine\n\n---\n\n### [scout] failed\n\nno luck");
-	});
 });
 
-describe("toResult: the sync content text", () => {
+describe("toResult: the content text", () => {
 	it("single success is the child's final text", async () => {
 		const h = rig([{}]);
 		h.runner(async () => reply("task 0", "the answer"));
@@ -589,6 +424,39 @@ describe("toResult: the sync content text", () => {
 		assert.equal(result.isError, undefined);
 	});
 
+	it("S12: a large structured result is compacted and names the saved folder (single and parallel)", async () => {
+		const h = rig([{}, {}]);
+		const structured = { verdicts: [{ spec: "S1", verdict: "met", evidence: "ok" }], blockers: [], advisories: [], regressionTests: [{ path: "tests/r.test.ts", covers: "S1", content: "t".repeat(60_000) }], scratch: [], unverified: [] };
+		h.runner(async (call) => reply(`task ${call.index}`, "", { structured, artifactsDir: `/docs/runs/r${call.index}` }));
+		const single = toResult("single", await h.launch("single"));
+		assert.ok(single.content[0].text.length < 2_000);
+		assert.ok(!single.content[0].text.includes("tttt"));
+		assert.match(single.content[0].text, /tests\/r\.test\.ts/);
+		assert.ok(single.content[0].text.endsWith("Full result: /docs/runs/r0/result.json"));
+		const parallel = toResult("parallel", await h.launch("parallel")).content[0].text;
+		assert.ok(parallel.length < 4_000);
+		assert.ok(parallel.includes("Full result: /docs/runs/r0/result.json") && parallel.includes("Full result: /docs/runs/r1/result.json"));
+	});
+
+	it("LOOP R3-003: a run whose folder could not be saved says so; a saved one does not", async () => {
+		const h = rig([{}, {}, {}]);
+		const structured = { verdicts: [{ spec: "S1", verdict: "met", evidence: "ok" }], blockers: [], advisories: [], regressionTests: [], scratch: [], unverified: [] };
+		h.runner(async (call) => (call.index === 0 ? reply("task 0", "answer", { runId: "r0" }) : call.index === 1 ? reply("task 1", "", { runId: "r1", structured }) : reply("task 2", "saved", { runId: "r2", artifactsDir: "/docs/runs/r2" })));
+		const text = toResult("parallel", await h.launch("parallel")).content[0].text;
+		const [first, second, third] = text.split("\n\n---\n\n");
+		assert.ok(first.endsWith("answer\n\n(full result not saved)"), first);
+		assert.ok(second.endsWith("(full result not saved)"), second);
+		assert.ok(!third.includes("not saved") && third.endsWith("Full result: /docs/runs/r2/result.json"), third);
+	});
+
+	it("S12: a long failure text is cut to head and tail", async () => {
+		const h = rig([{}]);
+		h.runner(async () => errored("task 0", `START${"e".repeat(40_000)}END`));
+		const text = toResult("single", await h.launch("single")).content[0].text;
+		assert.ok(text.length < 9_000);
+		assert.ok(text.startsWith("Agent error: START") && text.endsWith("END"));
+	});
+
 	it("appends warnings: unknown skills", async () => {
 		const h = rig([{ skills: ["nope"] }]);
 		const launched = await h.launch("single");
@@ -597,22 +465,10 @@ describe("toResult: the sync content text", () => {
 		assert.ok(toResult("parallel", launched).content[0].text.endsWith("\n\nWarnings: scout: unknown skills nope"));
 	});
 
-	it("appends warnings: files changed outside the writers' surfaces", async () => {
-		const before = new Map([["src/w0/a.ts", "1"]]);
-		const after = new Map([["src/w0/a.ts", "2"], ["README.md", "x"]]);
-		const h = rig([{ writer: true }], { snapshots: [before, after] });
-		const launched = await h.launch("single");
-		assert.deepEqual(launched.details.outsideSurfaces, ["README.md"]);
-		assert.equal(toResult("single", launched).content[0].text, "answer 0\n\nWarnings: files changed outside the writers' allowed edit surfaces: README.md");
-		assertClean(h);
-	});
-
 	it("streams progress: `done/total` for parallel, the child's text for single", async () => {
 		const h = rig([{}, {}]);
 		const texts: string[] = [];
-		const progress: string[] = [];
-		await h.launch("parallel", { onUpdate: (r) => void texts.push(r.content[0].text), onProgress: (d, t) => void progress.push(`${d}/${t}`) });
+		await h.launch("parallel", { onUpdate: (r) => void texts.push(r.content[0].text) });
 		assert.ok(texts.includes("2/2 done"));
-		assert.equal(progress.at(-1), "2/2");
 	});
 });

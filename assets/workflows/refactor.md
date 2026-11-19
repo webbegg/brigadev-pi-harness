@@ -2,8 +2,6 @@
 name: "Refactor a component"
 description: "Restructure a component without changing what it does"
 order: 80
-key: "x"
-group: "other"
 questions:
   - id: component
     label: "Component path"
@@ -24,11 +22,11 @@ questions:
     options: ["Tests exist", "Add tests first"]
     default: "Tests exist"
 ---
-Refactor request, started from the workflow menu. Follow the normal ODD flow: explore the component and its callers first. Behavior must stay the same in both cases below; refactor in small steps with the tests passing after each one.
+Refactor request, started from the workflow menu. Explore the component and its callers first. Behavior must stay the same in both cases below; refactor in small steps with the tests passing after each one.
 
 - Component: {{component}}
 - Goal: {{goal}}
 - Constraints: {{constraints}}
 - Test coverage: {{tests}}
 
-"Add tests first" means write characterization tests that pass on the current code before any restructuring. With "Keep the public API", leave exports, signatures, and other contracts untouched. With "The public API may change", update every caller you find, name the API change as a contract change in the summary, and end with `Risk: item 3 (public API change)`, so an independent `brigadev-verify` runs after the change's own checks. Commit by work unit, following the `brigadev-work-unit-commits` skill.
+"Add tests first" means write characterization tests that pass on the current code before any restructuring. With "Keep the public API", leave exports, signatures, and other contracts untouched. With "The public API may change", update every caller you find, name the API change as a contract change in the summary, and end with `Risk: contract (public API change)`, so an independent `brigadev-verify` runs after the change's own checks. Commit by work unit, following `brigadev-branch-pr`.

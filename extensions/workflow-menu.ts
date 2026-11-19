@@ -1,8 +1,7 @@
 /**
  * brigadev workflow menu (alt+w, /brigadev:start): pick a day-to-day workflow,
  * answer the questions it declares, review the composed request, and hand it
- * to the orchestrator. `/brigadev:start <name, file id, or key>` skips the list
- * (the launch dashboard uses it, with the name, which is unique). Workflows are files (assets/workflows/, plus the user's
+ * to the orchestrator. `/brigadev:start <name or file id>` skips the list. Workflows are files (assets/workflows/, plus the user's
  * own in ~/.brigadev/workflows/ and ~/.brigadev/<repo>/workflows/). The dialogs
  * are select/input/editor, so the menu works in the TUI and over RPC.
  */
@@ -69,6 +68,6 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(`${workflow.name}: cancelled, nothing sent`, "info");
 	};
 
-	pi.registerCommand(COMMAND, { description: "Start a day-to-day workflow: pick one (or name it: /brigadev:start bug-fix, /brigadev:start b), answer its questions, send the request", handler: async (args, ctx) => open(ctx, args) });
+	pi.registerCommand(COMMAND, { description: "Start a day-to-day workflow: pick one (or name it: /brigadev:start bug-fix), answer its questions, send the request", handler: async (args, ctx) => open(ctx, args) });
 	pi.registerShortcut(SHORTCUT, { description: "Open the brigadev workflow menu", handler: async (ctx) => open(ctx) });
 }

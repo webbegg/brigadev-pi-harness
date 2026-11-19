@@ -14,12 +14,10 @@ import {
 	ORCHESTRATOR_KEY,
 	parseProfilesFile,
 	resolveAgentRoute,
-	routeFor,
 	resolveModelRef,
 	THINKING_LEVELS,
 	unmatchedKeys,
 	validateProfileName,
-	withFallbacks,
 	withRoute,
 	type Profile,
 	type ProfilesFile,
@@ -30,7 +28,7 @@ import { effectiveProfile, PROFILE_ENTRY, profilesPath, readProfiles, writePiDef
 import { ASSETS_ROOT, isChildSession } from "../lib/runtime.ts";
 
 const STATUS_KEY = "brigadev-profile";
-const SUBCOMMANDS = ["show", "list", "use", "default", "clear", "set", "fallback", "new", "delete", "init", "path"] as const;
+const SUBCOMMANDS = ["show", "list", "use", "default", "clear", "set", "new", "delete", "init", "path"] as const;
 const USAGE = [
 	"/brigadev:profile                 show the effective routing",
 	"/brigadev:profile list            list profiles (◉ session, ★ default)",
@@ -38,7 +36,6 @@ const USAGE = [
 	"/brigadev:profile default <name>  make it the default (also sets Pi's default model)",
 	"/brigadev:profile clear           drop this session's profile",
 	"/brigadev:profile set <profile> <agent|review-*|*|orchestrator> <model|inherit> [thinking|inherit]",
-	"/brigadev:profile fallback <profile> <agent|review-*|*|orchestrator> <model> [thinking]   (add; \"clear\" instead of a model removes the chain)",
 	"/brigadev:profile new <name> [copy-from]   /brigadev:profile delete <name>",
 	"/brigadev:profile init            add the example profiles (economy, balanced, deep)",
 ].join("\n");
@@ -96,16 +93,12 @@ export default function (pi: ExtensionAPI) {
 		lines.push(header);
 		if (eff.missing) lines.push(`⚠ this session's profile "${eff.missing}" no longer exists`);
 		const orch = eff.profile?.[ORCHESTRATOR_KEY];
-		const chain = (key: string | undefined) => {
-			const steps = key ? eff.profile?.[key]?.fallbacks : undefined;
-			return steps?.length ? `  ↪ ${steps.map((f) => f.model.split("/").pop()).join(" → ")}` : "";
-		};
-		lines.push(`orchestrator        ${currentModelRef(ctx) ?? "?"} · ${ctx.thinkingLevel ?? "?"}  (live)${orch?.model ? `  profile wants ${orch.model}${orch.thinking ? ` · ${orch.thinking}` : ""}` : ""}${chain(ORCHESTRATOR_KEY)}`);
+		lines.push(`orchestrator        ${currentModelRef(ctx) ?? "?"} · ${ctx.thinkingLevel ?? "?"}  (live)${orch?.model ? `  profile wants ${orch.model}${orch.thinking ? ` · ${orch.thinking}` : ""}` : ""}`);
 		const width = Math.max(18, ...agents.map((a) => a.name.length));
 		for (const agent of agents) {
 			const r = resolveAgentRoute({ profile: eff.profile, agent, parent: { model: currentModelRef(ctx), thinking: ctx.thinkingLevel } });
 			const source = r.profileKey ? `profile:${r.profileKey}` : r.modelSource;
-			lines.push(`${agent.name.padEnd(width)}  ${r.model ?? "?"} · ${r.thinking ?? "default"}  (${source})${chain(routeFor(eff.profile, agent.name)?.key)}`);
+			lines.push(`${agent.name.padEnd(width)}  ${r.model ?? "?"} · ${r.thinking ?? "default"}  (${source})`);
 		}
 		const unknown = eff.profile ? unmatchedKeys(eff.profile, agents.map((a) => a.name)) : [];
 		if (unknown.length) lines.push(`⚠ routing keys that match no agent (ignored): ${unknown.join(", ")}`);
@@ -142,7 +135,7 @@ export default function (pi: ExtensionAPI) {
 				const items = SUBCOMMANDS.filter((s) => s.startsWith(parts[0] ?? "")).map((value) => ({ value, label: value }));
 				return items.length ? items : null;
 			}
-			if (parts.length === 2 && ["use", "default", "delete", "set", "fallback", "new"].includes(parts[0])) {
+			if (parts.length === 2 && ["use", "default", "delete", "set", "new"].includes(parts[0])) {
 				const names = Object.keys(readProfiles().file.profiles).filter((n) => n.startsWith(parts[1]));
 				return names.length ? names.map((n) => ({ value: `${parts[0]} ${n}`, label: n })) : null;
 			}
@@ -197,18 +190,6 @@ export default function (pi: ExtensionAPI) {
 						const shown = next.profiles[a][b];
 						return save(ctx, next, `${a}: ${b} → ${shown ? `${shown.model ?? "inherit"} · ${shown.thinking ?? "inherit"}` : "inherit"}${unknown.length ? `\n⚠ "${b}" matches no current agent` : ""}`);
 					}
-					case "fallback": {
-						if (!requireProfile(ctx, file, a)) return;
-						if (!b || !c) return ctx.ui.notify(USAGE, "error");
-						const current = file.profiles[a][b]?.fallbacks ?? [];
-						if (c === "clear") return save(ctx, withFallbacks(file, a, b, []), `${a}: ${b} has no fallback chain now`);
-						const resolved = resolveModelRef(c, modelCatalog(ctx), ctx.model?.provider);
-						if ("error" in resolved) return ctx.ui.notify(resolved.error, "error");
-						if (d !== undefined && !isThinkingLevel(d)) return ctx.ui.notify(`thinking must be one of ${THINKING_LEVELS.join(", ")}`, "error");
-						const step = { model: `${resolved.model.provider}/${resolved.model.id}`, ...(d ? { thinking: d } : {}) };
-						const next = withFallbacks(file, a, b, [...current.filter((f) => f.model !== step.model), step]);
-						return save(ctx, next, `${a}: ${b} falls back to ${next.profiles[a][b].fallbacks!.map((f) => f.model).join(" → ")}`);
-					}
 					case "new": {
 						const problem = a ? validateProfileName(a) : USAGE;
 						if (problem) return ctx.ui.notify(problem, "error");
@@ -243,16 +224,6 @@ export default function (pi: ExtensionAPI) {
 										continue;
 									}
 									next.model = `${ref.model.provider}/${ref.model.id}`;
-								}
-								if (route.fallbacks) {
-									next.fallbacks = route.fallbacks.flatMap((f) => {
-										const ref = resolveModelRef(f.model, catalog, ctx.model?.provider);
-										if ("error" in ref) {
-											dropped.push(`${name}.${key} fallback: ${ref.error}`);
-											return [];
-										}
-										return [{ ...f, model: `${ref.model.provider}/${ref.model.id}` }];
-									});
 								}
 								resolved[key] = next;
 							}

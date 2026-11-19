@@ -6,13 +6,13 @@
 		"verdicts": {
 			"type": "array",
 			"minItems": 1,
-			"description": "One verdict per S# in the feature document.",
+			"description": "One verdict per spec item: S# of the feature document, or A# of the task's own numbered acceptance criteria when there is no feature document.",
 			"items": {
 				"type": "object",
 				"required": ["spec", "verdict", "evidence"],
 				"additionalProperties": false,
 				"properties": {
-					"spec": { "type": "string", "minLength": 1, "description": "S1, S2, ..." },
+					"spec": { "type": "string", "minLength": 1, "description": "S1, S2, ... (feature document) or A1, A2, ... (the task's numbered acceptance criteria)." },
 					"verdict": { "type": "string", "enum": ["met", "unmet", "not implemented", "out of scope", "unverified"], "description": "unverified counts as unmet; give the reason and the missing command." },
 					"evidence": { "type": "string", "minLength": 1, "description": "Probe and observed result, or the scope reason." }
 				}
@@ -38,12 +38,17 @@
 		},
 		"regressionTests": {
 			"type": "array",
-			"description": "Ready-to-commit tests for the parent to hand to a writer.",
+			"description": "Regression tests for the parent to hand to a writer: path, what they cover, and a short reproduction.",
 			"items": {
 				"type": "object",
-				"required": ["path", "content", "covers"],
+				"required": ["path", "covers"],
 				"additionalProperties": false,
-				"properties": { "path": { "type": "string", "minLength": 1 }, "content": { "type": "string", "minLength": 1 }, "covers": { "type": "string", "minLength": 1, "description": "S# covered." } }
+				"properties": {
+					"path": { "type": "string", "minLength": 1 },
+					"covers": { "type": "string", "minLength": 1, "description": "S# or A# covered." },
+					"reproduction": { "type": "string", "description": "The command and its failing line, one or two lines." },
+					"content": { "type": "string", "description": "Full test file; only when the task asks for it." }
+				}
 			}
 		},
 		"scratch": { "type": "array", "items": { "type": "string" }, "description": "Exact scratch directories you created." },

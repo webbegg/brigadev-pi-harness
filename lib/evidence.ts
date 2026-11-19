@@ -4,23 +4,26 @@
  * keyed to the worktree content tree it ran on (lib/worktree-tree.ts).
  *
  * The commit gate reads it: a commit with source changes needs a passing
- * test recorded for the current tree, so any edit after the last passing run
- * blocks the commit until the tests run again. Only the user can force it.
+ * test recorded for the current tree, so any source edit after the last passing
+ * run blocks the commit until the tests run again (a docs-only edit does not:
+ * each run also carries the tree of its non-doc paths). The gate judges the
+ * repository the commit runs in (`git -C <dir>`, `cd <dir> &&`). Only the user
+ * can force it.
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
-import { basename as executableName, blankHeredocs, tokenize, unwrap, type Segment } from "./command-classifier.ts";
-import { stripLockPrelude } from "./dsp-credlock.ts";
+import { dirname, join, resolve } from "node:path";
+import { basename as executableName, blankHeredocs, classifyCommand, commitDirectory, segmentDirectories, tokenize, unwrap, type Segment } from "./command-classifier.ts";
+import { readCurrentBranch } from "./commit-branch.ts";
 import { canonicalPath, isInside } from "./paths.ts";
+import { repoDocsDir } from "./repo-docs.ts";
+import { type ExecFn, takeSnapshot } from "./worktree-snapshot.ts";
+import { isDocPath, worktreeTreeResult } from "./worktree-tree.ts";
 
 const MAX_COMMAND_CHARS = 500;
 const TAIL_LINES = 20;
 const TAIL_CHARS = 2000;
-// Prose only: `.txt` and `.mdx` hold requirements, CMake lists, and components, so they count as source.
-const DOC_EXTENSIONS = /\.(md|markdown|rst|adoc)$/i;
-const DOC_NAMES = new Set(["LICENSE", "NOTICE", "COPYING", "AUTHORS"]);
 
 const TEST_TOOLS = new Set(["vitest", "jest", "mocha", "pytest", "rspec", "phpunit"]);
 const CHECK_TOOLS = new Set(["tsc", "eslint"]);
@@ -49,8 +52,12 @@ export interface RunRecord {
 	type: "run";
 	ts: string;
 	branch: string | null;
-	/** Worktree content tree the command ran on; undefined outside git. */
+	/** Worktree content tree the command ran on; undefined outside git, or when only docs changed during the run. */
 	tree?: string;
+	/** The same tree without doc paths: a run still vouches for a tree that differs from it only in docs. */
+	srcTree?: string;
+	/** Top level of the repository the run belongs to (a nested repository's, not the session's). */
+	root?: string;
 	cwd: string;
 	/** "parent" or the subagent name. */
 	agent: string;
@@ -221,6 +228,13 @@ function mayRunNoTests(argv: string[]): boolean {
 	return toolMayRunNoTests([...before.slice(at), ...after]);
 }
 
+/** Directory the first check of `command` starts in: the session's `cwd` moved by the `cd <dir> &&` before it (`cwd` when that cannot be known). */
+export function checkDirectory(command: string, cwd: string, home?: string): string {
+	const segments = parse(command);
+	const found = firstCheck(segments);
+	return (found && segmentDirectories(segments, cwd, home)[found.index]) ?? cwd;
+}
+
 /** Where the command runs, so a `cd` before the check can be judged. */
 export interface CheckContext {
 	/** The session's working directory. */
@@ -281,6 +295,8 @@ export function checkOutcome(command: string, exitCode: number | undefined, cont
 		const { argv, before } = segments[i];
 		const allowed = (i === 0 && before === "") || before === "&&" || (before === ";" && pipefail && i === 1) || (before === "|" && (i <= found.index || pipefail));
 		if (!allowed || argv[0] === "!" || argv.some((word) => word.startsWith("#"))) return "unknown";
+		// Only the leading setter counts: a later `set` (`set +o pipefail`, `set +e`) can take back what it granted.
+		if (i > 0 && executableName(unwrap(argv).argv[0] ?? "") === "set") return "unknown";
 	}
 
 	let dir = context.cwd ? canonicalPath(context.cwd) : undefined;
@@ -295,7 +311,21 @@ export function checkOutcome(command: string, exitCode: number | undefined, cont
 			if (!dir) return "unknown";
 		}
 	}
+	// Under pipefail a consumer that closes early (`| head`) kills the runner with SIGPIPE: 141 says nothing about the tests.
+	if (exitCode === 141 && pipefail && segments.some((segment) => segment.before === "|")) return "unknown";
 	return exitCode === 0 ? "pass" : "fail";
+}
+
+/**
+ * The command with `set -o pipefail; ` in front when that is all a piped test
+ * run lacked for its exit code to be the runner's (`node --test | tail -20`);
+ * undefined when nothing is needed or it would not help (not a test, already
+ * trusted, or untrusted for another reason). Applied before the command runs.
+ */
+export function pipefailCommand(command: string, context: CheckContext = {}): string | undefined {
+	if (checkKind(command) !== "test" || checkOutcome(command, 0, context) !== "unknown") return undefined;
+	const prefixed = `set -o pipefail; ${command}`;
+	return checkOutcome(prefixed, 0, context) === "pass" ? prefixed : undefined;
 }
 
 export function outputTail(output: string, lines = TAIL_LINES): string {
@@ -303,9 +333,8 @@ export function outputTail(output: string, lines = TAIL_LINES): string {
 	return tail.length > TAIL_CHARS ? tail.slice(-TAIL_CHARS) : tail;
 }
 
-export function buildRunRecord(raw: { ts: string; branch: string | null; tree?: string; cwd: string; agent: string; command: string; exitCode?: number; output: string; topLevel?: string; note?: string }): RunRecord {
-	// What the agent ran, not the guard's DSP credential-lock line in front of it.
-	const input = { ...raw, command: stripLockPrelude(raw.command) };
+export function buildRunRecord(raw: { ts: string; branch: string | null; tree?: string; srcTree?: string; cwd: string; agent: string; command: string; exitCode?: number; output: string; topLevel?: string; note?: string }): RunRecord {
+	const input = raw;
 	const record: RunRecord = {
 		v: 1,
 		type: "run",
@@ -321,6 +350,8 @@ export function buildRunRecord(raw: { ts: string; branch: string | null; tree?: 
 		tail: outputTail(input.output),
 	};
 	if (input.note) record.note = input.note;
+	if (input.srcTree) record.srcTree = input.srcTree;
+	if (input.topLevel) record.root = input.topLevel;
 	return record;
 }
 
@@ -329,13 +360,16 @@ export function buildRunRecord(raw: { ts: string; branch: string | null; tree?: 
  * was the same before and after it: an edit made while it ran (a parallel tool
  * call, `test && edit`) must not be vouched for. Without the tree before the
  * run, or when it changed, the run is recorded without a tree and as unknown.
- * No tree after the run means no git: nothing is recorded.
+ * No tree after the run means no git: nothing is recorded. A change in docs
+ * only (the source trees, when given, are equal) leaves the run valid for its
+ * source tree.
  */
-export function settleRunTree(before: string | undefined, after: string | undefined): { record: false } | { record: true; tree: string | undefined; note?: string } {
+export function settleRunTree(before: string | undefined, after: string | undefined, sourceBefore?: string, sourceAfter?: string): { record: false } | { record: true; tree: string | undefined; srcTree?: string; note?: string } {
 	if (after === undefined) return { record: false };
 	if (before === undefined) return { record: true, tree: undefined, note: "tree before the run is unknown" };
-	if (before !== after) return { record: true, tree: undefined, note: "tree changed during run" };
-	return { record: true, tree: after };
+	const srcTree = sourceBefore !== undefined && sourceBefore === sourceAfter ? sourceAfter : undefined;
+	if (before !== after) return srcTree ? { record: true, tree: undefined, srcTree } : { record: true, tree: undefined, note: "tree changed during run" };
+	return srcTree ? { record: true, tree: after, srcTree } : { record: true, tree: after };
 }
 
 export function branchSlug(branch: string | null): string {
@@ -367,9 +401,9 @@ export function readEvidence(file: string): EvidenceRecord[] {
 	return records;
 }
 
-/** Prose and legal files never need a test run; everything else is source. */
+/** Prose (`*.md`, `*.rst`, ...) and the LICENSE/NOTICE/CHANGELOG/COPYING/AUTHORS files never need a test run; everything else, code under `docs/` included, is source. */
 export function isSourcePath(path: string): boolean {
-	return !DOC_EXTENSIONS.test(path) && !DOC_NAMES.has(basename(path));
+	return !isDocPath(path);
 }
 
 export type GateDecision = { action: "allow"; why: string } | { action: "block"; reason: string };
@@ -379,9 +413,13 @@ export interface GateInput {
 	dirtyPaths: readonly string[];
 	/** Current worktree content tree; undefined when there is no git work tree, or when `treeError` says it could not be computed. */
 	tree: string | undefined;
+	/** The current tree without doc paths; a run recorded for the same source tree vouches even when the full tree differs. */
+	sourceTree?: string;
+	/** Top level of the repository the commit runs in; runs recorded for another repository do not count. */
+	root?: string;
 	/** Why the tree could not be computed (timeout, git failure). Set means the gate fails closed; absent with no tree means no git. */
 	treeError?: string;
-	/** The commit may run in another directory or on another branch. */
+	/** The commit's directory or branch cannot be resolved (a branch switch, `GIT_DIR`, a non-literal `cd` or `-C`). */
 	elsewhere: boolean;
 	records: readonly EvidenceRecord[];
 	/** Tree a user force (/brigadev:force-commit) was granted for. */
@@ -396,7 +434,7 @@ const TREE_ERROR_UNBLOCK =
 
 export function decideCommitGate(input: GateInput): GateDecision {
 	if (input.elsewhere) {
-		return { action: "block", reason: `Blocked by brigadev evidence gate: this commit runs in another directory or on another branch, so the recorded test runs cannot vouch for it. Commit from the session's directory. ${UNBLOCK}` };
+		return { action: "block", reason: `Blocked by brigadev evidence gate: this commit runs in another directory or on another branch that cannot be resolved (a branch switch, GIT_DIR, --git-dir, --work-tree, a \`;\` or \`||\` after a \`cd\`, or a path with a variable), so the recorded test runs cannot vouch for it. Commit with \`git -C <dir> commit\` or \`cd <dir> && git commit\` using a literal path, on the current branch. ${UNBLOCK}` };
 	}
 	if (input.treeError !== undefined) {
 		return { action: "block", reason: `Blocked by brigadev evidence gate: the working tree could not be computed (${input.treeError}), so no recorded test run can be matched to this commit. ${TREE_ERROR_UNBLOCK}` };
@@ -404,7 +442,13 @@ export function decideCommitGate(input: GateInput): GateDecision {
 	if (input.tree === undefined) return { action: "allow", why: "no git tree to check" };
 	if (!input.dirtyPaths.some(isSourcePath)) return { action: "allow", why: "docs-only changes" };
 	if (input.forcedTree !== undefined && input.forcedTree === input.tree) return { action: "allow", why: "forced by the user" };
-	const runs = input.records.filter((r): r is RunRecord => r.type === "run" && r.kind === "test" && r.tree === input.tree);
+	const runs = input.records.filter(
+		(r): r is RunRecord =>
+			r.type === "run" &&
+			r.kind === "test" &&
+			(r.root === undefined || input.root === undefined || r.root === input.root) &&
+			(r.tree === input.tree || (input.sourceTree !== undefined && r.srcTree === input.sourceTree)),
+	);
 	if (runs.some((r) => r.outcome === "pass")) return { action: "allow", why: "passing test on this tree" };
 	const last = runs.at(-1);
 	const detail = !last
@@ -439,12 +483,12 @@ function textOf(content: unknown): string {
  * check command or there is no worktree tree to key it to (no git: nothing is
  * written, so scratch copies never create docs folders). Never throws.
  */
-export function runRecordFromResult(event: ToolResultLike | undefined, context: { ts: string; branch: string | null; tree: string | undefined; cwd: string; agent: string; topLevel?: string; note?: string }): RunRecord | undefined {
+export function runRecordFromResult(event: ToolResultLike | undefined, context: { ts: string; branch: string | null; tree: string | undefined; srcTree?: string; cwd: string; agent: string; topLevel?: string; note?: string }): RunRecord | undefined {
 	try {
 		// A note stands in for the tree when it could not be trusted; with neither there is no git to key the run to.
-		if (!event || event.toolName !== "bash" || (context.tree === undefined && !context.note)) return undefined;
+		if (!event || event.toolName !== "bash" || (context.tree === undefined && context.srcTree === undefined && !context.note)) return undefined;
 		const written = asObject(event.input)?.command;
-		const command = typeof written === "string" ? stripLockPrelude(written) : undefined;
+		const command = typeof written === "string" ? written : undefined;
 		if (command === undefined || checkKind(command) === undefined) return undefined;
 		const structured = asObject(event.structuredContent);
 		const exitCode = typeof structured?.exit_code === "number" ? structured.exit_code : undefined;
@@ -463,7 +507,7 @@ export function forceRecord(input: { ts: string; branch: string | null; tree?: s
 export function gateDialog(reason: string, command: string): { title: string; body: string } {
 	const detail = reason
 		.replace(/^Blocked by brigadev evidence gate:\s*/, "")
-		.replace(/\s*(Run the tests in their own|Commit from the session's directory|Retry the commit).*$/s, "")
+		.replace(/\s*(Run the tests in their own|Commit with `git -C|Retry the commit).*$/s, "")
 		.trim();
 	return {
 		title: "brigadev: evidence gate blocked this commit",
@@ -481,4 +525,57 @@ export function commitGateWithForce(input: GateInput): { decision: GateDecision;
 	if (plain.action === "allow" || input.forcedTree === undefined) return { decision: plain, consumedForce: false };
 	const forced = decideCommitGate(input);
 	return { decision: forced, consumedForce: forced.action === "allow" };
+}
+
+export interface CommitGateRequest {
+	exec: ExecFn;
+	/** The bash command; one without a `git commit` has nothing to gate. */
+	command: string;
+	/** Directory the command starts in: the session's, or a background process's `cwd`. */
+	cwd: string;
+	/** Tree a user force (/brigadev:force-commit) was granted for. */
+	forcedTree: string | undefined;
+}
+
+export interface CommitGateEvaluation {
+	decision: GateDecision;
+	/** The force decided the outcome: the caller spends and logs it once the commit is allowed to run. */
+	consumedForce: boolean;
+	/** Evidence log of the repository and branch the commit runs on (where a force is logged). */
+	file: string;
+	branch: string | null;
+	/** Worktree tree of that repository; undefined without git or when it could not be computed. */
+	tree: string | undefined;
+}
+
+/**
+ * The commit gate for one bash command, judged against the repository the
+ * commit runs in: `git -C <dir>` and a leading `cd <dir> &&` pick it, so a
+ * session in a parent folder of nested repositories commits as it should; any
+ * other move (a branch switch, `GIT_DIR`, a non-literal path) is "elsewhere" and
+ * blocks. Tree, branch, and evidence log are all those of that repository.
+ * Undefined when the command commits nothing.
+ */
+export async function evaluateCommitGate(request: CommitGateRequest): Promise<CommitGateEvaluation | undefined> {
+	const { exec, command, cwd, forcedTree } = request;
+	if (!classifyCommand(command).some((match) => match.commit)) return undefined;
+	const target = commitDirectory(command, cwd);
+	const dir = target ?? cwd;
+	const result = await worktreeTreeResult(dir, { sourceTree: true });
+	const keyed = result.kind === "tree" ? result : undefined;
+	const snapshot = keyed ? await takeSnapshot(exec, keyed.root) : undefined;
+	const branch = await readCurrentBranch(exec, dir);
+	const file = evidenceFile(repoDocsDir(dir), branch);
+	const { decision, consumedForce } = commitGateWithForce({
+		// Unknown dirty paths count as source: a gate that cannot see the change must not pass it.
+		dirtyPaths: snapshot ? [...snapshot.keys()] : ["(unknown)"],
+		tree: keyed?.tree,
+		sourceTree: keyed?.sourceTree,
+		root: keyed?.root,
+		treeError: result.kind === "error" ? result.reason : undefined,
+		elsewhere: target === undefined,
+		records: readEvidence(file),
+		forcedTree,
+	});
+	return { decision, consumedForce, file, branch, tree: keyed?.tree };
 }

@@ -11,15 +11,8 @@ const question = (id: string, extra: Partial<WorkflowQuestion> = {}): WorkflowQu
 const workflow = (body: string, questions: WorkflowQuestion[], name = "Sample"): Workflow => ({ name, description: "d", order: 1, questions, body, source: "package", filePath: "/w.md" });
 
 describe("workflowListLabel", () => {
-	it("shows name, description, and the group label", () => {
-		assert.equal(workflowListLabel({ ...workflow("b", [], "Bug fix"), description: "Reproduce and fix", group: "other" }), "Bug fix — Reproduce and fix [Other workflows]");
-		assert.equal(workflowListLabel({ ...workflow("b", [], "Quick change"), description: "Small", group: "feature" }), "Quick change — Small [New feature]");
-		assert.equal(workflowListLabel({ ...workflow("b", [], "Doctor"), description: "Look", group: "inspect" }), "Doctor — Look [Tools]");
-	});
-
-	it("no group reads as Other workflows; an unknown group keeps its name as written", () => {
-		assert.equal(workflowListLabel({ ...workflow("b", [], "Plain"), description: "d" }), "Plain — d [Other workflows]");
-		assert.equal(workflowListLabel({ ...workflow("b", [], "Notes"), description: "d", group: "Docs work" }), "Notes — d [Docs work]");
+	it("shows the name and the description", () => {
+		assert.equal(workflowListLabel({ ...workflow("b", [], "Bug fix"), description: "Reproduce and fix" }), "Bug fix — Reproduce and fix");
 	});
 });
 

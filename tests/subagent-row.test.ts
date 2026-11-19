@@ -42,30 +42,21 @@ describe("subagent row", () => {
 		assert.equal(header, "◐ brigadev-worker · default · 25s");
 	});
 
-	it("keeps the fallback trail in the model segment", () => {
-		const trail = modelSegment(input({ model: "claude-bridge/claude-sonnet-5-5", fallbacks: ["claude-bridge/claude-opus-5-5 (quota)"] }));
-		assert.equal(trail, "claude-opus-5-5 ✗ quota ↪ claude-sonnet-5-5");
-		assert.match(rowHeader(input({ fallbacks: ["a/opus-5-5 (quota)"], model: "a/sonnet-5-5" }), now), /· opus-5-5 ✗ quota ↪ sonnet-5-5 ·/);
-	});
-
-	it("chains several failed attempts and does not repeat the last failed model", () => {
-		assert.equal(modelSegment(input({ model: "p/c", fallbacks: ["p/a (quota)", "p/b (rate_limit)"] })), "a ✗ quota ↪ b ✗ rate_limit ↪ c");
-		assert.equal(modelSegment(input({ state: "failed", model: "p/b", fallbacks: ["p/a (quota)", "p/b (rate_limit)"] })), "a ✗ quota ↪ b ✗ rate_limit");
+	it("names the one model of the run", () => {
+		assert.equal(modelSegment(input({ model: "claude-bridge/claude-sonnet-5-5" })), "claude-sonnet-5-5");
+		assert.equal(modelSegment(input({ model: undefined })), "default");
 	});
 
 	it("marks only parent-inherited models with ↑ in the collapsed row", () => {
 		assert.match(rowHeader(input({ route: "parent" }), now), /· claude-sonnet-5-5 ↑ ·/);
 		assert.doesNotMatch(rowHeader(input({ route: "profile:fast/worker" }), now), /↑/);
 		assert.doesNotMatch(rowHeader(input({ route: "definition" }), now), /↑/);
-		// after a fallback the model no longer comes from the parent
-		assert.doesNotMatch(rowHeader(input({ route: "parent ↪ fallback", fallbacks: ["p/a (quota)"] }), now), /claude-sonnet-5-5 ↑/);
 	});
 
 	it("marks ↑ from the resolved route source, not the label: a profile that sets only thinking inherits the model (R3-003)", () => {
 		const header = rowHeader(input({ route: "profile:fast/worker", inherited: true }), now);
 		assert.match(header, /· claude-sonnet-5-5 ↑ ·/);
 		assert.doesNotMatch(rowHeader(input({ route: "parent", inherited: false }), now), /↑/);
-		assert.doesNotMatch(rowHeader(input({ route: "profile:fast/worker", inherited: true, fallbacks: ["p/a (quota)"] }), now), /claude-sonnet-5-5 ↑/);
 	});
 
 	it("a queued placeholder shows its routed model and queued, no elapsed (R3-002)", () => {

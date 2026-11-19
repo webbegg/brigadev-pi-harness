@@ -1,19 +1,18 @@
 // Idle-time delivery of the exit notice of a background process. No Pi imports: whether the parent is idle, how a
 // message is handed to it, and what the model has already seen are injected, so tests drive it with fakes.
 //
-// The rule is the one for async subagent results, and the same code carries it (createResultDelivery in
-// lib/result-delivery.ts is generic over what it delivers): an exit the model has not seen (`bg_status` of the settled
-// process, a `bg_kill` it waited for) is delivered exactly once, at once when the parent is idle, otherwise held until
-// the idle signal (`flush`, on `agent_settled`); everything held goes out as ONE message (one parent turn); a send that
-// throws is retried at the following idle signals, up to DELIVERY_ATTEMPTS, then given up with a notice. What this file
-// adds is only the message shape.
+// The rule: an exit the model has not seen (`bg_status` of the settled process, a `bg_kill` it waited for) is
+// delivered exactly once, at once when the parent is idle, otherwise held until the idle signal (`flush`, on
+// `agent_settled`); everything held goes out as ONE message (one parent turn); a send that throws (a stale session
+// context) is retried at the following idle signals, up to DELIVERY_ATTEMPTS, then given up with a notice.
 
 import { outputSection, stateLabel } from "./bg-view.ts";
 import type { BgSnapshot } from "./bg-processes.ts";
-import { createResultDelivery } from "./result-delivery.ts";
 
 /** Custom message type of a delivered exit notice. */
 export const BG_EXIT_MESSAGE_TYPE = "brigadev-bg-exit";
+/** Send attempts per exit (the first one included) before it is given up, left unseen so `bg_status` can still report it. */
+export const DELIVERY_ATTEMPTS = 3;
 /** A notice carries the tail of each process's output, not all of it: the model can ask `bg_status` for more. */
 const NOTICE_TAIL = { maxLines: 40, maxBytes: 8 * 1024 };
 
@@ -73,22 +72,70 @@ export interface BgDelivery {
 }
 
 export function createBgDelivery(deps: BgDeliveryDeps): BgDelivery {
-	const inner = createResultDelivery<BgSnapshot>({
-		isIdle: deps.isIdle,
-		isConsumed: deps.isConsumed,
-		markConsumed: (id) => deps.markConsumed(id),
-		deliver: (batch) => {
-			const snaps = batch.flatMap((item) => (item.result ? [item.result] : []));
-			if (snaps.length > 0) deps.send(bgExitMessage(snaps));
-		},
-		onDeliveryFailed: (item, error) => deps.onDeliveryFailed?.(item.id, error),
-	});
+	let queue: BgSnapshot[] = [];
+	let enabled = true;
+	let flushing = false;
+	// Failed sends per id.
+	let failures = new Map<string, number>();
+
+	const pass = () => {
+		// A send may synchronously start a turn that flushes again: that is the same idle signal and does nothing.
+		if (flushing || queue.length === 0 || !deps.isIdle()) return;
+		flushing = true;
+		// Whatever settles during the send lands in `queue` and waits for the next flush.
+		const batch = queue.filter((snap) => enabled && !deps.isConsumed(snap.id));
+		queue = [];
+		try {
+			if (batch.length === 0) return;
+			try {
+				deps.send(bgExitMessage(batch));
+			} catch (error) {
+				// Back in order, ahead of what settled meanwhile, until an exit has spent its attempts.
+				const retry: BgSnapshot[] = [];
+				for (const snap of batch) {
+					const attempts = (failures.get(snap.id) ?? 0) + 1;
+					if (attempts < DELIVERY_ATTEMPTS) {
+						failures.set(snap.id, attempts);
+						retry.push(snap);
+					} else {
+						failures.delete(snap.id);
+						try {
+							deps.onDeliveryFailed?.(snap.id, error);
+						} catch {
+							// The notice is best effort; the next exit still gets its own.
+						}
+					}
+				}
+				queue = [...retry, ...queue];
+				return;
+			}
+			for (const snap of batch) {
+				failures.delete(snap.id);
+				deps.markConsumed(snap.id);
+			}
+		} finally {
+			flushing = false;
+		}
+	};
+
 	return {
-		settled: (snapshot) => inner.settled({ launch: { id: snapshot.id, consumed: false, error: undefined }, result: snapshot }),
-		flush: () => inner.flush(),
-		held: () => inner.held(),
-		isHeld: (id) => inner.isHeld(id),
-		reset: () => inner.reset(),
-		stop: () => inner.stop(),
+		settled(snapshot) {
+			if (!enabled || deps.isConsumed(snapshot.id) || queue.some((q) => q.id === snapshot.id)) return;
+			queue.push(snapshot);
+			pass();
+		},
+		flush: pass,
+		held: () => queue.map((q) => q.id),
+		isHeld: (id) => queue.some((q) => q.id === id),
+		reset() {
+			queue = [];
+			failures = new Map();
+			enabled = true;
+		},
+		stop() {
+			queue = [];
+			failures = new Map();
+			enabled = false;
+		},
 	};
 }

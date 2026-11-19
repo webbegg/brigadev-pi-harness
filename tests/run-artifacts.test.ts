@@ -68,6 +68,19 @@ describe("writeRunArtifacts: one saved folder per run", () => {
 		}
 	});
 
+	it("S12: result.json keeps the full structured result and the final text", () => {
+		const docs = fs.mkdtempSync(path.join(os.tmpdir(), "brigadev-runs-"));
+		try {
+			const structured = { verdicts: [{ spec: "S1", verdict: "met", evidence: "e" }], regressionTests: [{ path: "t.ts", covers: "S1", content: "full file" }] };
+			const dir = writeRunArtifacts(docs, record({ structured, finalText: "closing words" }));
+			const result = JSON.parse(fs.readFileSync(path.join(dir, "result.json"), "utf8"));
+			assert.deepEqual(result.structured, structured);
+			assert.equal(result.finalText, "closing words");
+		} finally {
+			fs.rmSync(docs, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps the folder and files private to the user", { skip: process.platform === "win32" }, () => {
 		const docs = fs.mkdtempSync(path.join(os.tmpdir(), "brigadev-runs-"));
 		try {

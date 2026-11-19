@@ -24,8 +24,12 @@ export interface RunRecord {
 	startedAt?: number;
 	endedAt?: number;
 	usage: Tally;
-	/** What the parent was told: the final text, structured payload, or error. */
+	/** The full text of the result: the final text, the structured payload as a JSON block, or the error. */
 	output: string;
+	/** The validated structured payload as the child returned it, in full (agents with an output schema). */
+	structured?: unknown;
+	/** The child's final assistant text, in full. */
+	finalText?: string;
 	messages: Message[];
 }
 
@@ -152,7 +156,7 @@ export function pruneRunFolders(docsDir: string, options: PruneOptions = {}): Pr
 	return result;
 }
 
-/** Writes `task.md`, `transcript.json`, and `result.json` to `<docs>/runs/<runId>/`; returns the folder. */
+/** Writes `task.md`, `transcript.json`, and `result.json` (with the full structured result and final text) to `<docs>/runs/<runId>/`; returns the folder. */
 export function writeRunArtifacts(docsDir: string, record: RunRecord): string {
 	if (!RUN_ID.test(record.runId)) throw new Error(`invalid run id: ${record.runId}`);
 	const dir = path.join(runsDir(docsDir), record.runId);

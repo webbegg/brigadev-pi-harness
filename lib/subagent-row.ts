@@ -26,7 +26,7 @@ export interface RowInput {
 	state: RunState;
 	model?: string;
 	thinking?: string;
-	/** Where the model came from: "profile:<name>/<key>", "definition", "parent" (+ " ↪ fallback"). */
+	/** Where the model came from: "profile:<name>/<key>", "definition", "parent". */
 	route?: string;
 	/** True when the model came from the parent session (resolved route source), whatever the route label says. */
 	inherited?: boolean;
@@ -34,8 +34,6 @@ export interface RowInput {
 	queued?: boolean;
 	/** Settled without ever starting (aborted while queued). */
 	cancelled?: boolean;
-	/** Earlier attempts that failed, as "<model> (<category>)". */
-	fallbacks?: string[];
 	startedAt?: number;
 	endedAt?: number;
 	cost: number;
@@ -50,22 +48,11 @@ export interface RowLine {
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
-function parseAttempt(entry: string): { model: string; category: string } {
-	const match = /^(.*) \(([^()]*)\)$/.exec(entry);
-	return match ? { model: shortModel(match[1]), category: match[2] } : { model: shortModel(entry), category: "" };
-}
-
-/** `opus-5-5 ✗ quota ↪ sonnet-5-5`; the current model is not repeated when it is the one that just failed. */
-export function modelSegment(input: Pick<RowInput, "model" | "fallbacks" | "route" | "inherited">): string {
+/** `sonnet-5-5`, with `↑` when the model came from the parent session. The resolved route source decides; the label is only a fallback for rows without the flag. */
+export function modelSegment(input: Pick<RowInput, "model" | "route" | "inherited">): string {
 	const current = shortModel(input.model);
-	const attempts = (input.fallbacks ?? []).map(parseAttempt);
-	const trail = attempts.map((a) => (a.category ? `${a.model} ✗ ${a.category}` : `${a.model} ✗`));
-	const lastIsCurrent = attempts.length > 0 && current !== "" && attempts[attempts.length - 1].model === current;
-	if (!lastIsCurrent) trail.push(current || (attempts.length ? "" : "default"));
-	// The model came from the parent session only while no fallback replaced it.
-	// The resolved route source decides; the label is only a fallback for rows without the flag.
-	const inherited = (input.inherited ?? input.route === "parent") && attempts.length === 0 && current !== "";
-	return `${trail.filter(Boolean).join(" ↪ ")}${inherited ? " ↑" : ""}`;
+	const inherited = (input.inherited ?? input.route === "parent") && current !== "";
+	return `${current || "default"}${inherited ? " ↑" : ""}`;
 }
 
 export function rowHeader(input: RowInput, now: number): string {

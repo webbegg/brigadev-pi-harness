@@ -5,7 +5,8 @@ import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import { commitGateWithForce, forceRecord, gateDialog, runRecordFromResult, settleRunTree, type RunRecord } from "../lib/evidence.ts";
+import { commitGateWithForce, evidenceFile, forceRecord, gateDialog, readEvidence, runRecordFromResult, settleRunTree, type RunRecord } from "../lib/evidence.ts";
+import { repoDocsDir } from "../lib/repo-docs.ts";
 
 // The extensions import the Pi package at runtime; tests run without it.
 const STUB = `data:text/javascript,export const isToolCallEventType=(n,e)=>e.toolName===n;export const getAgentDir=()=>"/nonexistent";export const parseFrontmatter=()=>({});export const getMarkdownTheme=()=>({});`;
@@ -146,6 +147,14 @@ describe("settleRunTree (the tree a run may be keyed to)", () => {
 		assert.deepEqual(settleRunTree(T, undefined), { record: false });
 		assert.deepEqual(settleRunTree(undefined, undefined), { record: false });
 	});
+
+	it("S8c: a run whose source tree held keeps it when only docs changed during the run", () => {
+		const S = "c".repeat(40);
+		assert.deepEqual(settleRunTree(T, T, S, S), { record: true, tree: T, srcTree: S });
+		assert.deepEqual(settleRunTree(T, "b".repeat(40), S, S), { record: true, tree: undefined, srcTree: S });
+		assert.deepEqual(settleRunTree(T, "b".repeat(40), S, "d".repeat(40)), { record: true, tree: undefined, note: "tree changed during run" });
+		assert.deepEqual(settleRunTree(T, T), { record: true, tree: T }, "without source trees nothing changes");
+	});
 });
 
 describe("runRecordFromResult with an unsettled tree", () => {
@@ -169,6 +178,23 @@ describe("runRecordFromResult with an unsettled tree", () => {
 		assert.equal(runRecordFromResult(cd, { ...base, cwd: "/repo", topLevel: "/repo" })?.outcome, "pass");
 		assert.equal(runRecordFromResult(cd, { ...base, cwd: "/repo/x", topLevel: "/repo/x" })?.outcome, "pass");
 		assert.equal(runRecordFromResult({ ...passing, input: { command: "cd .. && npm test" } }, { ...base, cwd: "/repo", topLevel: "/repo" })?.outcome, "unknown");
+	});
+});
+
+describe("runRecordFromResult keyed by source tree and root (S8b, S8c)", () => {
+	const passing = { toolName: "bash", input: { command: "npm test" }, content: text("ok"), structuredContent: { exit_code: 0, output: "ok" } };
+
+	it("records a run that has only a source tree, with the repository root", () => {
+		const record = runRecordFromResult(passing, { ...base, tree: undefined, srcTree: "s".repeat(40), topLevel: "/repo" });
+		assert.equal(record?.outcome, "pass");
+		assert.equal(record?.tree, undefined);
+		assert.equal(record?.srcTree, "s".repeat(40));
+		assert.equal(record?.root, "/repo");
+	});
+
+	it("judges `cd <nested repo> && <test>` against the nested repository's top level", () => {
+		const nested = { ...passing, input: { command: "cd /work/parent/nested && npm test" } };
+		assert.equal(runRecordFromResult(nested, { ...base, cwd: "/work/parent", topLevel: "/work/parent/nested" })?.outcome, "pass");
 	});
 });
 
@@ -295,5 +321,115 @@ describe("the user's force is spent only when the commit goes ahead (A3)", () =>
 		assert.match(String(await s.call(`cp /tmp/forged.jsonl ${file}`)), /evidence log/);
 		assert.equal(await s.call(`cat ${file}`), undefined);
 		assert.equal(await s.call(`grep fail ${file} | tail -3`), undefined);
+	});
+});
+
+describe("the recorder (S8a pipefail, S8b nested repositories, S8c docs)", () => {
+	const saved = { ...process.env };
+	const base2 = realpathSync(mkdtempSync(join(tmpdir(), "brigadev-rec-")));
+	after(() => {
+		process.env = saved;
+		rmSync(base2, { recursive: true, force: true });
+	});
+	for (const key of ["BRIGADEV_CHILD", "BRIGADEV_AGENT", "BRIGADEV_READ_ONLY", "BRIGADEV_PROJECT_ROOT"]) delete process.env[key];
+	process.env.BRIGADEV_HOME = join(base2, "home");
+
+	// The session folder `parent` is no repository; `nested` is one, on feat/n.
+	const parent = join(base2, "parent");
+	const nested = join(parent, "nested");
+	mkdirSync(nested, { recursive: true });
+	const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: nested, encoding: "utf8" });
+	git("init", "-q", "-b", "feat/n");
+	writeFileSync(join(nested, "src.ts"), "1");
+	writeFileSync(join(nested, "README.md"), "# r\n");
+	git("add", "-A");
+	git("commit", "-qm", "init");
+
+	async function recorder(cwd: string) {
+		const handlers: Record<string, Function[]> = {};
+		const pi: any = {
+			on: (event: string, handler: Function) => (handlers[event] ??= []).push(handler),
+			exec: async (command: string, args: string[], options: { cwd: string }) => {
+				try {
+					return { stdout: execFileSync(command, args, { cwd: options.cwd, encoding: "utf8" }), stderr: "", code: 0 };
+				} catch (error: any) {
+					return { stdout: String(error.stdout ?? ""), stderr: "", code: typeof error.status === "number" ? error.status : 1 };
+				}
+			},
+		};
+		(await import(`../extensions/evidence.ts?${Math.random()}`)).default(pi);
+		const ctx: any = { cwd };
+		let id = 0;
+		return {
+			/** Runs a bash call through the handlers; `between` runs after tool_call and before tool_result (an edit during the run). */
+			async run(command: string, exitCode: number, between: () => void = () => {}) {
+				const toolCallId = String(++id);
+				const input = { command };
+				for (const handler of handlers.tool_call ?? []) await handler({ toolName: "bash", toolCallId, input }, ctx);
+				between();
+				// A result event may carry the input as written or as mutated; the recorder must cope with the written one.
+				for (const handler of handlers.tool_result ?? []) await handler({ toolName: "bash", toolCallId, input: { command }, content: [{ type: "text", text: "ok" }], structuredContent: { exit_code: exitCode, output: "ok" } }, ctx);
+				return input.command;
+			},
+		};
+	}
+	const records = () => readEvidence(evidenceFile(repoDocsDir(nested), "feat/n")).filter((r): r is RunRecord => r.type === "run");
+
+	it("S8a: injects pipefail into a piped test run so its exit code is the runner's, and trusts the outcome", async () => {
+		const before = records().length;
+		const s = await recorder(parent);
+		const ran = await s.run("cd nested && node --test tests/a.test.ts | tail -20", 1);
+		assert.equal(ran, "set -o pipefail; cd nested && node --test tests/a.test.ts | tail -20");
+		const record = records().at(-1);
+		assert.equal(records().length, before + 1);
+		assert.equal(record?.outcome, "fail", "the runner's exit code, not tail's");
+		assert.equal(record?.exitCode, 1);
+	});
+
+	it("GATE R3-001: a piped test run that ends in SIGPIPE (141) under the injected pipefail is recorded as unknown", async () => {
+		const before = records().length;
+		const s = await recorder(parent);
+		const ran = await s.run("cd nested && node --test tests/a.test.ts | head -5", 141);
+		assert.equal(ran, "set -o pipefail; cd nested && node --test tests/a.test.ts | head -5");
+		assert.equal(records().length, before + 1);
+		assert.equal(records().at(-1)?.outcome, "unknown");
+		assert.equal(records().at(-1)?.exitCode, 141);
+	});
+
+	it("does not touch a command that needs no pipefail, or is not a test run", async () => {
+		const s = await recorder(parent);
+		assert.equal(await s.run("cd nested && npm test", 0), "cd nested && npm test");
+		assert.equal(await s.run("ls | tail", 0), "ls | tail");
+		assert.equal(await s.run("set -o pipefail; npm test | tail", 0), "set -o pipefail; npm test | tail");
+	});
+
+	it("S8b: records a test run in a nested repository against that repository, on its branch", async () => {
+		const s = await recorder(parent);
+		await s.run("cd nested && npm test", 0);
+		const record = records().at(-1);
+		assert.equal(record?.outcome, "pass");
+		assert.equal(record?.branch, "feat/n");
+		assert.equal(record?.root, nested);
+		assert.match(record?.tree ?? "", /^[0-9a-f]{40}$/);
+		assert.match(record?.srcTree ?? "", /^[0-9a-f]{40}$/);
+	});
+
+	it("records nothing for a run outside any repository", async () => {
+		const before = records().length;
+		const s = await recorder(parent);
+		await s.run("npm test", 0);
+		assert.equal(records().length, before);
+	});
+
+	it("S8c: a doc edit while the test ran keeps the run valid for the source tree", async () => {
+		const s = await recorder(parent);
+		await s.run("cd nested && npm test", 0, () => writeFileSync(join(nested, "README.md"), `# edited ${Math.random()}\n`));
+		const record = records().at(-1);
+		assert.equal(record?.outcome, "pass");
+		assert.equal(record?.tree, undefined);
+		assert.match(record?.srcTree ?? "", /^[0-9a-f]{40}$/);
+
+		await s.run("cd nested && npm test", 0, () => writeFileSync(join(nested, "src.ts"), `${Math.random()}`));
+		assert.equal(records().at(-1)?.outcome, "unknown", "a source edit during the run is not vouched for");
 	});
 });
