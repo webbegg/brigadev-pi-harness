@@ -25,8 +25,8 @@ Check it loaded: `/brigadev:status`. Run `/brigadev:doctor` if something looks o
 | 2. Explore | One batch of `read`, `grep`, `find`, `ls` in the parent; a `brigadev-explore` subagent only when that does not settle it. | built-in tools, `subagent` |
 | 3. Test first | RED, minimal change, GREEN; bugs follow a diagnosis routine. | `assets/diagnosis.md`, `brigadev-worker` for parallel writers |
 | 4. Check | The focused test, then the suite, through one tool that returns a compact result and records evidence. | `check` tool, evidence gate |
-| 5. Verify | High-risk changes get one independent `brigadev-verify` run; its blockers are fixed and rechecked. | `subagent`, `Risk: <category>` line |
-| 6. Commit / PR | Each finished unit is committed on a `type/description` branch; push, PR, and merge go through the guard. `brigadev-review` runs only on request or once before the PR. | `brigadev-branch-pr`, `brigadev-review` |
+| 5. Verify | A path-based risk tier (shown by `check`) decides the checks: T2 (data, security, contract) branches get one independent `brigadev-verify` before the PR; blocker fixes are proven by a repro test RED→GREEN. | `subagent`, `Risk: <category>` line |
+| 6. Commit / PR | Each finished unit is committed on a `type/description` branch; push, PR, and merge go through the guard. `brigadev-review` runs only on request or once before the PR, with the tier's lenses ([review tiers](docs/configuration.md#review-tiers)). | `brigadev-branch-pr`, `brigadev-review` |
 
 Large multi-session work gets one feature document in the repo docs folder (`/track`); small work leaves no artifacts. A long session compacts itself (see Configuration). Start a day-to-day task from `alt+w` or `/brigadev:start`: feature, ticket, bug fix, refactor, my PRs' feedback, or a team PR review.
 
