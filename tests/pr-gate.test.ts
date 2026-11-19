@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { EvidenceRecord, RunRecord, VerifyRecord } from "../lib/evidence.ts";
-import { decidePrGate, prCreateDirectory } from "../lib/pr-gate.ts";
+import { decidePrGate, opensPrCreate, prCreateDirectory, prGateBlockMessage, UNRESOLVED_DIRECTORY_REASON } from "../lib/pr-gate.ts";
 
 const BRANCH = "feat/x";
 const T2 = { security: ["lib/guard-rules.ts"] };
@@ -10,8 +10,8 @@ const T2 = { security: ["lib/guard-rules.ts"] };
 const verify = (ts: string, outcome: VerifyRecord["outcome"], blockers: string[] = [], extra: Partial<VerifyRecord> = {}): VerifyRecord => ({ v: 1, type: "verify", ts, branch: BRANCH, scope: "branch", categories: [], blockers, outcome, ...extra });
 const run = (ts: string, outcome: RunRecord["outcome"], extra: Partial<RunRecord> = {}): RunRecord => ({ v: 1, type: "run", ts, branch: BRANCH, cwd: "/r", agent: "parent", command: "npm test", kind: "test", outcome, tail: "", ...extra });
 
-function decide(tier: "T0" | "T1" | "T2", records: EvidenceRecord[], options: { ledgerExists?: boolean; categories?: Record<string, string[]> } = {}) {
-	return decidePrGate({ tier, categories: options.categories ?? (tier === "T2" ? T2 : {}), records, branch: BRANCH, ledgerExists: options.ledgerExists ?? true });
+function decide(tier: "T0" | "T1" | "T2", records: EvidenceRecord[], options: { ledgerExists?: boolean; categories?: Record<string, string[]>; baseUnknown?: boolean } = {}) {
+	return decidePrGate({ tier, categories: options.categories ?? (tier === "T2" ? T2 : {}), records, branch: BRANCH, ledgerExists: options.ledgerExists ?? true, baseUnknown: options.baseUnknown });
 }
 
 describe("decidePrGate", () => {
@@ -37,8 +37,11 @@ describe("decidePrGate", () => {
 		assert.deepEqual(decide("T2", [verify("2026-01-01T00:00:00Z", "clean")]), { action: "allow", reasons: [] });
 	});
 
-	it("an unverified (non-failed) verify counts as a verify run", () => {
-		assert.equal(decide("T2", [verify("2026-01-01T00:00:00Z", "unverified")]).action, "allow");
+	it("W2: at T2 a verify counts only with a definite result; an unverified-only history asks", () => {
+		assert.deepEqual(decide("T2", [verify("2026-01-01T00:00:00Z", "unverified")]), { action: "ask", reasons: ["latest brigadev-verify was unverified"] });
+		assert.deepEqual(decide("T2", [verify("2026-01-01T00:00:00Z", "unverified"), verify("2026-01-01T00:01:00Z", "unverified", [], { scope: "recheck" })]).reasons, ["latest brigadev-verify was unverified"]);
+		assert.equal(decide("T2", [verify("2026-01-01T00:00:00Z", "clean"), verify("2026-01-01T00:01:00Z", "unverified")]).action, "allow", "an unverified later run does not undo a definite one");
+		assert.equal(decide("T1", [verify("2026-01-01T00:00:00Z", "unverified")]).action, "allow", "T1 never needed a verify");
 	});
 
 	describe("verify blockers", () => {
@@ -73,12 +76,24 @@ describe("decidePrGate", () => {
 			assert.equal(decide("T2", records).action, "ask");
 		});
 
-		it("a later clean recheck resolves them", () => {
-			assert.equal(decide("T2", [blockers, verify("2026-01-01T00:05:00Z", "clean", [], { scope: "recheck" })]).action, "allow");
+		it("a later clean recheck resolves the ids it rechecked", () => {
+			assert.equal(decide("T2", [blockers, verify("2026-01-01T00:05:00Z", "clean", [], { scope: "recheck", rechecked: ["B1", "B2"] })]).action, "allow");
+		});
+
+		it("W1: a clean recheck of some ids leaves the others needing a RED→GREEN test run after the verify", () => {
+			const recheck = verify("2026-01-01T00:05:00Z", "clean", [], { scope: "recheck", rechecked: ["B1"] });
+			assert.deepEqual(decide("T2", [blockers, recheck]), { action: "ask", reasons: ["verify blockers B2 have no repro test RED→GREEN after the verify"] });
+			const redGreen = [run("2026-01-01T00:01:00Z", "fail"), run("2026-01-01T00:02:00Z", "pass")];
+			assert.equal(decide("T2", [blockers, ...redGreen, recheck]).action, "allow");
+			assert.equal(decide("T2", [blockers, run("2026-01-01T00:01:00Z", "fail"), recheck]).action, "ask");
+		});
+
+		it("W1: a clean recheck that names no ids (or a record without them) resolves nothing", () => {
+			assert.deepEqual(decide("T2", [blockers, verify("2026-01-01T00:05:00Z", "clean", [], { scope: "recheck" })]).reasons, ["verify blockers B1,B2 have no repro test RED→GREEN after the verify"]);
 		});
 
 		it("a later recheck with blockers asks again, judged from its own time", () => {
-			const recheck = verify("2026-01-01T00:05:00Z", "blockers", ["B1"], { scope: "recheck" });
+			const recheck = verify("2026-01-01T00:05:00Z", "blockers", ["B1"], { scope: "recheck", rechecked: ["B1", "B2"] });
 			const redGreen = [run("2026-01-01T00:01:00Z", "fail"), run("2026-01-01T00:02:00Z", "pass")];
 			assert.deepEqual(decide("T2", [blockers, ...redGreen, recheck]).reasons, ["verify blockers B1 have no repro test RED→GREEN after the verify"]);
 			assert.equal(decide("T2", [blockers, ...redGreen, recheck, run("2026-01-01T00:06:00Z", "fail"), run("2026-01-01T00:07:00Z", "pass")]).action, "allow");
@@ -102,6 +117,20 @@ describe("decidePrGate", () => {
 
 		it("T2 without a verify reports only the missing verify", () => {
 			assert.equal(decide("T2", []).reasons.length, 1);
+		});
+	});
+
+	describe("unknown base branch (W3)", () => {
+		const reason = "risk tier unknown: no base branch found";
+		it("asks at any tier below T2 instead of skipping", () => {
+			for (const tier of ["T0", "T1"] as const) assert.deepEqual(decide(tier, [], { baseUnknown: true, ledgerExists: true }), { action: "ask", reasons: [reason] }, tier);
+		});
+		it("keeps the T2 reasons, without the unknown-tier one (T2 is the highest tier already)", () => {
+			assert.deepEqual(decide("T2", [], { baseUnknown: true }).reasons, ["T2 branch (security: lib/guard-rules.ts) has no brigadev-verify run"]);
+			assert.equal(decide("T2", [verify("2026-01-01T00:00:00Z", "clean")], { baseUnknown: true }).action, "allow");
+		});
+		it("the block message says how to clear it", () => {
+			assert.match(prGateBlockMessage(decide("T0", [], { baseUnknown: true }), []), /base branch/);
 		});
 	});
 
@@ -140,5 +169,17 @@ describe("prCreateDirectory", () => {
 
 	it("is undefined when the directory cannot be resolved", () => {
 		assert.equal(prCreateDirectory("cd $X && gh pr create", "/r"), undefined);
+	});
+});
+
+describe("opensPrCreate (W4)", () => {
+	it("is true for every shape the classifier reads as gh pr create, resolvable or not", () => {
+		for (const command of ["gh pr create --fill", "cd sub && gh pr create", "(cd . && gh pr create --fill)", "cd x; gh pr create", 'cd "$PWD" && gh pr create', "bash -c 'gh pr create --fill'", "eval 'gh pr create'"]) assert.equal(opensPrCreate(command), true, command);
+	});
+	it("is false for the rest", () => {
+		for (const command of ["gh pr view", "echo gh pr create", "git push"]) assert.equal(opensPrCreate(command), false, command);
+	});
+	it("the unresolved-directory reason names the gate", () => {
+		assert.equal(UNRESOLVED_DIRECTORY_REASON, "PR risk gate could not resolve the directory of gh pr create");
 	});
 });

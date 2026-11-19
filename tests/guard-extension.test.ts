@@ -193,6 +193,64 @@ describe("guard: PR risk gate", () => {
 		assert.deepEqual(s.dialogs, []);
 	});
 
+	it("W4: a gh pr create whose directory cannot be resolved asks in every mode, and blocks without a UI", async () => {
+		const { cwd } = repo(["tests/a.test.ts"]);
+		const commands = ["(cd . && gh pr create --fill)", "cd x; gh pr create --fill", 'cd "$PWD" && gh pr create --fill', "bash -c 'gh pr create --fill'", "eval 'gh pr create --fill'"];
+		for (const command of commands) {
+			const yolo = await session(cwd, { mode: "yolo" });
+			assert.match(String(await yolo.bash(command)), /could not resolve the directory of gh pr create/, `yolo declined: ${command}`);
+			assert.equal(yolo.dialogs.length, 1, command);
+			assert.match(yolo.dialogs[0].body, /PR risk gate could not resolve the directory of gh pr create/, command);
+			const accepted = await session(cwd, { mode: "yolo", answer: true });
+			assert.equal(await accepted.bash(command), undefined, `yolo accepted: ${command}`);
+			const normal = await session(cwd, { answer: true });
+			assert.equal(await normal.bash(command), undefined, `normal accepted: ${command}`);
+			assert.equal(normal.dialogs.length, 1, `normal: one dialog: ${command}`);
+			assert.match(normal.dialogs[0].body, /could not resolve the directory of gh pr create/);
+			assert.match(normal.dialogs[0].body, /Run it\?/);
+			for (const mode of ["yolo", undefined] as const) {
+				const blind = await session(cwd, { mode, ui: false });
+				assert.match(String(await blind.bash(command)), /could not resolve the directory of gh pr create/, `no UI: ${command}`);
+			}
+		}
+	});
+
+	it("W3: no resolvable base branch asks with `risk tier unknown: no base branch found`, instead of skipping", async () => {
+		const cwd = join(dir, `repo${++counter}`);
+		mkdirSync(join(cwd, "lib"), { recursive: true });
+		git(cwd, "init", "-q", "-b", "weird");
+		writeFileSync(join(cwd, "README.md"), "x\n");
+		git(cwd, "add", "-A");
+		git(cwd, "commit", "-q", "-m", "init");
+		git(cwd, "checkout", "-q", "-b", "feat/x");
+		writeFileSync(join(cwd, "lib/guard-rules.ts"), "x\n");
+		git(cwd, "add", "-A");
+		git(cwd, "commit", "-q", "-m", "guard");
+		const s = await session(cwd, { mode: "yolo" });
+		const reason = await s.bash(PR);
+		assert.equal(s.dialogs.length, 1);
+		assert.match(s.dialogs[0].body, /risk tier unknown: no base branch found/);
+		assert.match(String(reason), /base branch/);
+		const blind = await session(cwd, { mode: "yolo", ui: false });
+		assert.match(String(await blind.bash(PR)), /risk tier unknown: no base branch found/);
+	});
+
+	it("a committed T2 branch off a develop or trunk base is gated by the fallback base", async () => {
+		const cwd = join(dir, `repo${++counter}`);
+		mkdirSync(join(cwd, "lib"), { recursive: true });
+		git(cwd, "init", "-q", "-b", "trunk");
+		writeFileSync(join(cwd, "README.md"), "x\n");
+		git(cwd, "add", "-A");
+		git(cwd, "commit", "-q", "-m", "init");
+		git(cwd, "checkout", "-q", "-b", "feat/x");
+		writeFileSync(join(cwd, "lib/guard-rules.ts"), "x\n");
+		git(cwd, "add", "-A");
+		git(cwd, "commit", "-q", "-m", "guard");
+		const s = await session(cwd, { mode: "yolo" });
+		await s.bash(PR);
+		assert.match(s.dialogs[0].body, /T2 branch \(security: lib\/guard-rules\.ts\)/);
+	});
+
 	it("fails open outside a git repository", async () => {
 		const plain = join(dir, "plain");
 		mkdirSync(plain, { recursive: true });

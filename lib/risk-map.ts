@@ -22,8 +22,8 @@ const GIT_TIMEOUT_MS = 10_000;
 const named = (words: string): string[] => [`**/*{${words}}*`, `**/*{${words}}*/**`];
 
 export const DEFAULT_RISK_MAP: RiskMap = {
-	security: named("auth,permission,guard,secret,credential,token,session,crypto,sandbox,trust,sanitiz,acl"),
-	data: ["**/migrations/**", ...named("migration,store,storage,persist,retention,prune,backup"), "**/*.{sql,prisma}"],
+	security: named("auth,permission,guard,secret,credential,crypto,sandbox,trust,sanitiz"),
+	data: ["**/migrations/**", ...named("migration,storage,persist,retention,prune,backup"), "**/*.{sql,prisma}"],
 	contract: ["**/*.schema.json", "**/openapi*", "**/*.{proto,graphql}", "**/bin/**"],
 	concurrency: named("worker,queue,lock,semaphore,spawn,child,process,watchdog"),
 	delivery: ["**/package.json", "**/{package-lock.json,pnpm-lock.yaml,yarn.lock,bun.lock,bun.lockb,Cargo.lock,go.sum,poetry.lock,uv.lock}", "**/Dockerfile*", ".github/**"],
@@ -166,13 +166,16 @@ export interface BranchRisk extends Classification {
 	branch: string | null;
 	/** The merge-base the branch was compared with; absent when only the working tree counted. */
 	base?: string;
+	/** True when HEAD has commits but no base branch resolved: committed changes were not seen, so the tier is unknown. */
+	baseUnknown?: true;
 }
 
 /**
  * Classifies what the branch changes: `git diff --name-only <base>...HEAD`
  * plus the working tree (`git status`, renames count both paths). The base is
- * the merge-base with origin/HEAD, else main, else master; with none, only the
- * working tree counts. `map` may be a function of the repository slug (the
+ * the merge-base with origin/HEAD, else main, master, the repository's
+ * `init.defaultBranch`, develop, trunk; with none, only the working tree counts and, when HEAD has
+ * commits, the result says `baseUnknown`. `map` may be a function of the repository slug (the
  * top-level folder's name). Undefined outside a git repository or when git fails.
  */
 export async function branchRisk(exec: ExecFn, cwd: string, map: RiskMap | ((repoSlug: string) => RiskMap)): Promise<BranchRisk | undefined> {
@@ -187,7 +190,8 @@ export async function branchRisk(exec: ExecFn, cwd: string, map: RiskMap | ((rep
 	const root = (await git("rev-parse", "--show-toplevel"))?.trim();
 	if (!root) return undefined;
 	const committed = async (): Promise<{ base?: string; paths: string[] }> => {
-		for (const ref of ["origin/HEAD", "main", "master"]) {
+		const configured = (await git("config", "init.defaultBranch"))?.trim();
+		for (const ref of ["origin/HEAD", "main", "master", ...(configured ? [configured] : []), "develop", "trunk"]) {
 			const base = (await git("merge-base", "HEAD", ref))?.trim();
 			if (base) return { base, paths: ((await git("diff", "--name-only", "--no-renames", "-z", `${base}...HEAD`)) ?? "").split("\0") };
 		}
@@ -196,7 +200,8 @@ export async function branchRisk(exec: ExecFn, cwd: string, map: RiskMap | ((rep
 	const [{ base, paths: branchPaths }, status, branch] = await Promise.all([committed(), git("status", "--porcelain=v1", "-z", "--untracked-files=all"), readCurrentBranch(exec, cwd)]);
 	const paths = [...branchPaths.filter(Boolean), ...parsePorcelain(status ?? "")];
 	const resolved = typeof map === "function" ? map(basename(root)) : map;
-	return { ...classifyPaths(paths, resolved), root, base, branch };
+	const unknown = base === undefined && (await git("rev-parse", "--verify", "-q", "HEAD")) !== undefined;
+	return { ...classifyPaths(paths, resolved), root, base, branch, ...(unknown ? { baseUnknown: true as const } : {}) };
 }
 
 // --- The notice `check` appends ----------------------------------------------------
@@ -222,7 +227,8 @@ export const riskMapFor = (settings: unknown): ((slug: string) => RiskMap) => {
 export async function riskNotice(exec: ExecFn, cwd: string, settings: unknown): Promise<string | undefined> {
 	try {
 		const result = await branchRisk(exec, cwd, riskMapFor(settings));
-		if (!result) return undefined;
+		// With no base branch the tier is unknown: a line would read T0 for a branch whose commits were not seen.
+		if (!result || result.baseUnknown) return undefined;
 		const key = `${result.root}\0${result.branch ?? "HEAD"}`;
 		const signature = `${result.tier}|${Object.keys(result.categories).sort().join(",")}`;
 		if (lastNotice.get(key) === signature) return undefined;

@@ -249,12 +249,15 @@ describe("session_start run-folder pruning", () => {
 // child that answers brigadev-verify with a structured result (the task text picks it: BLOCKERS, FAIL).
 describe("brigadev-verify evidence, budget, and recheck route (S6-S8)", () => {
 	const CHILD_SOURCE = `
+import { existsSync } from "node:fs";
 const line = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
 const message = (extra) => ({ role: "assistant", content: [{ type: "text", text: "" }], provider: "p", model: "m", usage, ...extra });
 const task = String(process.argv.at(-1));
 const blockers = task.includes("BLOCKERS") ? [{ summary: "a", reproduction: "r" }, { summary: "b", reproduction: "r" }] : [];
 const payload = { verdicts: [{ spec: "S1", verdict: "met", evidence: "e" }], blockers, advisories: [], regressionTests: [], scratch: [], unverified: [] };
+const gate = /GATE:(\\S+)/.exec(task)?.[1];
+while (gate && !existsSync(gate)) await new Promise((resolve) => setTimeout(resolve, 50));
 line({ type: "session", version: 3, id: "fake", timestamp: new Date().toISOString(), cwd: process.cwd() });
 line({ type: "agent_start" });
 if (task.includes("FAIL")) line({ type: "message_end", message: message({ content: [], stopReason: "error", errorMessage: "boom" }) });
@@ -420,6 +423,7 @@ line({ type: "agent_settled", aborted: false });
 			const first = await verify("Risk: security (fix); recheck B1,B2", "recheck B1,B2");
 			assert.notEqual(first.isError, true, text(first));
 			assert.deepEqual(records().map((r) => r.scope), ["branch", "recheck"]);
+			assert.deepEqual(records().map((r) => r.rechecked), [undefined, ["B1", "B2"]], "W1: the recheck records the ids it probed");
 			const second = await verify("Risk: security (fix); recheck B1", "recheck B1");
 			assert.equal(second.isError, true);
 			assert.match(text(second), /one recheck per branch verify/);
@@ -443,6 +447,51 @@ line({ type: "agent_settled", aborted: false });
 			assert.equal(result.isError, true);
 			assert.match(text(result), /task 2: .*already verified this source tree|task 2: .*another branch verify/);
 			assert.equal(records().length, 0);
+		});
+	});
+
+	// Sibling calls of one message: the children hold at a gate file until the rejected call has returned, so the first is still
+	// running (nothing on disk) when the second is admitted. A child that was wrongly admitted would block the race for 20 s.
+	const sibling = async (calls: Array<(task: string) => Promise<any>>) => {
+		const gate = path.join(root, `gate-${process.hrtime.bigint()}`);
+		const pending = calls.map((call, i) => call(`verify ${i} GATE:${gate}`));
+		const timer = setTimeout(() => fs.writeFileSync(gate, ""), 20_000);
+		try {
+			await Promise.race(pending);
+		} finally {
+			fs.writeFileSync(gate, "");
+			clearTimeout(timer);
+		}
+		return Promise.all(pending);
+	};
+
+	it("B1: two sibling calls in parallel do not both pass the first-verify budget", { timeout: 60_000 }, async () => {
+		await withVerify({}, async ({ verify }) => {
+			const results = await sibling([(task) => verify("Risk: security (guard)", task), (task) => verify("Risk: security (guard)", task)]);
+			assert.deepEqual(results.map((r) => r.isError === true).sort(), [false, true], "exactly one of the two is rejected");
+			assert.match(text(results.find((r) => r.isError)), /already verified this source tree/);
+			assert.equal(records().length, 1);
+		});
+	});
+
+	it("B1: two sibling rechecks in parallel do not both pass; the reservation is released after the record", { timeout: 60_000 }, async () => {
+		await withVerify({}, async ({ verify }) => {
+			seed({ outcome: "blockers", blockers: ["B1"] });
+			const recheck = (task: string) => verify("Risk: security (fix); recheck B1", task);
+			const results = await sibling([recheck, recheck]);
+			assert.deepEqual(results.map((r) => r.isError === true).sort(), [false, true]);
+			assert.deepEqual(records().map((r) => r.scope), ["branch", "recheck"]);
+			// The record is there, so the budget now speaks from the log alone.
+			assert.match(text(await recheck("recheck B1 again")), /one recheck per branch verify/);
+		});
+	});
+
+	it("B1: an unreadable evidence log does not make the verify throw, and the reservation still holds", { timeout: 60_000 }, async () => {
+		await withVerify({}, async ({ verify }) => {
+			fs.mkdirSync(logFile(), { recursive: true });
+			const results = await sibling([(task) => verify("Risk: security (guard)", task), (task) => verify("Risk: security (guard)", task)]);
+			assert.deepEqual(results.map((r) => r.isError === true).sort(), [false, true]);
+			assert.match(text(results.find((r) => r.isError)), /already verified this source tree/);
 		});
 	});
 

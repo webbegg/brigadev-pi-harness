@@ -75,11 +75,20 @@ describe("verifyBudget: branch verify", () => {
 		assert.deepEqual(verifyBudget(records, branchRequest(), "s1"), { ok: true });
 	});
 
-	it("counts a verify that ended with blockers or unverified checks", () => {
-		for (const outcome of ["blockers", "unverified"] as const) {
-			const result = verifyBudget([verifyRecord({ outcome, blockers: outcome === "blockers" ? ["B1"] : [] })], branchRequest(), "s1");
-			assert.equal(result.ok, false, outcome);
-		}
+	it("counts a verify that ended with blockers", () => {
+		const result = verifyBudget([verifyRecord({ outcome: "blockers", blockers: ["B1"] })], branchRequest(), "s1");
+		assert.equal(result.ok, false);
+		assert.ok(!result.ok && !result.ask);
+	});
+
+	it("W2: after a verify that ended unverified, another branch verify on the same srcTree asks instead of a hard reject", () => {
+		const result = verifyBudget([verifyRecord({ outcome: "unverified" })], branchRequest(), "s1");
+		assert.equal(result.ok, false);
+		assert.equal(!result.ok && result.ask, true);
+		assert.match((result as { message: string }).message, /another branch verify/);
+		// A definite verify on the same tree still hard-rejects, whatever else ran before it.
+		const both = verifyBudget([verifyRecord({ outcome: "unverified" }), verifyRecord({ outcome: "clean" })], branchRequest(), "s1");
+		assert.ok(!both.ok && !both.ask);
 	});
 });
 

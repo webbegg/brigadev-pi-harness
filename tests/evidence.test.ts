@@ -541,8 +541,36 @@ describe("verify records (S6)", () => {
 	it("an unmet or not implemented verdict is outcome blockers even without a blocker entry", () => {
 		for (const v of ["unmet", "not implemented"]) {
 			const record = buildVerifyRecord({ ...context, result: { failed: false, structured: structured({ verdicts: [verdict("S1", "met"), verdict("S2", v)] }) } });
-			assert.deepEqual([record.outcome, record.blockers], ["blockers", []], v);
+			assert.deepEqual([record.outcome, record.blockers], ["blockers", ["S2"]], v);
 		}
+	});
+
+	it("W2: unmet verdicts without blocker entries list the unmet spec ids, never an empty list; blocker entries keep their B ids", () => {
+		const record = buildVerifyRecord({ ...context, result: { failed: false, structured: structured({ verdicts: [verdict("S7", "Unmet"), verdict("S2", "met"), verdict("S9", " NOT IMPLEMENTED ")] }) } });
+		assert.deepEqual([record.outcome, record.blockers], ["blockers", ["S7", "S9"]]);
+		const withBlocker = buildVerifyRecord({ ...context, result: { failed: false, structured: structured({ verdicts: [verdict("S7", "unmet")], blockers: [blocker("a")] }) } });
+		assert.deepEqual([withBlocker.outcome, withBlocker.blockers], ["blockers", ["B1"]]);
+	});
+
+	it("W2: a payload that is not a complete clean result is unverified, never clean", () => {
+		const outcome = (structuredValue: unknown) => buildVerifyRecord({ ...context, result: { failed: false, structured: structuredValue } }).outcome;
+		const degenerate: Array<[string, unknown]> = [
+			["empty object", {}],
+			["empty verdicts, no blockers", { verdicts: [] }],
+			["empty verdicts", structured({ verdicts: [] })],
+			["verdicts missing", { blockers: [], unverified: [] }],
+			["blockers missing", { verdicts: [verdict("S1", "met")] }],
+			["blockers not an array", structured({ blockers: "none" })],
+			["blockers an object", structured({ blockers: {} })],
+			["unverified not an array", structured({ unverified: "x" })],
+			["an array payload", [structured()]],
+			["unknown verdict", structured({ verdicts: [verdict("S1", "mostly")] })],
+			["verdict not a string", structured({ verdicts: [{ spec: "S1", verdict: 1 }] })],
+			["verdict entry not an object", structured({ verdicts: ["met"] })],
+		];
+		for (const [name, value] of degenerate) assert.equal(outcome(value), "unverified", name);
+		assert.equal(outcome(structured({ verdicts: [verdict("S1", "MET"), verdict("S2", "Out of scope")] })), "clean", "case-insensitive met and out of scope");
+		assert.equal(outcome({ verdicts: [verdict("S1", "met")], blockers: [] }), "clean", "an absent unverified list is nothing unverified");
 	});
 
 	it("an unverified verdict or unverified check is outcome unverified; blockers win over it", () => {

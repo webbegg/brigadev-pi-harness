@@ -18,7 +18,7 @@ import { checkRefusal, resolveCommand } from "../lib/check.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, sensitiveWords, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
-import { decidePrGate, prCreateDirectory, prGateBlockMessage, prGateDialogText, riskMapFor, type PrGateDecision } from "../lib/pr-gate.ts";
+import { decidePrGate, opensPrCreate, prCreateDirectory, prGateBlockMessage, prGateDialogText, riskMapFor, UNRESOLVED_DIRECTORY_REASON, type PrGateDecision } from "../lib/pr-gate.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
 import { branchRisk, type RiskCategory } from "../lib/risk-map.ts";
 import { agentDir, CHILD_ENV, childAllowedSurfaces, isChildSession, PACKAGE_ROOT, readSettings, writeSettings } from "../lib/runtime.ts";
@@ -186,12 +186,13 @@ export default function (pi: ExtensionAPI) {
 	/**
 	 * PR risk gate for `gh pr create` (parent only, every permission mode, S9): the branch's tier against its evidence and review ledger.
 	 * Undefined when the command opens no PR. It is advice on top of the human PR decision, so anything that fails while
-	 * reading the facts (no git, a detached HEAD, an unreadable log) fails open instead of blocking the PR.
+	 * reading the facts (no git, a detached HEAD, an unreadable log) fails open instead of blocking the PR. A `gh pr create`
+	 * whose directory cannot be resolved is not a read error: the gate cannot look, so it asks.
 	 */
 	const prGate = async (command: string, commandCwd: string): Promise<{ decision: PrGateDecision; categories: RiskCategory[] } | undefined> => {
 		try {
 			const dir = prCreateDirectory(command, commandCwd);
-			if (!dir) return undefined;
+			if (!dir) return opensPrCreate(command) ? { decision: { action: "ask", reasons: [UNRESOLVED_DIRECTORY_REASON] }, categories: [] } : undefined;
 			const risk = await branchRisk(exec, dir, riskMapFor(readSettings()));
 			if (!risk?.branch) return undefined;
 			const docs = repoDocsDir(dir);
@@ -201,6 +202,7 @@ export default function (pi: ExtensionAPI) {
 				records: readEvidence(evidenceFile(docs, risk.branch)),
 				branch: risk.branch,
 				ledgerExists: existsSync(join(docs, "reviews", `${branchSlug(risk.branch)}.md`)),
+				baseUnknown: risk.baseUnknown,
 			});
 			return { decision, categories: (Object.keys(risk.categories) as RiskCategory[]).filter((category) => category === "security" || category === "data" || category === "contract") };
 		} catch {

@@ -17,12 +17,16 @@ export interface PrGateInput {
 	branch: string | null;
 	/** `reviews/<branch>.md` exists in the repo docs folder. */
 	ledgerExists: boolean;
+	/** No base branch resolved: committed changes were not classified, so a tier below T2 is not trustworthy. */
+	baseUnknown?: boolean;
 }
 
 /** The categories that make a branch T2, in the order the risk line names them. */
 const T2_CATEGORIES: readonly RiskCategory[] = ["security", "data", "contract"];
 
 export const NO_LEDGER_NOTE = "no review ledger for this branch";
+export const UNKNOWN_BASE_REASON = "risk tier unknown: no base branch found";
+export const UNRESOLVED_DIRECTORY_REASON = "PR risk gate could not resolve the directory of gh pr create";
 
 const byTime = <T extends { ts: string }>(a: T, b: T): number => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0);
 
@@ -38,8 +42,9 @@ function redThenGreen(runs: readonly RunRecord[], after: string): boolean {
 
 export function decidePrGate(input: PrGateInput): PrGateDecision {
 	const { tier, branch } = input;
-	if (tier === "T0") return { action: "allow", reasons: [] };
+	if (tier === "T0" && !input.baseUnknown) return { action: "allow", reasons: [] };
 	const reasons: string[] = [];
+	if (input.baseUnknown && tier !== "T2") reasons.push(UNKNOWN_BASE_REASON);
 	const verifies = input.records.filter((r): r is VerifyRecord => r.type === "verify" && r.branch === branch && r.outcome !== "failed");
 	// The latest by time; among equal times the one recorded last (the log is append-only).
 	const latestOf = (list: readonly VerifyRecord[]) => list.reduce<VerifyRecord | undefined>((best, record) => (!best || record.ts >= best.ts ? record : best), undefined);
@@ -53,9 +58,20 @@ export function decidePrGate(input: PrGateInput): PrGateDecision {
 			return paths?.length ? [`${category}: ${paths[0]}`] : [];
 		}).join(", ");
 		reasons.push(`T2 branch${detail ? ` (${detail})` : ""} has no brigadev-verify run`);
-	} else if (decided?.outcome === "blockers") {
+	} else if (tier === "T2" && !decided) {
+		// A verify counts only with a definite result (clean or blockers); one that ended unverified proved nothing.
+		reasons.push("latest brigadev-verify was unverified");
+	} else if (decided && tier !== "T0") {
 		const runs = input.records.filter((r): r is RunRecord => r.type === "run" && r.branch === branch);
-		if (!redThenGreen(runs, decided.ts)) reasons.push(`verify blockers ${decided.blockers.join(",")} have no repro test RED→GREEN after the verify`);
+		const unresolved: string[] = [];
+		// A recheck probed only the ids its reason named: the other blockers of the branch verify it follows still need a test.
+		if (decided.scope === "recheck") {
+			const base = latestOf(verifies.filter((r) => r.scope === "branch" && r.outcome === "blockers" && r.ts <= decided.ts));
+			const open = base ? base.blockers.filter((id) => !(decided.rechecked ?? []).includes(id)) : [];
+			if (base && open.length > 0 && !redThenGreen(runs, base.ts)) unresolved.push(...open);
+		}
+		if (decided.outcome === "blockers" && !redThenGreen(runs, decided.ts)) unresolved.push(...decided.blockers.filter((id) => !unresolved.includes(id)));
+		if (unresolved.length > 0) reasons.push(`verify blockers ${unresolved.join(",")} have no repro test RED→GREEN after the verify`);
 	}
 
 	const decision: PrGateDecision = { action: reasons.length > 0 ? "ask" : "allow", reasons };
@@ -70,7 +86,7 @@ export { riskMapFor } from "./risk-map.ts";
  * Undefined when the command opens no PR, or when the directory cannot be resolved (the gate then does not run).
  */
 export function prCreateDirectory(command: string, cwd: string): string | undefined {
-	if (!classifyCommand(command).some((match) => match.reason === "gh pr create")) return undefined;
+	if (!opensPrCreate(command)) return undefined;
 	const segments = tokenize(blankHeredocs(command), { redirections: true });
 	const dirs = segmentDirectories(segments, cwd);
 	let found: string | undefined;
@@ -83,6 +99,9 @@ export function prCreateDirectory(command: string, cwd: string): string | undefi
 	return found;
 }
 
+/** True when the classifier reads the command as a `gh pr create`, whether or not its directory resolves. */
+export const opensPrCreate = (command: string): boolean => classifyCommand(command).some((match) => match.reason === "gh pr create");
+
 /** What a confirmation dialog adds for the gate: the reasons, then the note. Empty when there is nothing to show. */
 export function prGateDialogText(decision: PrGateDecision): string {
 	const lines = [...decision.reasons.map((reason) => `- ${reason}`), ...(decision.note ? [`Note: ${decision.note}`] : [])];
@@ -94,6 +113,8 @@ export function prGateBlockMessage(decision: PrGateDecision, categories: readonl
 	const joined = decision.reasons.join("; ");
 	const steps: string[] = [];
 	if (/no brigadev-verify run/.test(joined)) steps.push(`run one brigadev-verify for this branch with \`Risk: ${categories.length > 0 ? categories.join(",") : "<category>"}\` in the launch reason`);
+	if (joined.includes(UNKNOWN_BASE_REASON)) steps.push("make the default branch resolvable (fetch origin, or create `main`/`master`, or set `git config init.defaultBranch <name>`) so the branch's committed changes can be classified");
+	if (joined.includes(UNRESOLVED_DIRECTORY_REASON)) steps.push("run `gh pr create` as its own plain command from the repository directory (or after a leading `cd <dir> &&`), not inside a subshell, `bash -c`, `eval`, or a variable path");
 	if (/repro test/.test(joined)) steps.push("add the repro test for each verify blocker and run it through check (RED, then GREEN)");
 	return `Blocked by brigadev guard: gh pr create was declined (${joined}). To clear it: ${steps.join("; ")}; then retry. Do not open the PR another way.`;
 }

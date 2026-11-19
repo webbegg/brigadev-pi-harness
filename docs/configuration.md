@@ -37,7 +37,7 @@ An authorized change on the default branch starts a `type/description` branch, a
 
 ## Review tiers
 
-The branch's changed paths (against its merge-base with the default branch, plus uncommitted changes) set a tier through a path-based risk map (`lib/risk-map.ts` defaults plus `risk` above). `check` prints it as one line when it changes, for example `risk T2 security(lib/guard-rules.ts) → before PR: brigadev-verify + R1,R3`.
+The branch's changed paths (against its merge-base with the default branch — `origin/HEAD`, `main`, `master`, `init.defaultBranch`, `develop`, or `trunk`, whichever resolves first — plus uncommitted changes; when none resolves, `check` prints no line and the PR gate asks) set a tier through a path-based risk map (`lib/risk-map.ts` defaults plus `risk` above). `check` prints it as one line when it changes, for example `risk T2 security(lib/guard-rules.ts) → before PR: brigadev-verify + R1,R3`.
 
 | Tier | When | Before the PR |
 | --- | --- | --- |

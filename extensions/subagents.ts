@@ -28,7 +28,7 @@ import { pruneRunFolders, pruneWarning } from "../lib/run-artifacts.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
 import { runLaunch, toResult, type Details, type LaunchHooks, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
-import { admitLaunch, parseRecheck, riskCategories, verifyBudget, VERIFY_AGENT, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
+import { admitLaunch, enterVerifyAdmission, parseRecheck, pendingVerifies, reserveVerify, riskCategories, verifyBudget, VERIFY_AGENT, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
 import { appendEvidence, buildVerifyRecord, evidenceFile, readEvidence, type EvidenceRecord } from "../lib/evidence.ts";
 import { readCurrentBranch } from "../lib/commit-branch.ts";
 import { RECHECK_KEY, resolveAgentRoute, resolveModelRef, type ResolvedRoute } from "../lib/model-routing.ts";
@@ -139,11 +139,17 @@ async function readVerifyLog(exec: Parameters<typeof readCurrentBranch>[0], cwd:
 	const branch = await readCurrentBranch(exec, cwd);
 	const file = evidenceFile(repoDocsDir(cwd), branch);
 	const keyed = tree.kind === "tree" ? { tree: tree.tree, srcTree: tree.sourceTree, root: tree.root } : undefined;
-	return { branch, file, records: readEvidence(file), keyed, srcTree: keyed?.srcTree };
+	let records: EvidenceRecord[] = [];
+	try {
+		records = readEvidence(file);
+	} catch {
+		// An unreadable log (a directory, no permission) counts as no records, as before the budget existed; the reservation still holds.
+	}
+	return { branch, file, records, keyed, srcTree: keyed?.srcTree };
 }
 
 function verifyRecordFor(request: LaunchRequest, log: VerifyLog, result: { failed: boolean; structured?: unknown }, runId?: string) {
-	return buildVerifyRecord({ ts: new Date().toISOString(), branch: log.branch, ...log.keyed, runId, scope: parseRecheck(request.reason) ? "recheck" : "branch", categories: riskCategories(request.reason), result });
+	return buildVerifyRecord({ ts: new Date().toISOString(), branch: log.branch, ...log.keyed, runId, scope: parseRecheck(request.reason) ? "recheck" : "branch", categories: riskCategories(request.reason), rechecked: parseRecheck(request.reason), result });
 }
 
 function routeLabel(route: ResolvedRoute, profileName: string | undefined): string {
@@ -277,6 +283,16 @@ export default function (pi: ExtensionAPI) {
 
 	// The launch behind the `subagent` tool: always synchronous, it returns when every task has ended.
 	async function launch(params: Static<typeof Params>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: ExtensionContext) {
+		// Verify reservations of this call: released once the call is over and its records are appended (or it was rejected).
+		const held: Array<() => void> = [];
+		try {
+			return await launchWithin(params, signal, onUpdate, ctx, held);
+		} finally {
+			for (const release of held) release();
+		}
+	}
+
+	async function launchWithin(params: Static<typeof Params>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: ExtensionContext, held: Array<() => void>) {
 		const agents = loadAgents(ctx);
 		const requests: LaunchRequest[] = params.tasks?.length
 			? params.tasks
@@ -298,21 +314,30 @@ export default function (pi: ExtensionAPI) {
 
 		// Verify budget (S7), read from the evidence log of this repository and branch; a launch that is already rejected is not judged.
 		const verifyTasks = resolved.flatMap(({ request, agent }, i) => (agent?.name === VERIFY_AGENT && admission[i].length === 0 ? [{ index: i, request }] : []));
-		const verifyLog = verifyTasks.length > 0 ? await readVerifyLog(exec, ctx.cwd) : undefined;
+		// Sibling tool calls of one message run concurrently and nothing is on disk until a verify ends, so the section that reads the
+		// log, judges the budget, and reserves is entered synchronously (before any await) and runs one call at a time.
+		const leaveAdmission = verifyTasks.length > 0 ? await enterVerifyAdmission() : undefined;
+		let verifyLog: VerifyLog | undefined;
 		const asks: string[] = [];
-		if (verifyLog) {
-			// Tasks of this call count against each other: the log has no record of them yet.
-			const seen: EvidenceRecord[] = [...verifyLog.records];
-			for (const { index, request } of verifyTasks) {
-				const verdict = verifyBudget(seen, { reason: request.reason, branch: verifyLog.branch }, verifyLog.srcTree);
-				const label = requests.length > 1 ? `task ${index + 1}: ` : "";
-				if (!verdict.ok && !verdict.ask) {
-					problems.push(`${label}${verdict.message}`);
-					continue;
+		try {
+			verifyLog = verifyTasks.length > 0 ? await readVerifyLog(exec, ctx.cwd) : undefined;
+			if (verifyLog) {
+				const key = `${verifyLog.keyed?.root ?? canonicalPath(ctx.cwd)}\0${verifyLog.branch ?? ""}`;
+				for (const { index, request } of verifyTasks) {
+					// Verifies reserved by this call and by sibling calls count like finished ones: the log has no record of them yet.
+					const verdict = verifyBudget([...verifyLog.records, ...pendingVerifies(key)], { reason: request.reason, branch: verifyLog.branch }, verifyLog.srcTree);
+					const label = requests.length > 1 ? `task ${index + 1}: ` : "";
+					if (!verdict.ok && !verdict.ask) {
+						problems.push(`${label}${verdict.message}`);
+						continue;
+					}
+					if (!verdict.ok) asks.push(`${label}${verdict.message}`);
+					const record = verifyRecordFor(request, verifyLog, { failed: false });
+					held.push(reserveVerify(key, { ...record, outcome: "clean", blockers: [], pending: true }));
 				}
-				if (!verdict.ok) asks.push(`${label}${verdict.message}`);
-				seen.push(verifyRecordFor(request, verifyLog, { failed: false, structured: { verdicts: [], blockers: [] } }));
 			}
+		} finally {
+			leaveAdmission?.();
 		}
 
 		// Model routing: session profile > default profile > agent definition > this session's model. One model per agent.

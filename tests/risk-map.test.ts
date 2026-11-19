@@ -29,7 +29,7 @@ describe("classifyPaths (S1, S2)", () => {
 		[["assets/agents/reviewer.md"], "T1", [], ["R2", "R3"]],
 		[["skills/review/SKILL.md", "AGENTS.md"], "T1", [], ["R2", "R3"]],
 		[["assets/agents/reviewer.md", "src/render.ts"], "T1", [], ["R3"]],
-		[["src/store.ts", "src/guard.ts"], "T2", ["data", "security"], ["R1", "R3", "R4"]],
+		[["src/storage.ts", "src/guard.ts"], "T2", ["data", "security"], ["R1", "R3", "R4"]],
 		[["tests/guard.test.ts", "README.md"], "T0", [], []],
 		[["tests/guard.test.ts", "src/render.ts"], "T1", [], ["R3"]],
 	];
@@ -100,12 +100,25 @@ describe("formatRiskLine", () => {
 	it("shows at most two paths per category with +N and stays short", () => {
 		const line = formatRiskLine(classify("a/auth/one.ts", "a/auth/two.ts", "a/auth/three.ts", "a/auth/four.ts", "db/migrations/1.sql"));
 		assert.match(line, /^risk T2 security\(a\/auth\/one\.ts, a\/auth\/two\.ts \+2\) data\(db\/migrations\/1\.sql\) → before PR: brigadev-verify \+ R1,R3,R4$/);
-		assert.ok(formatRiskLine(classify("x".repeat(200) + "/guard.ts", "y".repeat(200) + "/store.ts")).length <= 140);
+		assert.ok(formatRiskLine(classify("x".repeat(200) + "/guard.ts", "y".repeat(200) + "/storage.ts")).length <= 140);
 	});
 	it("T1 and T0", () => {
 		assert.equal(formatRiskLine(classify("src/render.ts")), "risk T1 → before PR: review R3");
 		assert.equal(formatRiskLine(classify("package.json")), "risk T1 delivery(package.json) → before PR: review R1,R3");
 		assert.equal(formatRiskLine(classify("README.md")), "risk T0 → tests only");
+	});
+});
+
+describe("default name globs (W5)", () => {
+	it("ordinary code that only contains acl, store, session or token inside a word is not T2", () => {
+		for (const path of ["src/Oracle.ts", "src/miracle.ts", "src/restore.ts", "src/session-list.tsx", "src/tokenizer.ts", "ui/tokens/colors.ts", "src/bookstore/list.ts"]) {
+			assert.equal(classify(path).tier, "T1", path);
+		}
+	});
+	it("the words that name real risk still are", () => {
+		for (const path of ["lib/guard-rules.ts", "src/auth/login.ts", "db/migrations/001.sql", "src/storage.ts", "src/persist.ts", "src/crypto-utils.ts", "src/permissions.ts", "src/secrets.ts", "src/credential-helper.ts", "src/sandbox.ts", "src/trust.ts", "src/sanitize.ts", "src/backup.ts", "src/retention.ts", "src/prune.ts"]) {
+			assert.equal(classify(path).tier, "T2", path);
+		}
 	});
 });
 
@@ -206,8 +219,8 @@ describe("branchRisk (S4)", () => {
 		write("src/guard.ts");
 		assert.match((await riskNotice(exec, repo, {})) ?? "", /^risk T2 security\(src\/guard\.ts\)/);
 		assert.equal(await riskNotice(exec, repo, {}), undefined);
-		write("src/store.ts");
-		assert.match((await riskNotice(exec, repo, {})) ?? "", /data\(src\/store\.ts\)/, "a new category");
+		write("src/storage.ts");
+		assert.match((await riskNotice(exec, repo, {})) ?? "", /data\(src\/storage\.ts\)/, "a new category");
 		// Another branch has its own memory.
 		git("checkout", "-q", "-b", "feat/other");
 		assert.match((await riskNotice(exec, repo, {})) ?? "", /^risk T2/);
@@ -216,5 +229,71 @@ describe("branchRisk (S4)", () => {
 			throw new Error("boom");
 		};
 		assert.equal(await riskNotice(failing, repo, {}), undefined);
+	});
+});
+
+describe("branchRisk: the base branch fallbacks (W3)", () => {
+	let dir: string;
+	const exec: ExecFn = async (command, args, options) => {
+		try {
+			return { stdout: execFileSync(command, args, { cwd: options.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }), stderr: "", code: 0 };
+		} catch (error: any) {
+			return { stdout: String(error.stdout ?? ""), stderr: String(error.stderr ?? ""), code: error.status ?? 1 };
+		}
+	};
+	let count = 0;
+	/** A repository whose only base branch is `initial`, with lib/guard.ts committed on `feat/y` (and an optional local init.defaultBranch). */
+	const branchOff = (initial: string, defaultBranch?: string): string => {
+		const repo = join(dir, `r${++count}`);
+		mkdirSync(repo);
+		const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { cwd: repo, stdio: "ignore" });
+		git("init", "-q", "-b", initial);
+		if (defaultBranch) git("config", "init.defaultBranch", defaultBranch);
+		writeFileSync(join(repo, "README.md"), "x\n");
+		git("add", "-A");
+		git("commit", "-q", "-m", "init");
+		git("checkout", "-q", "-b", "feat/y");
+		mkdirSync(join(repo, "lib"));
+		writeFileSync(join(repo, "lib/guard.ts"), "x\n");
+		git("add", "-A");
+		git("commit", "-q", "-m", "guard");
+		return repo;
+	};
+	before(() => {
+		dir = realpathSync(mkdtempSync(join(tmpdir(), "risk-base-")));
+	});
+	after(() => rmSync(dir, { recursive: true, force: true }));
+
+	it("develop and trunk are tried after origin/HEAD, main and master", async () => {
+		for (const initial of ["develop", "trunk"]) {
+			const result = await branchRisk(exec, branchOff(initial), DEFAULT_RISK_MAP);
+			assert.equal(result?.tier, "T2", initial);
+			assert.ok(result?.base, initial);
+			assert.equal(result?.baseUnknown, undefined, initial);
+		}
+	});
+
+	it("the repository's init.defaultBranch is tried too", async () => {
+		const result = await branchRisk(exec, branchOff("release", "release"), DEFAULT_RISK_MAP);
+		assert.equal(result?.tier, "T2");
+		assert.ok(result?.base);
+	});
+
+	it("with commits but no resolvable base, the tier is unknown: flagged, and no notice", async () => {
+		resetRiskNotices();
+		const repo = branchOff("weird");
+		const result = await branchRisk(exec, repo, DEFAULT_RISK_MAP);
+		assert.equal(result?.baseUnknown, true);
+		assert.equal(result?.branch, "feat/y");
+		assert.equal(await riskNotice(exec, repo, {}), undefined);
+		assert.equal(await riskNotice(exec, repo, {}), undefined);
+	});
+
+	it("a repository without commits has no base to find: not flagged", async () => {
+		const empty = join(dir, "empty");
+		mkdirSync(empty);
+		execFileSync("git", ["init", "-q", "-b", "weird"], { cwd: empty });
+		const result = await branchRisk(exec, empty, DEFAULT_RISK_MAP);
+		assert.equal(result?.baseUnknown, undefined);
 	});
 });
