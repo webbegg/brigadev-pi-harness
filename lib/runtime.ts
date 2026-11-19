@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { RiskCategory } from "./risk-map.ts";
 
 /** Package root, resolved from this file so it works from any install location. */
 export const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -68,6 +69,11 @@ export interface BrigadevSettings {
 	};
 	/** The `check` tool's default test command (lib/check.ts); detected from the project when absent. */
 	check?: { test?: string };
+	/**
+	 * Extra risk globs (lib/risk-map.ts), additive to the defaults: `paths` for every repository, `repos.<slug>` for the one whose
+	 * top-level folder has that name. Read tolerantly: invalid entries are ignored and /brigadev:doctor lists them.
+	 */
+	risk?: { paths?: Partial<Record<RiskCategory, string[]>>; repos?: Record<string, Partial<Record<RiskCategory, string[]>>> };
 	/** Automatic compaction (lib/context-control.ts). */
 	context?: { enabled?: boolean; compactAt?: number; idleCompactMinutes?: number; idleCompactMin?: number };
 }

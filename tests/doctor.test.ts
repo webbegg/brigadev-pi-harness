@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { analyzeTools, TOOL_CHARS_LIMIT, type ToolInfo } from "../lib/doctor.ts";
+import { analyzeTools, riskWarnings, TOOL_CHARS_LIMIT, type ToolInfo } from "../lib/doctor.ts";
 import { PACKAGE_ROOT } from "../lib/runtime.ts";
 import { createFakeCtx, createFakePi } from "./helpers/fake-pi.ts";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
@@ -60,6 +60,20 @@ describe("analyzeTools", () => {
 	});
 });
 
+describe("riskWarnings (S3)", () => {
+	it("is empty for no risk config or a valid one", () => {
+		assert.deepEqual(riskWarnings(undefined), []);
+		assert.deepEqual(riskWarnings({ paths: { security: ["lib/x.ts"] }, repos: { r: { data: ["db/**"] } } }), []);
+	});
+	it("names each invalid entry as ignored", () => {
+		const warnings = riskWarnings({ paths: { bogus: ["a"], security: [1] } });
+		assert.equal(warnings.length, 2);
+		assert.match(warnings[0], /risk\.paths\.bogus: unknown category.*ignored/);
+		assert.match(warnings[1], /risk\.paths\.security\[0\].*ignored/);
+		assert.equal(riskWarnings("x").length, 1);
+	});
+});
+
 describe("doctor command", () => {
 	const saved = { ...process.env };
 	let dir: string, uninstall: () => void, doctor: (pi: any) => void;
@@ -103,5 +117,18 @@ describe("doctor command", () => {
 	});
 	it("still works when pi has no getAllTools", async () => {
 		assert.match(await run(undefined), /model:/);
+	});
+	it("reports invalid risk entries as warnings, and nothing for a valid config", async () => {
+		const file = join(dir, "agent", "brigadev.json");
+		try {
+			writeFileSync(file, JSON.stringify({ risk: { paths: { security: ["lib/x.ts"] } } }));
+			assert.doesNotMatch(await run(undefined), /risk/);
+			writeFileSync(file, JSON.stringify({ risk: { paths: { nonsense: ["a"], data: [5] } } }));
+			const text = await run(undefined);
+			assert.match(text, /⚠ risk: risk\.paths\.nonsense: unknown category/);
+			assert.match(text, /⚠ risk: risk\.paths\.data\[0\]/);
+		} finally {
+			writeFileSync(file, "{}");
+		}
 	});
 });
