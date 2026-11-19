@@ -7,6 +7,7 @@
 			"brigadev-explore": { "model": "claude-haiku-5-5", "thinking": "low" },
 			"brigadev-worker": { "model": "claude-sonnet-5-5", "thinking": "medium" },
 			"brigadev-verify": { "model": "claude-sonnet-5-5", "thinking": "high" },
+			"brigadev-verify-recheck": { "model": "claude-sonnet-5-5", "thinking": "medium" },
 			"review-*": { "model": "claude-haiku-5-5", "thinking": "medium" }
 		},
 		"balanced": {
@@ -14,6 +15,7 @@
 			"brigadev-explore": { "model": "claude-haiku-5-5", "thinking": "low" },
 			"brigadev-worker": { "model": "claude-sonnet-5-5", "thinking": "high" },
 			"brigadev-verify": { "model": "claude-opus-5-5", "thinking": "high" },
+			"brigadev-verify-recheck": { "model": "claude-sonnet-5-5", "thinking": "high" },
 			"review-*": { "model": "claude-sonnet-5-5", "thinking": "medium" }
 		},
 		"deep": {
@@ -21,6 +23,7 @@
 			"brigadev-explore": { "model": "claude-sonnet-5-5", "thinking": "medium" },
 			"brigadev-worker": { "model": "claude-opus-5-5", "thinking": "high" },
 			"brigadev-verify": { "model": "claude-opus-5-5", "thinking": "xhigh" },
+			"brigadev-verify-recheck": { "model": "claude-opus-5-5", "thinking": "high" },
 			"review-*": { "model": "claude-opus-5-5", "thinking": "high" }
 		}
 	}

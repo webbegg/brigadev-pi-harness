@@ -4,6 +4,8 @@
 
 export const ORCHESTRATOR_KEY = "orchestrator";
 export const DEFAULT_KEY = "*";
+/** Profile key of a brigadev-verify recheck (S8); a profile without it routes the recheck like any verify. */
+export const RECHECK_KEY = "brigadev-verify-recheck";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
@@ -117,8 +119,11 @@ export function resolveAgentRoute(input: {
 	profile?: Profile;
 	agent: { name: string; model?: string; thinking?: string };
 	parent: { model?: string; thinking?: string };
+	/** A profile key tried before the agent's name; used only when the profile has exactly that key. */
+	routeKey?: string;
 }): ResolvedRoute {
-	const match = routeFor(input.profile, input.agent.name);
+	const keyed = input.routeKey ? input.profile?.[input.routeKey] : undefined;
+	const match = input.routeKey && keyed ? { entry: keyed, key: input.routeKey } : routeFor(input.profile, input.agent.name);
 	const result: ResolvedRoute = { modelSource: "none", thinkingSource: "none", profileKey: match?.key };
 
 	if (match?.entry.model) [result.model, result.modelSource] = [match.entry.model, "profile"];
@@ -177,6 +182,7 @@ export function withRoute(file: ProfilesFile, profileName: string, key: string, 
 export function unmatchedKeys(profile: Profile, agentNames: readonly string[]): string[] {
 	return Object.keys(profile).filter((key) => {
 		if (key === DEFAULT_KEY || key === ORCHESTRATOR_KEY) return false;
+		if (key === RECHECK_KEY) return !agentNames.includes("brigadev-verify");
 		if (key.endsWith("*")) return !agentNames.some((n) => n.startsWith(key.slice(0, -1)));
 		return !agentNames.includes(key);
 	});

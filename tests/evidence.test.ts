@@ -13,6 +13,7 @@ import {
 	appendEvidence,
 	branchSlug,
 	buildRunRecord,
+	buildVerifyRecord,
 	checkKind,
 	checkOutcome,
 	decideCommitGate,
@@ -506,5 +507,71 @@ describe("evaluateCommitGate (S8b/S8c: the gate judges the repository the commit
 		const calls: string[] = [];
 		await evaluateCommitGate({ exec: async (command, args, options) => (calls.push(args.join(" ")), exec(command, args, options)), command: `git -C ${repo} commit -am x`, cwd: parent, forcedTree: undefined });
 		assert.deepEqual(calls.filter((call) => call.startsWith("symbolic-ref") || call.includes("refs/heads")), ["symbolic-ref --short -q HEAD"]);
+	});
+});
+
+describe("verify records (S6)", () => {
+	const context = { ts: "2026-11-19T10:00:00.000Z", branch: "feat/x", tree: "T", srcTree: "S", root: "/repo", runId: "run-1", scope: "branch" as const, categories: ["security"] };
+	const verdict = (spec: string, v: string) => ({ spec, verdict: v, evidence: "e" });
+	const blocker = (summary: string) => ({ summary, reproduction: "r" });
+	const structured = (over: Record<string, unknown> = {}) => ({ verdicts: [verdict("S1", "met")], blockers: [], advisories: [], regressionTests: [], scratch: [], unverified: [], ...over });
+
+	it("a clean result is outcome clean with no blockers", () => {
+		assert.deepEqual(buildVerifyRecord({ ...context, result: { failed: false, structured: structured() } }), {
+			v: 1,
+			type: "verify",
+			ts: context.ts,
+			branch: "feat/x",
+			tree: "T",
+			srcTree: "S",
+			root: "/repo",
+			runId: "run-1",
+			scope: "branch",
+			categories: ["security"],
+			blockers: [],
+			outcome: "clean",
+		});
+	});
+
+	it("blockers are listed by the ids the parent reads (B1, B2, ...)", () => {
+		const record = buildVerifyRecord({ ...context, result: { failed: false, structured: structured({ blockers: [blocker("a"), blocker("b")] }) } });
+		assert.deepEqual([record.outcome, record.blockers], ["blockers", ["B1", "B2"]]);
+	});
+
+	it("an unmet or not implemented verdict is outcome blockers even without a blocker entry", () => {
+		for (const v of ["unmet", "not implemented"]) {
+			const record = buildVerifyRecord({ ...context, result: { failed: false, structured: structured({ verdicts: [verdict("S1", "met"), verdict("S2", v)] }) } });
+			assert.deepEqual([record.outcome, record.blockers], ["blockers", []], v);
+		}
+	});
+
+	it("an unverified verdict or unverified check is outcome unverified; blockers win over it", () => {
+		assert.equal(buildVerifyRecord({ ...context, result: { failed: false, structured: structured({ verdicts: [verdict("S1", "unverified")] }) } }).outcome, "unverified");
+		assert.equal(buildVerifyRecord({ ...context, result: { failed: false, structured: structured({ unverified: ["tsc: missing"] }) } }).outcome, "unverified");
+		assert.equal(buildVerifyRecord({ ...context, result: { failed: false, structured: structured({ unverified: ["x"], blockers: [blocker("a")] }) } }).outcome, "blockers");
+	});
+
+	it("a failed run, or a finished run without a payload, never reads as clean", () => {
+		assert.deepEqual(buildVerifyRecord({ ...context, result: { failed: true, structured: structured() } }).outcome, "failed");
+		assert.equal(buildVerifyRecord({ ...context, result: { failed: true } }).blockers.length, 0);
+		assert.equal(buildVerifyRecord({ ...context, result: { failed: false } }).outcome, "unverified");
+		assert.equal(buildVerifyRecord({ ...context, result: { failed: false, structured: "junk" } }).outcome, "unverified");
+	});
+
+	it("is appended and read back, and an unknown record type is still dropped", () => {
+		const dir = mkdtempSync(join(tmpdir(), "brigadev-ev-"));
+		const file = join(dir, "evidence", "b.jsonl");
+		const record = buildVerifyRecord({ ...context, scope: "recheck", result: { failed: false, structured: structured() } });
+		appendEvidence(file, record);
+		writeFileSync(file, `${readFileSync(file, "utf8")}${JSON.stringify({ v: 1, type: "mystery", ts: "t" })}\n`);
+		assert.deepEqual(readEvidence(file), [record]);
+	});
+
+	it("never satisfies the commit gate", () => {
+		const record = buildVerifyRecord({ ...context, result: { failed: false, structured: structured() } });
+		const input = { dirtyPaths: ["lib/a.ts"], tree: "T", sourceTree: "S", elsewhere: false, records: [record], forcedTree: undefined };
+		const gate = decideCommitGate(input);
+		assert.equal(gate.action, "block");
+		assert.match(gate.action === "block" ? gate.reason : "", /no passing test/);
 	});
 });

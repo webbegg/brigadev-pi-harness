@@ -28,14 +28,17 @@ import { pruneRunFolders, pruneWarning } from "../lib/run-artifacts.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
 import { runLaunch, toResult, type Details, type LaunchHooks, type LaunchTask, type TaskView } from "../lib/subagent-launch.ts";
-import { admitLaunch, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
-import { resolveAgentRoute, resolveModelRef, type ResolvedRoute } from "../lib/model-routing.ts";
+import { admitLaunch, parseRecheck, riskCategories, verifyBudget, VERIFY_AGENT, writerConflicts, type ActiveWriter, type LaunchRequest, type SkillRef } from "../lib/delegation.ts";
+import { appendEvidence, buildVerifyRecord, evidenceFile, readEvidence, type EvidenceRecord } from "../lib/evidence.ts";
+import { readCurrentBranch } from "../lib/commit-branch.ts";
+import { RECHECK_KEY, resolveAgentRoute, resolveModelRef, type ResolvedRoute } from "../lib/model-routing.ts";
 import { costCalculator, currentModelRef, loadAgents, modelCatalog } from "../lib/pi-adapters.ts";
 import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
 import { canonicalPath } from "../lib/paths.ts";
 import { isChildSession } from "../lib/runtime.ts";
 import { loadOutputSchema } from "../lib/structured-output.ts";
 import { takeSnapshot } from "../lib/worktree-snapshot.ts";
+import { worktreeTreeResult } from "../lib/worktree-tree.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -119,6 +122,28 @@ function rowInput(r: RunResult): RowInput {
 		calls: calls.flatMap((c) => (c.type === "toolCall" ? [{ name: c.name, arguments: c.arguments as Record<string, unknown> }] : [])),
 		error: r.errorMessage,
 	};
+}
+
+/** The evidence log of the repository and branch a verify launches from, and the source tree it would verify. */
+interface VerifyLog {
+	branch: string | null;
+	file: string;
+	records: EvidenceRecord[];
+	/** The worktree trees; undefined without git, or when they could not be computed (no record is written then). */
+	keyed?: { tree: string; srcTree?: string; root: string };
+	srcTree?: string;
+}
+
+async function readVerifyLog(exec: Parameters<typeof readCurrentBranch>[0], cwd: string): Promise<VerifyLog> {
+	const tree = await worktreeTreeResult(cwd, { sourceTree: true });
+	const branch = await readCurrentBranch(exec, cwd);
+	const file = evidenceFile(repoDocsDir(cwd), branch);
+	const keyed = tree.kind === "tree" ? { tree: tree.tree, srcTree: tree.sourceTree, root: tree.root } : undefined;
+	return { branch, file, records: readEvidence(file), keyed, srcTree: keyed?.srcTree };
+}
+
+function verifyRecordFor(request: LaunchRequest, log: VerifyLog, result: { failed: boolean; structured?: unknown }, runId?: string) {
+	return buildVerifyRecord({ ts: new Date().toISOString(), branch: log.branch, ...log.keyed, runId, scope: parseRecheck(request.reason) ? "recheck" : "branch", categories: riskCategories(request.reason), result });
 }
 
 function routeLabel(route: ResolvedRoute, profileName: string | undefined): string {
@@ -265,15 +290,38 @@ export default function (pi: ExtensionAPI) {
 		if (requests.length > MAX_PARALLEL_TASKS) return reject(`Too many parallel tasks (${requests.length}); max ${MAX_PARALLEL_TASKS}.`);
 
 		const resolved = requests.map((request) => ({ request, agent: agents.find((a) => a.name === request.agent) }));
-		const problems = resolved.flatMap(({ request, agent }, i) => admitLaunch(request, agent, agents).map((p) => (requests.length > 1 ? `task ${i + 1}: ${p}` : p)));
+		const admission = resolved.map(({ request, agent }) => admitLaunch(request, agent, agents));
+		const problems = admission.flatMap((found, i) => found.map((p) => (requests.length > 1 ? `task ${i + 1}: ${p}` : p)));
 		problems.push(...writerConflicts(resolved.filter((r) => r.agent).map((r) => ({ agent: r.agent!, surfaces: r.request.allowedEditSurfaces ?? [] })), activeWriters));
+
+		const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);
+
+		// Verify budget (S7), read from the evidence log of this repository and branch; a launch that is already rejected is not judged.
+		const verifyTasks = resolved.flatMap(({ request, agent }, i) => (agent?.name === VERIFY_AGENT && admission[i].length === 0 ? [{ index: i, request }] : []));
+		const verifyLog = verifyTasks.length > 0 ? await readVerifyLog(exec, ctx.cwd) : undefined;
+		const asks: string[] = [];
+		if (verifyLog) {
+			// Tasks of this call count against each other: the log has no record of them yet.
+			const seen: EvidenceRecord[] = [...verifyLog.records];
+			for (const { index, request } of verifyTasks) {
+				const verdict = verifyBudget(seen, { reason: request.reason, branch: verifyLog.branch }, verifyLog.srcTree);
+				const label = requests.length > 1 ? `task ${index + 1}: ` : "";
+				if (!verdict.ok && !verdict.ask) {
+					problems.push(`${label}${verdict.message}`);
+					continue;
+				}
+				if (!verdict.ok) asks.push(`${label}${verdict.message}`);
+				seen.push(verifyRecordFor(request, verifyLog, { failed: false, structured: { verdicts: [], blockers: [] } }));
+			}
+		}
 
 		// Model routing: session profile > default profile > agent definition > this session's model. One model per agent.
 		const { file } = readProfiles();
 		const profile = effectiveProfile(file, ctx.sessionManager.getBranch());
 		const parent = { model: currentModelRef(ctx), thinking: ctx.thinkingLevel };
 		const catalog = modelCatalog(ctx);
-		const routes = resolved.map(({ agent }) => (agent ? resolveAgentRoute({ profile: profile.profile, agent, parent }) : undefined));
+		// A recheck routes through the profile's recheck key when it has one, else like any verify.
+		const routes = resolved.map(({ request, agent }) => (agent ? resolveAgentRoute({ profile: profile.profile, agent, parent, routeKey: agent.name === VERIFY_AGENT && parseRecheck(request.reason) ? RECHECK_KEY : undefined }) : undefined));
 		routes.forEach((route, i) => {
 			if (route?.model && route.modelSource !== "parent" && "error" in resolveModelRef(route.model, catalog, ctx.model?.provider)) {
 				problems.push(`${requests.length > 1 ? `task ${i + 1}: ` : ""}${resolved[i].request.agent} routes to unknown model "${route.model}" (${routeLabel(route, profile.name)}); fix it with /brigadev:profile set`);
@@ -288,6 +336,14 @@ export default function (pi: ExtensionAPI) {
 			return undefined;
 		});
 		if (problems.length > 0) return reject(`Launch rejected by brigadev delegation rules:\n- ${problems.join("\n- ")}`);
+		// Another branch verify on a changed source tree is the user's call.
+		for (const message of asks) {
+			const instead = "Prove the fix with a repro test RED→GREEN via check instead.";
+			if (!ctx.hasUI) return reject(`Launch rejected by brigadev delegation rules:\n- ${message} It needs the user's confirmation, and there is no UI. ${instead}`);
+			if (!(await ctx.ui.confirm("brigadev: another branch verify?", `${message}\n\nA full verify is the costliest review step. Run it anyway?`))) {
+				return reject(`Launch rejected by brigadev delegation rules:\n- ${message} The user declined. ${instead}`);
+			}
+		}
 
 		// Placeholders carry the routed model so a queued task (beyond MAX_CONCURRENCY) already shows it.
 		const results: RunResult[] = resolved.map(({ request }, i) => ({
@@ -303,8 +359,6 @@ export default function (pi: ExtensionAPI) {
 		const hooks: LaunchHooks = { onUpdate: onUpdate as LaunchHooks["onUpdate"] };
 
 		const price = costCalculator(ctx);
-		const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);
-
 		// Agents card rows, one per task that got a slot.
 		const cards = new Map<number, AgentRun>();
 		const id = launchSeq++;
@@ -372,6 +426,18 @@ export default function (pi: ExtensionAPI) {
 				),
 			);
 		} finally {
+			// Every verify that ran leaves one record (S6), whatever its outcome; the log must never fail the launch.
+			if (verifyLog?.keyed) {
+				try {
+					for (const { index, request } of verifyTasks) {
+						const result = results[index];
+						const status = runStatus(result);
+						if (status === "done" || status === "failed") appendEvidence(verifyLog.file, verifyRecordFor(request, verifyLog, { failed: status === "failed", structured: result.structured }, result.runId));
+					}
+				} catch {
+					// Evidence is a ledger, not part of the run.
+				}
+			}
 			// It no longer counts as running, its rows settle, and its runs stay viewable.
 			if (launchEpoch === epoch) {
 				launches.delete(results);
