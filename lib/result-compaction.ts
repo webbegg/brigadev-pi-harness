@@ -21,7 +21,7 @@ const ADVISORY_REPRO_CHARS = 160;
 const UNVERIFIED_ITEM_CHARS = 300;
 const WARNING_CLAIM_CHARS = 400;
 const WARNING_EVIDENCE_CHARS = 240;
-const WARNING_MAX = 10;
+const WARNING_MAX = 5;
 const REVIEWED_CHARS = 600;
 /** Room kept for the omission marker. */
 const MARKER_CHARS = 260;

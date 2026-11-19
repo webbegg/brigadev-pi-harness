@@ -79,6 +79,16 @@ describe("compactStructured: a review result", () => {
 		assert.match(out, /patch of 3 files, ran the suite/);
 	});
 
+	it("lists at most 5 WARNING findings and counts the rest, with a SUGGESTION count instead of suggestions", () => {
+		const many = { findings: [...Array.from({ length: 7 }, (_, i) => finding(`W-${i + 1}`, "WARNING")), finding("S-1", "SUGGESTION"), finding("S-2", "SUGGESTION"), finding("S-3", "SUGGESTION")], reviewed: "x" };
+		const out = compactStructured(many);
+		for (let i = 1; i <= 5; i++) assert.match(out, new RegExp(`W-${i} WARNING`));
+		assert.ok(!out.includes("W-6") && !out.includes("W-7"), "the sixth and seventh warnings are not listed");
+		assert.match(out, /2 more WARNING findings in the full result/);
+		assert.ok(!out.includes("S-1"), "suggestions are not listed");
+		assert.match(out, /3 SUGGESTION/);
+	});
+
 	it("a clean review says so and keeps `reviewed`", () => {
 		const out = compactStructured({ findings: [], reviewed: "all of it" });
 		assert.match(out, /no findings/i);

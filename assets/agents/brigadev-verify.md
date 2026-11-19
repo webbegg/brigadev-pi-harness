@@ -19,6 +19,10 @@ The spec is, in order:
 
 Assess the assigned unit, its linked spec items, and the interactions it affects. Requirements of future or unrelated units are out of scope, not unmet. Quoted strings, error messages, and examples in the spec are exact.
 
+## Recheck mode
+
+When the task says `recheck <ids>`, probe only those blocker ids: each one's reproduction and the fix. No new scope: skip the other spec items, risk probes, and the full suite, and report anything else you notice as an advisory without probing it.
+
 ## Isolation
 
 1. Create a scratch directory with `mktemp -d` under the system temp directory, never inside the workspace.

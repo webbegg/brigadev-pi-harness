@@ -282,6 +282,13 @@ describe("package workflows composed", () => {
 		assert.ok(!/Risk: item/.test(text));
 	});
 
+	it("Refactor: the verify runs before the PR, never per unit", () => {
+		const text = compose("refactor", { component: "c", goal: "g" });
+		assert.ok(text.includes("`brigadev-verify` runs before the PR"));
+		assert.ok(!text.includes("after the change's own checks"));
+		for (const workflow of loaded.workflows) assert.ok(!/brigadev-verify[^.]*(?<!not )(per|each|every) (work )?unit/i.test(workflow.body), workflow.name);
+	});
+
 	it("no workflow reaches a ticket system or the network by itself: no Jira API, no credentials", () => {
 		for (const workflow of loaded.workflows) assert.ok(!/jira|api[_ -]?token|credential/i.test(workflow.body), workflow.name);
 	});

@@ -29,4 +29,4 @@ Refactor request, started from the workflow menu. Explore the component and its 
 - Constraints: {{constraints}}
 - Test coverage: {{tests}}
 
-"Add tests first" means write characterization tests that pass on the current code before any restructuring. With "Keep the public API", leave exports, signatures, and other contracts untouched. With "The public API may change", update every caller you find, name the API change as a contract change in the summary, and end with `Risk: contract (public API change)`, so an independent `brigadev-verify` runs after the change's own checks. Commit by work unit, following `brigadev-branch-pr`.
+"Add tests first" means write characterization tests that pass on the current code before any restructuring. With "Keep the public API", leave exports, signatures, and other contracts untouched. With "The public API may change", update every caller you find, name the API change as a contract change in the summary, and end with `Risk: contract (public API change)`, so an independent `brigadev-verify` runs before the PR, once for the branch, not per unit. Commit by work unit, following `brigadev-branch-pr`.

@@ -23,8 +23,8 @@ After a writer returns: read its report (covered `S#`/`A#`, commands with observ
 
 ## Verification
 
-Risk `none`: your checks and the spot check suffice. A named risk category: after your own checks, one `brigadev-verify` with `reason: "Risk: <category> (why)"`.
+Risk `none`: your checks and the spot check suffice. A named risk category: verify once per branch, before the PR (not per unit), with `reason: "Risk: <category> (why)"` and the task's `S#`.
 
 Handoff: `featureDoc` and the linked `S#`, or the task's numbered acceptance criteria `A1..An` when there is no feature document; the baseline commit; the exact test, CLI, and typecheck commands it may run. It probes in a `mktemp -d` scratch copy, never the workspace, and returns a compact result (verdicts, blockers, paths); its full result is in the run folder.
 
-Corrections are bounded: one batch fixing every reported blocker, then one new `brigadev-verify` limited to those blockers (IDs and reproductions in its task; your own test re-run is not a recheck). A second correction only if the same blocker still fails, never for a new finding. Leftovers become one **Needs your decision**; advisories never start a correction. If verifier setup fails once, stop with **Needs your decision** naming the missing prerequisite and the unrun checks.
+Corrections are bounded: one batch of blockers plus at most 5 defect WARNINGs in the same files; the rest is one line each in **Follow-ups**. Prove each fix with its repro test, observed RED→GREEN via `check`. A recheck only for security/data blockers, at most one, with `recheck <ids>` in the reason (enforced); otherwise no new `brigadev-verify`. Leftovers become one **Needs your decision**; advisories never start a correction. If verifier setup fails once, stop with **Needs your decision** naming the missing prerequisite and the unrun checks.

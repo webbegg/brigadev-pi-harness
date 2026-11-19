@@ -8,7 +8,7 @@ metadata:
 
 ## When to use
 
-The user asks for a review, or `brigadev-branch-pr` is about to open a PR and the user chose a review scope (review the branch once, after the work units are done). Never review per commit during the work loop: high-risk units get `brigadev-verify`. Review is proportionate: name only the lenses that fit unless the user asks for a full review.
+The user asks for a review, or `brigadev-branch-pr` is about to open a PR and the user chose a review scope (review the branch once, after the work units are done). Never review per commit during the work loop: a high-risk branch gets one `brigadev-verify` before the PR. Review is proportionate: name only the lenses that fit unless the user asks for a full review.
 
 ## Rules
 
@@ -22,7 +22,7 @@ The user asks for a review, or `brigadev-branch-pr` is about to open a PR and th
 | Lens | Pick when the candidate touches |
 | --- | --- |
 | R1 Risk | auth, permissions, secrets, input handling, dependencies, data exposure |
-| R2 Readability | new modules, non-trivial logic, public APIs, large diffs |
+| R2 Readability | prompt/docs diffs or on request only |
 | R3 Reliability | behavior changes, contracts, tests, edge-case-heavy logic |
 | R4 Resilience | I/O, network, retries, migrations, long-running or concurrent code |
 
@@ -45,7 +45,7 @@ git diff --stat <base>...HEAD
    - **follow-up**: `pre-existing` findings;
    - **advisory**: WARNING and SUGGESTION.
    Discard claims without evidence, and say so.
-4. **Correct** (only when the user authorized changes): one correction batch for all blockers, then one re-review limited to those blocker IDs and their lenses. Blockers still open after that become one **Needs your decision**.
+4. **Correct** (only when the user authorized changes): one batch of blockers plus at most 5 defect WARNINGs in the same files; the other advisories are one line each in Follow-ups and never start a correction. Prove each fix with its repro test observed RED→GREEN, not a re-review; re-review the lens only for a security-parser fix. Blockers still open become one **Needs your decision**.
 5. **Save** the final ledger (the Output block) to `reviews/<branch with / as ->.md` in the repo docs folder named in the orchestrator prompt, replacing the branch's earlier ledger, and show it. It lives outside the project; never write it into the repository. Before a PR, blockers still open mean asking the user before the PR is opened.
 6. Remove the scratch directory when done with the literal path `mktemp -d` printed (`rm -rf /var/folders/.../tmp.XXXX`), never `$(…)` or a variable: the guard runs a literal temp-dir path without a confirmation.
 
@@ -54,8 +54,8 @@ git diff --stat <base>...HEAD
 ```
 Candidate: <base>..<head> (<files>, +<add>/-<del>)
 Lenses: <lens — reason>
-Blockers: <id, location, claim, evidence>
+Blockers: <id, location, claim, evidence, in full>
 Follow-ups: ...
-Advisories: ...
+Advisories: <top 5 advisories, one line each>; SUGGESTION count: <n>
 Verdict: clean | blockers fixed | needs your decision
 ```
