@@ -213,10 +213,15 @@ export function resetRiskNotices(): void {
  * category set differs from the last notice for this root and branch (the
  * first call always answers). Never throws: undefined also means no git.
  */
+/** The risk map for a repository slug: the defaults plus `risk` from brigadev.json (used by check and the PR gate). */
+export const riskMapFor = (settings: unknown): ((slug: string) => RiskMap) => {
+	const risk = (settings as { risk?: unknown } | undefined)?.risk;
+	return (slug) => mergeRiskMap(DEFAULT_RISK_MAP, risk, slug).map;
+};
+
 export async function riskNotice(exec: ExecFn, cwd: string, settings: unknown): Promise<string | undefined> {
 	try {
-		const risk = (settings as { risk?: unknown } | undefined)?.risk;
-		const result = await branchRisk(exec, cwd, (slug) => mergeRiskMap(DEFAULT_RISK_MAP, risk, slug).map);
+		const result = await branchRisk(exec, cwd, riskMapFor(settings));
 		if (!result) return undefined;
 		const key = `${result.root}\0${result.branch ?? "HEAD"}`;
 		const signature = `${result.tier}|${Object.keys(result.categories).sort().join(",")}`;

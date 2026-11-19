@@ -6,18 +6,21 @@
  * Subagents load this file explicitly (`-e`), so it must work standalone.
  */
 
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
-import { appendEvidence, evaluateCommitGate, forceRecord, gateDialog, type ForceRecord } from "../lib/evidence.ts";
+import { appendEvidence, branchSlug, evaluateCommitGate, evidenceFile, forceRecord, gateDialog, readEvidence, type ForceRecord } from "../lib/evidence.ts";
 import { checkRefusal, resolveCommand } from "../lib/check.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, sensitiveWords, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
+import { decidePrGate, prCreateDirectory, prGateBlockMessage, prGateDialogText, riskMapFor, type PrGateDecision } from "../lib/pr-gate.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
+import { branchRisk, type RiskCategory } from "../lib/risk-map.ts";
 import { agentDir, CHILD_ENV, childAllowedSurfaces, isChildSession, PACKAGE_ROOT, readSettings, writeSettings } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
 import { worktreeTreeResult } from "../lib/worktree-tree.ts";
@@ -180,6 +183,31 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	};
 
+	/**
+	 * PR risk gate for `gh pr create` (parent only, every permission mode, S9): the branch's tier against its evidence and review ledger.
+	 * Undefined when the command opens no PR. It is advice on top of the human PR decision, so anything that fails while
+	 * reading the facts (no git, a detached HEAD, an unreadable log) fails open instead of blocking the PR.
+	 */
+	const prGate = async (command: string, commandCwd: string): Promise<{ decision: PrGateDecision; categories: RiskCategory[] } | undefined> => {
+		try {
+			const dir = prCreateDirectory(command, commandCwd);
+			if (!dir) return undefined;
+			const risk = await branchRisk(exec, dir, riskMapFor(readSettings()));
+			if (!risk?.branch) return undefined;
+			const docs = repoDocsDir(dir);
+			const decision = decidePrGate({
+				tier: risk.tier,
+				categories: risk.categories,
+				records: readEvidence(evidenceFile(docs, risk.branch)),
+				branch: risk.branch,
+				ledgerExists: existsSync(join(docs, "reviews", `${branchSlug(risk.branch)}.md`)),
+			});
+			return { decision, categories: (Object.keys(risk.categories) as RiskCategory[]).filter((category) => category === "security" || category === "data" || category === "contract") };
+		} catch {
+			return undefined;
+		}
+	};
+
 	/** The command a `check` call will run (explicit, else the configured or detected one, plus the focus); undefined when none resolves, where check only errors. */
 	const checkCallOf = (input: unknown, ctx: ExtensionContext): { command: string } | undefined => {
 		const fields = (input && typeof input === "object" ? input : {}) as { command?: unknown; focus?: unknown };
@@ -245,9 +273,16 @@ export default function (pi: ExtensionAPI) {
 			if (decision.action === "block") return { block: true, reason: decision.reason };
 			const gated = isChild ? undefined : await evidenceGate(command, ctx, commandCwd);
 			if (gated?.reason) return { block: true, reason: gated.reason };
+			// The PR gate shares the PR confirmation in normal mode (one dialog, the reasons and the note appended); in yolo it asks on its own, only for reasons.
+			const pr = isChild ? undefined : await prGate(command, commandCwd);
+			const prBlock = pr?.decision.action === "ask" ? { block: true as const, reason: prGateBlockMessage(pr.decision, pr.categories) } : undefined;
 			if (decision.action === "confirm") {
-				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(command)}\n\nRun it?`);
-				if (!ok) return { block: true, reason: `User declined: ${decision.reason}` };
+				const prText = pr ? prGateDialogText(pr.decision) : "";
+				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(command)}${prText ? `\n\n${prText}` : ""}\n\nRun it?`);
+				if (!ok) return prBlock ?? { block: true, reason: `User declined: ${decision.reason}` };
+			} else if (pr && prBlock) {
+				const ok = await confirm(ctx, "brigadev: PR risk gate", `${commandPreview(command)}\n\n${prGateDialogText(pr.decision)}\n\nOpen the PR anyway?`);
+				if (!ok) return prBlock;
 			}
 			// Every rule allowed the commit: only now is the user's force spent and logged.
 			gated?.settle();
