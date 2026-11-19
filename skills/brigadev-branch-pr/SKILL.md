@@ -22,7 +22,7 @@ Deciding what goes into each commit, creating or preparing a pull request, or sp
 2. Work on a `type/description` branch from the verified default branch (normally already started).
 3. Implement in work units (see Commits), test-first where applicable, running the applicable checks.
 4. If the change exceeds ~400 changed lines, follow Oversized changes before opening anything.
-5. **Review before the PR**, once the work units are done: first ask the scope with one `ask_user_choice`: **Full 4R** (all four lenses, slowest), **Fitting lenses** (recommended: only the lenses the change's risk needs), or **Skip the review** (then say so in the PR body's Risk line). Without a UI, ask in your reply and stop. Then run `brigadev-review` on `<default>...HEAD` with the chosen scope and write the ledger to `reviews/<branch with / as ->.md` in the repo docs folder named in the orchestrator prompt. Show the ledger. If it has blockers, ask the user before opening the PR.
+5. **Review before the PR**, once the work units are done: first ask the scope with one `ask_user_choice`: **Full 4R** (all four lenses), **Fitting lenses** (recommended: only the lenses the change's risk needs), or **Skip the review** (then say so in the PR body's Risk line). Without a UI, ask in your reply and stop. Then run `brigadev-review` on `<default>...HEAD` with the chosen scope and write the ledger to `reviews/<branch with / as ->.md` in the repo docs folder named in the orchestrator prompt. Show the ledger. If it has blockers, ask the user before opening the PR.
 6. Draft the PR body from the repository template (or, with none, the evidence-based body below) and observed evidence. Show it to the user.
 7. On explicit authorization: push, then open the PR with explicit `--repo` and `--base`.
 8. Report required CI status; never call a PR merge-ready on an unverified green claim.
@@ -77,11 +77,11 @@ Add `Closes #N` or `Refs #N` only when the user named an issue. Record only comm
 
 The log is `<repo docs>/evidence/<branch with / as ->.jsonl`, in the repo docs folder named in the orchestrator prompt. Read it with `read` or `grep`; it is JSON lines, and the guard blocks writing it, so never edit it.
 
-- `type:"run"` records: `command`, `kind` (`test` or `check`), `exitCode`, `outcome` (`pass`, `fail`, or `unknown`), `ts`, `tree`, `agent`, and `tail` (the end of the output).
+- `type:"run"` records: `command`, `kind` (`test` or `check`), `exitCode`, `outcome` (`pass`, `fail`, or `unknown`), `ts`, `tree`, `srcTree` (the tree without doc paths), `root` (the repository the run belongs to; a nested repository's own, not the session's), `agent`, and `tail` (the end of the output).
 - `type:"force"` records: the user forced a commit past the evidence gate. State this in the body under Forced commits, with its time; never leave it out.
 - Before: the earliest `fail` run for the bug or the RED test, quoting its `command` and what `tail` shows. Without one (no bug, or nothing was recorded), write `none recorded` instead of inventing it.
-- After: the latest `pass` run, quoting `command` and `outcome`. Prefer a `test` run whose `tree` is the final one; if the last edit came after it, say so.
-- Quote commands and outcomes as logged. Treat `unknown` as not verified. Never claim a check that is not in the log; a check you ran outside the log may be listed as run without a log record.
+- After: the latest `pass` run, quoting `command` and `outcome`. Prefer a `test` run whose `tree` is the final one. A run is also valid for the final tree when its `srcTree` equals the final tree's source tree (only docs changed after it); if a source edit came after it, say so.
+- Quote commands as the model ran them, without the `set -o pipefail; ` the harness puts in front of a piped test run (it is not part of the command), and outcomes as logged. Treat `unknown` as not verified. Never claim a check that is not in the log; a check you ran outside the log may be listed as run without a log record.
 - Secrets: the log stores commands and output tails in plaintext. Before showing the draft, check every command and output tail quoted from it for secrets, tokens, and credentials, and replace them with `<REDACTED>`.
 - No log file: say the PR has no recorded evidence, and list only what you observed yourself.
 

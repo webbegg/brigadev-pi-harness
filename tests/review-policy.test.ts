@@ -156,8 +156,18 @@ describe("review policy checks catch a regression (mutated copies of the asset t
 		});
 
 		it("an option is only named after the invocation", () => {
-			const mutated = mutate(mutate(text, "**Full 4R** (all four lenses, slowest), ", ""), "with the chosen scope", "with the chosen scope (full)");
+			const mutated = mutate(mutate(text, "**Full 4R** (all four lenses), ", ""), "with the chosen scope", "with the chosen scope (full)");
 			assert.match(branchPrProblems(mutated).join("\n"), /full option only after/);
+		});
+
+		it("LOOP R3-007: the options carry no stale timing claim (one reviewer pass now)", () => {
+			assert.doesNotMatch(text, /slowest/);
+		});
+
+		it("GATE R3-002: the evidence section names srcTree and root and the injected pipefail prefix", () => {
+			assert.match(text, /`srcTree`/);
+			assert.match(text, /`root`/);
+			assert.match(text, /without the `set -o pipefail; `/);
 		});
 
 		it("step 5 missing", () => {
@@ -168,5 +178,15 @@ describe("review policy checks catch a regression (mutated copies of the asset t
 			const mutated = text.replace("(recommended: only the lenses the change's risk needs)", "(the default pick)").replace("Show the ledger.", "Share the ledger.");
 			assert.deepEqual(branchPrProblems(mutated), []);
 		});
+	});
+});
+
+describe("team review focus (LOOP R3-007)", () => {
+	const text = read("assets", "workflows", "team-review.md");
+
+	it("names the chosen lens first and adds the lens of any high-risk category, without the legacy item wording", () => {
+		assert.doesNotMatch(text, /that lens only/);
+		assert.doesNotMatch(text, /high-risk item/);
+		assert.match(text, /name the chosen lens first, then add the lens that covers any high-risk category/);
 	});
 });

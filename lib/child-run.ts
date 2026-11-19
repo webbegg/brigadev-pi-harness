@@ -620,7 +620,11 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 		});
 		// A child that ended mid-message leaves no live text behind.
 		delete result.partial;
-		if (aborted) throw new Error("Subagent was aborted");
+		if (aborted) {
+			// The folder is written before the error leaves, so the parent can be told where the partial run is.
+			saveArtifacts(options, result, deps);
+			throw new Error(result.artifactsDir ? `Subagent was aborted (partial run saved in ${result.artifactsDir})` : "Subagent was aborted");
+		}
 		if (structured && !failed(result)) {
 			const check = checkStructuredRun(result.messages, options.schema!);
 			if (check.ok) result.structured = check.value;
@@ -635,7 +639,7 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 
 /** Saves the attempt's folder under the repo docs; a failed write never fails the run. */
 function saveArtifacts(options: RunOptions, result: RunResult, deps: ChildRunDeps): void {
-	if (!result.runId) return;
+	if (!result.runId || result.artifactsDir) return;
 	try {
 		result.artifactsDir = writeRunArtifacts((deps.docsDir ?? repoDocsDir)(options.cwd), {
 			runId: result.runId,

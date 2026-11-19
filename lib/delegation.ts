@@ -21,8 +21,12 @@ export interface ActiveWriter {
 	surfaces: string[];
 }
 
-/** A named high-risk category (`Risk: security (why)`); the legacy numbered form (`item 2`) is still admitted. */
-const RISK_REASON = /\brisk\s*:?\s*(data|security|contract|concurrency|delivery|untested)\b|\b(risk\s*:?\s*)?item\s*[1-6]\b/i;
+/**
+ * A named high-risk category (`Risk: security (why)`); the legacy numbered form (`Risk: item 2`) is still admitted. The literal
+ * `Risk:` (colon required) must come right before the category or item, and not after a word that negates or lowers it
+ * (`no risk: security`, `low risk data`, `explore item 3` do not admit).
+ */
+const RISK_REASON = /(?<![\w-])(?<!\b(?:no|not|low|without|zero|minimal|any|little|non|never)\s+)risk\s*:\s*(?:(?:data|security|contract|concurrency|delivery|untested)\b|item\s*[1-6]\b)/i;
 
 /**
  * Checks one launch against the delegation rules. Returns the list of

@@ -387,7 +387,8 @@ function classifyRm(args: string[], viaXargs: boolean): CommandMatch | undefined
 const STAYS_ON_BRANCH_GIT = new Set(["add", "rm", "mv", "status", "diff", "log", "show", "apply", "fetch", "pull", "push", "commit", "stash", "tag", "blame", "ls-files", "rev-parse", "remote", "describe"]);
 
 // Variables that point git at another repository, work tree, ref store, or index.
-const GIT_LOCATION_ASSIGNMENT = /^(GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_INDEX_FILE)=/;
+// GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT/KEY_n/VALUE_n and GIT_CONFIG_GLOBAL can set `core.worktree` or `core.bare` from the environment, like `-c`.
+const GIT_LOCATION_ASSIGNMENT = /^(GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_INDEX_FILE|GIT_CONFIG(?:_[A-Z0-9_]+)?)=/;
 
 /** Any word of the segment assigns a git-location variable (prefix, `env`, `export`, `declare -x`, ...). */
 function setsGitLocation(rawArgv: string[]): boolean {
@@ -420,7 +421,7 @@ function gitTargetsElsewhere(args: string[], rawArgv: string[]): boolean {
 	const gitAt = rawArgv.findIndex((a) => basename(a) === "git");
 	if (setsGitLocation(rawArgv.slice(0, Math.max(gitAt, 0)))) return true;
 	const index = gitSubcommand(args);
-	return args.slice(0, Math.max(index, 0)).some((a, i) => a === "-C" || a.startsWith("--git-dir") || a.startsWith("--work-tree") || (a === "-c" && /^core\.(worktree|bare)\b/i.test(args[i + 1] ?? "")));
+	return args.slice(0, Math.max(index, 0)).some((a, i) => a === "-C" || a.startsWith("--git-dir") || a.startsWith("--work-tree") || a.startsWith("--config-env") || (a === "-c" && /^core\.(worktree|bare)\b/i.test(args[i + 1] ?? "")));
 }
 
 /** Returns the git subcommand index, skipping global options such as -C <dir>. */
@@ -734,7 +735,7 @@ export function commitDirectory(command: string, cwd: string, home: string = hom
 		let dir = dirs[i];
 		for (let j = 0; j < index && dir !== undefined; j++) {
 			if (args[j] === "-C") dir = moveDirectory(dir, args[++j], home);
-			else if (args[j].startsWith("--git-dir") || args[j].startsWith("--work-tree") || (args[j] === "-c" && /^core\.(worktree|bare)\b/i.test(args[j + 1] ?? ""))) return undefined;
+			else if (args[j].startsWith("--git-dir") || args[j].startsWith("--work-tree") || args[j].startsWith("--config-env") || (args[j] === "-c" && /^core\.(worktree|bare)\b/i.test(args[j + 1] ?? ""))) return undefined;
 			else if (args[j] === "-c" || args[j] === "--namespace") j++;
 		}
 		if (dir === undefined || (found !== undefined && dir !== found)) return undefined;

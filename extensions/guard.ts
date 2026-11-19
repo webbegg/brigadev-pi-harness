@@ -13,7 +13,8 @@ import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
 import { appendEvidence, evaluateCommitGate, forceRecord, gateDialog, type ForceRecord } from "../lib/evidence.ts";
-import { bashWritesEvidence, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
+import { checkRefusal, resolveCommand } from "../lib/check.ts";
+import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, sensitiveWords, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
@@ -179,6 +180,13 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	};
 
+	/** The command a `check` call will run (explicit, else the configured or detected one, plus the focus); undefined when none resolves, where check only errors. */
+	const checkCallOf = (input: unknown, ctx: ExtensionContext): { command: string } | undefined => {
+		const fields = (input && typeof input === "object" ? input : {}) as { command?: unknown; focus?: unknown };
+		const choice = resolveCommand({ command: typeof fields.command === "string" ? fields.command : undefined, focus: typeof fields.focus === "string" ? fields.focus : undefined, cwd: ctx.cwd, settings: readSettings() });
+		return "command" in choice ? { command: choice.command } : undefined;
+	};
+
 	pi.on("session_start", async (_event, ctx) => restoreMode(ctx));
 	pi.on("session_tree", async (_event, ctx) => restoreMode(ctx));
 	// A compaction drops the notice from the model's context: announce the mode again on the next turn.
@@ -198,7 +206,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
 		// `bash` and `bg_start` (a background shell process) are one path: same classification, same permission rules,
 		// same evidence-log and commit-gate rules. `bg_start` adds its working directory, decided like a write into it.
-		const shell = shellCallOf(event.toolName, event.input);
+		// `check` runs a command through `bash -c`: it is decided as a bash call of the command that will run.
+		const shell = event.toolName === CHECK_TOOL ? checkCallOf(event.input, ctx) : shellCallOf(event.toolName, event.input);
 		if (shell) {
 			const { command } = shell;
 			// Where the command starts: a bg_start `cwd` is the same move as `cd <cwd> && <command>`, so relative paths in the
@@ -206,6 +215,15 @@ export default function (pi: ExtensionAPI) {
 			const commandCwd = shell.cwd === undefined ? ctx.cwd : canonicalPath(resolve(ctx.cwd, expandHome(shell.cwd)));
 			// Nobody forges a recorded test result: the evidence log is written only by the recorder. (Textual rule; reading stays allowed.)
 			if ((command.includes("evidence") || commandCwd.includes("evidence")) && bashWritesEvidence(command, [join(repoDocsDir(ctx.cwd), "evidence")], undefined, shell.cwd === undefined ? undefined : commandCwd)) return { block: true, reason: EVIDENCE_BLOCK };
+			if (event.toolName === CHECK_TOOL) {
+				// A test tool never delivers, deletes, or publishes (even in YOLO); and it reads no secret without the sensitive-path question.
+				const refusal = checkRefusal(command);
+				if (refusal) return { block: true, reason: `Blocked by brigadev guard: ${refusal}` };
+				for (const { word, absolute } of sensitiveWords(command, commandCwd)) {
+					const blocked = await checkPath(event.toolName, word, absolute, false, ctx, true);
+					if (blocked) return blocked;
+				}
+			}
 			if (shell.cwd !== undefined) {
 				const blocked = await checkPath(event.toolName, shell.cwd, commandCwd, true, ctx, true);
 				if (blocked) return blocked;

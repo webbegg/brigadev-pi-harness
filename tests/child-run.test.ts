@@ -480,6 +480,30 @@ describe("runChild: structured output", () => {
 	});
 });
 
+describe("runChild: abort names the saved folder (LOOP R3-003)", () => {
+	it("the abort error carries the run's folder path", async () => {
+		const abort = new AbortController();
+		const h = harness({ signal: abort.signal });
+		const promise = h.start();
+		const proc = await h.ready();
+		abort.abort();
+		proc.close(null);
+		await assert.rejects(promise, (error: Error) => /^Subagent was aborted/.test(error.message) && error.message.includes(path.join(h.docs, "runs", h.savedRuns()[0])));
+		assert.equal(h.savedRuns().length, 1, "saved once");
+	});
+
+	it("the abort error stays plain when the folder could not be written", async () => {
+		const abort = new AbortController();
+		const h = harness({ signal: abort.signal });
+		fs.writeFileSync(path.join(h.docs, "runs"), "not a folder");
+		const promise = h.start();
+		const proc = await h.ready();
+		abort.abort();
+		proc.close(null);
+		await assert.rejects(promise, (error: Error) => error.message === "Subagent was aborted");
+	});
+});
+
 describe("runChild: artifacts", () => {
 	it("a failed artifact write never fails the run", async () => {
 		const h = harness();

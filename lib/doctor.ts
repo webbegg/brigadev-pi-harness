@@ -25,7 +25,13 @@ const roots = (() => {
 	return list.map((r) => r + sep);
 })();
 
-const isBrigadev = (tool: ToolInfo): boolean => roots.some((r) => (tool.sourceInfo?.path ?? "").startsWith(r));
+/** Tools brigadev's own extensions register. Pi may report one without a source path: the name then says whose it is. */
+const OWN_TOOL = /^(?:subagent|todo|ask_user_choice|check|bg_[a-z]+)$/;
+
+const isBrigadev = (tool: ToolInfo): boolean => {
+	const path = tool.sourceInfo?.path;
+	return path ? roots.some((r) => path.startsWith(r)) : OWN_TOOL.test(tool.name);
+};
 const isShipped = (tool: ToolInfo): boolean => tool.sourceInfo?.source === "builtin" || tool.sourceInfo?.source === "sdk";
 const sizeOf = (tool: ToolInfo): number => JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.parameters }).length;
 const origin = (tool: ToolInfo): string => tool.sourceInfo?.source ?? tool.sourceInfo?.path ?? "unknown source";
@@ -43,7 +49,8 @@ export interface ToolReport {
 
 export function analyzeTools(tools: readonly ToolInfo[]): ToolReport {
 	const foreign = tools.filter((t) => !isShipped(t) && !isBrigadev(t)).map((t) => ({ ...t, chars: sizeOf(t) }));
-	const delegation = foreign.filter((t) => DELEGATION.test(t.name) || DELEGATION.test(t.description ?? ""));
+	// By name only: a description that mentions delegation is documentation, not a competing tool.
+	const delegation = foreign.filter((t) => DELEGATION.test(t.name));
 	const totalChars = foreign.reduce((sum, t) => sum + t.chars, 0);
 	const oversized = totalChars > TOOL_CHARS_LIMIT;
 	const warnings: string[] = [];

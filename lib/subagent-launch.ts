@@ -56,7 +56,8 @@ export interface LaunchHooks {
  * What the parent reads of one task (S12): a structured result as verdicts, blockers and paths, long text as head and tail,
  * and the path of the full result in the run folder. The tool details keep the whole run for the viewer.
  */
-export const taskOutput = (r: RunResult): string => compactResult({ structured: !failed(r) ? r.structured : undefined, text: output(r), artifactsDir: r.artifactsDir });
+export const taskOutput = (r: RunResult): string =>
+	compactResult({ structured: !failed(r) ? r.structured : undefined, text: output(r), artifactsDir: r.artifactsDir, notSaved: r.runId !== undefined && r.artifactsDir === undefined });
 
 /** The content the model reads. */
 export function toResult(mode: Details["mode"], { details, warnings }: Launched): LaunchResult {

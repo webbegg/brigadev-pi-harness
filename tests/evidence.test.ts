@@ -72,6 +72,28 @@ describe("checkOutcome", () => {
 		assert.equal(checkOutcome("set -o pipefail; npm test 2>&1 | tail -5", 1), "fail");
 	});
 
+	it("GATE R1-002: a later `set` (turning pipefail or errexit off) makes the run untrusted", () => {
+		for (const command of [
+			"set -o pipefail && set +o pipefail && npm test | tail",
+			"set -o pipefail; set +o pipefail; npm test | tail",
+			"set -o pipefail; set +e; npm test | tail",
+			"set -o pipefail; npm test | tail && set +o pipefail",
+			"set -o pipefail; echo x && set +o pipefail && npm test | tail",
+		]) {
+			assert.equal(checkOutcome(command, 0), "unknown", command);
+			assert.equal(checkOutcome(command, 1), "unknown", command);
+		}
+		assert.equal(checkOutcome("set -o pipefail; npm test | tail", 0), "pass", "the leading setter still counts");
+	});
+
+	it("GATE R3-001: exit 141 (SIGPIPE from a consumer that closed early) under pipefail is unknown, not a failure", () => {
+		assert.equal(checkOutcome("set -o pipefail; node --test | head -5", 141), "unknown");
+		assert.equal(checkOutcome("set -o pipefail; npm test 2>&1 | head", 141), "unknown");
+		assert.equal(checkOutcome("set -o pipefail; node --test | head -5", 1), "fail");
+		assert.equal(checkOutcome("set -o pipefail; node --test | head -5", 0), "pass");
+		assert.equal(checkOutcome("node --test", 141), "fail", "without a pipe 141 is the runner's own code");
+	});
+
 	it("is unknown when a later command owns the exit code", () => {
 		assert.equal(checkOutcome("npm test 2>&1 | tail -5", 0), "unknown");
 		assert.equal(checkOutcome("npm test; echo done", 0), "unknown");

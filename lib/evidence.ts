@@ -295,6 +295,8 @@ export function checkOutcome(command: string, exitCode: number | undefined, cont
 		const { argv, before } = segments[i];
 		const allowed = (i === 0 && before === "") || before === "&&" || (before === ";" && pipefail && i === 1) || (before === "|" && (i <= found.index || pipefail));
 		if (!allowed || argv[0] === "!" || argv.some((word) => word.startsWith("#"))) return "unknown";
+		// Only the leading setter counts: a later `set` (`set +o pipefail`, `set +e`) can take back what it granted.
+		if (i > 0 && executableName(unwrap(argv).argv[0] ?? "") === "set") return "unknown";
 	}
 
 	let dir = context.cwd ? canonicalPath(context.cwd) : undefined;
@@ -309,6 +311,8 @@ export function checkOutcome(command: string, exitCode: number | undefined, cont
 			if (!dir) return "unknown";
 		}
 	}
+	// Under pipefail a consumer that closes early (`| head`) kills the runner with SIGPIPE: 141 says nothing about the tests.
+	if (exitCode === 141 && pipefail && segments.some((segment) => segment.before === "|")) return "unknown";
 	return exitCode === 0 ? "pass" : "fail";
 }
 

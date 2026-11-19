@@ -17,6 +17,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { COMPACT_INSTRUCTIONS, type ControlState, decide, formatTokens, type Reason, recordCompaction, resolveContextSettings } from "../lib/context-control.ts";
 import { isChildSession, readSettings } from "../lib/runtime.ts";
 
+/** A compaction that has not called back by now counts as lost: the swallowed prompt is resubmitted anyway. */
+const COMPACT_SAFETY_MS = 120_000;
+
 /** When the last assistant message of the current branch was written (resumed sessions have no in-memory turn). */
 function lastAssistantMs(ctx: ExtensionContext): number | undefined {
 	let branch: any[] = [];
@@ -56,21 +59,31 @@ export default function (pi: ExtensionAPI) {
 		turnsSinceCompact = 0;
 		recordCompaction({ atMs: Date.now(), reason, tokens });
 		ctx.ui.notify(`brigadev: compacting context (${formatTokens(tokens)} tokens, ${reason === "idle" ? "cache is cold after the idle gap" : "over the threshold"})`, "info");
-		const finish = () => {
+		// Whichever of complete, error, a synchronous throw, or the safety timeout comes first settles it; the rest do nothing,
+		// so the swallowed prompt is resubmitted exactly once and `inFlight` never sticks.
+		let settled = false;
+		let safety: ReturnType<typeof setTimeout> | undefined;
+		const finish = (notice?: { message: string; type: "info" | "warning" }) => {
+			if (settled) return;
+			settled = true;
+			if (safety !== undefined) clearTimeout(safety);
 			inFlight = false;
+			if (notice) ctx.ui.notify(notice.message, notice.type);
 			then?.();
 		};
-		ctx.compact({
-			customInstructions: COMPACT_INSTRUCTIONS,
-			onComplete: () => {
-				ctx.ui.notify("brigadev: context compacted", "info");
-				finish();
-			},
-			onError: (error: Error) => {
-				ctx.ui.notify(`brigadev: compaction failed (${error.message})`, "warning");
-				finish();
-			},
-		});
+		if (then) {
+			safety = setTimeout(() => finish({ message: "brigadev: compaction did not report back; continuing with your prompt", type: "warning" }), COMPACT_SAFETY_MS);
+			safety.unref?.();
+		}
+		try {
+			ctx.compact({
+				customInstructions: COMPACT_INSTRUCTIONS,
+				onComplete: () => finish({ message: "brigadev: context compacted", type: "info" }),
+				onError: (error: Error) => finish({ message: `brigadev: compaction failed (${error.message})`, type: "warning" }),
+			});
+		} catch (error) {
+			finish({ message: `brigadev: compaction failed (${error instanceof Error ? error.message : String(error)})`, type: "warning" });
+		}
 	}
 
 	pi.on("turn_end", async () => {
@@ -98,7 +111,8 @@ export default function (pi: ExtensionAPI) {
 		const decision = decide(s, settings(), Date.now());
 		if (decision.action !== "compact") return { action: "continue" as const };
 		const content = event.images?.length ? [{ type: "text" as const, text: event.text }, ...event.images] : event.text;
-		compact(ctx, decision.reason, s.tokens as number, () => pi.sendUserMessage(content, { expandPromptTemplates: true }));
+		// While the agent is running, a message needs a delivery mode; a follow-up waits for it to finish.
+		compact(ctx, decision.reason, s.tokens as number, () => pi.sendUserMessage(content, ctx.isIdle() ? { expandPromptTemplates: true } : { expandPromptTemplates: true, deliverAs: "followUp" }));
 		return { action: "handled" as const };
 	});
 }

@@ -438,6 +438,17 @@ describe("toResult: the content text", () => {
 		assert.ok(parallel.includes("Full result: /docs/runs/r0/result.json") && parallel.includes("Full result: /docs/runs/r1/result.json"));
 	});
 
+	it("LOOP R3-003: a run whose folder could not be saved says so; a saved one does not", async () => {
+		const h = rig([{}, {}, {}]);
+		const structured = { verdicts: [{ spec: "S1", verdict: "met", evidence: "ok" }], blockers: [], advisories: [], regressionTests: [], scratch: [], unverified: [] };
+		h.runner(async (call) => (call.index === 0 ? reply("task 0", "answer", { runId: "r0" }) : call.index === 1 ? reply("task 1", "", { runId: "r1", structured }) : reply("task 2", "saved", { runId: "r2", artifactsDir: "/docs/runs/r2" })));
+		const text = toResult("parallel", await h.launch("parallel")).content[0].text;
+		const [first, second, third] = text.split("\n\n---\n\n");
+		assert.ok(first.endsWith("answer\n\n(full result not saved)"), first);
+		assert.ok(second.endsWith("(full result not saved)"), second);
+		assert.ok(!third.includes("not saved") && third.endsWith("Full result: /docs/runs/r2/result.json"), third);
+	});
+
 	it("S12: a long failure text is cut to head and tail", async () => {
 		const h = rig([{}]);
 		h.runner(async () => errored("task 0", `START${"e".repeat(40_000)}END`));

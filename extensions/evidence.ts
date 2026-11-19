@@ -18,7 +18,12 @@
  *
  * A recognized test run whose output is piped (`node --test | tail -20`) gets
  * `set -o pipefail; ` in front before it runs, so its exit code is the
- * runner's and the outcome can be trusted.
+ * runner's and the outcome can be trusted. Pi's bash tool runs commands in
+ * bash (or zsh), where `pipefail` exists; the prefix would be an error in a
+ * plain POSIX `sh` such as dash, which Pi's bash tool does not use. When the
+ * consumer closes early (`| head`) the runner can die of SIGPIPE: exit 141
+ * under the injected prefix is recorded as `unknown`, not as a failure
+ * (lib/evidence.ts `checkOutcome`).
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";

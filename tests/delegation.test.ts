@@ -65,6 +65,12 @@ describe("admitLaunch", () => {
 		assert.ok(admitLaunch({ agent: "brigadev-verify", task: "t", reason: "security review please" }, verify, all).length > 0);
 	});
 
+	it("LOOP R1-003: admits only a literal `Risk:` followed by a category or item, not look-alike text", () => {
+		const admitted = (reason: string) => admitLaunch({ agent: "brigadev-verify", task: "t", reason }, verify, all).length === 0;
+		for (const reason of ["no risk: security", "low risk data", "risk untested", "explore item 3", "no risk: item 2", "without risk: data (x)", "Risk item 2", "Risk: item"]) assert.equal(admitted(reason), false, reason);
+		for (const reason of ["Risk: security (x)", "Risk: item 2 (x)", "RISK: Data (x)", "Risk: security (x); Risk: item 4 (y)", "Context handoff. Risk: delivery (push)", "Risk:untested"]) assert.equal(admitted(reason), true, reason);
+	});
+
 	it("names the real delegation triggers when the reason is missing", () => {
 		const [problem] = admitLaunch({ agent: "brigadev-explore", task: "t", reason: "" }, explore, all);
 		assert.match(problem, /exploration/);

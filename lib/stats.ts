@@ -115,10 +115,18 @@ function segmentPhase(segment: string): Phase {
 	return "other";
 }
 
-/** Phase of one bash command: poll if it sleeps, else deliver, verify, explore (every segment read-like), other. */
+/** A segment that waits: `sleep` or `gh run watch` as the command word (text that merely mentions sleep does not). */
+function isPollSegment(segment: string): boolean {
+	const args = words(segment);
+	const first = (args[0] ?? "").replace(/^.*\//, "");
+	return first === "sleep" || (first === "gh" && args[1] === "run" && args[2] === "watch");
+}
+
+/** Phase of one bash command: poll if a segment sleeps or watches a run, else deliver, verify, explore (every segment read-like), other. */
 export function classifyBash(command: string): Phase {
-	if (/\bsleep\b/.test(command)) return "poll";
-	const phases = command.split(SEGMENT_SPLIT).filter((s) => s.trim()).map(segmentPhase);
+	const segments = command.split(SEGMENT_SPLIT).filter((s) => s.trim());
+	if (segments.some(isPollSegment)) return "poll";
+	const phases = segments.map(segmentPhase);
 	if (phases.length === 0) return "other";
 	for (const phase of ["deliver", "verify"] as const) if (phases.includes(phase)) return phase;
 	return phases.every((p) => p === "explore") ? "explore" : "other";
@@ -301,9 +309,11 @@ export function computeStats(sessions: SessionLog[], evidence: EvidenceRecord[])
 
 function summarizeEvidence(records: EvidenceRecord[], from: number, to: number): NonNullable<Stats["evidence"]> {
 	const out = { pass: 0, fail: 0, unknown: 0, forces: 0 };
+	// Sessions without a single timestamp have no window to match records against: count none, not all.
+	if (!Number.isFinite(from) || !Number.isFinite(to)) return out;
 	for (const r of records) {
 		const at = Date.parse(r.ts);
-		if (Number.isFinite(from) && Number.isFinite(at) && (at < from || at > to)) continue;
+		if (Number.isFinite(at) && (at < from || at > to)) continue;
 		if (r.type === "force") out.forces++;
 		else if (r.outcome === "pass" || r.outcome === "fail" || r.outcome === "unknown") out[r.outcome]++;
 	}
@@ -387,7 +397,13 @@ export function readEvidenceDir(docsDir: string): EvidenceRecord[] {
 	const records: EvidenceRecord[] = [];
 	for (const name of readdirSync(dir)) {
 		if (!name.endsWith(".jsonl")) continue;
-		for (const parsed of parseJsonl(readFileSync(join(dir, name), "utf8"))) {
+		let text: string;
+		try {
+			text = readFileSync(join(dir, name), "utf8");
+		} catch {
+			continue; // One unreadable log does not hide the rest.
+		}
+		for (const parsed of parseJsonl(text)) {
 			const r = parsed as { v?: unknown; type?: unknown };
 			if (r.v === 1 && (r.type === "run" || r.type === "force")) records.push(parsed as EvidenceRecord);
 		}

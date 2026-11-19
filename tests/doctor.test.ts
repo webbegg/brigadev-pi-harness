@@ -21,15 +21,31 @@ describe("analyzeTools", () => {
 		assert.equal(r.oversized, false);
 		assert.deepEqual(r.warnings, []);
 	});
-	it("warns about another package's delegation-like tool (name or description)", () => {
+	it("warns about another package's delegation-like tool (by name)", () => {
 		const byName = analyzeTools([own("subagent"), foreign("subagent")]);
 		assert.deepEqual(byName.delegation.map((t) => t.name), ["subagent"]);
-		const byDescription = analyzeTools([foreign("run_helper", "Spawn agent to do work in parallel")]);
-		assert.deepEqual(byDescription.delegation.map((t) => t.name), ["run_helper"]);
 		assert.equal(analyzeTools([foreign("delegate_task")]).delegation.length, 1);
+		assert.equal(analyzeTools([foreign("spawn_agents")]).delegation.length, 1);
 		assert.equal(byName.warnings.length, 1);
 		assert.match(byName.warnings[0], /delegation tool.*subagent/);
 	});
+	it("LOOP R3-006: a description that merely mentions delegation does not flag a tool whose name does not", () => {
+		const r = analyzeTools([foreign("run_helper", "Spawn agent to do work in parallel"), foreign("notes", "Notes the subagent output and delegates nothing")]);
+		assert.deepEqual(r.delegation, []);
+		assert.deepEqual(r.warnings, []);
+	});
+
+	it("LOOP R3-006: brigadev's own tools are recognized by name when Pi gives no source path", () => {
+		const bare = (name: string, description = "x"): ToolInfo => ({ name, description, parameters: {} });
+		const r = analyzeTools([bare("subagent", "Delegate work to a subagent"), bare("todo"), bare("ask_user_choice"), bare("check"), bare("bg_start"), bare("bg_status"), bare("bg_list"), bare("bg_kill")]);
+		assert.deepEqual(r.delegation, []);
+		assert.deepEqual(r.foreign, []);
+		// Another package's tool by the same name still counts: it has its own path.
+		assert.equal(analyzeTools([foreign("subagent")]).delegation.length, 1);
+		// An unknown tool without a path is not assumed to be brigadev's.
+		assert.equal(analyzeTools([bare("delegate_task")]).delegation.length, 1);
+	});
+
 	it("warns when other packages' definitions exceed 8,000 chars in total", () => {
 		const small = analyzeTools([foreign("a", "x".repeat(3000)), foreign("b", "y".repeat(3000))]);
 		assert.equal(small.oversized, false);

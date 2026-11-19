@@ -236,9 +236,9 @@ describe("package workflows composed", () => {
 		assert.ok(!text.includes("or check it out in a separate worktree"));
 	});
 
-	it("Review a team PR: any other focus is that lens only, plus the lens a high-risk item needs", () => {
+	it("Review a team PR: any other focus names that lens first, plus the lens a high-risk category needs", () => {
 		const text = compose("team-review", { focus: "Reliability" });
-		for (const needle of ["Focus: Reliability", "Any other focus means review with that lens only", "unless the change carries a high-risk item", "add the lens that covers it and say so"]) assert.ok(text.includes(needle), needle);
+		for (const needle of ["Focus: Reliability", "Any other focus: name the chosen lens first", "add the lens that covers any high-risk category the change carries", "and say so"]) assert.ok(text.includes(needle), needle);
 	});
 
 	it("both PR workflows list the same way: 0 PRs ask for a number, 1-5 get ask_user_choice with one option per PR, more than 5 get the 5 most recently updated", () => {

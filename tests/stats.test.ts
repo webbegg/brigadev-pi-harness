@@ -52,6 +52,16 @@ describe("phase classification", () => {
 		assert.equal(bash("sed -i s/a/b/ f"), "other");
 	});
 
+	it("LOOP R3-005: only a `sleep` or `gh run watch` command word polls, not text that mentions sleep", () => {
+		for (const command of ["sleep 5", "FOO=1 sleep 5", "gh run watch", "npm test; sleep 2", "echo a | sleep 1"]) assert.equal(bash(command), "poll", command);
+		assert.equal(bash("grep -rn sleep src"), "explore");
+		assert.equal(bash("cat notes-about-sleep.md"), "explore");
+		assert.equal(bash("echo 'sleep well'"), "explore");
+		assert.equal(bash("npm test -- --grep sleep"), "verify");
+		assert.equal(bash("git commit -m 'no more sleep loops'"), "deliver");
+		assert.equal(bash("mkdir sleeper"), "other");
+	});
+
 	it("classifies a turn by its highest-priority tool call; no tool call is text-only", () => {
 		const call = (name: string, command?: string) => ({ name, arguments: command === undefined ? {} : { command } });
 		assert.equal(classifyTurn([]), "text-only");
@@ -143,6 +153,25 @@ describe("computeStats across sessions", () => {
 
 	it("widens the evidence window to every selected session", () => {
 		assert.deepEqual(stats.evidence, { pass: 2, fail: 1, unknown: 1, forces: 1 });
+	});
+});
+
+describe("computeStats evidence window (LOOP R3-005)", () => {
+	it("counts no evidence for sessions without timestamps", () => {
+		const untimed: SessionLog = { id: "u", entries: [{ type: "message", message: { role: "assistant", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 1 } }, content: [] } }] };
+		const stats = computeStats([untimed], evidence());
+		assert.deepEqual(stats.evidence, { pass: 0, fail: 0, unknown: 0, forces: 0 });
+	});
+
+	it("skips an unreadable evidence file instead of failing the report", () => {
+		const docs = mkdtempSync(join(tmpdir(), "brigadev-stats-ev-"));
+		try {
+			cpSync(join(FIXTURES, "evidence"), join(docs, "evidence"), { recursive: true });
+			mkdirSync(join(docs, "evidence", "a-directory.jsonl")); // reading it as a file throws EISDIR
+			assert.deepEqual(readEvidenceDir(docs), readEvidenceDir(FIXTURES));
+		} finally {
+			rmSync(docs, { recursive: true, force: true });
+		}
 	});
 });
 

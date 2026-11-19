@@ -202,4 +202,63 @@ describe("extension", () => {
 		assert.deepEqual(await oldInput({ text: "x", source: "interactive", streamingBehavior: "steer" }, old.ctx), { action: "continue" });
 		assert.equal(compactions.length + old.compactions.length, 0);
 	});
+
+	// LOOP R1-001 / R3-004: the swallowed prompt is resubmitted exactly once, whatever ctx.compact does.
+	const idleBranch = () => ({ branch: [{ type: "message", message: { role: "assistant", timestamp: Date.now() - 90 * MIN } }] });
+
+	it("resubmits at once when ctx.compact throws, and a later compaction can run", async () => {
+		const { pi, ctx, sent } = setup(170_000);
+		ctx.compact = () => {
+			throw new Error("no session");
+		};
+		assert.deepEqual(await pi.handlers.get("input")![0]({ text: "next", source: "interactive" }, ctx), { action: "handled" });
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0].content, "next");
+		assert.ok(ctx.notifications.some((n: any) => /no session/.test(n.message)));
+		ctx.compact = () => {};
+		await pi.fire("turn_end", {}, ctx);
+		assert.deepEqual(await pi.handlers.get("input")![0]({ text: "again", source: "interactive" }, ctx), { action: "handled" }, "inFlight was reset, so the next prompt over the threshold compacts again");
+	});
+
+	it("resubmits as a follow-up when the agent is not idle when the compaction ends", async () => {
+		const { pi, ctx, sent } = setup(120_000, { ...idleBranch(), autoComplete: false });
+		const compactions: any[] = [];
+		ctx.compact = (o: any) => void compactions.push(o);
+		await pi.handlers.get("input")![0]({ text: "next", source: "interactive" }, ctx);
+		ctx.idle = false;
+		compactions[0].onComplete({});
+		assert.deepEqual(sent[0].options, { expandPromptTemplates: true, deliverAs: "followUp" });
+		const second = setup(120_000, idleBranch());
+		second.ctx.idle = true;
+		await second.pi.handlers.get("input")![0]({ text: "next", source: "interactive" }, second.ctx);
+		assert.deepEqual(second.sent[0].options, { expandPromptTemplates: true });
+	});
+
+	it("a compaction that never calls back is resubmitted by the safety timeout, once", async (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const { pi, ctx, sent } = setup(120_000, { ...idleBranch(), autoComplete: false });
+		const compactions: any[] = [];
+		ctx.compact = (o: any) => void compactions.push(o);
+		await pi.handlers.get("input")![0]({ text: "next", source: "interactive" }, ctx);
+		t.mock.timers.tick(119_000);
+		assert.equal(sent.length, 0);
+		t.mock.timers.tick(2_000);
+		assert.equal(sent.length, 1);
+		compactions[0].onComplete({});
+		compactions[0].onError(new Error("late"));
+		t.mock.timers.tick(300_000);
+		assert.equal(sent.length, 1, "exactly once");
+	});
+
+	it("a callback that arrives in time cancels the safety timeout and fires twice at most once", async (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const { pi, ctx, sent } = setup(120_000, { ...idleBranch(), autoComplete: false });
+		const compactions: any[] = [];
+		ctx.compact = (o: any) => void compactions.push(o);
+		await pi.handlers.get("input")![0]({ text: "next", source: "interactive" }, ctx);
+		compactions[0].onComplete({});
+		compactions[0].onError(new Error("again"));
+		t.mock.timers.tick(300_000);
+		assert.equal(sent.length, 1);
+	});
 });

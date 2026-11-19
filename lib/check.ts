@@ -9,6 +9,7 @@ import { spawn } from "node:child_process";
 import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { classifyCommand, COMMAND_KIND } from "./command-classifier.ts";
 import { readCurrentBranch } from "./commit-branch.ts";
 import { appendEvidence, buildRunRecord, checkDirectory, checkKind, checkOutcome, type CheckOutcome, evidenceFile, settleRunTree } from "./evidence.ts";
 import { repoDocsDir } from "./repo-docs.ts";
@@ -68,6 +69,15 @@ export function resolveCommand(input: { command?: string; focus?: string; cwd: s
 	if (base) return { command: withFocus(base, input.focus) };
 	const detected = detectTestCommand(input.cwd);
 	return "error" in detected ? detected : { command: withFocus(detected.command, input.focus) };
+}
+
+/** Why `check` will not run a command: a test tool never delivers, deletes, or publishes. */
+export const CHECK_REFUSAL = "check runs tests; use bash for commits, pushes, PRs, removals, and publishing (those go through the guard's confirmation).";
+
+/** A refusal when the classifier sees a delivery (commit, push, PR), destructive, or publish command in `command`; undefined for anything else. */
+export function checkRefusal(command: string): string | undefined {
+	const found = classifyCommand(command).filter((match) => match.commit || match.kind === COMMAND_KIND.DELIVERY || match.kind === COMMAND_KIND.DESTRUCTIVE || match.kind === COMMAND_KIND.PUBLISH);
+	return found.length > 0 ? `${CHECK_REFUSAL} (${[...new Set(found.map((match) => match.reason))].join("; ")})` : undefined;
 }
 
 // --- Counts ----------------------------------------------------------------
@@ -385,6 +395,8 @@ export async function runCheck(request: CheckRequest, env: CheckEnvironment): Pr
 	const choice = resolveCommand({ command: request.command, focus: request.focus, cwd: env.cwd, settings: env.settings });
 	if ("error" in choice) return { text: `Error: ${choice.error}`, isError: true };
 	const { command } = choice;
+	const refusal = checkRefusal(command);
+	if (refusal) return { text: `Error: ${refusal}`, isError: true };
 
 	const dir = checkDirectory(command, env.cwd);
 	let before: Awaited<ReturnType<typeof trees>>;

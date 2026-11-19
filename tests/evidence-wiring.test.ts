@@ -386,6 +386,16 @@ describe("the recorder (S8a pipefail, S8b nested repositories, S8c docs)", () =>
 		assert.equal(record?.exitCode, 1);
 	});
 
+	it("GATE R3-001: a piped test run that ends in SIGPIPE (141) under the injected pipefail is recorded as unknown", async () => {
+		const before = records().length;
+		const s = await recorder(parent);
+		const ran = await s.run("cd nested && node --test tests/a.test.ts | head -5", 141);
+		assert.equal(ran, "set -o pipefail; cd nested && node --test tests/a.test.ts | head -5");
+		assert.equal(records().length, before + 1);
+		assert.equal(records().at(-1)?.outcome, "unknown");
+		assert.equal(records().at(-1)?.exitCode, 141);
+	});
+
 	it("does not touch a command that needs no pipefail, or is not a test run", async () => {
 		const s = await recorder(parent);
 		assert.equal(await s.run("cd nested && npm test", 0), "cd nested && npm test");

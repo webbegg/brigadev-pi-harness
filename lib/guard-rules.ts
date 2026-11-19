@@ -161,6 +161,24 @@ export function shellCallOf(toolName: string, input: unknown): { command: string
 	return typeof fields.cwd === "string" && fields.cwd.trim() !== "" ? { command, cwd: fields.cwd } : { command };
 }
 
+/** The tool that runs a test command through the shell (extensions/check.ts); the guard decides its command like bash. */
+export const CHECK_TOOL = "check";
+
+/**
+ * Paths a shell command string names that commonly hold secrets (`cat ~/.ssh/id_rsa`, a `.env` focus, `< .env`), canonical,
+ * resolved against `cwd` (`~`, `$HOME`, and `${HOME}` expand). Textual and conservative: any word that looks like such a path counts.
+ */
+export function sensitiveWords(command: string, cwd: string, home: string = homedir()): Array<{ word: string; absolute: string }> {
+	const found: Array<{ word: string; absolute: string }> = [];
+	for (const word of command.split(/[\s'"`<>=;|&(){}]+/)) {
+		if (word === "") continue;
+		const expanded = word.replace(/^\$\{?HOME\}?(?=\/|$)/, home).replace(/^~(?=\/|$)/, home);
+		const absolute = canonicalPath(resolve(cwd, expanded));
+		if (isSensitivePath(absolute) || isSensitivePath(`${absolute}/`)) found.push({ word, absolute });
+	}
+	return found;
+}
+
 export interface BashDecisionInput {
 	command: string;
 	mode: PermissionMode;
