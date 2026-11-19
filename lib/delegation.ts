@@ -1,4 +1,5 @@
 import type { AgentDefinition } from "./agents.ts";
+import type { EvidenceRecord, VerifyRecord } from "./evidence.ts";
 import { surfacesOverlap, validateSurfaces } from "./edit-surfaces.ts";
 
 export interface LaunchRequest {
@@ -27,6 +28,111 @@ export interface ActiveWriter {
  * (`no risk: security`, `low risk data`, `explore item 3` do not admit).
  */
 const RISK_REASON = /(?<![\w-])(?<!\b(?:no|not|low|without|zero|minimal|any|little|non|never)\s+)risk\s*:\s*(?:(?:data|security|contract|concurrency|delivery|untested)\b|item\s*[1-6]\b)/i;
+/** The same reason, reading only the named category (`Risk: security (why)`); the numbered form names none. */
+const RISK_CATEGORY = /(?<![\w-])(?<!\b(?:no|not|low|without|zero|minimal|any|little|non|never)\s+)risk\s*:\s*(data|security|contract|concurrency|delivery|untested)\b/gi;
+
+export const VERIFY_AGENT = "brigadev-verify";
+/** Categories a recheck is worth its cost for. */
+const RECHECK_CATEGORIES = new Set(["security", "data"]);
+const RECHECK_REASON = /(?<![\w-])recheck\s+(B\d+(?:\s*,\s*B\d+)*)(?![\w])/i;
+
+/** Categories a reason names with `Risk: <category>`, lowercased, in order, without duplicates. */
+export function riskCategories(reason: string): string[] {
+	return [...new Set([...reason.matchAll(RISK_CATEGORY)].map((m) => m[1].toLowerCase()))];
+}
+
+/** Blocker ids of a recheck reason (`recheck B1,B2`, case-insensitive); undefined when the reason is not a recheck. */
+export function parseRecheck(reason: string): string[] | undefined {
+	const ids = RECHECK_REASON.exec(reason)?.[1];
+	return ids ? ids.split(",").map((id) => id.trim().toUpperCase()) : undefined;
+}
+
+/** A verify that was admitted and has not written its record yet: counted by the budget like a finished clean one. */
+export type PendingVerify = VerifyRecord & { pending: true };
+
+const reserved = new Map<string, PendingVerify[]>();
+
+/** The verifies admitted but not yet recorded for a repository root and branch key. */
+export function pendingVerifies(key: string): readonly PendingVerify[] {
+	return reserved.get(key) ?? [];
+}
+
+/** Reserves a verify under `key` until the returned function runs (idempotent); call it once the run's record is appended. */
+export function reserveVerify(key: string, record: PendingVerify): () => void {
+	const list = reserved.get(key) ?? [];
+	list.push(record);
+	reserved.set(key, list);
+	return () => {
+		const at = list.indexOf(record);
+		if (at >= 0) list.splice(at, 1);
+		if (list.length === 0 && reserved.get(key) === list) reserved.delete(key);
+	};
+}
+
+let admissionTail: Promise<void> = Promise.resolve();
+
+/**
+ * Queues for the verify admission critical section (read the log, judge the budget, reserve). Call it synchronously, before any
+ * await, so sibling tool calls of one message are admitted one at a time; the returned function ends the section.
+ */
+export function enterVerifyAdmission(): Promise<() => void> {
+	const before = admissionTail;
+	let leave!: () => void;
+	admissionTail = new Promise<void>((resolve) => (leave = resolve));
+	return before.then(() => leave);
+}
+
+export interface VerifyRequest {
+	reason: string;
+	branch: string | null;
+}
+
+export type VerifyBudget = { ok: true } | { ok: false; ask?: boolean; message: string };
+
+const REPRO_ADVICE = "prove the fix with a repro test RED→GREEN via check (it fails before the fix and passes after) instead of another verify";
+
+/**
+ * The verify budget (S7), judged from the evidence log so it holds across sessions: one branch verify per source tree, a new
+ * source tree asks the user, and at most one recheck after a branch verify, only of that verify's blockers and only for security
+ * or data. A failed run used nothing up: it never counts. `srcTree` is the current source tree (undefined when unknown).
+ */
+export function verifyBudget(records: readonly EvidenceRecord[], request: VerifyRequest, srcTree: string | undefined): VerifyBudget {
+	const finished = records.filter((r): r is VerifyRecord => r.type === "verify" && r.branch === request.branch && r.outcome !== "failed");
+	const branchVerifies = finished.filter((r) => r.scope === "branch");
+	const ids = parseRecheck(request.reason);
+
+	if (ids === undefined) {
+		if (branchVerifies.length === 0) return { ok: true };
+		const sameTree = srcTree === undefined ? [] : branchVerifies.filter((r) => r.srcTree === srcTree);
+		// Only verifies that ended unverified proved nothing about this tree: another one is the user's call, not a hard stop.
+		if (sameTree.length > 0 && sameTree.every((r) => r.outcome === "unverified")) {
+			return { ok: false, ask: true, message: "The last branch verify on this source tree ended unverified; this is another branch verify on it." };
+		}
+		if (sameTree.length > 0) {
+			return { ok: false, message: `${VERIFY_AGENT} already verified this source tree; do not launch another. ${REPRO_ADVICE}. After a fix, one recheck of its security or data blockers is allowed: reason "Risk: security (why); recheck B1,B2".` };
+		}
+		return { ok: false, ask: true, message: "A branch verify already ran on this branch; this is another branch verify on a changed source tree." };
+	}
+
+	const last = branchVerifies.at(-1);
+	if (!last) return { ok: false, message: `recheck needs an earlier branch verify on this branch, and there is no earlier branch verify. Launch ${VERIFY_AGENT} without "recheck" first.` };
+	const lastAt = finished.lastIndexOf(last);
+	if ((last as Partial<PendingVerify>).pending) {
+		return { ok: false, message: `The branch verify is still running, so its blockers are not known yet. Wait for its result before a recheck.` };
+	}
+	if (finished.slice(lastAt + 1).some((r) => r.scope === "recheck")) {
+		return { ok: false, message: `Only one recheck per branch verify, and it is used. ${REPRO_ADVICE}; anything still failing goes to the user as a decision.` };
+	}
+	if (!ids.every((id) => last.blockers.includes(id))) {
+		const known = last.blockers.length > 0 ? `blockers of the last branch verify: ${last.blockers.join(", ")}` : "the last branch verify reported no blockers";
+		return { ok: false, message: `recheck names ids that are not ${known}. Name only those ids ("recheck B1,B2"); ${REPRO_ADVICE}.` };
+	}
+	const category = riskCategories(request.reason)[0];
+	if (!category || !RECHECK_CATEGORIES.has(category)) {
+		return { ok: false, message: `A recheck runs only for security or data blockers: put "Risk: security (why)" or "Risk: data (why)" in reason. For other categories ${REPRO_ADVICE}.` };
+	}
+	return { ok: true };
+}
 
 /**
  * Checks one launch against the delegation rules. Returns the list of

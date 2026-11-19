@@ -13,6 +13,7 @@ import { classifyCommand, COMMAND_KIND } from "./command-classifier.ts";
 import { readCurrentBranch } from "./commit-branch.ts";
 import { appendEvidence, buildRunRecord, checkDirectory, checkKind, checkOutcome, type CheckOutcome, evidenceFile, settleRunTree } from "./evidence.ts";
 import { repoDocsDir } from "./repo-docs.ts";
+import { riskNotice } from "./risk-map.ts";
 import type { ExecFn } from "./worktree-snapshot.ts";
 import { worktreeTreeResult } from "./worktree-tree.ts";
 
@@ -446,8 +447,10 @@ export async function runCheck(request: CheckRequest, env: CheckEnvironment): Pr
 	}
 
 	const shaped = shapeResult({ command, exitCode: run.exitCode, signal: run.signal, timedOut: run.timedOut, aborted: run.aborted, durationMs: run.durationMs, output: run.output, outputFile });
+	// One risk line, only when the branch's tier or categories changed since the last one; never fatal.
+	const notice = await riskNotice(env.exec, dir, env.settings);
 	return {
-		text: vouches ? shaped : `${shaped}\n${NOT_RECORDED}`,
+		text: `${vouches ? shaped : `${shaped}\n${NOT_RECORDED}`}${notice ? `\n${notice}` : ""}`,
 		details: { command, exitCode: run.exitCode, outcome, outputFile, durationMs: run.durationMs, counts: parseCounts(run.output), recorded },
 	};
 }

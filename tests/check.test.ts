@@ -1,10 +1,13 @@
 // S13: lib/check.ts: command detection, count parsing, and result shaping for the `check` tool.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, describe, it } from "node:test";
-import { configuredTestCommand, detectTestCommand, evidenceOutcome, formatCounts, parseCounts, resolveCommand, shapeResult, withFocus } from "../lib/check.ts";
+import { after, before, describe, it } from "node:test";
+import { configuredTestCommand, detectTestCommand, evidenceOutcome, formatCounts, parseCounts, resolveCommand, runCheck, shapeResult, withFocus } from "../lib/check.ts";
+import { resetRiskNotices } from "../lib/risk-map.ts";
+import type { ExecFn } from "../lib/worktree-snapshot.ts";
 
 const root = mkdtempSync(join(tmpdir(), "check-lib-"));
 after(() => rmSync(root, { recursive: true, force: true }));
@@ -200,5 +203,74 @@ describe("evidenceOutcome", () => {
 	it("is unknown for a run that lists tests or prints help instead of running them", () => {
 		assert.equal(evidenceOutcome("npm test -- --help", 0), "unknown");
 		assert.equal(evidenceOutcome("pytest --collect-only", 0), "unknown");
+	});
+});
+
+describe("runCheck risk notice (S5)", () => {
+	const saved = process.env.BRIGADEV_HOME;
+	const exec: ExecFn = async (command, args, options) => {
+		try {
+			return { stdout: execFileSync(command, args, { cwd: options.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }), stderr: "", code: 0 };
+		} catch (error: any) {
+			return { stdout: String(error.stdout ?? ""), stderr: String(error.stderr ?? ""), code: error.status ?? 1 };
+		}
+	};
+	let repo: string;
+	const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	const write = (path: string) => {
+		mkdirSync(join(repo, path, ".."), { recursive: true });
+		writeFileSync(join(repo, path), `${Math.random()}\n`);
+	};
+	const run = (cwd = repo, execFn: ExecFn = exec) => runCheck({}, { cwd, exec: execFn, agent: "parent", settings: { check: { test: "node -e 0" } } });
+
+	before(() => {
+		process.env.BRIGADEV_HOME = join(root, "home");
+		repo = join(root, "risk-repo");
+		mkdirSync(repo, { recursive: true });
+		git("init", "-q", "-b", "main");
+		write("README.md");
+		git("add", "-A");
+		git("commit", "-q", "-m", "init");
+		git("checkout", "-q", "-b", "feat/x");
+		resetRiskNotices();
+	});
+	after(() => {
+		if (saved === undefined) delete process.env.BRIGADEV_HOME;
+		else process.env.BRIGADEV_HOME = saved;
+	});
+
+	it("appends one risk line on the first run, nothing while tier and categories stay, and a line when they change", async () => {
+		const first = await run();
+		assert.match(first.text, /^PASS exit=0 /);
+		assert.equal(first.text.split("\n").at(-1), "risk T0 → tests only");
+		const quiet = await run();
+		assert.doesNotMatch(quiet.text, /^risk /m);
+		assert.equal(quiet.text.split("\n").length, first.text.split("\n").length - 1, "the result is otherwise identical in shape");
+
+		write("src/render.ts");
+		assert.equal((await run()).text.split("\n").at(-1), "risk T1 → before PR: review R3");
+		write("src/render2.ts");
+		assert.doesNotMatch((await run()).text, /^risk /m);
+		write("src/guard.ts");
+		assert.match((await run()).text.split("\n").at(-1) ?? "", /^risk T2 security\(src\/guard\.ts\) → before PR: brigadev-verify \+ R1,R3$/);
+		assert.equal(first.details?.recorded, quiet.details?.recorded);
+	});
+
+	it("adds nothing outside git or when git fails, and never throws", async () => {
+		const plain = project("risk-plain", {});
+		assert.doesNotMatch((await run(plain)).text, /^risk /m);
+		const failing: ExecFn = async () => {
+			throw new Error("boom");
+		};
+		resetRiskNotices();
+		const result = await run(repo, failing);
+		assert.match(result.text, /^PASS exit=0 /);
+		assert.doesNotMatch(result.text, /^risk /m);
+	});
+
+	it("does not add the notice to a refusal", async () => {
+		const result = await runCheck({ command: "git push" }, { cwd: repo, exec, agent: "parent", settings: {} });
+		assert.equal(result.isError, true);
+		assert.doesNotMatch(result.text, /^risk /m);
 	});
 });

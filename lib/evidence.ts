@@ -81,7 +81,36 @@ export interface ForceRecord {
 	command: string;
 }
 
-export type EvidenceRecord = RunRecord | ForceRecord;
+export type VerifyScope = "branch" | "recheck";
+export type VerifyOutcome = "clean" | "blockers" | "unverified" | "failed";
+
+/**
+ * A finished brigadev-verify (S6). It records that a verifier ran, never that tests passed: the commit gate reads
+ * only `run` records, so a verify record cannot satisfy it. The verify budget (lib/delegation.ts) reads these.
+ */
+export interface VerifyRecord {
+	v: 1;
+	type: "verify";
+	ts: string;
+	branch: string | null;
+	/** Worktree content tree the verify started on. */
+	tree?: string;
+	/** The same tree without doc paths: what the budget compares. */
+	srcTree?: string;
+	/** Top level of the repository the verify belongs to. */
+	root?: string;
+	runId?: string;
+	scope: VerifyScope;
+	/** Risk categories named in the launch reason. */
+	categories: string[];
+	/** Blocker ids as the parent reads them (`B1`, `B2`, ...). */
+	blockers: string[];
+	outcome: VerifyOutcome;
+	/** A recheck: the blocker ids its reason named, the only ones it probed. */
+	rechecked?: string[];
+}
+
+export type EvidenceRecord = RunRecord | ForceRecord | VerifyRecord;
 
 /** Skips leading option words (`-y`, `--silent`). */
 const skipFlags = (args: string[]): string[] => {
@@ -372,6 +401,53 @@ export function settleRunTree(before: string | undefined, after: string | undefi
 	return srcTree ? { record: true, tree: after, srcTree } : { record: true, tree: after };
 }
 
+const UNMET_VERDICTS = new Set(["unmet", "not implemented"]);
+const MET_VERDICTS = new Set(["met", "out of scope"]);
+
+const verdictOf = (entry: unknown): string | undefined => {
+	const verdict = asObject(entry)?.verdict;
+	return typeof verdict === "string" ? verdict.trim().toLowerCase() : undefined;
+};
+
+/**
+ * Blocker ids and outcome of a verify result. Blocker entries (`B1`, ...) or unmet verdicts (listed by spec id when there is no
+ * blocker entry) beat everything else. `clean` needs a complete result: a non-empty `verdicts` array that is all met or out of
+ * scope (case-insensitive), a `blockers` array that is empty, and nothing unverified; anything else, unreadable payloads
+ * included, is unverified, never clean.
+ */
+function verifyFindings(result: { failed: boolean; structured?: unknown }): { blockers: string[]; outcome: VerifyOutcome } {
+	if (result.failed) return { blockers: [], outcome: "failed" };
+	const payload = asObject(result.structured);
+	if (!payload) return { blockers: [], outcome: "unverified" };
+	const verdicts = Array.isArray(payload.verdicts) ? payload.verdicts : undefined;
+	const entries = Array.isArray(payload.blockers) ? payload.blockers : undefined;
+	const blockers = (entries ?? []).map((_, i) => `B${i + 1}`);
+	if (blockers.length === 0 && verdicts) {
+		const unmet = verdicts.flatMap((entry, i) => {
+			const verdict = verdictOf(entry);
+			if (verdict === undefined || !UNMET_VERDICTS.has(verdict)) return [];
+			const spec = asObject(entry)?.spec;
+			return [typeof spec === "string" && spec.trim() ? spec.trim() : `verdict ${i + 1}`];
+		});
+		if (unmet.length > 0) return { blockers: unmet, outcome: "blockers" };
+	}
+	if (blockers.length > 0) return { blockers, outcome: "blockers" };
+	const complete = verdicts !== undefined && verdicts.length > 0 && verdicts.every((entry) => MET_VERDICTS.has(verdictOf(entry) ?? "")) && entries !== undefined;
+	const unverifiedClear = payload.unverified === undefined || (Array.isArray(payload.unverified) && payload.unverified.length === 0);
+	return { blockers: [], outcome: complete && unverifiedClear ? "clean" : "unverified" };
+}
+
+export function buildVerifyRecord(input: { ts: string; branch: string | null; tree?: string; srcTree?: string; root?: string; runId?: string; scope: VerifyScope; categories: readonly string[]; rechecked?: readonly string[]; result: { failed: boolean; structured?: unknown } }): VerifyRecord {
+	const { blockers, outcome } = verifyFindings(input.result);
+	const record: VerifyRecord = { v: 1, type: "verify", ts: input.ts, branch: input.branch, scope: input.scope, categories: [...input.categories], blockers, outcome };
+	if (input.tree) record.tree = input.tree;
+	if (input.srcTree) record.srcTree = input.srcTree;
+	if (input.root) record.root = input.root;
+	if (input.runId) record.runId = input.runId;
+	if (input.scope === "recheck" && input.rechecked?.length) record.rechecked = [...input.rechecked];
+	return record;
+}
+
 export function branchSlug(branch: string | null): string {
 	return branch ? branch.replace(/[^A-Za-z0-9._-]+/g, "-") : "detached";
 }
@@ -393,7 +469,7 @@ export function readEvidence(file: string): EvidenceRecord[] {
 		if (!line.trim()) continue;
 		try {
 			const parsed = JSON.parse(line);
-			if (parsed?.v === 1 && (parsed.type === "run" || parsed.type === "force")) records.push(parsed);
+			if (parsed?.v === 1 && (parsed.type === "run" || parsed.type === "force" || parsed.type === "verify")) records.push(parsed);
 		} catch {
 			// A torn or hand-edited line must not hide the rest of the log.
 		}

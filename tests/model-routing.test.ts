@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it } from "node:test";
-import { parseProfilesFile, resolveAgentRoute, resolveModelRef, routeFor, unmatchedKeys, validateProfileName, withRoute, emptyProfilesFile } from "../lib/model-routing.ts";
+import { RECHECK_KEY, parseProfilesFile, resolveAgentRoute, resolveModelRef, routeFor, unmatchedKeys, validateProfileName, withRoute, emptyProfilesFile } from "../lib/model-routing.ts";
 
 const catalog = [
 	{ provider: "claude-bridge", id: "claude-haiku-5-5" },
@@ -76,6 +78,46 @@ describe("resolveAgentRoute", () => {
 	});
 	it("reports no profile key when the profile supplied nothing", () => {
 		assert.equal(resolveAgentRoute({ profile: {}, agent: { name: "x" }, parent }).profileKey, undefined);
+	});
+});
+
+describe("resolveAgentRoute routeKey (S8: recheck route)", () => {
+	const parent = { model: "claude-bridge/claude-opus-5-5", thinking: "high" };
+	const verify = { name: "brigadev-verify" };
+	const profile = { "brigadev-verify": { model: "a/opus", thinking: "high" as const }, "brigadev-verify-recheck": { model: "a/sonnet", thinking: "medium" as const } };
+
+	it("uses the recheck key when the profile has it", () => {
+		const r = resolveAgentRoute({ profile, agent: verify, parent, routeKey: RECHECK_KEY });
+		assert.deepEqual([r.model, r.thinking, r.profileKey, r.modelSource], ["a/sonnet", "medium", "brigadev-verify-recheck", "profile"]);
+	});
+
+	it("falls back to the verify route when the profile has no recheck key", () => {
+		const { "brigadev-verify-recheck": _, ...withoutKey } = profile;
+		const r = resolveAgentRoute({ profile: withoutKey, agent: verify, parent, routeKey: RECHECK_KEY });
+		assert.deepEqual([r.model, r.thinking, r.profileKey], ["a/opus", "high", "brigadev-verify"]);
+		const globbed = resolveAgentRoute({ profile: { "brigadev-*": { model: "a/glob" } }, agent: verify, parent, routeKey: RECHECK_KEY });
+		assert.equal(globbed.model, "a/glob");
+	});
+
+	it("a launch without a routeKey keeps routing by the agent name", () => {
+		assert.equal(resolveAgentRoute({ profile, agent: verify, parent }).model, "a/opus");
+	});
+
+	it("a recheck key that supplies only thinking keeps the verify definition's model", () => {
+		const r = resolveAgentRoute({ profile: { "brigadev-verify-recheck": { thinking: "low" } }, agent: { name: "brigadev-verify", model: "a/def" }, parent, routeKey: RECHECK_KEY });
+		assert.deepEqual([r.model, r.modelSource, r.thinking, r.profileKey], ["a/def", "definition", "low", "brigadev-verify-recheck"]);
+	});
+
+	it("the shipped example profiles route the recheck as specified", () => {
+		const { file } = parseProfilesFile(JSON.parse(readFileSync(join(import.meta.dirname, "..", "assets", "profiles.example.json"), "utf8")));
+		const entry = (name: string) => [file.profiles[name][RECHECK_KEY].model, file.profiles[name][RECHECK_KEY].thinking];
+		assert.deepEqual(entry("balanced"), ["claude-sonnet-5-5", "high"]);
+		assert.deepEqual(entry("economy"), ["claude-sonnet-5-5", "medium"]);
+		assert.deepEqual(entry("deep"), ["claude-opus-5-5", "high"]);
+	});
+
+	it("the recheck key is not reported as an unmatched key", () => {
+		assert.deepEqual(unmatchedKeys({ "brigadev-verify-recheck": {}, "brigadev-wroker": {} }, ["brigadev-verify", "brigadev-worker"]), ["brigadev-wroker"]);
 	});
 });
 

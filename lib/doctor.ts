@@ -2,6 +2,7 @@
 
 import { realpathSync } from "node:fs";
 import { sep } from "node:path";
+import { DEFAULT_RISK_MAP, mergeRiskMap } from "./risk-map.ts";
 import { PACKAGE_ROOT } from "./runtime.ts";
 
 /** The part of `pi.getAllTools()` entries the check reads. */
@@ -36,6 +37,11 @@ const isShipped = (tool: ToolInfo): boolean => tool.sourceInfo?.source === "buil
 const sizeOf = (tool: ToolInfo): number => JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.parameters }).length;
 const origin = (tool: ToolInfo): string => tool.sourceInfo?.source ?? tool.sourceInfo?.path ?? "unknown source";
 const n = (x: number): string => x.toLocaleString("en-US");
+
+/** One warning per `risk` entry in brigadev.json that the risk map ignores (unknown category, non-string glob, wrong shape). */
+export function riskWarnings(risk: unknown): string[] {
+	return mergeRiskMap(DEFAULT_RISK_MAP, risk, "").invalid.map((problem) => `${problem} (ignored)`);
+}
 
 export interface ToolReport {
 	/** Tools from packages other than brigadev (Pi built-ins and sdk tools excluded). */

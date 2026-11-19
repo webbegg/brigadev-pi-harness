@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Review tiers: a path-based risk map (`lib/risk-map.ts`, extra globs under `risk` in `brigadev.json`) sets the branch tier — T0 tests/docs only, T1 one review with the fitting lenses, T2 one `brigadev-verify` plus those lenses before the PR. `check` prints the tier when it changes; `/brigadev:doctor` reports invalid `risk` entries.
+- Finished `brigadev-verify` runs are recorded in the evidence log (`type: "verify"`).
+- `gh pr create` asks, in every mode, when a T2 branch has no verify run or verify blockers have no repro test that failed and then passed.
+- Profile key `brigadev-verify-recheck` routes a recheck to a cheaper model.
+
+### Changed
+
+- Verify runs once per branch before the PR instead of after every unit; a second branch verify on the same source tree is refused and a changed tree asks. A recheck is allowed only for security or data blockers, at most once, with `recheck <ids>` in the launch reason.
+- Blocker fixes are proven by a repro test RED→GREEN instead of a re-review; correction batches are the blockers plus at most five defect WARNINGs in the same files.
+- R2 Readability runs only for prompt/docs diffs or on request. `review-4r` calibrates severity (CRITICAL is a shipped defect; test gaps and wording cap at WARNING) and has an R1 checklist (git config that runs programs, symlinks, fail-open parsing, ReDoS).
+- Compact review results and ledgers list blockers in full, the top five WARNINGs, and a SUGGESTION count.
+- Brace alternation (`{a,b}`) in writer edit-surface globs now means alternation, not literal braces.
+
 ## [0.21.0] - 2026-11-19
 
 ### Breaking
