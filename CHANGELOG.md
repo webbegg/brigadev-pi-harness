@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.23.0-rc.2] - 2026-11-20
+
+Pre-release.
+
+### Fixed
+
+- Web UI: assistant messages render as markdown: headings, emphasis, code, lists and task lists, quotes, tables, and http(s) links. The parser (`assets/web-ui/markdown.js`) returns a tree that the page turns into DOM nodes, so agent text never becomes HTML.
+- Web UI: scrollbars follow the dark theme.
+
 ## [0.23.0-rc.1] - 2026-11-20
 
 Pre-release.
