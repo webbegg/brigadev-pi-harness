@@ -6,6 +6,8 @@
 import { randomBytes } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type Action, BUS, CHANNELS, publish } from "../lib/bus.ts";
+import { basename } from "node:path";
+import { readCurrentBranch } from "../lib/commit-branch.ts";
 import { isChildSession } from "../lib/runtime.ts";
 import { createWebLog } from "../lib/web-log.ts";
 import { webPage } from "../lib/web-page.ts";
@@ -115,11 +117,22 @@ export default function (pi: ExtensionAPI) {
 		"agent_start",
 		guarded(() => log.append({ type: "run", data: { id: "run", running: true, at: Date.now() } })),
 	);
+	// Where the session works: the page's header. The branch is read again after each run (the agent may switch it).
+	const publishSession = async () => {
+		try {
+			const cwd = typeof ctx?.cwd === "string" ? ctx.cwd : process.cwd();
+			const branch = await readCurrentBranch((command, args, options) => pi.exec(command, args, options), cwd);
+			log.append({ type: "session", data: { id: "session", project: basename(cwd), branch } });
+		} catch {
+			// The header just lacks it.
+		}
+	};
 	pi.on(
 		"agent_end",
 		guarded(() => {
 			endLive();
 			log.append({ type: "run", data: { id: "run", running: false, at: Date.now() } });
+			void publishSession();
 		}),
 	);
 	pi.on(
@@ -166,7 +179,10 @@ export default function (pi: ExtensionAPI) {
 			log.append({ type: "tool", data: { id: event.toolCallId, name: cap(String(event.toolName), 80), summary, status: event.isError ? "error" : "done", durationMs, at: Date.now() } });
 		}),
 	);
-	pi.on("session_start", guarded(() => {}));
+	pi.on("session_start", (_event: unknown, context: unknown) => {
+		ctx = context ?? ctx;
+		return publishSession();
+	});
 	pi.on(
 		"session_shutdown",
 		guarded(() => void stop()),

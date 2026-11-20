@@ -99,6 +99,14 @@ export interface AgentState {
 	agent: string;
 	/** First line of the task. */
 	task: string;
+	/** The whole task, capped. */
+	taskText?: string;
+	/** The launch's reason (delegation trigger or `Risk: ...`). */
+	reason?: string;
+	/** The child's most recent tool calls, oldest first. */
+	steps?: AgentStep[];
+	/** What the parent is told, once settled (capped). */
+	output?: string;
 	status: AgentStatus;
 	model?: string;
 	thinking?: string;
@@ -111,6 +119,12 @@ export interface AgentState {
 	endedAt?: number;
 	/** A UI may offer cancel. */
 	cancellable: boolean;
+}
+
+export interface AgentStep {
+	tool: string;
+	/** Path, command or pattern of the call, capped. */
+	summary: string;
 }
 
 export type PromptStatus = "open" | "answered" | "dismissed";

@@ -33,7 +33,7 @@ export interface WebLogOptions {
 }
 
 /** UI-only event types the extension builds from Pi's core events, and the payload field that keys each. */
-export const CORE_KEYED_TYPES: Record<string, string> = { run: "id", tool: "id", assistant_live: "id" };
+export const CORE_KEYED_TYPES: Record<string, string> = { run: "id", tool: "id", assistant_live: "id", session: "id" };
 
 function defaultKeyed(): Record<string, string> {
 	const keyed: Record<string, string> = { ...CORE_KEYED_TYPES };

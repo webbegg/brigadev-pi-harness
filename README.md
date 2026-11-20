@@ -75,7 +75,7 @@ Per field, a launch resolves: session profile, default profile, agent frontmatte
 | `alt+g`, `/brigadev:changes` | Uncommitted files and diffs (read-only) |
 | `alt+a`, `/brigadev:runs` | Agents viewer: every subagent run with its thread (read-only) |
 | `/brigadev:ps` | Background processes started with `bg_start` |
-| `/brigadev:web [start\|stop\|status]` | Local web UI for this session: loop phase, conversation, subagent cards (cancel one), guard and ask prompts (answer from the browser), checks, todos, composer (send, steer, abort) |
+| `/brigadev:web [start\|stop\|status]` | Local web UI for this session: a board of the loop (subagents, checks, commits, your decisions, prompts waiting on you), detail panels, and a composer (send, steer, abort) |
 | `/brigadev:pr` | The current branch's pull request (needs `gh`) |
 | `/brigadev:force-commit`, `/brigadev:yolo-dir` | One-shot commit override; folders where writes run without asking |
 | `/track`, `/review` | Force feature-document tracking; 4R review of a frozen change |
@@ -99,7 +99,14 @@ Profiles live in `~/.pi/agent/brigadev-profiles.json`. Paths, environment variab
 
 ## Web UI
 
-`/brigadev:web` starts a server for the current parent session on `127.0.0.1` (ephemeral port, or `BRIGADEV_WEB_PORT`). It prints a URL with a random token, which every request must carry. The page is one static file with no dependencies. It follows the session over SSE and replays what happened before it was opened.
+`/brigadev:web` starts a server for the current parent session on `127.0.0.1` (ephemeral port, or `BRIGADEV_WEB_PORT`). It prints a URL with a random token; the session data (`/events`) and every action need it. The page is one static file with no dependencies. It follows the session over SSE and replays what happened before it was opened.
+
+The page is a board with one column per loop step: Explore, Decide, Implement, Check, Commit, and a red **Needs you** column.
+
+- Every subagent run, check, commit, choice you made, and batch of the main agent's own tool calls is a card in the step where it happened.
+- Cards show status, verdict, model, tokens, cost, and elapsed time; a running card pulses and can be cancelled.
+- Guard confirmations and `ask_user_choice` questions wait in **Needs you** and can be answered there.
+- Clicking a card opens a side panel: a subagent's output, recent tool calls, and full task; a check's counts; the conversation. The message box stays usable while the panel is open.
 
 The extensions publish their state as snapshots on the brigadev bus, which is typed `brigadev:*` channels on `pi.events` ([lib/bus.ts](lib/bus.ts)):
 

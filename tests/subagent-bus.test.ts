@@ -24,6 +24,9 @@ if (task.includes("HANG")) {
 	line({ type: "message_update", message: message({}), assistantMessageEvent: { type: "text_delta", delta: "working on it" } });
 	setInterval(() => {}, 1000);
 } else {
+	if (task.includes("TOOLS")) {
+		for (let i = 0; i < 15; i++) line({ type: "message_end", message: message({ content: [{ type: "toolCall", id: "c" + i, name: "read", arguments: { path: "lib/f" + i + ".ts" } }], stopReason: "toolUse" }) });
+	}
 	line({ type: "message_end", message: message({ content: [{ type: "text", text: "all done" }], stopReason: "stop" }) });
 	line({ type: "agent_end", messages: [], willRetry: false });
 	line({ type: "agent_settled", aborted: false });
@@ -112,6 +115,24 @@ describe("brigadev:agent snapshots", () => {
 			assert.ok(last.runId, "the run id");
 			assert.ok(last.endedAt !== undefined && last.startedAt !== undefined);
 			assert.equal(latest(pi, first.id), last);
+		});
+	});
+
+	it("a snapshot carries what a detail view needs: the whole task, the reason, recent tool calls, and the output once settled", { timeout: 60_000 }, async () => {
+		await withChild(async ({ pi, ctx }) => {
+			const result = await single(pi, ctx, "TOOLS first line\nsecond line");
+			assert.notEqual(result.isError, true);
+			const all = snapshots(pi);
+			const [first] = all;
+			assert.equal(first.task, "TOOLS first line");
+			assert.equal(first.taskText, "TOOLS first line\nsecond line");
+			assert.equal(first.reason, "independent units");
+			assert.equal(first.output, undefined, "no output before it settles");
+			const last = all.at(-1)!;
+			assert.equal(last.output, "all done");
+			assert.equal(last.steps?.length, 12, "the most recent tool calls only");
+			assert.deepEqual(last.steps?.at(-1), { tool: "read", summary: "lib/f14.ts" });
+			assert.deepEqual(last.steps?.[0], { tool: "read", summary: "lib/f3.ts" });
 		});
 	});
 

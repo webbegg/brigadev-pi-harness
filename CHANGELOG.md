@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Web UI redesigned as a loop board: one column per loop step plus a red **Needs you** column for open guard and `ask_user_choice` prompts. Subagent runs, checks, commits, your choices and the main agent's tool calls are cards in the step where they happened, with status, verdict, model, tokens, cost and elapsed time. A card opens a side panel (output, activity, task; check details; the conversation; tasks; guard log) that leaves the message box usable.
+- `brigadev:agent` snapshots also carry the whole task, the launch reason, the child's last 12 tool calls, and the output once settled. The web UI also receives the session's project and branch.
+
 ## [0.23.0-rc.2] - 2026-11-20
 
 Pre-release.

@@ -24,7 +24,7 @@ import { listWidth, renderTwoPane } from "../lib/two-pane.ts";
 import { emptyTally, formatCost, formatTokens } from "../lib/cost.ts";
 import { installParentExitGuard, KILL_GRACE_MS, liveChildren, runChild } from "../lib/child-run.ts";
 import { isUnfinished, output, runStatus, toRunState, type RunResult } from "../lib/run-status.ts";
-import { BUS, onAction, publish, tail, type AgentState } from "../lib/bus.ts";
+import { BUS, onAction, publish, tail, type AgentState, type AgentStep } from "../lib/bus.ts";
 import { pruneRunFolders, pruneWarning } from "../lib/run-artifacts.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
@@ -130,16 +130,36 @@ function cardUsage(r: RunResult): { tokens: number; cost: number } {
 	return { tokens: r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output, cost: r.usage.cost };
 }
 
+const MAX_BUS_STEPS = 12;
+const MAX_BUS_TASK = 4000;
+const MAX_BUS_OUTPUT = 20_000;
+const STEP_FIELDS = ["path", "file_path", "command", "pattern", "query", "agent"] as const;
+const capText = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max - 1)}…`);
+
+/** The child's last tool calls as one-line steps, for a detail view. */
+function recentSteps(r: RunResult): AgentStep[] {
+	const calls = r.messages.flatMap((m) => (m.role === "assistant" ? m.content.filter((p) => p.type === "toolCall") : []));
+	return calls.slice(-MAX_BUS_STEPS).map((c) => {
+		const args = (c.arguments ?? {}) as Record<string, unknown>;
+		const field = STEP_FIELDS.find((f) => typeof args[f] === "string" && args[f]);
+		return { tool: capText(String(c.name), 80), summary: field ? capText(String(args[field]).replace(/\s+/g, " ").trim(), 160) : "" };
+	});
+}
+
 /** One task as the bus shows it (`brigadev:agent`): a full snapshot, from the same run data as the card. */
 function agentState(launchId: number, index: number, r: RunResult, cancellable: boolean, over: Partial<AgentState> = {}): AgentState {
 	const status = runStatus(r);
 	const live = isUnfinished(status);
+	const steps = recentSteps(r);
 	return {
 		id: `${launchId}:${index}`,
 		launchId: String(launchId),
 		index,
 		agent: r.agent,
 		task: r.task.split("\n")[0],
+		taskText: capText(r.task, MAX_BUS_TASK),
+		steps: steps.length ? steps : undefined,
+		output: live || r.exitCode === -1 ? undefined : capText(output(r), MAX_BUS_OUTPUT),
 		status,
 		model: r.model,
 		thinking: r.thinking,
@@ -437,7 +457,7 @@ export default function (pi: ExtensionAPI) {
 		const lastStatus = new Map<number, string>();
 		const announce = (index: number, over?: Partial<AgentState>) => {
 			try {
-				const state = agentState(id, index, results[index], cancelTasks.has(`${id}:${index}`), over);
+				const state = agentState(id, index, results[index], cancelTasks.has(`${id}:${index}`), { reason: capText(resolved[index]?.request.reason ?? "", 500) || undefined, ...over });
 				lastStatus.set(index, state.status);
 				publish(pi.events, BUS.agent, state);
 			} catch {

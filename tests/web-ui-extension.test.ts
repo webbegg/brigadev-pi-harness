@@ -108,6 +108,27 @@ test("web-ui: registers the command in the parent and nothing in a child session
 	}
 });
 
+test("web-ui: publishes the session's project and branch at start and after each run", async () => {
+	const h = setup();
+	let branch = "feat/one";
+	(h.pi as any).exec = async (command: string, args: string[]) => ({ stdout: command === "git" && args.includes("symbolic-ref") ? `${branch}\n` : "", stderr: "", code: 0, killed: false });
+	const ctx = createFakeCtx({ cwd: "/tmp/my-proj" }) as any;
+	try {
+		await h.pi.fire("session_start", { type: "session_start", reason: "startup" }, ctx);
+		await h.command("");
+		const url = h.url();
+		const first = (await snapshot(h.port(), tokenOf(url))).filter((e) => e.type === "session");
+		assert.deepEqual(first.at(-1)?.data, { id: "session", project: "my-proj", branch: "feat/one" });
+		branch = "feat/two";
+		await h.pi.fire("agent_end", { type: "agent_end" }, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const second = (await snapshot(h.port(), tokenOf(url))).filter((e) => e.type === "session");
+		assert.equal(second.at(-1)?.data.branch, "feat/two");
+	} finally {
+		await stop(h);
+	}
+});
+
 test("web-ui: never starts a server without the command", async () => {
 	const h = setup();
 	await h.pi.fire("agent_start", { type: "agent_start" }, h.ctx);
