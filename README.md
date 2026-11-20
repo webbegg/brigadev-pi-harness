@@ -75,6 +75,7 @@ Per field, a launch resolves: session profile, default profile, agent frontmatte
 | `alt+g`, `/brigadev:changes` | Uncommitted files and diffs (read-only) |
 | `alt+a`, `/brigadev:runs` | Agents viewer: every subagent run with its thread (read-only) |
 | `/brigadev:ps` | Background processes started with `bg_start` |
+| `/brigadev:web [start\|stop\|status]` | Local web UI for this session: loop phase, conversation, subagent cards (cancel one), guard and ask prompts (answer from the browser), checks, todos, composer (send, steer, abort) |
 | `/brigadev:pr` | The current branch's pull request (needs `gh`) |
 | `/brigadev:force-commit`, `/brigadev:yolo-dir` | One-shot commit override; folders where writes run without asking |
 | `/track`, `/review` | Force feature-document tracking; 4R review of a frozen change |
@@ -96,6 +97,22 @@ Also: `/brigadev:agents`, `/brigadev:harness on|off`, `/brigadev:ui footer on|of
 
 Profiles live in `~/.pi/agent/brigadev-profiles.json`. Paths, environment variables, and agent overrides: [docs/configuration.md](docs/configuration.md).
 
+## Web UI
+
+`/brigadev:web` starts a server for the current parent session on `127.0.0.1` (ephemeral port, or `BRIGADEV_WEB_PORT`). It prints a URL with a random token, which every request must carry. The page is one static file with no dependencies. It follows the session over SSE and replays what happened before it was opened.
+
+The extensions publish their state as snapshots on the brigadev bus, which is typed `brigadev:*` channels on `pi.events` ([lib/bus.ts](lib/bus.ts)):
+
+- the loop phase, inferred from tool activity and labeled as inferred;
+- todos and check results;
+- subagent tasks;
+- open and settled prompts;
+- guard decisions and the permission mode.
+
+Guard confirmations and `ask_user_choice` can be answered in the terminal or the browser. The first answer wins and the other dialog closes.
+
+The same channels feed [pi-agent-dashboard](https://github.com/BlackBeltTechnology/pi-agent-dashboard) when it is installed. They are declared for its event forwarding, along with a loop breadcrumb and footer segments. Its own prompt bus shows guard dialogs.
+
 ## Development
 
 ```bash
@@ -111,6 +128,7 @@ Pure logic lives in `lib/` and is covered by `tests/`; extensions in `extensions
 - A read-only child can still write through `bash`.
 - Subagent runs live in the running Pi process: a finished run cannot be resumed, only read from its saved folder (kept 14 days, at most 200).
 - No classifier-based "auto" permission mode.
+- The web UI covers one session per server, and its loop phase is a guess from tool activity. Approving a guard prompt from the browser has the same effect as approving it in the terminal, so keep the URL private.
 - `pi-claude-bridge` runs your Claude Code hooks inside Pi turns: see [docs/claude-bridge.md](docs/claude-bridge.md).
 
 ## License
