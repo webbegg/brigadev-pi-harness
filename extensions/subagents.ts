@@ -23,7 +23,8 @@ import { FULLSCREEN_OVERLAY, themePainter } from "../lib/tui-adapters.ts";
 import { listWidth, renderTwoPane } from "../lib/two-pane.ts";
 import { emptyTally, formatCost, formatTokens } from "../lib/cost.ts";
 import { installParentExitGuard, KILL_GRACE_MS, liveChildren, runChild } from "../lib/child-run.ts";
-import { output, runStatus, toRunState, type RunResult } from "../lib/run-status.ts";
+import { isUnfinished, output, runStatus, toRunState, type RunResult } from "../lib/run-status.ts";
+import { BUS, onAction, publish, tail, type AgentState } from "../lib/bus.ts";
 import { pruneRunFolders, pruneWarning } from "../lib/run-artifacts.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { createSemaphore } from "../lib/semaphore.ts";
@@ -124,6 +125,34 @@ function rowInput(r: RunResult): RowInput {
 	};
 }
 
+/** The agents card's numbers for one run: every kind of token, and the cost. */
+function cardUsage(r: RunResult): { tokens: number; cost: number } {
+	return { tokens: r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output, cost: r.usage.cost };
+}
+
+/** One task as the bus shows it (`brigadev:agent`): a full snapshot, from the same run data as the card. */
+function agentState(launchId: number, index: number, r: RunResult, cancellable: boolean, over: Partial<AgentState> = {}): AgentState {
+	const status = runStatus(r);
+	const live = isUnfinished(status);
+	return {
+		id: `${launchId}:${index}`,
+		launchId: String(launchId),
+		index,
+		agent: r.agent,
+		task: r.task.split("\n")[0],
+		status,
+		model: r.model,
+		thinking: r.thinking,
+		...cardUsage(r),
+		partial: live ? tail(r.partial) : undefined,
+		runId: r.runId,
+		startedAt: r.startedAt,
+		endedAt: r.endedAt,
+		cancellable: cancellable && live,
+		...over,
+	};
+}
+
 /** The evidence log of the repository and branch a verify launches from, and the source tree it would verify. */
 interface VerifyLog {
 	branch: string | null;
@@ -180,6 +209,15 @@ export default function (pi: ExtensionAPI) {
 
 	// One concurrency cap for every launch in this process.
 	const slots = createSemaphore(MAX_CONCURRENCY);
+
+	// Tasks a UI may cancel, by row id (`<launchId>:<index>`): present from admission until the launch ends. A cancel of an
+	// unknown or settled id is ignored. The subscription follows the session so a /reload never leaves a stale listener.
+	const cancelTasks = new Map<string, () => boolean>();
+	let stopListening: (() => void) | undefined;
+	const listen = () => {
+		stopListening ??= onAction(pi.events, "cancel-agent", ({ id }) => void cancelTasks.get(id)?.());
+	};
+	listen();
 
 	// Agents card: live rows above the editor while subagents run.
 	let runs: AgentRun[] = [];
@@ -249,6 +287,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		listen();
 		runs = [];
 		launches.clear();
 		settled = [];
@@ -266,6 +305,8 @@ export default function (pi: ExtensionAPI) {
 	// SIGKILLed before this returns, so no child or grandchild outlives the parent. The wait is bounded: shutdown cannot hang.
 	pi.on("session_shutdown", async () => {
 		stopTimers();
+		stopListening?.();
+		stopListening = undefined;
 		await liveChildren.shutdown({ graceMs: KILL_GRACE_MS + SHUTDOWN_SLACK_MS, setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout) });
 	});
 
@@ -388,26 +429,41 @@ export default function (pi: ExtensionAPI) {
 		const cards = new Map<number, AgentRun>();
 		const id = launchSeq++;
 		const syncCard = (cardRun: AgentRun, r: RunResult) => {
-			cardRun.tokens = r.usage.input + r.usage.cacheRead + r.usage.cacheWrite + r.usage.output;
-			cardRun.cost = r.usage.cost;
+			Object.assign(cardRun, cardUsage(r));
 			if (r.model) cardRun.model = r.model;
+		};
+		// Bus snapshots of this launch's tasks. Never throws: an observer must not change the launch.
+		let cancelTask: ((index: number) => boolean) | undefined;
+		const lastStatus = new Map<number, string>();
+		const announce = (index: number, over?: Partial<AgentState>) => {
+			try {
+				const state = agentState(id, index, results[index], cancelTasks.has(`${id}:${index}`), over);
+				lastStatus.set(index, state.status);
+				publish(pi.events, BUS.agent, state);
+			} catch {
+				// A snapshot that cannot be built is skipped.
+			}
 		};
 		const view: TaskView = {
 			start(index, info) {
 				const cardRun: AgentRun = { id: randomUUID().slice(0, 8), agent: info.agent, task: info.task, state: "running", model: info.model, thinking: info.thinking, tokens: 0, cost: 0, startedAt: info.startedAt };
 				cards.set(index, cardRun);
 				runs.push(cardRun);
+				// The placeholder is replaced right after this hook: the task is running now.
+				announce(index, { status: "running", startedAt: info.startedAt, model: info.model, thinking: info.thinking, cancellable: cancelTasks.has(`${id}:${index}`) });
 				showCard(ctx);
 				repaintViewer?.();
 			},
 			attempt(index, result) {
 				const cardRun = cards.get(index)!;
 				Object.assign(cardRun, { model: result.model, thinking: result.thinking });
+				announce(index);
 				repaintViewer?.();
 			},
 			update(index, partial) {
 				const cardRun = cards.get(index)!;
 				syncCard(cardRun, partial);
+				announce(index);
 				repaintViewer?.();
 			},
 			finish(index, result) {
@@ -415,13 +471,21 @@ export default function (pi: ExtensionAPI) {
 				syncCard(cardRun, result);
 				cardRun.state = runStatus(result) === "done" ? "done" : "failed";
 				cardRun.endedAt = Date.now();
+				announce(index);
 				showCard(ctx);
+				repaintViewer?.();
+			},
+			// A queued task the user cancelled has no card row; the bus still hears how it ended.
+			skipped(index) {
+				announce(index);
 				repaintViewer?.();
 			},
 		};
 
 		const launchEpoch = epoch;
 		launches.set(results, id);
+		results.forEach((_, i) => cancelTasks.set(`${id}:${i}`, () => cancelTask?.(i) ?? false));
+		results.forEach((_, i) => announce(i));
 		syncStatus(ctx);
 		repaintViewer?.();
 
@@ -429,7 +493,7 @@ export default function (pi: ExtensionAPI) {
 			return toResult(
 				mode,
 				await runLaunch(
-					{ mode, tasks, results, signal, hooks },
+					{ mode, tasks, results, signal, hooks, exposeCancel: (cancel) => void (cancelTask = cancel) },
 					{
 						slots,
 						runAgent: (call) =>
@@ -451,6 +515,12 @@ export default function (pi: ExtensionAPI) {
 				),
 			);
 		} finally {
+			// Nothing of this launch can be cancelled any more; each task's last word reaches the bus (a task the launch abort ended included).
+			cancelTask = undefined;
+			results.forEach((_, i) => cancelTasks.delete(`${id}:${i}`));
+			results.forEach((result, i) => {
+				if (lastStatus.get(i) !== runStatus(result) || isUnfinished(runStatus(result))) announce(i);
+			});
 			// Every verify that ran leaves one record (S6), whatever its outcome; the log must never fail the launch.
 			if (verifyLog?.keyed) {
 				try {

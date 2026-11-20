@@ -26,7 +26,7 @@ import type { ResolvedRoute } from "./model-routing.ts";
 import { canonicalPath } from "./paths.ts";
 import { repoDocsDir } from "./repo-docs.ts";
 import { newRunId, writeRunArtifacts } from "./run-artifacts.ts";
-import { failed, finalText, output, type RunResult } from "./run-status.ts";
+import { failed, finalText, output, USER_CANCEL, type RunResult } from "./run-status.ts";
 import { createStallWatchdog, resolveStallTimeouts, stallMessage } from "./stall-watchdog.ts";
 import { checkStructuredRun, type JsonSchema } from "./structured-output.ts";
 
@@ -620,6 +620,12 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 		});
 		// A child that ended mid-message leaves no live text behind.
 		delete result.partial;
+		if (aborted && options.signal?.reason === USER_CANCEL) {
+			// The user cancelled this task alone (the launch goes on): it ends with what it had, flagged cancelled, and its folder is saved below.
+			result.stopReason ??= "aborted";
+			Object.assign(result, { cancelled: true, cancelledBy: "user" });
+			return result;
+		}
 		if (aborted) {
 			// The folder is written before the error leaves, so the parent can be told where the partial run is.
 			saveArtifacts(options, result, deps);

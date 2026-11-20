@@ -23,8 +23,10 @@ export interface RunResult {
 	inherited?: boolean;
 	/** Placeholder of a task that is waiting for a concurrency slot. */
 	queued?: boolean;
-	/** Settled without ever starting (aborted while queued). */
+	/** Settled without finishing: aborted while queued, or (with a real exit code) stopped by the user while running. */
 	cancelled?: boolean;
+	/** Who cancelled it, when a person did (the web UI's cancel); the result text says so. */
+	cancelledBy?: "user";
 	/** Epoch ms when the run was launched (first attempt); drives the row's elapsed time. */
 	startedAt?: number;
 	/** Epoch ms when the run settled; set for aborted placeholders too. */
@@ -40,6 +42,12 @@ export interface RunResult {
 	/** Folder holding task.md, transcript.json, and result.json for this attempt. */
 	artifactsDir?: string;
 }
+
+/**
+ * The abort reason of a task the user cancelled. A task's signal carries it (`AbortSignal.any` keeps the first reason), so
+ * the child runner can tell a cancel, which ends only that task, from an abort of the whole launch, which throws.
+ */
+export const USER_CANCEL: Error = new Error("Cancelled by the user");
 
 export function finalText(messages: Message[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -58,13 +66,14 @@ export type RunStatus = "queued" | "running" | "done" | "failed" | "cancelled";
 /**
  * The one run-state rule. Exit code -1 is a placeholder: with no end time it is unfinished (queued until it gets a slot,
  * else running); with an end time it settled without finishing (cancelled when it never started, else failed).
- * Any other exit code is a real run: failed per `failed`, else done.
+ * Any other exit code is a real run: cancelled when the user stopped it, else failed per `failed`, else done.
  */
 export function runStatus(r: Pick<RunResult, "exitCode" | "endedAt" | "queued" | "cancelled" | "stopReason">): RunStatus {
 	if (r.exitCode === -1) {
 		if (r.endedAt === undefined) return r.queued ? "queued" : "running";
 		return r.cancelled ? "cancelled" : "failed";
 	}
+	if (r.cancelled) return "cancelled";
 	return failed(r) ? "failed" : "done";
 }
 
