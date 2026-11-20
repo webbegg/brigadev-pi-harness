@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- The parent session activates Pi's built-in `codemode` tool at start, next to `grep`, `find`, and `ls`. `/brigadev:codemode on|off` turns it on or off now and for new sessions (`codemode` in `brigadev.json`); off leaves a `codemode` enabled by Pi's own `defaultTools` alone. Subagents are unchanged. Tool calls made from codemode scripts still pass the guard.
+
 ## [0.22.0] - 2026-11-19
 
 ### Added

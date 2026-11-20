@@ -10,12 +10,18 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { repoDocsDir } from "../lib/repo-docs.ts";
-import { appendSystemPromptOnce, ASSETS_ROOT, isChildSession, PACKAGE_ROOT, settingsPath } from "../lib/runtime.ts";
+import { appendSystemPromptOnce, ASSETS_ROOT, isChildSession, PACKAGE_ROOT, readSettings, settingsPath, writeSettings } from "../lib/runtime.ts";
 
 const HARNESS_ENTRY = "brigadev-harness";
 const STATUS_KEY = "brigadev-harness";
 /** Pi built-ins the parent searches with; Pi enables only read, bash, edit, and write by default. */
 const SEARCH_TOOLS = ["grep", "find", "ls"];
+/** Pi's built-in tool that runs scripts calling the other tools; on in the parent unless `codemode: false` in brigadev.json. */
+const CODEMODE_TOOL = "codemode";
+
+function codemodeEnabled(): boolean {
+	return readSettings().codemode !== false;
+}
 
 /** The orchestrator prompt with the assets root and this session's repo docs folder filled in. */
 export function loadOrchestratorPrompt(cwd: string): string {
@@ -48,15 +54,19 @@ export default function (pi: ExtensionAPI) {
 		publishStatus(ctx);
 	};
 
-	/** Adds grep, find, and ls to the active tools once per session start, keeping every other active tool; changes nothing when all are active. */
-	const activateSearchTools = () => {
+	/**
+	 * Adds grep, find, ls, and (unless turned off) codemode to the active tools once per session start, keeping every other active
+	 * tool; changes nothing when all are active. With codemode off it is not removed: Pi's own `defaultTools` may enable it.
+	 */
+	const activateParentTools = () => {
+		const wanted = codemodeEnabled() ? [...SEARCH_TOOLS, CODEMODE_TOOL] : SEARCH_TOOLS;
 		const active = pi.getActiveTools();
-		if (SEARCH_TOOLS.every((name) => active.includes(name))) return;
-		pi.setActiveTools([...new Set([...active, ...SEARCH_TOOLS])]);
+		if (wanted.every((name) => active.includes(name))) return;
+		pi.setActiveTools([...new Set([...active, ...wanted])]);
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		activateSearchTools();
+		activateParentTools();
 		restore(ctx);
 	});
 	pi.on("session_tree", async (_event, ctx) => restore(ctx));
@@ -83,6 +93,25 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("brigadev:codemode", {
+		description: "Pi's codemode tool in this and new sessions (on by default): on | off",
+		getArgumentCompletions: (prefix) => ["on", "off"].filter((v) => v.startsWith(prefix)).map((value) => ({ value, label: value })),
+		handler: async (args, ctx) => {
+			const value = args.trim();
+			if (value !== "on" && value !== "off") {
+				const state = codemodeEnabled() ? "on" : "off";
+				const active = pi.getActiveTools().includes(CODEMODE_TOOL) ? "active" : "not active";
+				return ctx.ui.notify(`codemode: ${state} (${active} in this session)\nUsage: /brigadev:codemode on|off`, "info");
+			}
+			const on = value === "on";
+			writeSettings({ codemode: on });
+			const active = pi.getActiveTools();
+			if (on && !active.includes(CODEMODE_TOOL)) pi.setActiveTools([...active, CODEMODE_TOOL]);
+			if (!on && active.includes(CODEMODE_TOOL)) pi.setActiveTools(active.filter((name) => name !== CODEMODE_TOOL));
+			ctx.ui.notify(`brigadev codemode ${value} (this session and new ones)`, "info");
+		},
+	});
+
 	pi.registerCommand("brigadev:status", {
 		description: "Show brigadev harness status",
 		handler: async (_args, ctx) => {
@@ -90,10 +119,11 @@ export default function (pi: ExtensionAPI) {
 				[
 					`brigadev-harness v${packageVersion()}`,
 					`orchestrator prompt: ${enabled ? "on" : "off"}`,
+					`codemode: ${codemodeEnabled() ? "on" : "off"}`,
 					`assets: ${ASSETS_ROOT}`,
 					`repo docs: ${repoDocsDir(ctx.cwd)}`,
 					`settings: ${settingsPath()}`,
-					"commands: /brigadev:start (alt+w), /brigadev:doctor, /brigadev:profile, /brigadev:cost, /brigadev:changes (alt+g), /brigadev:runs (alt+a), /brigadev:mode, /brigadev:agents, /brigadev:ui, /brigadev:harness, /review, /track",
+					"commands: /brigadev:start (alt+w), /brigadev:doctor, /brigadev:profile, /brigadev:cost, /brigadev:changes (alt+g), /brigadev:runs (alt+a), /brigadev:mode, /brigadev:agents, /brigadev:ui, /brigadev:harness, /brigadev:codemode, /review, /track",
 				].join("\n"),
 				"info",
 			);

@@ -74,6 +74,8 @@ export interface BrigadevSettings {
 	 * top-level folder has that name. Read tolerantly: invalid entries are ignored and /brigadev:doctor lists them.
 	 */
 	risk?: { paths?: Partial<Record<RiskCategory, string[]>>; repos?: Record<string, Partial<Record<RiskCategory, string[]>>> };
+	/** Pi's codemode tool in the parent session; on unless false (/brigadev:codemode). */
+	codemode?: boolean;
 	/** Automatic compaction (lib/context-control.ts). */
 	context?: { enabled?: boolean; compactAt?: number; idleCompactMinutes?: number; idleCompactMin?: number };
 }
