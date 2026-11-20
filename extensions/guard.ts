@@ -234,6 +234,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
+		// A subagent's active tools are its agent's `tools:` list. A codemode script can also call tools that are callable without being active
+		// (MCP tools, `codemode`/`deferred` exposure), so a subagent's call to any tool outside that list is blocked.
+		if (isChild && typeof pi.getActiveTools === "function" && !pi.getActiveTools().includes(event.toolName)) {
+			return { block: true, reason: `Blocked by brigadev guard: ${process.env[CHILD_ENV.AGENT] ?? "this agent"} may only call its own tools, and ${event.toolName} is not one of them.` };
+		}
 		// `bash` and `bg_start` (a background shell process) are one path: same classification, same permission rules,
 		// same evidence-log and commit-gate rules. `bg_start` adds its working directory, decided like a write into it.
 		// `check` runs a command through `bash -c`: it is decided as a bash call of the command that will run.

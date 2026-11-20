@@ -23,6 +23,11 @@ function codemodeEnabled(): boolean {
 	return readSettings().codemode !== false;
 }
 
+/** How the loop uses codemode; appended after the orchestrator prompt while the tool is active. */
+export function loadCodemodePrompt(): string {
+	return readFileSync(join(ASSETS_ROOT, "codemode.md"), "utf8");
+}
+
 /** The orchestrator prompt with the assets root and this session's repo docs folder filled in. */
 export function loadOrchestratorPrompt(cwd: string): string {
 	return readFileSync(join(ASSETS_ROOT, "orchestrator.md"), "utf8").replaceAll("{{ASSETS_ROOT}}", ASSETS_ROOT).replaceAll("{{REPO_DOCS}}", repoDocsDir(cwd));
@@ -75,6 +80,7 @@ export default function (pi: ExtensionAPI) {
 		if (!enabled) return;
 		try {
 			appendSystemPromptOnce(event.systemPromptOptions, loadOrchestratorPrompt(ctx.cwd));
+			if (pi.getActiveTools().includes(CODEMODE_TOOL)) appendSystemPromptOnce(event.systemPromptOptions, loadCodemodePrompt());
 		} catch (error) {
 			if (ctx.hasUI) ctx.ui.notify(`brigadev: could not load orchestrator prompt (${String(error)})`, "error");
 		}

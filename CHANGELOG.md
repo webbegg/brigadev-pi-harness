@@ -4,7 +4,13 @@
 
 ### Added
 
-- The parent session activates Pi's built-in `codemode` tool at start, next to `grep`, `find`, and `ls`. `/brigadev:codemode on|off` turns it on or off now and for new sessions (`codemode` in `brigadev.json`); off leaves a `codemode` enabled by Pi's own `defaultTools` alone. Subagents are unchanged. Tool calls made from codemode scripts still pass the guard.
+- The parent session activates Pi's built-in `codemode` tool at start, next to `grep`, `find`, and `ls`. `/brigadev:codemode on|off` turns it on or off now and for new sessions (`codemode` in `brigadev.json`); off leaves a `codemode` enabled by Pi's own `defaultTools` alone. Tool calls made from codemode scripts still pass the guard.
+- While `codemode` is active, the parent's prompt gains a short block (`assets/codemode.md`): run an explore batch as one parallel script that returns only the needed lines, and gather git/PR/CI state (`gh pr checks`, `gh run view --log-failed`) into one digest. `diagnosis.md` says the same for CI failures.
+- `brigadev-explore`, `review-4r`, and `brigadev-verify` list `codemode` and say when to use it. The worker does not.
+
+### Security
+
+- A subagent may call only its own tools (its active `tools:` list). A codemode script could otherwise reach tools that are callable without being active, such as MCP tools.
 
 ## [0.22.0] - 2026-11-19
 
