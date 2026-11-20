@@ -50,6 +50,11 @@ describe("ticket list: parse", () => {
 		assert.equal(setTicketStatus("## Tasks\n- T10 [S12] — pending\n", "T10", "done", "x"), "## Tasks\n- T10 [S12] — done x\n");
 	});
 
+	it("flags whether done: was a backticked command (doneIsCommand), for runners that can only run commands", () => {
+		const { tickets } = parseTicketList("## Tasks\n- T1 [S1] a done: `npm test` — pending\n- T2 [S1] b done: the board shows cards — pending\n- T3 [S1] c — pending\n");
+		assert.deepEqual(tickets.map((t) => [t.done, t.doneIsCommand]), [["npm test", true], ["the board shows cards", false], [undefined, false]]);
+	});
+
 	it("keeps today's lines without deps or done (both absent, nothing invented)", () => {
 		const { tickets } = parseTicketList("## Tasks\n- T1 [S1] inline — pending\n- T2 [S1,S2] inline: docs — done f52f882\n");
 		assert.deepEqual(tickets.map((t) => [t.id, t.deps, t.done, t.status, t.note]), [["T1", [], undefined, "pending", ""], ["T2", [], undefined, "done", "f52f882"]]);

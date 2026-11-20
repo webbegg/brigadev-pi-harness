@@ -19,6 +19,8 @@ export interface Ticket {
 	deps: string[];
 	/** The check that proves the ticket is finished: a command (backticks removed) or an observable outcome. */
 	done?: string;
+	/** True when the `done:` value was wrapped in backticks, so a runner that only runs commands can execute it. */
+	doneIsCommand: boolean;
 	status?: TicketStatus;
 	/** Text after the status word: commit, evidence, or why it is blocked. */
 	note: string;
@@ -70,9 +72,12 @@ function parseLine(raw: string): Ticket | undefined {
 	const { body, status, note } = splitStatus(match[3]);
 	let head = ` ${body}`;
 	let done: string | undefined;
+	let doneIsCommand = false;
 	const doneAt = head.lastIndexOf(" done: ");
 	if (doneAt !== -1) {
-		done = unquote(head.slice(doneAt + " done: ".length));
+		const value = head.slice(doneAt + " done: ".length);
+		done = unquote(value);
+		doneIsCommand = done !== "" && done !== value.trim();
 		head = head.slice(0, doneAt);
 	}
 	let deps: string[] = [];
@@ -82,7 +87,7 @@ function parseLine(raw: string): Ticket | undefined {
 		deps = field === "none" ? [] : field.split(/[,\s]+/).filter(Boolean);
 		head = head.slice(0, depsAt);
 	}
-	return { id: match[1], specs: expandSpecs(match[2]), title: head.trim(), deps, done, status, note, raw };
+	return { id: match[1], specs: expandSpecs(match[2]), title: head.trim(), deps, done, doneIsCommand, status, note, raw };
 }
 
 export function parseTicketList(markdown: string): TicketList {
