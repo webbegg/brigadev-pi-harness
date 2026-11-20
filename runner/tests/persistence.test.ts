@@ -8,12 +8,12 @@ import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/n
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { Storage } from "@earendil-works/pi-durable";
 import { parseTicketList } from "../../lib/ticket-list.ts";
-import { commitFile, context, docText, git, isolateGitEnv, makeWorker, makeWorkspace, openFixtureRunner, readDoc } from "./fixture.ts";
+import { commitFile, context, docText, git, isolateEnv, makeWorker, makeWorkspace, openFixtureRunner, readDoc } from "./fixture.ts";
 import { defaultDeps, type TicketDeps } from "../src/tasks.ts";
 
 let restoreEnv: () => void;
 before(() => {
-	restoreEnv = isolateGitEnv();
+	restoreEnv = isolateEnv().restore;
 });
 after(() => restoreEnv());
 
@@ -52,7 +52,7 @@ for (const [name, open] of backends) {
 				const first = await openFixtureRunner(ws, worker, { storage: await open(store), deps: hung });
 				const taskId = await first.start(ws.docPath);
 				await inCheck;
-				assert.equal(worker.faux.state.callCount, 2, "T1's worker answered: tool call + final text");
+				assert.equal(worker.faux.state.callCount, 4, "T1's worker answered: three tool calls (write, check, commit) + final text");
 				const headBeforeClose = git(ws.repo, "rev-parse", "HEAD");
 				await first.close();
 
@@ -69,7 +69,7 @@ for (const [name, open] of backends) {
 				assert.deepEqual(first.reports.map((r) => r.kind), [], "closing mid-check is not a fault");
 
 				assert.deepEqual(worker.prompts.map((p) => p.ticketId), ["T1", "T2"], "one attempt per ticket");
-				assert.equal(worker.faux.state.callCount, 4, "two model calls per ticket, none repeated");
+				assert.equal(worker.faux.state.callCount, 8, "four model calls per ticket, none repeated");
 				assert.equal(git(ws.repo, "rev-list", "--count", "HEAD"), "3", "initial + one commit per ticket");
 				assert.ok(git(ws.repo, "rev-parse", "HEAD~1") === headBeforeClose, "T1's commit survived and is not replaced");
 				assert.deepEqual(parseTicketList(readDoc(ws)).tickets.map((t) => t.status), ["done", "done"]);

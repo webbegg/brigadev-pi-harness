@@ -4,7 +4,7 @@
 import { execFile, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { configure, defineTask, SubmissionSettled } from "@earendil-works/pi-durable";
-import type { ModelRef, TaskId } from "@earendil-works/pi-durable";
+import type { ModelRef, TaskId, ToolRegistration } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import {
 	appendLogLine,
@@ -90,13 +90,17 @@ export type TicketState = { phase: "start"; attempt: number; failure?: string } 
 
 export type TicketResult = { commit: string; outputTail: string; attempts: number };
 
-/** Tools the runner can give the worker: the worker's tool list, restricted to what pi-durable's CodingTools provides. */
-function workerTools(worker: Worker) {
-	const wanted = worker.tools.length > 0 ? worker.tools : CodingTools.tools?.map((tool) => tool.name) ?? [];
-	return (CodingTools.tools ?? []).filter((tool) => wanted.includes(tool.name));
+/**
+ * Tools the runner can give the worker: the worker's tool list restricted to what pi-durable's CodingTools provides, plus the
+ * runner's own tools (`check`, which the worker's list does not name: the Pi worker records evidence through an extension instead).
+ */
+function workerTools(worker: Worker, extra: readonly ToolRegistration[]) {
+	const available = [...(CodingTools.tools ?? []), ...extra] as ToolRegistration[];
+	const wanted = worker.tools.length > 0 ? [...worker.tools, ...extra.map((tool) => tool.name)] : available.map((tool) => tool.name);
+	return available.filter((tool) => wanted.includes(tool.name));
 }
 
-function createTicketTask(deps: TicketDeps, worker: Worker) {
+function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly ToolRegistration[]) {
 	return defineTask<TicketInput, TicketState, TicketResult>({
 		name: TICKET_TASK,
 		version: 1,
@@ -118,7 +122,7 @@ function createTicketTask(deps: TicketDeps, worker: Worker) {
 						return undefined;
 					}
 					const created = await tx.createConversation({ ownership: { kind: "task", taskId: task.id } });
-					await configure(tx, created.id, { model: input.model, cwd: input.cwd, tools: workerTools(worker), instructions: workerInstructions(worker, brief) });
+					await configure(tx, created.id, { model: input.model, cwd: input.cwd, tools: workerTools(worker, extraTools), instructions: workerInstructions(worker, brief) });
 					conversationId = created.id;
 					return undefined;
 				}, context);
@@ -351,8 +355,8 @@ export interface Tasks {
 	ticket: ReturnType<typeof createTicketTask>;
 }
 
-/** The two tasks over `deps` (default: real shell and git) and the worker definition (default: assets/agents/brigadev-worker.md). */
-export function createTasks(deps: TicketDeps = defaultDeps, worker: Worker = loadWorker()): Tasks {
-	const ticket = createTicketTask(deps, worker);
+/** The two tasks over `deps` (default: real shell and git), the worker definition (default: assets/agents/brigadev-worker.md), and the tools the worker gets besides CodingTools. */
+export function createTasks(deps: TicketDeps = defaultDeps, worker: Worker = loadWorker(), extraTools: readonly ToolRegistration[] = []): Tasks {
+	const ticket = createTicketTask(deps, worker, extraTools);
 	return { loop: createLoopTask(ticket), ticket };
 }

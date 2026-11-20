@@ -4,11 +4,11 @@ import { dirname } from "node:path";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { parseTicketList } from "../../lib/ticket-list.ts";
 import { defaultDeps, type TicketDeps } from "../src/tasks.ts";
-import { commitFile, context, docText, git, isolateGitEnv, makeWorker, makeWorkspace, openFixtureRunner, readDoc, ticketLine, type FixtureRunner, type Workspace } from "./fixture.ts";
+import { commitFile, context, docText, git, isolateEnv, makeWorker, makeWorkspace, openFixtureRunner, readDoc, ticketLine, type FixtureRunner, type Workspace } from "./fixture.ts";
 
 let restoreEnv: () => void;
 before(() => {
-	restoreEnv = isolateGitEnv();
+	restoreEnv = isolateEnv().restore;
 });
 after(() => restoreEnv());
 

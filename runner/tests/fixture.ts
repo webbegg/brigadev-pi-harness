@@ -1,6 +1,6 @@
 // Shared test fixtures: a temp git repo, a feature doc, and a faux "worker" model whose scripted bash calls do the work.
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -37,9 +37,57 @@ export function isolateGitEnv(): () => void {
 	};
 }
 
+export interface Isolation {
+	restore(): void;
+	/** `BRIGADEV_HOME`: the repo docs and evidence folders live here, never in the real `~/.brigadev`. */
+	brigadevHome: string;
+	/** `PI_CODING_AGENT_DIR`: where `brigadev.json` (permission mode, `check.test`) is read from. */
+	agentDir: string;
+	/** Replace the brigadev settings (`brigadev.json`). */
+	settings(value: object): void;
+}
+
+/**
+ * Everything the guard, the check tool, and the evidence log read from the environment, pointed at a temp dir:
+ * the ambient git environment is dropped, `BRIGADEV_HOME` (repo docs + evidence) and `PI_CODING_AGENT_DIR` (brigadev.json) are
+ * temp dirs, and every other `BRIGADEV_*` variable is removed. `restore()` puts it all back and deletes the temp dir.
+ */
+export function isolateEnv(): Isolation {
+	const restoreGit = isolateGitEnv();
+	const saved: Record<string, string | undefined> = {};
+	for (const key of Object.keys(process.env)) if (key.startsWith("BRIGADEV_") || key === "PI_CODING_AGENT_DIR") saved[key] = process.env[key];
+	for (const key of Object.keys(saved)) delete process.env[key];
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "brigadev-runner-env-")));
+	const brigadevHome = join(root, "bhome");
+	const agentDir = join(root, "agent");
+	mkdirSync(agentDir, { recursive: true });
+	saved.BRIGADEV_HOME ??= undefined;
+	saved.PI_CODING_AGENT_DIR ??= undefined;
+	process.env.BRIGADEV_HOME = brigadevHome;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	const settings = (value: object) => writeFileSync(join(agentDir, "brigadev.json"), JSON.stringify(value));
+	// A passing test command by default, so scripted workers can unlock the commit gate with `check`.
+	settings({ check: { test: "true" } });
+	return {
+		brigadevHome,
+		agentDir,
+		settings,
+		restore() {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+			restoreGit();
+			rmSync(root, { recursive: true, force: true });
+		},
+	};
+}
+
 export function git(cwd: string, ...args: string[]): string {
 	return execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Runner", "-c", "user.email=runner@example.com", ...args], { cwd, encoding: "utf8" }).trim();
 }
+
+export const FEATURE_BRANCH = "feat/runner-test";
 
 export interface Workspace {
 	root: string;
@@ -49,13 +97,15 @@ export interface Workspace {
 }
 
 export function makeWorkspace(): Workspace {
-	const root = mkdtempSync(join(tmpdir(), "brigadev-runner-"));
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "brigadev-runner-")));
 	const repo = join(root, "repo");
 	execFileSync("mkdir", [repo]);
 	git(repo, "init", "-q", "-b", "main");
 	writeFileSync(join(repo, "README.md"), "fixture\n");
 	git(repo, "add", "-A");
 	git(repo, "commit", "-q", "-m", "initial");
+	// The worker commits on a feature branch, as the guard requires (S5).
+	git(repo, "checkout", "-q", "-b", FEATURE_BRANCH);
 	return { root, repo, docPath: join(root, "feature.md"), cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -75,9 +125,12 @@ export function ticketLine(text: string, id: string): string {
 	return line;
 }
 
-/** A worker script: the bash command the faux model runs for a ticket (one command per attempt). */
-export function commitFile(file: string): string {
-	return `echo "$(date +%s%N)" >> ${file} && git add -A && ${GIT_COMMIT} -m "work on ${file}"`;
+/**
+ * A worker script for a ticket (per attempt): change a file, run `check` (the fixture's brigadev.json sets `check.test` to `true`),
+ * then commit in its own bash call, as the guard requires.
+ */
+export function commitFile(file: string): Step[] {
+	return [bash(`echo "$(date +%s%N)" >> ${file}`), check(), bash(`git add -A && ${GIT_COMMIT} -m "work on ${file}"`)];
 }
 
 export interface Prompt {
@@ -87,9 +140,26 @@ export interface Prompt {
 	run: number;
 }
 
+/** One scripted tool call of a worker run. */
+export interface Step {
+	tool: string;
+	input: Record<string, unknown>;
+}
+export const bash = (command: string): Step => ({ tool: "bash", input: { command } });
+export const check = (input: Record<string, unknown> = {}): Step => ({ tool: "check", input });
+export const writeFile = (path: string, content: string): Step => ({ tool: "write", input: { path, content } });
+
+/** A tool result the worker got back (what the guard or a tool said). */
+export interface Result {
+	ticketId: string;
+	text: string;
+	isError: boolean;
+}
+
 export interface Worker {
 	faux: FauxProviderHandle;
 	prompts: Prompt[];
+	results: Result[];
 	/** Runs inside the model call, before the scripted answer: lets a test edit the doc "while the worker runs". */
 	onPrompt?: (prompt: Prompt) => void;
 }
@@ -100,16 +170,26 @@ function text(content: unknown): string {
 	return "";
 }
 
-/** A faux model that, per ticket id found in the prompt, runs `scripts[id]` with `bash`, then answers. */
-export function makeWorker(scripts: Record<string, string>): Worker {
+/**
+ * A faux model that, per ticket id found in the prompt, runs `scripts[id]` one tool call per model turn, then answers.
+ * A string is one `bash` command; a list is a sequence of steps (a step runs even when the guard blocked the one before).
+ */
+export function makeWorker(scripts: Record<string, string | Step[]>): Worker {
 	const faux = fauxProvider({ models: [{ id: "worker" }] });
-	const worker: Worker = { faux, prompts: [] };
+	const worker: Worker = { faux, prompts: [], results: [] };
 	const runs = new Map<string, number>();
-	const step = (ctx: { messages: Array<{ role: string; content?: unknown }> }) => {
-		const last = ctx.messages.at(-1);
-		if (last?.role === "toolResult") return fauxAssistantMessage(fauxText("done"));
+	const step = (ctx: { messages: Array<{ role: string; content?: unknown; isError?: boolean }> }) => {
 		const user = ctx.messages.filter((m) => m.role === "user").map((m) => text(m.content)).join("\n");
 		const ticketId = /Implement ticket (T\d+[A-Za-z0-9.]*)/.exec(user)?.[1] ?? "?";
+		const last = ctx.messages.at(-1);
+		if (last?.role === "toolResult") {
+			worker.results.push({ ticketId, text: text(last.content), isError: last.isError === true });
+			const script = scripts[ticketId];
+			const steps = typeof script === "string" ? [bash(script)] : (script ?? []);
+			const done = ctx.messages.filter((m) => m.role === "toolResult").length;
+			const next = steps[done];
+			return next ? fauxAssistantMessage([fauxToolCall(next.tool, next.input as never)], { stopReason: "toolUse" }) : fauxAssistantMessage(fauxText("done"));
+		}
 		// Instructions render as the `instructions` section of the leading system message.
 		const system = ctx.messages
 			.filter((m) => m.role === "system")
@@ -120,9 +200,10 @@ export function makeWorker(scripts: Record<string, string>): Worker {
 		const prompt = { ticketId, system, run };
 		worker.prompts.push(prompt);
 		worker.onPrompt?.(prompt);
-		const command = scripts[ticketId];
-		if (command === undefined) return fauxAssistantMessage(fauxText(`nothing scripted for ${ticketId}`));
-		return fauxAssistantMessage([fauxToolCall("bash", { command })], { stopReason: "toolUse" });
+		const script = scripts[ticketId];
+		const first = typeof script === "string" ? bash(script) : script?.[0];
+		if (first === undefined) return fauxAssistantMessage(fauxText(`nothing scripted for ${ticketId}`));
+		return fauxAssistantMessage([fauxToolCall(first.tool, first.input as never)], { stopReason: "toolUse" });
 	};
 	faux.setResponses(Array.from({ length: 80 }, () => step as never));
 	return worker;

@@ -1,4 +1,4 @@
-// Opens the Harness for one repo: registry (CodingTools + the ticket tasks), a Node environment on each conversation's cwd,
+// Opens the Harness for one repo: registry (CodingTools, the guard hook, the check tool, the ticket tasks), a Node environment on each conversation's cwd,
 // and helpers to start a loop for a feature doc (once per doc path) and wait for its outcome.
 import { resolve } from "node:path";
 import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
@@ -7,6 +7,8 @@ import { createRegistry, defineExtension, Harness } from "@earendil-works/pi-dur
 import type { HarnessSettings, ModelRef, Report, Storage, TaskId } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
+import { createCheckTool } from "./check-tool.ts";
+import { guardExtension } from "./guard.ts";
 import { createTasks, defaultDeps, LOOP_TASK, type LoopInput, type LoopResult, type TicketDeps } from "./tasks.ts";
 import type { Worker } from "./worker.ts";
 
@@ -45,9 +47,13 @@ export interface Runner {
 export async function openRunner(options: RunnerOptions): Promise<Runner> {
 	const context = options.context ?? BACKGROUND_CONTEXT;
 	const cwd = resolve(options.cwd);
-	const { loop, ticket } = createTasks(options.deps ?? defaultDeps, options.worker);
+	const checkTool = createCheckTool({ cwd });
+	const { loop, ticket } = createTasks(options.deps ?? defaultDeps, options.worker, [checkTool]);
 	const registry = createRegistry();
 	registry.install(CodingTools);
+	// S5: every tool call of a worker conversation (nested ones too) goes through the brigadev guard rules.
+	registry.install(guardExtension({ cwd }));
+	registry.install(defineExtension({ name: "brigadev-check", tools: [checkTool] }));
 	registry.install(defineExtension({ name: "brigadev-runner", tasks: [loop, ticket] }));
 
 	const harness = await Harness.open(
