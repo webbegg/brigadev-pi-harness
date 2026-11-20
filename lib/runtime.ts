@@ -66,6 +66,8 @@ export interface BrigadevSettings {
 		footer?: boolean;
 		/** One-line rows for built-in tools; on unless false. */
 		compactTools?: boolean;
+		/** Escape during a run asks before stopping it (extensions/stop-confirm.ts); on unless false. */
+		confirmStop?: boolean;
 	};
 	/** The `check` tool's default test command (lib/check.ts); detected from the project when absent. */
 	check?: { test?: string };
@@ -103,7 +105,7 @@ export function writeSettings(update: BrigadevSettings): void {
 	writeFileSync(path, `${JSON.stringify({ ...readSettings(), ...update }, null, 2)}\n`, "utf8");
 }
 
-const UI_FEATURES = ["footer"] as const;
+const UI_FEATURES = ["footer", "confirmStop"] as const;
 export type UiFeature = (typeof UI_FEATURES)[number];
 
 export interface UiSettingsStore {
@@ -120,7 +122,9 @@ export function runUiCommand(args: string, store: UiSettingsStore = { read: read
 	const ui = store.read().ui ?? {};
 	if ((UI_FEATURES as readonly string[]).includes(feature) && (value === "on" || value === "off")) {
 		store.write({ ui: { ...ui, [feature]: value === "on" } });
-		return { feature: feature as UiFeature, message: `brigadev ${feature} ${value}` };
+		// The footer reinstalls at once; the Escape listener is set up at session start.
+		return { feature: feature as UiFeature, message: `brigadev ${feature} ${value}${feature === "confirmStop" ? " (applies after /reload)" : ""}` };
 	}
-	return { message: `footer: ${ui.footer === false ? "off" : "on"}\nUsage: /brigadev:ui footer on|off` };
+	const state = (on: boolean | undefined) => (on === false ? "off" : "on");
+	return { message: `footer: ${state(ui.footer)}\nconfirmStop: ${state(ui.confirmStop)}\nUsage: /brigadev:ui ${UI_FEATURES.join("|")} on|off` };
 }

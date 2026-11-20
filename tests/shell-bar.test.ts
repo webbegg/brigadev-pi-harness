@@ -75,12 +75,18 @@ describe("runUiCommand", () => {
 		assert.deepEqual(s.writes, [{ ui: { compactTools: false, footer: false } }]);
 	});
 
+	it("writes the confirmStop setting; it applies after /reload", () => {
+		const s = store({ ui: { footer: false } });
+		assert.deepEqual(runUiCommand("confirmStop off", s), { feature: "confirmStop", message: "brigadev confirmStop off (applies after /reload)" });
+		assert.deepEqual(s.writes, [{ ui: { footer: false, confirmStop: false } }]);
+	});
+
 	it("shows the current state and the usage, and writes nothing, for anything else", () => {
-		for (const args of ["", "footer", "footer maybe", "dashboard off", "phase on"]) {
+		for (const args of ["", "footer", "footer maybe", "dashboard off", "phase on", "confirmStop"]) {
 			const s = store({ ui: { footer: false } });
 			const result = runUiCommand(args, s);
 			assert.equal(result.feature, undefined, args);
-			assert.equal(result.message, "footer: off\nUsage: /brigadev:ui footer on|off", args);
+			assert.equal(result.message, "footer: off\nconfirmStop: on\nUsage: /brigadev:ui footer|confirmStop on|off", args);
 			assert.deepEqual(s.writes, [], args);
 		}
 	});

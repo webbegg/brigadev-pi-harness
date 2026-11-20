@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Escape during a run asks "Stop the current run?" instead of stopping it at once (`extensions/stop-confirm.ts`): Enter stops it, Escape or No keeps it running. Dialogs, autocomplete, and everything Escape does while idle (double Escape, `!` commands) are unchanged; TUI only. Turn it off with `/brigadev:ui confirmStop off` or `ui.confirmStop: false` in `brigadev.json`.
+
 ## [0.22.0] - 2026-11-19
 
 ### Added

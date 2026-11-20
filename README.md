@@ -79,7 +79,7 @@ Per field, a launch resolves: session profile, default profile, agent frontmatte
 | `/brigadev:force-commit`, `/brigadev:yolo-dir` | One-shot commit override; folders where writes run without asking |
 | `/track`, `/review` | Force feature-document tracking; 4R review of a frozen change |
 
-Also: `/brigadev:agents`, `/brigadev:harness on|off`, `/brigadev:ui footer on|off`; `ctrl+shift+t` and `ctrl+shift+a` collapse the todo and agents cards.
+Also: `/brigadev:agents`, `/brigadev:harness on|off`, `/brigadev:ui footer|confirmStop on|off`; Escape during a run asks before stopping it (Enter stops, Escape keeps it running); `ctrl+shift+t` and `ctrl+shift+a` collapse the todo and agents cards.
 
 ## Configuration
 
@@ -91,6 +91,7 @@ Also: `/brigadev:agents`, `/brigadev:harness on|off`, `/brigadev:ui footer on|of
 | `secureYoloDirs` | Folders outside the project where the parent's `write`/`edit` skip the question (`/brigadev:yolo-dir`) |
 | `bridgePricing` | `false` stops pricing zero-cost `claude-bridge` turns at the API list price |
 | `ui.footer`, `ui.compactTools` | `false` turns off the status bar or the one-line tool rows |
+| `ui.confirmStop` | `false` makes Escape stop a run at once, without asking (applies after `/reload`) |
 | `check.test` | Test command for the `check` tool; detected from the project when absent |
 | `context.enabled`, `context.compactAt`, `context.idleCompactMinutes`, `context.idleCompactMin` | Automatic compaction: at 160,000 tokens at a turn boundary, or on a request after 60 idle minutes with at least 100,000 tokens; `enabled: false` turns it off |
 
