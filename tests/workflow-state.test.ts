@@ -69,6 +69,15 @@ test("workflow-state publishes todo snapshots and check results from tool result
 	assert.deepEqual({ ...checks[0], at: 0 }, { id: "c", command: "npm test", outcome: "pass", exitCode: 0, counts: { passed: 3, failed: 0 }, durationMs: 10, at: 0 });
 });
 
+test("workflow-state installs the dashboard adapter: channels declared, probe answered", () => {
+	const pi = createFakePi();
+	workflowState(pi as any);
+	assert.equal(pi.emitted.filter((e) => e.channel === "dashboard:register-event-forward").length, 1);
+	const probe = { modules: [] as any[] };
+	pi.events.emit("ui:list-modules", probe);
+	assert.ok(probe.modules.some((m) => m.kind === "breadcrumb" && m.namespace === "brigadev"));
+});
+
 test("workflow-state stays silent in a subagent", async () => {
 	const previous = process.env.BRIGADEV_CHILD;
 	process.env.BRIGADEV_CHILD = "1";

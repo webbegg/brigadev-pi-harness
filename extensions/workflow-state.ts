@@ -1,8 +1,10 @@
 // Publishes workflow state on the brigadev bus (lib/bus.ts) for the web UI and the dashboard adapter: the
 // inferred loop phase, the todo list, and finished check runs. Read-only: it never changes what the agent does.
+// It also installs the pi-agent-dashboard adapter (lib/dashboard-adapter.ts), inert without the dashboard.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { BUS, type CheckState, publish, type TodoItem } from "../lib/bus.ts";
+import { installDashboardAdapter } from "../lib/dashboard-adapter.ts";
 import { createPhaseTracker } from "../lib/phase.ts";
 import { isChildSession } from "../lib/runtime.ts";
 
@@ -10,6 +12,7 @@ export default function (pi: ExtensionAPI) {
 	if (isChildSession()) return;
 	const bus = pi.events;
 	const phase = createPhaseTracker();
+	if (bus) installDashboardAdapter(bus);
 
 	pi.on("agent_start", () => publish(bus, BUS.phase, phase.agentStart()));
 	pi.on("agent_end", () => publish(bus, BUS.phase, phase.agentEnd()));
