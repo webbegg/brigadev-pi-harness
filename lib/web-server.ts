@@ -187,8 +187,12 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
 		}
 
 		if (req.method !== "GET") return reply(res, 405, { error: "method not allowed" }, { Allow: "GET" });
-		if (!tokenMatches(queryToken(url) ?? headerToken(req), token)) return reply(res, 401, { error: "unauthorized" });
-		if (route === "/events") return serveEvents(req, res, url);
+		if (route === "/events") {
+			if (!tokenMatches(queryToken(url) ?? headerToken(req), token)) return reply(res, 401, { error: "unauthorized" });
+			return serveEvents(req, res, url);
+		}
+		// The page is static and holds no session data, so it needs no token: it strips the token from the address bar
+		// and keeps it in the tab, and a reload must still load it. Everything with data (/events, /action) is gated.
 		res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(html) });
 		res.end(html);
 	});

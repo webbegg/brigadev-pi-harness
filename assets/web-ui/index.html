@@ -124,7 +124,13 @@ footer textarea { flex: 1; resize: vertical; min-height: 38px; max-height: 30vh;
 "use strict";
 (function () {
 	var STEPS = ["authorize", "explore", "decide", "implement", "check", "commit", "close"];
+	// The token leaves the address bar (history, copied URLs) and lives in this tab's sessionStorage, so a reload still works.
 	var TOKEN = new URLSearchParams(location.search).get("token") || "";
+	try {
+		if (TOKEN) sessionStorage.setItem("brigadev-token", TOKEN);
+		else TOKEN = sessionStorage.getItem("brigadev-token") || "";
+	} catch (e) { /* storage off: the URL token still works for this load */ }
+	if (location.search) history.replaceState(null, "", location.pathname);
 	var MAX_TIMELINE = 1000;
 	var state = {
 		phase: null, mode: null, running: false, live: { active: false, text: "" },

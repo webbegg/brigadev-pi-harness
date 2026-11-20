@@ -99,12 +99,14 @@ test("web-server: binds to loopback on an ephemeral port and builds the url", as
 	}
 });
 
-test("web-server: GET / needs the token and serves the page with security headers", async () => {
+test("web-server: GET / serves the static page without the token (it holds no data; a reload after the page strips the token still loads), with security headers", async () => {
 	const { server } = await boot();
 	try {
-		assert.equal((await send(server, { path: "/" })).status, 401);
-		assert.equal((await send(server, { path: "/?token=nope" })).status, 401);
-		assert.equal((await send(server, { path: `/?token=${TOKEN}x` })).status, 401);
+		for (const path of ["/", "/?token=nope"]) {
+			const bare = await send(server, { path });
+			assert.equal(bare.status, 200, path);
+			assert.equal(bare.body, HTML, path);
+		}
 		const ok = await send(server, { path: `/?token=${TOKEN}` });
 		assert.equal(ok.status, 200);
 		assert.equal(ok.body, HTML);
