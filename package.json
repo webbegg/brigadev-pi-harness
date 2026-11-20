@@ -31,7 +31,8 @@
 			"./extensions/pr-info.ts",
 			"./extensions/check.ts",
 			"./extensions/stats.ts",
-			"./extensions/context-control.ts"
+			"./extensions/context-control.ts",
+			"./extensions/workflow-state.ts"
 		],
 		"skills": [
 			"./skills"

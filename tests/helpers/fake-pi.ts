@@ -1,5 +1,7 @@
 // TEST-ONLY fakes of Pi's ExtensionAPI (`pi`) and ExtensionContext (`ctx`) that record what an extension does with them.
 
+import { type Bus, createBus } from "../../lib/bus.ts";
+
 type Handler = (event: any, ctx: any) => unknown;
 
 export interface FakeTool {
@@ -18,6 +20,9 @@ export interface FakePi {
 	commands: Map<string, any>;
 	shortcuts: Map<string, any>;
 	entries: Array<{ type: string; data: unknown }>;
+	/** Pi's shared event bus (`pi.events`); `emitted` records every emit in order. */
+	events: Bus;
+	emitted: Array<{ channel: string; data: unknown }>;
 	registerTool(tool: FakeTool): void;
 	on(event: string, handler: Handler): void;
 	sendMessage(message: unknown, options?: unknown): void;
@@ -32,7 +37,16 @@ export interface FakePi {
 }
 
 export function createFakePi(): FakePi {
+	const bus = createBus();
 	const pi: FakePi = {
+		emitted: [],
+		events: {
+			emit: (channel, data) => {
+				pi.emitted.push({ channel, data });
+				bus.emit(channel, data);
+			},
+			on: (channel, handler) => bus.on(channel, handler),
+		},
 		tools: new Map(),
 		handlers: new Map(),
 		messages: [],
