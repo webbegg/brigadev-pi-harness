@@ -4,12 +4,11 @@
 // ways in are the validated actions of lib/web-server.ts (send a prompt, abort, answer, cancel a subagent).
 
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type Action, BUS, CHANNELS, publish } from "../lib/bus.ts";
-import { ASSETS_ROOT, isChildSession } from "../lib/runtime.ts";
+import { isChildSession } from "../lib/runtime.ts";
 import { createWebLog } from "../lib/web-log.ts";
+import { webPage } from "../lib/web-page.ts";
 import { startWebServer, type WebServer } from "../lib/web-server.ts";
 
 const STATUS_KEY = "brigadev-web";
@@ -196,7 +195,7 @@ export default function (pi: ExtensionAPI) {
 	async function start(): Promise<WebServer> {
 		if (server) return server;
 		starting ??= (async () => {
-			const html = readFileSync(join(ASSETS_ROOT, "web-ui", "index.html"), "utf8");
+			const html = webPage();
 			return startWebServer({ host: "127.0.0.1", port: configuredPort(), token: randomBytes(32).toString("hex"), html, log, onAction: handleAction });
 		})();
 		try {

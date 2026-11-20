@@ -7,6 +7,7 @@
 <title>brigadev</title>
 <style>
 :root {
+	color-scheme: dark;
 	--bg: #0f1115; --panel: #161a21; --panel2: #1c212a; --line: #262c37; --text: #d7dce4; --dim: #8892a3;
 	--accent: #6aa8ff; --ok: #4cc38a; --warn: #e5b04a; --bad: #ef6b6b; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
@@ -41,6 +42,24 @@ main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1
 #convo { overflow-y: auto; padding: 10px 14px; border-right: 1px solid var(--line); }
 #timeline { display: flex; flex-direction: column; gap: 6px; }
 .msg { max-width: 92%; padding: 6px 10px; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); }
+.msg.md { white-space: normal; }
+.md > :first-child, .md > .who + *, .md .t > :first-child { margin-top: 0; } .md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md blockquote, .md pre, .md table, .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 6px 0; }
+.md p, .md li, .md blockquote, .md td, .md th { white-space: pre-wrap; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { font-size: 13px; font-weight: 700; }
+.md h1, .md h2 { font-size: 14px; }
+.md ul, .md ol { padding-left: 20px; }
+.md li.task { list-style: none; margin-left: -18px; }
+.md li.task input { margin: 0 6px 0 0; vertical-align: -1px; }
+.md blockquote { padding-left: 10px; border-left: 3px solid var(--line); color: var(--dim); }
+.md code { font: 12px var(--mono); background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+.md pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; overflow-x: auto; white-space: pre; }
+.md pre code { border: 0; padding: 0; background: none; }
+.md table { border-collapse: collapse; display: block; overflow-x: auto; }
+.md th, .md td { border: 1px solid var(--line); padding: 3px 8px; text-align: left; vertical-align: top; }
+.md th { background: var(--panel2); }
+.md hr { border: 0; border-top: 1px solid var(--line); }
+.md a { color: var(--accent); }
 .msg .who { display: block; font-size: 11px; color: var(--dim); margin-bottom: 2px; }
 .msg.user { align-self: flex-end; background: #1d2a40; border-color: #2c4163; }
 .msg.assistant { align-self: flex-start; background: var(--panel); }
@@ -120,6 +139,7 @@ footer textarea { flex: 1; resize: vertical; min-height: 38px; max-height: 30vh;
 	<button class="danger" id="abort" title="Abort the current run">Abort</button>
 </footer>
 <div id="toast" role="alert"></div>
+<!-- @inline markdown.js -->
 <script>
 "use strict";
 (function () {
@@ -192,6 +212,50 @@ footer textarea { flex: 1; resize: vertical; min-height: 38px; max-height: 30vh;
 		else if (note) note.remove();
 	}
 
+	// ---- markdown: the parser's tree becomes DOM nodes through h(), so text never becomes markup ----
+	var MD = window.brigadevMarkdown;
+	function mdInline(nodes) {
+		return nodes.map(function (n) {
+			if (n.t === "code") return h("code", { text: n.v });
+			if (n.t === "b") return h.apply(null, ["strong", null].concat(mdInline(n.c)));
+			if (n.t === "i") return h.apply(null, ["em", null].concat(mdInline(n.c)));
+			if (n.t === "a" && /^https?:\/\//i.test(n.href)) return h.apply(null, ["a", { href: n.href, target: "_blank", rel: "noopener noreferrer" }].concat(mdInline(n.c)));
+			return document.createTextNode(String(n.v != null ? n.v : ""));
+		});
+	}
+	function mdBlock(b) {
+		switch (b.t) {
+			case "h": return h.apply(null, ["h" + Math.min(6, Math.max(1, b.level | 0)), null].concat(mdInline(b.c)));
+			case "code": return h("pre", { title: b.lang || null }, h("code", { text: b.text }));
+			case "hr": return h("hr");
+			case "quote": return h.apply(null, ["blockquote", null].concat(mdInline(b.c)));
+			case "ul": case "ol":
+				return h.apply(null, [b.t, b.t === "ol" && b.start !== 1 ? { start: b.start } : null].concat(b.items.map(function (it) {
+					var box = it.check === null ? null : h("input", { type: "checkbox", disabled: true });
+					if (box) box.checked = it.check;
+					return h.apply(null, ["li", { class: box ? "task" : null }, box].concat(mdInline(it.c)));
+				})));
+			case "table":
+				return h("table", null,
+					h("thead", null, h.apply(null, ["tr", null].concat(b.head.map(function (c) { return h.apply(null, ["th", null].concat(mdInline(c))); })))),
+					h.apply(null, ["tbody", null].concat(b.rows.map(function (row) {
+						return h.apply(null, ["tr", null].concat(row.map(function (c) { return h.apply(null, ["td", null].concat(mdInline(c))); })));
+					}))));
+			default: return h.apply(null, ["p", null].concat(mdInline(b.c || [])));
+		}
+	}
+	/** Markdown as DOM nodes; plain text when the parser is missing or fails. */
+	function markdown(text) {
+		var wrap = document.createDocumentFragment();
+		try {
+			if (!MD) throw new Error("no parser");
+			MD.parse(text).forEach(function (b) { wrap.appendChild(mdBlock(b)); });
+		} catch (e) {
+			wrap.replaceChildren(h("p", { text: text }));
+		}
+		return wrap;
+	}
+
 	// ---- actions ----
 	function post(body) {
 		return fetch("/action", { method: "POST", headers: { "content-type": "application/json", "x-brigadev-token": TOKEN }, body: JSON.stringify(body) })
@@ -258,8 +322,9 @@ footer textarea { flex: 1; resize: vertical; min-height: 38px; max-height: 30vh;
 		reconcile($("timeline"), items, function (i) { return i.key; }, function (i) {
 			var d = i.data;
 			if (i.kind === "message") {
-				return h("div", { class: "msg " + (d.role === "user" ? "user" : "assistant") },
-					h("span", { class: "who", text: (d.role === "user" ? "you" : "assistant") + (d.at ? " · " + time(d.at) : "") }), String(d.text || ""));
+				var user = d.role === "user";
+				return h("div", { class: "msg " + (user ? "user" : "assistant md") },
+					h("span", { class: "who", text: (user ? "you" : "assistant") + (d.at ? " · " + time(d.at) : "") }), user ? String(d.text || "") : markdown(String(d.text || "")));
 			}
 			var icon = d.status === "running" ? "●" : d.status === "error" ? "✗" : "✓";
 			return h("div", { class: "tool " + (d.status || "") },
@@ -270,8 +335,9 @@ footer textarea { flex: 1; resize: vertical; min-height: 38px; max-height: 30vh;
 		$("empty").style.display = items.length || state.live.active ? "none" : "";
 		var live = $("live");
 		if (state.live.active && state.live.text) {
-			if (!live.firstChild) live.appendChild(h("div", { class: "msg assistant" }, h("span", { class: "who", text: "assistant · typing…" }), h("span", { class: "t" })));
-			live.querySelector(".t").textContent = state.live.text;
+			if (!live.firstChild) live.appendChild(h("div", { class: "msg assistant md" }, h("span", { class: "who", text: "assistant · typing…" }), h("div", { class: "t" })));
+			var body = live.querySelector(".t");
+			if (body._text !== state.live.text) { body._text = state.live.text; body.replaceChildren(markdown(state.live.text)); }
 		} else live.replaceChildren();
 		if (stick) convo.scrollTop = convo.scrollHeight;
 	}
