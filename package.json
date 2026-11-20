@@ -32,7 +32,8 @@
 			"./extensions/check.ts",
 			"./extensions/stats.ts",
 			"./extensions/context-control.ts",
-			"./extensions/workflow-state.ts"
+			"./extensions/workflow-state.ts",
+			"./extensions/web-ui.ts"
 		],
 		"skills": [
 			"./skills"
