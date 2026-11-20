@@ -204,6 +204,8 @@ export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<L
 			results[index] = { agent: agent.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), model: route.model, thinking: route.thinking, route: routeLabel, inherited: route.modelSource === "parent", startedAt };
 			deps.view.attempt(index, results[index]);
 			emit();
+			// The runner, not the request, decides: a cancel that lands after the child finished leaves its result alone.
+			let killedForCancel = false;
 			try {
 				results[index] = await deps.runAgent({
 					index,
@@ -223,10 +225,11 @@ export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<L
 				ended[index] = true;
 				// A child killed for the user's cancel may reject instead of resolving: that is the cancellation, not a failure.
 				if (!cancelledByUser(index)) throw error;
+				killedForCancel = true;
 			}
 			ended[index] = true;
 			Object.assign(results[index], { startedAt, endedAt: now() });
-			if (cancelledByUser(index)) Object.assign(results[index], { cancelled: true, cancelledBy: "user" });
+			if (cancelledByUser(index) && (killedForCancel || results[index].cancelled)) Object.assign(results[index], { cancelled: true, cancelledBy: "user" });
 			// One model per agent: a quota or limit failure is not retried elsewhere, and is said out loud.
 			else if (limitFailed(results[index])) warnings.push(`${agent.name}: ${results[index].model ?? route.model ?? "its model"} hit a quota or rate limit. No other model was tried; wait for the limit to reset or route this agent to another model with /brigadev:profile set`);
 		} finally {

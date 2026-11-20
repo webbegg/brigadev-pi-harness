@@ -611,6 +611,8 @@ export async function runChild(options: RunOptions, deps: ChildRunDeps): Promise
 
 			if (options.signal) {
 				const kill = () => {
+					// A user cancel that lands once the child has exited (its output still draining) reaches nothing: the run finished.
+					if (exited && options.signal?.reason === USER_CANCEL) return;
 					aborted = true;
 					terminate();
 				};

@@ -121,6 +121,22 @@ describe("runLaunch: cancel one task", () => {
 		assertClean(h);
 	});
 
+	it("a cancel that lands after the child finished keeps its result: the runner, not the request, decides", async () => {
+		// The child already exited and its run is draining (close, artifacts): the abort reaches nothing and runChild
+		// resolves a normal result, without the cancelled flag.
+		const h = rig([{}]);
+		const draining = manual();
+		h.runner(() => draining.promise);
+		const { results, done } = h.launch();
+		await settle();
+		assert.equal(h.cancel(0), true, "the request is accepted while the run is still open");
+		draining.resolve(reply(0, "answer 0"));
+		const launched = await done;
+		assert.equal(runStatus(results[0]), "done");
+		assert.match(toResult("parallel", launched).content[0].text, /### \[scout\] completed\n\nanswer 0/);
+		assertClean(h);
+	});
+
 	it("a running task is killed through its signal and settles as cancelled while the sibling completes", async () => {
 		const h = rig([{}, {}]);
 		const sibling = manual();
