@@ -36,7 +36,8 @@ function statuses(ws: Workspace): Record<string, string | undefined> {
 async function run(worker: ReturnType<typeof makeWorker>, options: { maxAttempts?: number } = {}) {
 	runner = await openFixtureRunner(ws, worker);
 	const id = await runner.start(ws.docPath, options);
-	return { id, outcome: await runner.wait(id) };
+	// A paused loop sleeps instead of ending (T5): `settle` returns its outcome, or `waiting` when it is parked.
+	return { id, outcome: await runner.settle(id) };
 }
 
 describe("ticket loop (S2)", () => {
@@ -112,10 +113,7 @@ describe("ticket loop (S2)", () => {
 		);
 		const worker = makeWorker({ T1: commitFile("t1.txt"), T2: commitFile("t2.txt"), T3: commitFile("t3.txt") });
 		const { outcome } = await run(worker, { maxAttempts: 1 });
-		assert.equal(outcome.status, "completed");
-		const result = (outcome as { result: { status: string; reason: string } }).result;
-		assert.equal(result.status, "paused");
-		assert.match(result.reason, /two consecutive tickets failed: T1, T2/);
+		assert.deepEqual(outcome, { status: "waiting", paused: "two consecutive tickets failed: T1, T2", decisions: [] });
 		assert.deepEqual(worker.prompts.map((p) => p.ticketId), ["T1", "T2"]);
 		assert.deepEqual(statuses(ws), { T1: "blocked", T2: "blocked", T3: "pending" });
 	});
@@ -235,7 +233,7 @@ describe("doc ownership while running (S8, A4)", () => {
 			writeFileSync(ws.docPath, edited);
 		};
 		const { outcome } = await run(worker);
-		assert.deepEqual(outcome, { status: "completed", result: { status: "paused", reason: "doc edited: T1" } });
+		assert.deepEqual(outcome, { status: "waiting", paused: "doc edited: T1", decisions: [] });
 		assert.equal(readDoc(ws), edited, "nothing was written over the user's edit");
 		assert.deepEqual(worker.prompts.map((p) => p.ticketId), ["T1"]);
 	});
@@ -250,7 +248,7 @@ describe("doc ownership while running (S8, A4)", () => {
 			writeFileSync(ws.docPath, edited);
 		};
 		const { outcome } = await run(worker);
-		assert.deepEqual(outcome, { status: "completed", result: { status: "paused", reason: "doc edited: T1" } });
+		assert.deepEqual(outcome, { status: "waiting", paused: "doc edited: T1", decisions: [] });
 		assert.equal(readDoc(ws), edited);
 	});
 
@@ -295,7 +293,7 @@ describe("doc ownership while running (S8, A4)", () => {
 			if (prompt.ticketId === "T3") writeFileSync(ws.docPath, readDoc(ws).replace("First behavior.", "First behavior, revised."));
 		};
 		const { outcome } = await run(worker, { maxAttempts: 1 });
-		assert.equal((outcome as { result: { status: string } }).result.status, "paused");
+		assert.equal(outcome.status, "waiting");
 		assert.match(ticketLine(readDoc(ws), "T1"), /— pending reopened: S1 changed$/);
 		assert.deepEqual(statuses(ws), { T1: "pending", T2: "blocked", T3: "blocked" });
 	});

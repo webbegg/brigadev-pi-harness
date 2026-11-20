@@ -2,6 +2,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parseAgent, type FrontmatterParser } from "../../lib/agents.ts";
+import type { AnsweredDecision } from "./decision.ts";
 
 export const WORKER_AGENT_PATH = fileURLToPath(new URL("../../assets/agents/brigadev-worker.md", import.meta.url));
 
@@ -41,6 +42,19 @@ export interface TicketBrief {
 	maxAttempts: number;
 	/** The previous attempt's failure, with the tail of the check output. */
 	failure?: string;
+	/** A decision this ticket parked on, with the user's answer: the rerun's brief. */
+	decision?: AnsweredDecision;
+}
+
+/** The `## Decision` section of a rerun: the question, the numbered options, the user's answer, and an approved command. */
+export function decisionSection(decision: AnsweredDecision): string[] {
+	const lines = ["## Decision from the user", "A previous run of this ticket asked a question and parked; the user answered. Follow the answer; do not ask it again.", `- question: ${decision.question}`, "- options:"];
+	decision.options.forEach((option, index) => lines.push(`  ${index + 1}. ${option.label}${option.description ? ` — ${option.description}` : ""}${decision.recommended === index + 1 ? " (recommended)" : ""}`));
+	lines.push(`- answer: ${decision.answer}`);
+	if (decision.command !== null && decision.approved) {
+		lines.push(`- approved command: \`${decision.command}\` — the user approved running exactly this command, once, in this run. Any other command, or a second run of this one, is still denied.`);
+	}
+	return lines;
 }
 
 /** System instructions: the worker prompt, what differs when the runner drives it, and the ticket. */
@@ -49,10 +63,11 @@ export function workerInstructions(worker: Worker, brief: TicketBrief): string {
 		worker.systemPrompt,
 		"",
 		"## Runner mode",
-		"You are driven by the unattended brigadev runner, one ticket per conversation, with no one to answer questions.",
+		"You are driven by the unattended brigadev runner, one ticket per conversation, with no one to answer questions during a run.",
+		"You never pick a product or design option yourself, not even a reversible one: call `ask_user_choice` (a focused question, 2-6 options, your recommendation). That ends your attempt without a failure; the ticket parks until the user answers and then runs again with the answer in this brief.",
 		"Differences from the interactive workflow above: you MUST commit your finished work with `git commit` on the current branch (the runner proves the ticket by running the done command and checking that HEAD moved); there are no skills or sub-agents to load.",
 		"Run the project's tests with the `check` tool, not with bash: `check` records the run as evidence. Run `check` before you commit, and make no edit between `check` and `git commit`: the commit gate blocks a commit with source changes unless a passing `check` is recorded for the exact working tree, and it tells you why when it blocks.",
-		"The runner delivers: `git push`, merges, publishing, and `gh pr`/`gh release` commands are always blocked. A command blocked with `needs you:` is one only a person may approve (a destructive command, a dependency change, a commit off a feature branch): do not retry it; continue without it, or stop and say what you need.",
+		"The runner delivers: `git push`, merges, publishing, and `gh pr`/`gh release` commands are always blocked. A command blocked with `needs you:` is one only a person may approve (a destructive command, a dependency change, a commit off a feature branch): do not retry it; continue without it. If the ticket cannot be done without that command, call `ask_user_choice` with `command` set to the exact command string and an option whose label starts with `Approve`.",
 		"Your file tools reach only this worktree; the feature document and the evidence log are the runner's and read-only to you.",
 		"",
 		"## Ticket",
@@ -63,6 +78,7 @@ export function workerInstructions(worker: Worker, brief: TicketBrief): string {
 		`- feature document: ${brief.docPath}`,
 		`- attempt: ${brief.attempt} of ${brief.maxAttempts}`,
 	];
+	if (brief.decision) lines.push("", ...decisionSection(brief.decision));
 	if (brief.failure) lines.push("", "## Previous attempt failed", brief.failure);
 	return lines.join("\n");
 }

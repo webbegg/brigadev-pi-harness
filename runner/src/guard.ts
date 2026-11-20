@@ -8,7 +8,10 @@
 //   while file tools are decided like a *child* (`isChild: true`: nothing outside the worktree, secrets blocked, never asked).
 // - A commit passes the evidence commit gate (extension: parent only); the worker cannot force it.
 // - The branch rule holds in every mode (extension: normal mode only).
-// - There is no human to answer a "confirm": it is denied as `needs you: <reason>`. T5 turns these denials into durable signals.
+// - There is no human to answer a "confirm" during a run (Q6): it is denied as `needs you: <reason>`. The route to approval is a decision: the
+//   worker calls `ask_user_choice` with `command` set, the ticket parks, and an approving answer lifts the denial of that exact command string
+//   once in the ticket's rerun (src/decision.ts `commandApproved`). Nothing else is lifted: never-allowed commands, delivery, the commit gate,
+//   the branch rule, and file rules stay as they are.
 // - Push, merge, publish, and gh pr/release/api writes are always blocked: the runner owns PR delivery.
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -24,12 +27,13 @@ import { isPermissionMode, isSensitivePath, PERMISSION_MODE, type PermissionMode
 import { brigadevHome, isRepoDocsPath, repoDocsDir as docsDirOf } from "../../lib/repo-docs.ts";
 import { agentDir, PACKAGE_ROOT, readSettings, type BrigadevSettings } from "../../lib/runtime.ts";
 import type { ExecFn } from "../../lib/worktree-snapshot.ts";
+import { ASK_TOOL, commandApproved } from "./decision.ts";
 import { nodeExec } from "./exec.ts";
 
 /** The agent name on evidence records the worker's `check` calls write. */
 export const RUNNER_AGENT = "runner-worker";
 /** Tools the worker may call; anything else is blocked. */
-export const WORKER_TOOLS: readonly string[] = ["read", "write", "edit", "bash", CHECK_TOOL];
+export const WORKER_TOOLS: readonly string[] = ["read", "write", "edit", "bash", CHECK_TOOL, ASK_TOOL];
 
 export interface GuardOptions {
 	/** The worktree root: the project root of every file rule, and where commands run. */
@@ -46,9 +50,12 @@ export type GuardCall = Pick<ToolHookCall, "name" | "arguments"> & { parent?: un
 
 /**
  * A confirmation the extension would ask the user for. The runner has no one to ask during a run, so it is denied (Q6).
- * The `needs you: ` prefix is the contract T5 reads to turn a denial into a signal.
+ * `approvable` (a bash command, the one case an answer can lift) adds how to get it approved: a decision with `command` set.
  */
-export const needsYou = (reason: string): string => `needs you: ${reason}. The runner cannot ask during a run: do not retry this command; take another approach, or stop and say what you need.`;
+export const needsYou = (reason: string, approvable = false): string =>
+	approvable
+		? `needs you: ${reason}. The runner cannot ask during a run: do not retry this command; take another approach. If the ticket cannot be done without it, call \`ask_user_choice\` with \`command\` set to this exact command and an option whose label starts with "Approve": the ticket parks until the user answers, and an approved command runs once when the ticket reruns.`
+		: `needs you: ${reason}. The runner cannot ask during a run: do not retry this command; take another approach, or stop and say what you need.`;
 
 const DELIVERY_BLOCK = (what: string): string =>
 	`Blocked by brigadev runner: the runner owns PR delivery (${what}). The worker never pushes, merges, publishes, or runs gh pr/release commands; commit on the branch and stop.`;
@@ -221,8 +228,11 @@ export function createGuard(options: GuardOptions) {
 		return () => (read ??= readBranchFacts(exec, root).catch((): BranchFacts => ({ currentBranch: null, defaultBranch: null, protectedBranches: [] })));
 	};
 
-	/** Every rule that applies to a shell command string: evidence log, delivery, the branch rule, the permission policy, the commit gate. */
-	const decideShell = async (command: string): Promise<string | undefined> => {
+	/**
+	 * Every rule that applies to a shell command string: evidence log, delivery, the branch rule, the permission policy, the commit gate.
+	 * `approved` says whether the user approved exactly this command for this call: it lifts only the permission policy's confirmation.
+	 */
+	const decideShell = async (command: string, approved?: (command: string) => Promise<boolean>): Promise<string | undefined> => {
 		const branchFacts = branchFactsOnce();
 		// Nobody forges a recorded test result: the evidence log is written only by the recorder.
 		if (command.includes("evidence") && bashWritesEvidence(command, [join(repoDocsDir(root), "evidence")])) return EVIDENCE_BLOCK;
@@ -242,7 +252,7 @@ export function createGuard(options: GuardOptions) {
 		// `isChild: false`: the worker must be able to commit; the file rules above are the child's.
 		const decision = await decideBashCommand({ command, mode: mode(), isChild: false, cwd: root, readFacts: (dir) => (dir === root ? branchFacts() : readBranchFacts(exec, dir)) });
 		if (decision.action === "block") return decision.reason;
-		if (decision.action === "confirm") return needsYou(decision.reason);
+		if (decision.action === "confirm" && !(approved && (await approved(command)))) return needsYou(decision.reason, true);
 
 		const gate = await evaluateCommitGate({ exec, command, cwd: root, forcedTree: undefined });
 		if (gate?.decision.action === "block") return gate.decision.reason;
@@ -265,11 +275,12 @@ export function createGuard(options: GuardOptions) {
 	};
 
 	return {
-		async decide(call: GuardCall): Promise<string | undefined> {
+		/** `approved`: whether the user approved exactly this bash command for this call (default: never); see `commandApproved`. */
+		async decide(call: GuardCall, approved?: (command: string) => Promise<boolean>): Promise<string | undefined> {
 			const args = asRecord(call.arguments);
 			if (!tools.includes(call.name)) return `Blocked by brigadev guard: unknown tool ${call.name}; the runner's worker has ${tools.join(", ")}.`;
 			if (call.name === CHECK_TOOL) return decideCheck(args);
-			if (call.name === "bash") return decideShell(shellCallOf("bash", args)?.command ?? "");
+			if (call.name === "bash") return decideShell(shellCallOf("bash", args)?.command ?? "", approved);
 			// read, write, edit: a call without a path decides nothing, as in the extension. (A test tool outside these has no rule here.)
 			if (call.name !== "read" && call.name !== "write" && call.name !== "edit") return undefined;
 			const rawPath = String(args.path ?? "");
@@ -285,9 +296,9 @@ export function guardExtension(options: GuardOptions) {
 		name: "brigadev-guard",
 		hooks: [
 			hook(ToolTask, {
-				beforeTool: async (call) => {
+				beforeTool: async (call, api, context) => {
 					try {
-						const reason = await guard.decide(call);
+						const reason = await guard.decide(call, (command) => commandApproved(api, call, command, context));
 						return reason === undefined ? undefined : { block: reason };
 					} catch (error) {
 						return { block: `Blocked by brigadev guard: could not decide (${error instanceof Error ? error.message : String(error)})` };

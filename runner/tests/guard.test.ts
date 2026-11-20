@@ -46,6 +46,8 @@ type Case = { name: string; call: () => GuardCall; expect: "allow" | RegExp; mod
 const bash = (command: string): GuardCall => ({ name: "bash", arguments: { command } });
 
 const NEEDS_YOU = /^needs you: /;
+/** The denial of a command tells the worker how to get it approved (T5): ask with `command` set and an Approve option. */
+const ASK_HINT = /ask_user_choice.*`command`.*Approve/s;
 const DELIVERY = /the runner owns PR delivery/;
 const COMMIT_ALONE = /a commit runs in its own bash call/;
 
@@ -71,6 +73,8 @@ const CASES: Case[] = [
 
 	// confirm-class commands: no one can answer, so they are denied as "needs you" (Q6; T5 turns them into signals)
 	{ name: "rm -rf build", call: () => bash("rm -rf build"), expect: NEEDS_YOU },
+	{ name: "rm -rf build says how to get it approved", call: () => bash("rm -rf build"), expect: ASK_HINT },
+	{ name: "a worker tool of its own: ask_user_choice needs no rule", call: () => ({ name: "ask_user_choice", arguments: { question: "x", options: [] } }), expect: "allow" },
 	{ name: "git reset --hard", call: () => bash("git reset --hard HEAD~1"), expect: NEEDS_YOU },
 	{ name: "npm install changes dependencies", call: () => bash("npm install left-pad"), expect: NEEDS_YOU },
 	{ name: "sudo", call: () => bash("sudo ls"), expect: NEEDS_YOU },

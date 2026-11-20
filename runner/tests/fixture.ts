@@ -148,6 +148,33 @@ export interface Step {
 export const bash = (command: string): Step => ({ tool: "bash", input: { command } });
 export const check = (input: Record<string, unknown> = {}): Step => ({ tool: "check", input });
 export const writeFile = (path: string, content: string): Step => ({ tool: "write", input: { path, content } });
+/** The worker's `ask_user_choice` call (T5): a decision for the user, with an optional command it needs approved. */
+export const askUser = (question: string, options: Array<string | { label: string; description?: string }>, extra: { recommended?: number; command?: string } = {}): Step => ({
+	tool: "ask_user_choice",
+	input: { question, options: options.map((option) => (typeof option === "string" ? { label: option } : option)), ...extra },
+});
+
+/** A manual clock for a Harness: `now` and `setTimer` go to the runner; `advance(ms)` moves time and fires the timers that came due. */
+export function fakeClock(start = Date.parse("2026-11-20T10:00:00Z")) {
+	let time = start;
+	let timers: Array<{ at: number; callback: () => void }> = [];
+	return {
+		now: () => time,
+		setTimer: (callback: () => void, delayMs: number) => {
+			const timer = { at: time + delayMs, callback };
+			timers.push(timer);
+			return () => {
+				timers = timers.filter((other) => other !== timer);
+			};
+		},
+		advance(ms: number) {
+			time += ms;
+			const due = timers.filter((timer) => timer.at <= time);
+			timers = timers.filter((timer) => timer.at > time);
+			for (const timer of due) timer.callback();
+		},
+	};
+}
 
 /** A tool result the worker got back (what the guard or a tool said). */
 export interface Result {
@@ -172,20 +199,24 @@ function text(content: unknown): string {
 
 /**
  * A faux model that, per ticket id found in the prompt, runs `scripts[id]` one tool call per model turn, then answers.
- * A string is one `bash` command; a list is a sequence of steps (a step runs even when the guard blocked the one before).
+ * A string is one `bash` command; a list is a sequence of steps (a step runs even when the guard blocked the one before);
+ * a function gets the 1-based number of this worker run for the ticket (a rerun after a decision, or a retry) and returns the steps.
  */
-export function makeWorker(scripts: Record<string, string | Step[]>): Worker {
+export function makeWorker(scripts: Record<string, string | Step[] | ((run: number) => Step[])>): Worker {
 	const faux = fauxProvider({ models: [{ id: "worker" }] });
 	const worker: Worker = { faux, prompts: [], results: [] };
 	const runs = new Map<string, number>();
+	const stepsOf = (ticketId: string): Step[] => {
+		const script = scripts[ticketId];
+		return typeof script === "string" ? [bash(script)] : typeof script === "function" ? script(runs.get(ticketId) ?? 1) : (script ?? []);
+	};
 	const step = (ctx: { messages: Array<{ role: string; content?: unknown; isError?: boolean }> }) => {
 		const user = ctx.messages.filter((m) => m.role === "user").map((m) => text(m.content)).join("\n");
 		const ticketId = /Implement ticket (T\d+[A-Za-z0-9.]*)/.exec(user)?.[1] ?? "?";
 		const last = ctx.messages.at(-1);
 		if (last?.role === "toolResult") {
 			worker.results.push({ ticketId, text: text(last.content), isError: last.isError === true });
-			const script = scripts[ticketId];
-			const steps = typeof script === "string" ? [bash(script)] : (script ?? []);
+			const steps = stepsOf(ticketId);
 			const done = ctx.messages.filter((m) => m.role === "toolResult").length;
 			const next = steps[done];
 			return next ? fauxAssistantMessage([fauxToolCall(next.tool, next.input as never)], { stopReason: "toolUse" }) : fauxAssistantMessage(fauxText("done"));
@@ -200,8 +231,7 @@ export function makeWorker(scripts: Record<string, string | Step[]>): Worker {
 		const prompt = { ticketId, system, run };
 		worker.prompts.push(prompt);
 		worker.onPrompt?.(prompt);
-		const script = scripts[ticketId];
-		const first = typeof script === "string" ? bash(script) : script?.[0];
+		const first = stepsOf(ticketId)[0];
 		if (first === undefined) return fauxAssistantMessage(fauxText(`nothing scripted for ${ticketId}`));
 		return fauxAssistantMessage([fauxToolCall(first.tool, first.input as never)], { stopReason: "toolUse" });
 	};
@@ -219,7 +249,11 @@ export function modelsFor(worker: Worker) {
 /** A runner plus every `onReport` the Harness made (faulted tasks, hook errors, storage failures): tests expect none. */
 export type FixtureRunner = Runner & { reports: Report[] };
 
-export async function openFixtureRunner(ws: Workspace, worker: Worker, options: { storage?: Storage; deps?: TicketDeps } = {}): Promise<FixtureRunner> {
+export async function openFixtureRunner(
+	ws: Workspace,
+	worker: Worker,
+	options: { storage?: Storage; deps?: TicketDeps; clock?: ReturnType<typeof fakeClock> } = {},
+): Promise<FixtureRunner> {
 	const { models, model } = modelsFor(worker);
 	const reports: Report[] = [];
 	// Progress commits are paced for a UI; tests have none, so store everything at once.
@@ -229,6 +263,8 @@ export async function openFixtureRunner(ws: Workspace, worker: Worker, options: 
 		cwd: ws.repo,
 		model,
 		deps: options.deps,
+		now: options.clock?.now,
+		setTimer: options.clock?.setTimer,
 		settings: { progress: { partialIntervalMs: 0, outputIntervalMs: 0, persistWithinMs: 0 } },
 		onReport: (report) => reports.push(report),
 	});
