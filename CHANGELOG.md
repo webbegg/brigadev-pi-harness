@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Feature-document tickets carry `deps:` (the tickets they need) and `done:` (the check that proves them), documented in `odd-tracking.md`. `lib/ticket-list.ts` parses the `## Tasks` list, validates it for an unattended run (missing `done:`, unknown deps, duplicates, cycles), picks ready tickets, writes a status or a `## Log` line back without touching other lines, detects edits to lines a runner owns and changed specs, and writes files atomically. Groundwork for the durable ticket runner; nothing uses it yet.
+
 ## [0.22.0] - 2026-11-19
 
 ### Added
