@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.23.0-rc.1] - 2026-11-20
+
+Pre-release.
+
+### Added
+
+- `/brigadev:web [start|stop|status]`: a local web UI for the current session on `127.0.0.1`, ephemeral port or `BRIGADEV_WEB_PORT`. `/events` and `/action` require a random token, which the page removes from the address bar. The page is one static file with no dependencies, and it replays the session history over SSE. It shows:
+  - the loop steps and the conversation with tool rows;
+  - subagent cards with per-task cancel;
+  - guard and `ask_user_choice` prompts that can be answered from the browser;
+  - checks, todos and guard decisions;
+  - a composer to send, steer and abort.
+- The brigadev bus (`lib/bus.ts`): typed `brigadev:*` channels on `pi.events` for the loop phase, todos, checks, subagent tasks, prompts, guard decisions and the permission mode. Publishing never throws, and actions coming back from the browser are validated.
+- The inferred loop phase (`lib/phase.ts`, `extensions/workflow-state.ts`): authorize, explore, decide, implement, check, commit or close, guessed from tool activity and labeled as inferred.
+- Guard confirmations and `ask_user_choice` can be answered in the terminal or the browser. The first answer wins and the other dialog closes.
+- Cancelling one subagent task: a queued task never starts and a running one is stopped, while its siblings and the launch go on. The result reads "Cancelled by the user". A cancel that lands after the child finished keeps its result.
+- pi-agent-dashboard adapter: when the dashboard is installed, the bus channels are declared for its event forwarding, and the harness adds a loop breadcrumb and footer segments.
+
 ## [0.22.0] - 2026-11-19
 
 ### Added
