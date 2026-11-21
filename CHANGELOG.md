@@ -9,7 +9,7 @@
 
 ### Fixed
 
-- A guard confirm or `ask_user_choice` that is open when the run is aborted (Esc, the web Abort) now closes in the terminal and the browser and counts as not approved, so a late answer cannot resume an aborted call.
+- A guard confirm or `ask_user_choice` that is open when the run is aborted (Esc, the web Abort) now closes in the terminal and the browser and counts as not approved, so a late answer cannot resume an aborted call. A web answer to a prompt that is no longer open gets 409, and the page shows why.
 - The web UI and the dashboard adapter remove their bus listeners at session shutdown, so a reload no longer doubles events and footer segments.
 - The web UI's event replay waits for slow readers instead of cutting the stream at the 4 MB backlog cap; the cap still applies to a live client that stops reading.
 - The web log keeps `mode`, `todo`, `session`, `phase` and the live run state however many tool calls pass; per-item types (tools, agents, prompts) have their own caps.

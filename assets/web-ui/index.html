@@ -417,6 +417,8 @@ body.open .drawer { transform: none; }
 		return fetch("/action", { method: "POST", headers: { "content-type": "application/json", "Authorization": "Bearer " + SECRET }, body: JSON.stringify(body) })
 			.then(function (res) {
 				if (res.status === 401) { end(ENDED_MESSAGE); throw new Error(ENDED_MESSAGE); }
+				// 409: the action no longer applies (a prompt answered in the terminal or closed by an abort); the server says why.
+				if (res.status === 409) return res.json().then(function (b) { throw new Error((b && b.error) || "no longer applies"); }, function () { throw new Error("no longer applies"); });
 				if (res.status !== 202) throw new Error("action rejected (" + res.status + ")");
 			});
 	}

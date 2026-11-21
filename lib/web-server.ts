@@ -21,6 +21,9 @@ const MAX_DRAIN_BYTES = 1024 * 1024;
 
 /** How long a bootstrap code can be exchanged. */
 export const CODE_TTL_MS = 60_000;
+
+/** Thrown by `onAction` for a valid action that no longer applies (an answer to a prompt that closed): the page gets 409 and the message. */
+export class ActionRefused extends Error {}
 /** Unspent codes and live session secrets kept; the oldest go first. */
 const MAX_CODES = 32;
 const MAX_SECRETS = 64;
@@ -252,7 +255,7 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
 				.then(() => onAction(action))
 				.then(
 					() => reply(res, 202, { ok: true }),
-					() => reply(res, 500, { error: "action failed" }),
+					(error) => (error instanceof ActionRefused ? reply(res, 409, { error: error.message }) : reply(res, 500, { error: "action failed" })),
 				);
 		});
 	}

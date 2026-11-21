@@ -505,11 +505,31 @@ test("web-ui: abort calls the latest ctx's abort", async () => {
 	}
 });
 
+test("web-ui: an answer to a prompt that is not open (never opened, answered, dismissed by an abort) is refused with 409 and never reaches the bus", async () => {
+	const h = setup();
+	try {
+		await h.command("start");
+		const [port, secret] = [h.port(), await login(h)];
+		const answers = () => h.pi.emitted.filter((e) => e.channel === BUS.action).length;
+		assert.equal(await post(port, secret, { action: "answer", id: "nope", value: "A" }), 409, "never opened");
+		h.pi.events.emit(BUS.prompt, { id: "p2", status: "open", at: 1 });
+		h.pi.events.emit(BUS.prompt, { id: "p2", status: "dismissed", at: 2 });
+		assert.equal(await post(port, secret, { action: "answer", id: "p2", value: "A" }), 409, "dismissed (the run was aborted)");
+		h.pi.events.emit(BUS.prompt, { id: "p3", status: "open", at: 3 });
+		h.pi.events.emit(BUS.prompt, { id: "p3", status: "answered", by: "tui", at: 4 });
+		assert.equal(await post(port, secret, { action: "answer", id: "p3", value: "A" }), 409, "already answered in the terminal");
+		assert.equal(answers(), 0);
+	} finally {
+		await stop(h);
+	}
+});
+
 test("web-ui: answer and cancel-agent are re-emitted on the bus, validated; invalid ones never are", async () => {
 	const h = setup();
 	try {
 		await h.command("start");
 		const [port, secret] = [h.port(), await login(h)];
+		h.pi.events.emit(BUS.prompt, { id: "p1", status: "open", at: 1 });
 		assert.equal(await post(port, secret, { action: "answer", id: "p1", value: "Option A" }), 202);
 		assert.equal(await post(port, secret, { action: "cancel-agent", id: "l:0", junk: 1 }), 202);
 		assert.equal(await post(port, secret, { action: "answer", id: "p1" }), 400);

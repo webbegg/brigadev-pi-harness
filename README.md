@@ -108,7 +108,8 @@ How the link works:
 - The link carries a single-use `code` (32 random bytes) that is valid for 60 seconds. The page reads it, removes it from the address bar at once, and trades it for a session secret with one `POST /session`. The code authorizes nothing else, and a second use of it is refused.
 - The secret is random, lives in the server's memory and in one JavaScript variable of the page, and travels in an `Authorization: Bearer` header (the page reads the event stream with `fetch`). It is never in the URL, browser storage, a cookie, or the browser's history, and a token in a query string is refused. Each tab has its own secret; `/brigadev:web stop` revokes them all.
 - A reload, a second tab, or a used or expired link has no code, so the page says: "This link was already used or expired. In pi, run /brigadev:web open for a new one." `/brigadev:web open` prints a new link for the running server (starting again does the same), and `status` shows the address without a code. If that message appears on a link you just opened, something else used the code first.
-- What this does not stop: a process of your own user that reads the code in the first milliseconds, before the page does, or that reads the page's memory.
+- What this does not stop: a process of your own user that reads the code before the page uses it, or that reads the page's memory. The code is live from the moment pi prints it until the page loads, so that is seconds, not milliseconds (for example, something scraping your terminal or clipboard). If another process wins, the page shows the message above; run `/brigadev:web stop` and start again. A session secret lasts until `stop`, even after its tab closes.
+- An answer to a prompt that already closed (answered in the terminal, or its run aborted) is refused, and the page says so.
 
 The page is a board with one column per loop step: Explore, Decide, Implement, Check, Commit, and a red **Needs you** column.
 

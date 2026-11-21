@@ -11,7 +11,7 @@ import { redact } from "../lib/redact.ts";
 import { isChildSession } from "../lib/runtime.ts";
 import { createWebLog } from "../lib/web-log.ts";
 import { webPage } from "../lib/web-page.ts";
-import { startWebServer, type WebServer } from "../lib/web-server.ts";
+import { ActionRefused, startWebServer, type WebServer } from "../lib/web-server.ts";
 
 const STATUS_KEY = "brigadev-web";
 const USAGE = "Usage: /brigadev:web [start|open|stop|status]";
@@ -82,9 +82,17 @@ export default function (pi: ExtensionAPI) {
 
 	// The bus: every outbound channel, from load on. Pi's bus outlives a reload, so each listener is removed at shutdown.
 	const unsubscribers: Array<() => void> = [];
+	// The prompts open right now (their last `brigadev:prompt` said `open`): an answer to any other id is refused with 409, so the page
+	// learns that a prompt it still shows was answered in the terminal or dismissed by an abort.
+	const openPrompts = new Set<string>();
 	for (const [channel, spec] of Object.entries(CHANNELS)) {
 		const off = pi.events.on(channel, (data) => {
 			try {
+				if (channel === BUS.prompt && data && typeof (data as { id?: unknown }).id === "string") {
+					const { id, status } = data as { id: string; status?: unknown };
+					if (status === "open") openPrompts.add(id);
+					else openPrompts.delete(id);
+				}
 				log.append({ type: spec.as, data });
 			} catch {
 				// see above
@@ -219,6 +227,9 @@ export default function (pi: ExtensionAPI) {
 				ctx.abort();
 				return;
 			case "answer":
+				if (!openPrompts.has(action.id)) throw new ActionRefused("this prompt is no longer open: it was answered elsewhere or its run was aborted");
+				publish(pi.events, BUS.action, action);
+				return;
 			case "cancel-agent":
 				// Other extensions own prompts and subagents; they listen on the bus.
 				publish(pi.events, BUS.action, action);
