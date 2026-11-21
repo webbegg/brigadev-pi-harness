@@ -2,7 +2,7 @@
 // tests without the Pi packages that extensions/guard.ts imports. The
 // extension reads the facts (paths, environment, git) and acts on the answer.
 
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { basename as executableName, blankHeredocs, classifyCommand, tokenize } from "./command-classifier.ts";
@@ -201,9 +201,9 @@ export function decideBashCommand(input: BashDecisionInput): Promise<Decision> {
 // ---- Trusted folders outside the project: the system temp dir and the secure-yolo folders ----
 // A parent `write`/`edit` there runs without asking (subagents stay blocked). The list lives in brigadev.json (`secureYoloDirs`).
 
-/** The system temp directories (canonical). */
+/** The system temp directories that exist (canonical); `/private/tmp` is macOS only. */
 export function tempRoots(): string[] {
-	return [...new Set([tmpdir(), "/tmp", "/private/tmp"].map((root) => canonicalPath(root)))];
+	return [...new Set([tmpdir(), "/tmp", "/private/tmp"].filter((root) => existsSync(root)).map((root) => canonicalPath(root)))];
 }
 
 /**
