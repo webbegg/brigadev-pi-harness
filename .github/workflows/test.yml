@@ -23,8 +23,11 @@ jobs:
         # 22.x is the engines floor (>=22.19: unflagged type stripping, module.registerHooks); 24.x is the current LTS.
         node: ["22.x", "24.x"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # CI never pushes: no token left in .git/config for the tests' code to find.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
       # Test fixtures create commits in scratch repositories.
@@ -41,12 +44,14 @@ jobs:
       matrix:
         node: ["22.x", "24.x"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # The steps below run only on branches that have the runner package (runner/); a job-level `if` cannot read the checkout.
       - id: has
         run: test -f runner/package-lock.json && echo "runner=true" >> "$GITHUB_OUTPUT" || echo "runner=false" >> "$GITHUB_OUTPUT"
       - if: steps.has.outputs.runner == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
