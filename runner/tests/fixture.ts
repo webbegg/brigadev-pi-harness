@@ -10,12 +10,15 @@ import { MemoryStorage } from "@earendil-works/pi-durable";
 import type { Report, Storage } from "@earendil-works/pi-durable";
 import { openRunner, type Runner } from "../src/runner.ts";
 import type { PrDeps } from "../src/pr.ts";
-import type { TicketDeps } from "../src/tasks.ts";
+import { defaultDeps, type TicketDeps } from "../src/tasks.ts";
 
 export const context = BACKGROUND_CONTEXT;
 
-/** Commit without hooks, signing, or any ambient identity. */
-export const GIT_COMMIT = "git -c commit.gpgsign=false -c core.hooksPath=/dev/null -c user.name=Runner -c user.email=runner@example.com commit -q";
+/**
+ * A plain commit: the guard blocks `git -c` and `git config` (B1), so the identity comes from the environment (`isolateGitEnv` sets it), signing is off
+ * through `GIT_CONFIG_GLOBAL=/dev/null`, and hooks are off through the contained environment of the worker's shell.
+ */
+export const GIT_COMMIT = "git commit -q";
 
 /** Strip the ambient git environment for the test process (children inherit it) and restore it afterwards. */
 export function isolateGitEnv(): () => void {
@@ -26,7 +29,8 @@ export function isolateGitEnv(): () => void {
 			delete process.env[key];
 		}
 	}
-	for (const [key, value] of Object.entries({ GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" })) {
+	const identity = { GIT_AUTHOR_NAME: "Runner", GIT_AUTHOR_EMAIL: "runner@example.com", GIT_COMMITTER_NAME: "Runner", GIT_COMMITTER_EMAIL: "runner@example.com" };
+	for (const [key, value] of Object.entries({ GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", ...identity })) {
 		saved[key] ??= undefined;
 		process.env[key] = value;
 	}
@@ -154,6 +158,14 @@ export const askUser = (question: string, options: Array<string | { label: strin
 	tool: "ask_user_choice",
 	input: { question, options: options.map((option) => (typeof option === "string" ? { label: option } : option)), ...extra },
 });
+
+/**
+ * Ticket deps whose done command calls `hook(command)` first. A user's edit of the doc "meanwhile" lands here, after the worker's run and the integrity check
+ * (any change of the doc during a worker's conversation parks the loop: B2) and before the write-back that must not overwrite it (S8).
+ */
+export function depsWithHook(hook: (command: string) => void): TicketDeps {
+	return { head: defaultDeps.head, run: (command, cwd, signal, shell) => (hook(command), defaultDeps.run(command, cwd, signal, shell)) };
+}
 
 /** A manual clock for a Harness: `now` and `setTimer` go to the runner; `advance(ms)` moves time and fires the timers that came due. */
 export function fakeClock(start = Date.parse("2026-11-20T10:00:00Z")) {

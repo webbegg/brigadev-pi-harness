@@ -279,6 +279,24 @@ describe("the hook reaches nested calls (call.parent) inside the Harness (A1)", 
 
 // T6 (A4): the verify conversation's rules. Its calls are decided by a read-only guard: `read`, `bash`, and the verdict tool only; nothing writes inside the worktree.
 const READ_ONLY = /verifier is read-only/;
+const VERIFY_EXTRA_CASES: Case[] = [
+	// B1 (R1-001): a git flag that writes or runs a program, an interpreter with inline code
+	{ name: "git diff --output=file", call: () => bash("git diff --output=out.patch"), expect: READ_ONLY },
+	{ name: "git diff --output file", call: () => bash("git diff main --output out.patch"), expect: READ_ONLY },
+	{ name: "git log --ext-diff", call: () => bash("git log -p --ext-diff"), expect: READ_ONLY },
+	{ name: "git show --textconv", call: () => bash("git show --textconv HEAD:README.md"), expect: READ_ONLY },
+	{ name: "git diff --ext-diff", call: () => bash("git diff --ext-diff"), expect: READ_ONLY },
+	{ name: "python3 -c", call: () => bash("python3 -c \"open('a.ts','w').write('x')\""), expect: READ_ONLY },
+	{ name: "python -c", call: () => bash("python -c 'print(1)'"), expect: READ_ONLY },
+	{ name: "node -e", call: () => bash("node -e \"require('fs').writeFileSync('a','x')\""), expect: READ_ONLY },
+	{ name: "node --eval", call: () => bash("node --eval 1"), expect: READ_ONLY },
+	{ name: "node -p", call: () => bash("node -p 1"), expect: READ_ONLY },
+	{ name: "perl -e", call: () => bash("perl -e 'print 1'"), expect: READ_ONLY },
+	{ name: "perl -pi -e", call: () => bash("perl -pi -e 's/a/b/' README.md"), expect: READ_ONLY },
+	{ name: "ruby -e", call: () => bash("ruby -e 'puts 1'"), expect: READ_ONLY },
+	{ name: "inside bash -c", call: () => bash("bash -c \"python3 -c 'print(1)'\""), expect: READ_ONLY },
+	{ name: "an interpreter on a script file is allowed", call: () => bash("python3 probe.py && node probe.js"), expect: "allow" },
+];
 const VERIFY_CASES: Case[] = [
 	{ name: "read a file", call: () => ({ name: "read", arguments: { path: "README.md" } }), expect: "allow" },
 	{ name: "read a secret still blocked", call: () => ({ name: "read", arguments: { path: ".env" } }), expect: /may hold secrets/ },
@@ -309,7 +327,7 @@ describe("verify guard: read-only (A4)", { concurrency: 8 }, () => {
 		ws = makeWorkspace();
 	});
 	after(() => ws.cleanup());
-	for (const entry of VERIFY_CASES) {
+	for (const entry of [...VERIFY_CASES, ...VERIFY_EXTRA_CASES]) {
 		it(`${entry.expect === "allow" ? "allows" : "blocks"}: ${entry.name}`, async () => {
 			const reason = await createGuard({ cwd: ws.repo, readOnly: true, settings: () => ({}) }).decide(entry.call());
 			if (entry.expect === "allow") assert.equal(reason, undefined);
@@ -319,4 +337,179 @@ describe("verify guard: read-only (A4)", { concurrency: 8 }, () => {
 			}
 		});
 	}
+});
+
+// B1/B3 (the first layer; best effort, see runner/README.md "What containment cannot stop"): the spellings of the ledger's repros, for the worker and the verifier
+// alike. Each is blocked with a reason; ordinary commands still pass.
+/** The string layer's reason, or the delivery rule's (`gh api` with fields was already one): both are blocks with a reason. */
+const CONTAINED = /Blocked by brigadev (guard|runner): /;
+const BLOCKED_BOTH: Array<[string, string]> = [
+	// git: -c and --config-env, config writes
+	["git -c alias (the ledger's B1 repro)", "git -c alias.p=push p origin HEAD:refs/heads/aliased"],
+	["git -c alias commit (B3)", "git -c alias.c=commit c -m x"],
+	["git -c core.fsmonitor", "git -c core.fsmonitor=/tmp/x status"],
+	["git -C . -c", "git -C . -c core.hooksPath=/tmp/h status"],
+	["git --config-env", "git --config-env=alias.p=PUSHALIAS p"],
+	["git config alias", "git config alias.p push"],
+	["git config key value", "git config user.name x"],
+	["git config --add", "git config --add remote.origin.pushurl https://evil/x.git"],
+	["git config --unset", "git config --unset core.hooksPath"],
+	["git config --global alias", "git config --global alias.x 'push -f'"],
+	["git config --global read", "git config --global --get user.email"],
+	["git config --system", "git config --system --list"],
+	["git config --file", "git config --file ../x.cfg core.x y"],
+	["git config --local key value", "git config --local core.hooksPath /tmp/h"],
+	["bash -c git -c", "bash -c 'git -c alias.p=push p origin HEAD'"],
+	["absolute git path -c", "/usr/bin/git -c x.y=z status"],
+	["env git -c", "env git -c x.y=z status"],
+	["git -c in a chain", "npm test && git -c alias.p=push p"],
+	// git plumbing that writes refs or remotes
+	["git update-ref", "git update-ref refs/heads/main HEAD"],
+	["git send-pack --force (the ledger's B1 repro)", "git send-pack --force /tmp/remote.git HEAD:refs/heads/main"],
+	["git http-push", "git http-push https://x/y.git HEAD"],
+	["git commit-tree", "git commit-tree HEAD^{tree} -m x"],
+	["git reset --soft $(git commit-tree) (B3)", "git reset --soft $(git commit-tree HEAD^{tree} -p HEAD -m forged)"],
+	["git reset --soft `git commit-tree` (B3)", "git reset --soft `git commit-tree HEAD^{tree} -p HEAD -m forged`"],
+	["git symbolic-ref HEAD <ref>", "git symbolic-ref HEAD refs/heads/main"],
+	["git symbolic-ref -d", "git symbolic-ref -d HEAD"],
+	["git remote add", "git remote add evil https://evil/x.git"],
+	["git remote set-url", "git remote set-url origin https://evil/x.git"],
+	["git fetch into a local branch", "git fetch . HEAD:refs/heads/main"],
+	["git branch -f", "git branch -f main HEAD"],
+	["git checkout -B", "git checkout -B main HEAD"],
+	["git credential", "git credential fill"],
+	["git credential-osxkeychain", "git credential-osxkeychain get"],
+	// gh api writes in every spelling, graphql, and the commands that change gh itself
+	["gh api -XPUT (the ledger's B1 repro)", "gh api -XPUT repos/o/r/pulls/1/merge"],
+	["gh api -X PUT", "gh api -X PUT repos/o/r/pulls/1/merge"],
+	["gh api -X post lowercase", "gh api -X post repos/o/r/issues"],
+	["gh api --method PUT", "gh api --method PUT repos/o/r/pulls/1/merge"],
+	["gh api --method=DELETE", "gh api --method=DELETE repos/o/r/git/refs/heads/x"],
+	["gh api after the endpoint", "gh api repos/o/r/issues/1 -X PATCH"],
+	["gh api --input", "gh api repos/o/r/issues --input body.json"],
+	["gh api --input=", "gh api repos/o/r/issues --input=body.json"],
+	["gh api -f", "gh api repos/o/r/issues -f title=x"],
+	["gh api -ftitle=x", "gh api repos/o/r/issues -ftitle=x"],
+	["gh api -F", "gh api repos/o/r/issues -F draft=true"],
+	["gh api --field", "gh api repos/o/r/issues --field title=x"],
+	["gh api --field=", "gh api repos/o/r/issues --field=title=x"],
+	["gh api --raw-field", "gh api repos/o/r/issues --raw-field title=x"],
+	["gh api graphql", "gh api graphql -f query='mutation{x}'"],
+	["gh api graphql without a body flag", "gh api graphql"],
+	["gh -R o/r api -XPUT", "gh -R o/r api -XPUT repos/o/r/pulls/1/merge"],
+	["gh alias set", "gh alias set pm 'pr merge'"],
+	["gh extension install", "gh extension install x/gh-evil"],
+	["gh auth login", "gh auth login --with-token"],
+	["gh auth token", "gh auth token"],
+	// credential and containment variables, inline or exported
+	["GH_CONFIG_DIR inline", "GH_CONFIG_DIR=/tmp/other gh api user"],
+	["GH_TOKEN inline", "GH_TOKEN=x gh api user"],
+	["GITHUB_TOKEN inline", "GITHUB_TOKEN=x npm test"],
+	["GIT_SSH_COMMAND inline", "GIT_SSH_COMMAND='ssh -i /tmp/k' git status"],
+	["GIT_SSH inline", "GIT_SSH=/tmp/ssh git status"],
+	["GIT_CONFIG_COUNT inline", "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0=push git p"],
+	["GIT_CONFIG_PARAMETERS inline", "GIT_CONFIG_PARAMETERS=\"'alias.p=push'\" git p"],
+	["GIT_ASKPASS inline", "GIT_ASKPASS=/tmp/a git status"],
+	["SSH_AUTH_SOCK inline", "SSH_AUTH_SOCK=/tmp/s ssh -T git@github.com"],
+	["SSH_ASKPASS inline", "SSH_ASKPASS=/tmp/a ssh x"],
+	["HOME inline", "HOME=/tmp/h git status"],
+	["env GH_TOKEN", "env GH_TOKEN=x gh api user"],
+	["env -u GH_CONFIG_DIR", "env -u GH_CONFIG_DIR gh api user"],
+	["export GH_TOKEN", "export GH_TOKEN=abc"],
+	["export then use", "export GIT_SSH_COMMAND='ssh -i /tmp/k'; git status"],
+	["unset GH_CONFIG_DIR", "unset GH_CONFIG_DIR"],
+	["declare -x HOME", "declare -x HOME=/tmp/h"],
+	["a variable inside bash -c", "bash -c 'GH_TOKEN=x gh api user'"],
+	// credential stores by name
+	["security (macOS keychain cli)", "security find-generic-password -s github.com -w"],
+	["/usr/bin/security", "/usr/bin/security dump-keychain"],
+	[".git-credentials", "cat ~/.git-credentials"],
+	[".netrc", "cat ~/.netrc"],
+	[".config/gh/hosts.yml", "cat ~/.config/gh/hosts.yml"],
+	["ls .config/gh", "ls ~/.config/gh"],
+	["hosts.yml", "grep oauth_token hosts.yml"],
+	// a shell fed a program the guard cannot read
+	["bash <<EOF", "bash <<EOF\ngit push origin HEAD\nEOF"],
+	["sh <<'EOF'", "sh <<'EOF'\ngit update-ref refs/heads/main HEAD\nEOF"],
+	["zsh here-string", "zsh <<< 'git push'"],
+	["cat <<EOF | sh", "cat <<EOF | sh\ngit push\nEOF"],
+	["echo | sh", "echo git push | sh"],
+	["echo | bash", "echo 'git push' | bash"],
+	["bare shell", "sh"],
+	["bash -s", "bash -s"],
+];
+
+const ALLOWED_BOTH: Array<[string, string]> = [
+	["git status", "git status"],
+	["git diff", "git diff main...HEAD"],
+	["git log", "git log --oneline -5"],
+	["git remote -v", "git remote -v"],
+	["git symbolic-ref (read)", "git symbolic-ref --short HEAD"],
+	["git branch -a", "git branch -a"],
+	["gh api GET", "gh api repos/o/r/pulls/1"],
+	["gh api -X GET", "gh api -X GET repos/o/r/pulls/1"],
+	["gh api --method=GET", "gh api --method=GET repos/o/r/pulls/1"],
+	["gh api -XGET", "gh api -XGET repos/o/r/pulls/1 --jq .state"],
+	["npm test", "npm test"],
+	["node --test", "node --test tests/a.test.ts"],
+	["a script file in a shell", "sh scripts/build.sh"],
+	["a script file with flags", "bash -x scripts/build.sh"],
+	["bash -c of an ordinary command", "bash -c 'npm test'"],
+	["an assignment of an ordinary variable", "NODE_ENV=test npm test"],
+	["a heredoc to cat (a commit message)", "cat <<EOF\nnotes\nEOF"],
+	["a pipe to grep", "git log --oneline | grep fix"],
+	["export of an ordinary variable", "export NODE_ENV=test"],
+];
+
+const ALLOWED_WORKER: Array<[string, string]> = [
+	["git commit on the feature branch", "git commit -m x"],
+	["a commit message that mentions git config", "git commit -m 'document git config and gh api usage'"],
+	["git config read: one key", "git config user.name"],
+	["git config --get", "git config --get user.email"],
+	["git config --list", "git config --list"],
+	["git branch new-name", "git branch spike"],
+	["git checkout -b", "git checkout -b feat/other"],
+	["git fetch origin", "git fetch origin"],
+	["git reset --soft HEAD~1", "git reset --soft HEAD~1"],
+	["python3 -c in the worker", "python3 -c 'print(1)'"],
+	["node -e in the worker", "node -e 'console.log(1)'"],
+];
+
+describe("containment: the string layer (B1, B3; best effort)", { concurrency: 8 }, () => {
+	before(() => {
+		env.settings({});
+		ws = makeWorkspace();
+	});
+	after(() => ws.cleanup());
+	const readOnly = () => createGuard({ cwd: ws.repo, readOnly: true, settings: () => ({}) });
+	const worker = (mode?: "yolo") => createGuard({ cwd: ws.repo, settings: () => (mode ? { defaultMode: mode } : {}) });
+	for (const [name, command] of BLOCKED_BOTH) {
+		it(`blocks for the worker: ${name}`, async () => {
+			const reason = await worker().decide(bash(command));
+			assert.ok(reason !== undefined, `not blocked: ${command}`);
+			assert.match(reason, CONTAINED);
+		});
+		it(`blocks for the worker in yolo: ${name}`, async () => {
+			assert.ok((await worker("yolo").decide(bash(command))) !== undefined, `not blocked in yolo: ${command}`);
+		});
+		it(`blocks for the verifier: ${name}`, async () => {
+			assert.ok((await readOnly().decide(bash(command))) !== undefined, `not blocked for the verifier: ${command}`);
+		});
+	}
+	for (const [name, command] of ALLOWED_BOTH) {
+		it(`still allows for the worker: ${name}`, async () => assert.equal(await worker().decide(bash(command)), undefined));
+	}
+	for (const [name, command] of ALLOWED_BOTH.filter(([, command]) => !/^(gh api|git branch|git remote|git symbolic-ref|a script|bash|sh |NODE_ENV|export|cat|node --test|npm)/.test(command))) {
+		it(`still allows for the verifier: ${name}`, async () => assert.equal(await readOnly().decide(bash(command)), undefined));
+	}
+	for (const [name, command] of ALLOWED_WORKER) {
+		it(`still allows for the worker: ${name}`, async () => assert.equal(await worker().decide(bash(command)), undefined));
+	}
+	it("`gh pr view` is unchanged: the runner owns PR commands, so it stays a delivery block", async () => {
+		assert.match((await worker("yolo").decide(bash("gh pr view 12"))) ?? "", DELIVERY);
+	});
+	it("a worker-side check tool whose command is a forbidden spelling is blocked too", async () => {
+		const reason = await createGuard({ cwd: ws.repo, settings: () => ({}) }).decide({ name: "check", arguments: { command: "GH_TOKEN=x npm test" } });
+		assert.match(reason ?? "", CONTAINED);
+	});
 });

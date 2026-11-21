@@ -151,6 +151,7 @@ export async function statusText(runner: Runner, docPath: string): Promise<Contr
 	if (status.pr) {
 		lines.push(`pr: ${status.pr.phase}${status.pr.url ? `  ${status.pr.url}` : ""}`);
 		if (status.pr.reason) lines.push(`  needs you: ${status.pr.reason}`);
+		if (status.pr.warning) lines.push(`  warning: ${status.pr.warning}`);
 	}
 	lines.push("tickets:");
 	try {

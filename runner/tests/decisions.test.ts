@@ -11,7 +11,7 @@ import type { Storage } from "@earendil-works/pi-durable";
 import { parseTicketList } from "../../lib/ticket-list.ts";
 import { answerDecision } from "../src/control.ts";
 import { ANSWER } from "../src/signals.ts";
-import { askUser, bash, commitFile, context, docText, fakeClock, isolateEnv, makeWorker, makeWorkspace, openFixtureRunner, readDoc, ticketLine, type FixtureRunner, type Workspace } from "./fixture.ts";
+import { askUser, bash, commitFile, context, depsWithHook, docText, fakeClock, isolateEnv, makeWorker, makeWorkspace, openFixtureRunner, readDoc, ticketLine, type FixtureRunner, type Workspace } from "./fixture.ts";
 
 let restoreEnv: () => void;
 before(() => {
@@ -121,11 +121,12 @@ describe("decision parking (S4, S9)", () => {
 	it("a user who hand-edits the parked line back to pending gets it picked as usual, and its decision is dropped", async () => {
 		writeFileSync(ws.docPath, docText([T1, T3]));
 		const worker = makeWorker({ T1: (run) => (run === 1 ? [askUser(QUESTION, OPTIONS)] : commitFile("t1.txt")), T3: commitFile("t3.txt") });
-		// "Meanwhile": the edit lands while an independent ticket runs, so the next pick sees it (a sleeping loop is not woken by a doc edit).
-		worker.onPrompt = (prompt) => {
-			if (prompt.ticketId === "T3") writeFileSync(ws.docPath, readDoc(ws).replace(/^(- T1 .*) — blocked .*$/m, "$1 — pending"));
-		};
-		runner = await openFixtureRunner(ws, worker);
+		// "Meanwhile": the edit lands while an independent ticket's done command runs (after its worker's conversation: a doc change during one is an integrity
+		// finding, B2), so the next pick sees it (a sleeping loop is not woken by a doc edit).
+		const deps = depsWithHook((command) => {
+			if (command === "test -f t3.txt") writeFileSync(ws.docPath, readDoc(ws).replace(/^(- T1 .*) — blocked .*$/m, "$1 — pending"));
+		});
+		runner = await openFixtureRunner(ws, worker, { deps });
 		const outcome = await runner.settle(await runner.start(ws.docPath));
 		assert.equal((outcome as { result?: { status: string } }).result?.status, "done");
 		assert.deepEqual(worker.prompts.map((p) => p.ticketId), ["T1", "T3", "T1"]);

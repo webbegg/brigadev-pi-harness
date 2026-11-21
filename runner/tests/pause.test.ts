@@ -6,7 +6,7 @@ import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { parseTicketList } from "../../lib/ticket-list.ts";
 import { pauseLoop, resumeLoop } from "../src/control.ts";
 import { defaultDeps, type TicketDeps } from "../src/tasks.ts";
-import { commitFile, docText, isolateEnv, makeWorker, makeWorkspace, openFixtureRunner, readDoc, type FixtureRunner, type Workspace } from "./fixture.ts";
+import { commitFile, depsWithHook, docText, isolateEnv, makeWorker, makeWorkspace, openFixtureRunner, readDoc, type FixtureRunner, type Workspace } from "./fixture.ts";
 
 let restoreEnv: () => void;
 before(() => {
@@ -103,13 +103,14 @@ describe("doc conflict pause (A4, S8)", () => {
 		const worker = makeWorker({ T1: commitFile("t1.txt"), T2: commitFile("t2.txt") });
 		let original = "";
 		let edited = "";
-		worker.onPrompt = (prompt) => {
-			if (prompt.ticketId !== "T1") return;
+		// While T1's done command runs: after the worker's conversation (a doc change during it is an integrity finding, B2).
+		const deps = depsWithHook((command) => {
+			if (command !== "test -f t1.txt" || edited) return;
 			original = readDoc(ws);
 			edited = original.replace("inline: first", "inline: first (user reworded)");
 			writeFileSync(ws.docPath, edited);
-		};
-		runner = await openFixtureRunner(ws, worker);
+		});
+		runner = await openFixtureRunner(ws, worker, { deps });
 		const id = await runner.start(ws.docPath);
 		assert.deepEqual(await runner.settle(id), { status: "waiting", paused: "doc edited: T1", decisions: [] });
 		assert.equal(readDoc(ws), edited, "nothing was written over the user's edit");

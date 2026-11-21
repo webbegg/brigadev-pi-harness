@@ -157,3 +157,60 @@ describe("the PR loop from the CLI (A8)", () => {
 		assert.equal((await cli(["merge", ws.docPath, "extra"])).code, 2);
 	});
 });
+
+describe("start cannot change how a loop was started (B5, R3-002)", () => {
+	const message = async (r: FixtureRunner, options: { pr: boolean }) => {
+		let err = "";
+		const code = await startLoop(r, ws.docPath, { out: () => {}, err: (text) => (err += `${text}\n`) }, options);
+		return { code, err };
+	};
+
+	it("`start --no-pr` on a loop started with the PR loop exits 1 with how it was started, and pushes, opens, and comments nothing more (the ledger's repro: it pushed 1, created 1, commented 1)", async () => {
+		writeFileSync(ws.docPath, docText([T1]));
+		runner = await open();
+		const parked = await startTicking(runner, true);
+		assert.equal(parked.code, 1);
+		await runner.close();
+		runner = undefined;
+		const before = { pushes: gh.pushes().length, creates: gh.creates().length, comments: gh.comments.length, ghCalls: gh.ghCalls.length };
+		assert.deepEqual([before.pushes, before.creates], [1, 1]);
+
+		runner = await open();
+		const refused = await message(runner, { pr: false });
+		assert.equal(refused.code, 1);
+		assert.match(refused.err, /Refusing to start: this loop was started with the PR loop and that cannot change/);
+		assert.match(refused.err, new RegExp(`brigadev-runner start ${ws.docPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+		assert.deepEqual({ pushes: gh.pushes().length, creates: gh.creates().length, comments: gh.comments.length, ghCalls: gh.ghCalls.length }, before, "nothing touched git or gh");
+	});
+
+	it("starting a loop that began with --no-pr with the PR loop is refused the same way, and the same options continue it", async () => {
+		writeFileSync(ws.docPath, docText([T1]));
+		runner = await open();
+		assert.equal((await message(runner, { pr: false })).code, 0, "the first start runs the tickets and ends done");
+		await runner.close();
+		runner = undefined;
+
+		runner = await open();
+		const refused = await message(runner, { pr: true });
+		assert.equal(refused.code, 1);
+		assert.match(refused.err, /started with --no-pr \(tickets only\) and that cannot change/);
+		assert.equal(gh.ghCalls.length, 0);
+		assert.equal((await message(runner, { pr: false })).code, 0, "the options it was started with are fine");
+	});
+
+	it("starting from another worktree than the loop's is refused, naming both (R3-002)", async () => {
+		writeFileSync(ws.docPath, docText([T1]));
+		runner = await open();
+		assert.equal((await message(runner, { pr: false })).code, 0);
+		await runner.close();
+		runner = undefined;
+
+		const elsewhere = join(ws.root, "elsewhere");
+		mkdirSync(elsewhere);
+		runner = await openFixtureRunner({ ...ws, repo: elsewhere }, makeWorker({ T1: commitFile("app.js") }), { storage: await openStore(), clock, prDeps: prDepsOf(gh) });
+		const refused = await message(runner, { pr: false });
+		assert.equal(refused.code, 1);
+		assert.ok(refused.err.includes(`this loop was started in ${ws.repo}`), refused.err);
+		assert.ok(refused.err.includes(`cannot move to ${elsewhere}`), refused.err);
+	});
+});

@@ -85,10 +85,12 @@ describe("brigadev-runner status / answer / pause / resume", () => {
 		}
 		assert.equal(lockHolder(storePathFor(ws.repo, env)), undefined, "released");
 		assert.equal((await cli(["pause", ws.docPath])).code, 0, "free again");
-		// A stale lock (its process is gone) holds nothing.
-		writeFileSync(`${storePathFor(ws.repo, env)}.lock`, "999999999");
+		// The lock is the OS's, not a file's: a pid file left by a dead process holds nothing.
+		writeFileSync(`${storePathFor(ws.repo, env)}.lock.pid`, "999999999");
 		assert.equal(lockHolder(storePathFor(ws.repo, env)), undefined);
-		rmSync(`${storePathFor(ws.repo, env)}.lock`, { force: true });
+		const again = acquireStore(storePathFor(ws.repo, env));
+		assert.equal(typeof again, "function", "taken again over the stale pid file");
+		(again as () => void)();
 	});
 
 	it("shows the open decision with its options, the recommended mark, and the exact answer command; answer maps every signal result to an exit code", async () => {

@@ -14,13 +14,16 @@
 // the foreground for an answer it could not see; run it again after answering.
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { onFeatureBranch, readBranchFacts } from "../../lib/commit-branch.ts";
 import { canonicalPath } from "../../lib/paths.ts";
 import { repoDocsDir, repoName } from "../../lib/repo-docs.ts";
+import { hardenGitEnv } from "./contain.ts";
 import { answerDecision, mergeLoop, pauseLoop, resumeLoop, statusText, type ControlResult } from "./control.ts";
 import { validateDoc } from "./doc.ts";
 import { nodeExec } from "./exec.ts";
+import { LoopStartedDifferently } from "./errors.ts";
 import type { Runner } from "./runner.ts";
 import { answerCommand, mergeCommand } from "./signals.ts";
 
@@ -47,7 +50,11 @@ export const storePathFor = (cwd: string, env: Env = process.env): string => joi
 // ---------------------------------------------------------------------------------------------------------------------
 // The store lock: one `start` per store, and no control command while it runs
 
+// B4: the lock is an OS lock that dies with its process, not a file a stale-removal race can take twice. `<store>.lock` is an SQLite database held in one
+// `BEGIN EXCLUSIVE` transaction with `locking_mode=EXCLUSIVE` and no busy timeout, from `acquireStore` until the release (or the process's death, which releases it:
+// there is no stale lock to take over). The holder's pid is written to `<store>.lock.pid` after the lock is held, for messages only.
 const lockPathOf = (storePath: string) => `${storePath}.lock`;
+const pidPathOf = (storePath: string) => `${storePath}.lock.pid`;
 const alive = (pid: number) => {
 	try {
 		process.kill(pid, 0);
@@ -57,37 +64,94 @@ const alive = (pid: number) => {
 	}
 };
 
-/** The pid of a live process holding the store, or undefined. */
-export function lockHolder(storePath: string): number | undefined {
+/** Locks this process holds, by store path: not re-entrant (one open of the store per lock). */
+const heldHere = new Map<string, DatabaseSync>();
+
+const isBusy = (error: unknown) => /locked|busy/i.test(error instanceof Error ? error.message : String(error));
+
+/** The pid in the side file when that process is alive, else -1 (locked, holder unknown: it has just taken the lock, or the file is stale). */
+function pidOnFile(storePath: string): number {
 	try {
-		const pid = Number(readFileSync(lockPathOf(storePath), "utf8").trim());
-		return Number.isInteger(pid) && pid > 0 && alive(pid) ? pid : undefined;
+		const pid = Number(readFileSync(pidPathOf(storePath), "utf8").trim());
+		return Number.isInteger(pid) && pid > 0 && alive(pid) ? pid : -1;
 	} catch {
-		return undefined;
+		return -1;
 	}
 }
 
-/** Take the store for this process; returns the holder's pid instead when another live process has it, else a release function. */
+/** Open the lock database and take its exclusive lock now, or undefined when another process (or this one) holds it. */
+function takeLock(storePath: string, legacyChecked = false): DatabaseSync | undefined {
+	const db = new DatabaseSync(lockPathOf(storePath));
+	try {
+		db.exec("PRAGMA busy_timeout=0");
+		db.exec("PRAGMA locking_mode=EXCLUSIVE");
+		db.exec("BEGIN EXCLUSIVE");
+		return db;
+	} catch (error) {
+		try {
+			db.close();
+		} catch {
+			// Closing a connection that never held the lock cannot release anyone else's.
+		}
+		if (isBusy(error)) return undefined;
+		// A pid file left by the earlier lock (a number, not a database): its process is long gone, or `start` was upgraded under it. Replace it once.
+		if (!legacyChecked && /not a database/i.test(error instanceof Error ? error.message : String(error))) {
+			rmSync(lockPathOf(storePath), { force: true });
+			return takeLock(storePath, true);
+		}
+		throw error;
+	}
+}
+
+/** The pid of the process holding the store (-1 when it holds it but its pid is not known yet), or undefined when nobody does. */
+export function lockHolder(storePath: string): number | undefined {
+	if (heldHere.has(storePath)) return process.pid;
+	if (!existsSync(lockPathOf(storePath))) return undefined;
+	const probe = takeLock(storePath);
+	if (probe) {
+		try {
+			probe.exec("ROLLBACK");
+		} finally {
+			probe.close();
+		}
+		return undefined;
+	}
+	return pidOnFile(storePath);
+}
+
+/** Take the store for this process; returns the holder's pid (-1: unknown) instead when another process has it, else a release function (idempotent). */
 export function acquireStore(storePath: string): number | (() => void) {
 	mkdirSync(dirname(storePath), { recursive: true });
-	// Exclusive create, so two `start`s racing cannot both take it; a stale lock (dead pid) is removed once and the create retried.
-	for (let attempt = 0; ; attempt++) {
-		try {
-			writeFileSync(lockPathOf(storePath), String(process.pid), { flag: "wx" });
-			break;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			const holder = lockHolder(storePath);
-			// A live holder, this process included: the lock is not re-entrant (one open of the store per lock).
-			if (holder !== undefined) return holder;
-			if (attempt > 0) return -1;
-			rmSync(lockPathOf(storePath), { force: true });
-		}
+	// This process holds it already: the lock is not re-entrant.
+	if (heldHere.has(storePath)) return process.pid;
+	const db = takeLock(storePath);
+	if (!db) return pidOnFile(storePath);
+	heldHere.set(storePath, db);
+	try {
+		writeFileSync(pidPathOf(storePath), String(process.pid));
+	} catch {
+		// The pid is for messages: the lock is held either way.
 	}
+	let released = false;
 	return () => {
-		if (readFileSync(lockPathOf(storePath), "utf8").trim() === String(process.pid)) rmSync(lockPathOf(storePath), { force: true });
+		if (released) return;
+		released = true;
+		heldHere.delete(storePath);
+		try {
+			db.exec("ROLLBACK");
+		} catch {
+			// Closing the connection releases the lock all the same.
+		}
+		db.close();
+		try {
+			if (readFileSync(pidPathOf(storePath), "utf8").trim() === String(process.pid)) rmSync(pidPathOf(storePath), { force: true });
+		} catch {
+			// No pid file: nothing to remove.
+		}
 	};
 }
+
+const holderText = (pid: number) => (pid > 0 ? `pid ${pid}` : "another process");
 
 /**
  * Q5: the runner never shares a checkout or a branch with a live Pi session, and never commits on the default branch. It starts only in
@@ -115,7 +179,15 @@ export async function worktreeRefusal(cwd: string): Promise<string | undefined> 
  * answer, and return 1; the loop continues from storage the next time `start` runs.
  */
 export async function startLoop(runner: Runner, docPath: string, io: Io, options: { pr?: boolean } = {}): Promise<number> {
-	const id = await runner.start(docPath, { pr: options.pr === true });
+	let id: Awaited<ReturnType<Runner["start"]>>;
+	try {
+		id = await runner.start(docPath, { pr: options.pr === true });
+	} catch (error) {
+		// B5: the loop exists with other options; nothing was started.
+		if (!(error instanceof LoopStartedDifferently)) throw error;
+		io.err(`Refusing to start: ${error.message}`);
+		return 1;
+	}
 	const outcome = await runner.settle(id);
 	io.out(JSON.stringify(outcome, null, 2));
 	if (outcome.status === "waiting") {
@@ -177,7 +249,7 @@ async function control(command: string, args: string[], env: Env, io: Io, cwd: s
 	if (command !== "status") {
 		const held = acquireStore(storePath);
 		if (typeof held === "number") {
-			io.err(`a \`brigadev-runner start\` is running on this store (pid ${held}). \`${command}\` opens the store too, which is unsafe beside it: wait until \`start\` parks or ends, or stop it, then run \`${command}\` again.`);
+			io.err(`a \`brigadev-runner start\` is running on this store (${holderText(held)}). \`${command}\` opens the store too, which is unsafe beside it: wait until \`start\` parks or ends, or stop it, then run \`${command}\` again.`);
 			return 1;
 		}
 		release = held;
@@ -266,7 +338,7 @@ export async function main(args: string[], env: Env = process.env, io: Io = { ou
 	if (!existsSync(dirname(storePath))) mkdirSync(dirname(storePath), { recursive: true });
 	const held = acquireStore(storePath);
 	if (typeof held === "number") {
-		io.err(`another \`brigadev-runner start\` is running on this store (pid ${held}); one process per store.`);
+		io.err(`another \`brigadev-runner start\` is running on this store (${holderText(held)}); one process per store.`);
 		return 1;
 	}
 	try {
@@ -289,6 +361,9 @@ export async function main(args: string[], env: Env = process.env, io: Io = { ou
 
 const entry = process.argv[1];
 if (entry && import.meta.url === pathToFileURL(realpathSync(entry)).href) {
+	// The runner's own git calls (the guard's branch facts, the commit gate's tree hash, the PR loop's push) read a repository config the agent may have edited:
+	// no fsmonitor or hook program of it may run with the runner's credentials in reach.
+	hardenGitEnv(process.env);
 	main(process.argv.slice(2)).then(
 		(code) => process.exit(code),
 		(error) => {

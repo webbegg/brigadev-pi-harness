@@ -24,6 +24,13 @@ export const PASS = { name: "test", status: "COMPLETED", conclusion: "SUCCESS", 
 export const PENDING = { name: "test", status: "IN_PROGRESS", conclusion: "", detailsUrl: `${RUN}/100/job/1` };
 export const FAIL = { name: "test", status: "COMPLETED", conclusion: "FAILURE", detailsUrl: `${RUN}/101/job/2` };
 
+/** `git -c a=b -c c=d push …` as `git push …`. */
+export function withoutConfig(args: string[]): string[] {
+	let at = 0;
+	while (args[at] === "-c") at += 2;
+	return args.slice(at);
+}
+
 export interface FakePr {
 	number: number;
 	title: string;
@@ -32,15 +39,19 @@ export interface FakePr {
 	head: string;
 	state: "OPEN" | "CLOSED" | "MERGED";
 	isDraft: boolean;
+	/** The head commit the PR shows, when it is not the remote branch's (an older PR of a reused branch name). */
+	headSha?: string;
 }
 
 /** `gh` as the PR loop calls it: `pr view|create|comment|merge`, `run view --log-failed`; every call is recorded. git passes through to the real one. */
 export class FakeGh {
 	prs: FakePr[] = [];
 	comments: Array<{ number: number; body: string }> = [];
-	/** Every `gh` call's arguments, and every `git` call's. */
+	/** Every `gh` call's arguments, and every `git` call's with the leading `-c name=value` pairs removed (the runner passes `-c core.hooksPath=/dev/null` to its push). */
 	ghCalls: string[][] = [];
 	gitCalls: string[][] = [];
+	/** Every `git` call's arguments as they were passed. */
+	gitRaw: string[][] = [];
 	/** The checks a PR shows for its head sha (default: one passing check). */
 	checks: (sha: string) => unknown[] = () => [PASS];
 	logs: Record<string, string> = { "101": "FAIL: expected 1, got 2\n  at suite.test" };
@@ -68,10 +79,12 @@ export class FakeGh {
 
 	readonly exec: PrExec = async (command, args, options) => {
 		if (command !== "gh") {
-			this.gitCalls.push(args);
-			await this.before?.(command, args);
+			const plain = withoutConfig(args);
+			this.gitRaw.push(args);
+			this.gitCalls.push(plain);
+			await this.before?.(command, plain);
 			const result = await nodeExec(command, args, { cwd: options.cwd ?? ".", timeout: options.timeout ?? 60_000 });
-			await this.after?.(command, args);
+			await this.after?.(command, plain);
 			return result;
 		}
 		this.ghCalls.push(args);
@@ -82,7 +95,7 @@ export class FakeGh {
 	};
 
 	private view(pr: FakePr, fields: string[]): string {
-		const sha = this.remoteSha(pr.head) ?? "";
+		const sha = pr.headSha ?? this.remoteSha(pr.head) ?? "";
 		const all: Record<string, unknown> = {
 			number: pr.number,
 			title: pr.title,

@@ -1,7 +1,7 @@
 // The two durable tasks: `brigadev.ticket-loop` (pick → launch → record, ticket by ticket; parks on decisions and pauses) and
 // `brigadev.ticket` (one ticket: a worker conversation per attempt, then the done check). Both only commit state; the doc is written
 // through lib/ticket-list.ts after re-reading it, so a user's edit is never overwritten.
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { configure, defineTask, SubmissionSettled } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord/context";
@@ -18,9 +18,15 @@ import {
 	writeFileAtomic,
 	type TicketStatus,
 } from "../../lib/ticket-list.ts";
+import type { ExecFn } from "../../lib/worktree-snapshot.ts";
 import { ApprovalDoc, approves, DecisionDoc, decisionOf, type AnsweredDecision, type Decision } from "./decision.ts";
 import { validateDoc } from "./doc.ts";
+import { asExec, nodeExec } from "./exec.ts";
+import { redact } from "./redact.ts";
+import { branchOf, compareIntegrity, integrityReason, takeIntegrity, type Integrity } from "./integrity.ts";
+import { defaultContainedEnv } from "./contain.ts";
 import { createPrTask, type PrOptions, type PrResult } from "./pr.ts";
+import { DEFAULT_DONE_TIMEOUT_MINUTES, runShell } from "./shell.ts";
 import { ANSWER, answerCommand, DECISION_DEADLINE_MS, decisionKey, PAUSE, pauseKey, RESUME, resumeKey } from "./signals.ts";
 import { tailOf } from "./tail.ts";
 import { loadWorker, workerInput, workerInstructions, type TicketBrief, type Worker } from "./worker.ts";
@@ -41,24 +47,28 @@ export interface RunResult {
 	output: string;
 }
 
+/** How the agent's commands are run: the contained environment (src/contain.ts) and the longest a command may take. */
+export interface ShellContext {
+	env?: NodeJS.ProcessEnv;
+	timeoutMs?: number;
+}
+
 /** Everything the ticket task does outside storage; tests pass their own to observe or interrupt it. */
 export interface TicketDeps {
-	/** Run a shell command in `cwd`; stdout and stderr are combined. Rejects when `signal` aborts. */
-	run(command: string, cwd: string, signal?: AbortSignal): Promise<RunResult>;
+	/**
+	 * Run a shell command in `cwd` (the ticket's `done` check: it is worker-supplied code): stdout and stderr are combined (the last 1 MB), the process group
+	 * is killed after `shell.timeoutMs` (default 30 min) or when `signal` aborts. Rejects when `signal` aborts.
+	 */
+	run(command: string, cwd: string, signal?: AbortSignal, shell?: ShellContext): Promise<RunResult>;
 	/** The commit HEAD points at; "" when there is none yet. */
 	head(cwd: string, signal?: AbortSignal): Promise<string>;
 }
 
 export const defaultDeps: TicketDeps = {
-	run: (command, cwd, signal) =>
-		new Promise((resolve, reject) => {
-			let output = "";
-			const child = spawn("sh", ["-c", command], { cwd, signal, stdio: ["ignore", "pipe", "pipe"] });
-			child.stdout.on("data", (chunk) => (output += chunk));
-			child.stderr.on("data", (chunk) => (output += chunk));
-			child.on("error", reject);
-			child.on("close", (exitCode) => resolve({ exitCode, output }));
-		}),
+	run: async (command, cwd, signal, shell) => {
+		const result = await runShell(command, cwd, { signal, env: shell?.env ?? defaultContainedEnv(), timeoutMs: shell?.timeoutMs ?? DEFAULT_DONE_TIMEOUT_MINUTES * 60_000 });
+		return { exitCode: result.exitCode, output: result.output };
+	},
 	head: (cwd, signal) =>
 		new Promise((resolve, reject) => {
 			execFile("git", ["rev-parse", "--verify", "-q", "HEAD"], { cwd, signal }, (error, stdout) => {
@@ -86,12 +96,17 @@ export type TicketInput = {
 	model: ModelRef;
 	/** The decision this ticket parked on in an earlier run, with the user's answer: the brief carries it, and an approved command is lifted in the first attempt's conversation only. */
 	decision?: AnsweredDecision;
+	/** The HEAD an earlier run of this ticket started from (it parked on an integrity change and the user resumed): "the worker committed" is measured from it, not from now. */
+	sinceHead?: string;
 };
 
 export type TicketState = { phase: "start"; attempt: number; failure?: string } | { phase: "check"; attempt: number; key: string; conversationId: string };
 
-/** Finished (`commit`), or the worker asked a question (`decision`): a decision uses no attempt, so `attempts` counts the ones before it. */
-export type TicketResult = { commit: string; outputTail: string; attempts: number } | { decision: Decision; attempts: number };
+/**
+ * Finished (`commit`), the worker asked a question (`decision`: it uses no attempt, so `attempts` counts the ones before it), or the worker's run changed what it must
+ * not (`integrity`, src/integrity.ts: the done check was not run; `startHead` is where the ticket started, for the rerun after `resume`).
+ */
+export type TicketResult = { commit: string; outputTail: string; attempts: number } | { decision: Decision; attempts: number } | { integrity: string[]; attempts: number; startHead: string };
 
 /**
  * Tools the runner can give the worker: the worker's tool list restricted to what pi-durable's CodingTools provides, plus the
@@ -105,7 +120,10 @@ function workerTools(worker: Worker, extra: readonly ToolRegistration[]) {
 
 export type TicketTask = ReturnType<typeof createTicketTask>;
 
-function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly ToolRegistration[]) {
+/** The beforeKey of the snapshot taken before an attempt's worker conversation. */
+const integrityKey = (attempt: number) => `integrity.before.${attempt}`;
+
+function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly ToolRegistration[], shell: ShellContext, exec: ExecFn) {
 	return defineTask<TicketInput, TicketState, TicketResult>({
 		name: TICKET_TASK,
 		version: 1,
@@ -115,7 +133,9 @@ function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly
 				const input = task.input;
 				const { attempt, failure } = task.state.checkpoint;
 				// The HEAD this ticket started from, memoized so a rerun (or a later attempt) compares against the same one.
-				if ((await runtime.memo<string>("startHead", context)) === undefined) await runtime.memo("startHead", await deps.head(input.cwd, runtime.signal), context);
+				if ((await runtime.memo<string>("startHead", context)) === undefined) await runtime.memo("startHead", input.sinceHead ?? (await deps.head(input.cwd, runtime.signal)), context);
+				// What the worker must not touch, as it is before its run (compared in `check`, before the done check is trusted). Memoized: a rerun keeps the first.
+				if ((await runtime.memo<Integrity>(integrityKey(attempt), context)) === undefined) await runtime.memo(integrityKey(attempt), await takeIntegrity(input.cwd, exec, { docPath: input.docPath }), context);
 
 				const brief: TicketBrief = { ticketId: input.ticketId, title: input.title, specs: input.specs, ...(input.spec ? { spec: input.spec } : {}), done: input.done, docPath: input.docPath, attempt, maxAttempts: input.maxAttempts, failure, decision: input.decision };
 				// One worker conversation per attempt, owned by this task and found again by position after a rerun.
@@ -154,6 +174,24 @@ function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly
 				const input = task.input;
 				const { attempt, key, conversationId } = task.state.checkpoint;
 
+				// B2/B3: before anything the worker made is run or believed, check it left alone the document, the settings, git's config and hooks, every ref, and the remote.
+				const before = await runtime.memo<Integrity>(integrityKey(attempt), context);
+				if (before) {
+					let changes: string[];
+					try {
+						changes = compareIntegrity(before, await takeIntegrity(input.cwd, exec, { docPath: input.docPath, previous: before }), { featureBranch: branchOf(before.head.ref) });
+					} catch (error) {
+						if (runtime.signal.aborted) return;
+						throw error;
+					}
+					if (runtime.signal.aborted) return;
+					if (changes.length > 0) {
+						const startHead = (await runtime.memo<string>("startHead", context)) ?? "";
+						await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { integrity: changes, attempts: attempt - 1, startHead } } }), context);
+						return;
+					}
+				}
+
 				// The worker asked a question (`ask_user_choice`): the ticket completes with it instead of running the done check, and the attempt is
 				// not used. The question was recorded on the conversation by the tool's own commit, before its run ended.
 				const asked = decisionOf(await runtime.snapshot(DecisionDoc, conversationId as never, context));
@@ -169,7 +207,7 @@ function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly
 				let run: RunResult;
 				let head: string;
 				try {
-					run = await deps.run(input.done, input.cwd, runtime.signal);
+					run = await deps.run(input.done, input.cwd, runtime.signal, shell);
 					head = await deps.head(input.cwd, runtime.signal);
 				} catch (error) {
 					// Closing the Harness aborts the signal; this phase reruns from its top on reopen.
@@ -219,14 +257,15 @@ export type OpenDecision = Decision & { ticketId: string; key: string; round: nu
 export type Carry = { owned: Owned; baseline: string; failed: string[]; decisions: OpenDecision[]; rounds: Record<string, number>; answers: Record<string, AnsweredDecision>; epoch: number };
 
 type PickState = { phase: "pick"; first: boolean } & Carry;
-type LaunchState = { phase: "launch"; ticketId: string } & Carry;
+/** `since`: set when the ticket parked on an integrity change; the rerun measures "HEAD moved" from there. */
+type LaunchState = { phase: "launch"; ticketId: string; since?: string } & Carry;
 type RecordState = { phase: "record"; ticketId: string; childId: string; done: string } & Carry;
 type Working = PickState | LaunchState | RecordState;
 /** With every ticket done and `pr` set: launch the PR loop, then wait for it. The PR loop is a child task; it parks and resumes on its own signals. */
 type PrLaunchState = { phase: "pr" } & Carry;
 type PrRecordState = { phase: "pr-record"; childId: string } & Carry;
 
-export type PauseKind = "user" | "conflict" | "failures";
+export type PauseKind = "user" | "conflict" | "failures" | "integrity";
 
 /** The loop asleep on its resume signal (no deadline); `next` is the state it continues with, its epoch already past this pause. */
 export type PausedState = { phase: "resume"; kind: PauseKind; reason: string; key: string; next: Working };
@@ -266,7 +305,8 @@ function writeBack(docPath: string, carry: Pick<Carry, "owned" | "baseline">, ch
 	let next = text;
 	if (change) {
 		try {
-			next = setTicketStatus(next, change.id, change.status, change.note);
+			// What the runner writes into the doc quotes command output and worker text: no credential, no home directory (src/redact.ts).
+			next = setTicketStatus(next, change.id, change.status, redact(change.note));
 		} catch {
 			return { conflict: change.id }; // the ticket's line is gone
 		}
@@ -274,7 +314,7 @@ function writeBack(docPath: string, carry: Pick<Carry, "owned" | "baseline">, ch
 	// A rerun after a crash may find the change already written: that is not the user's edit.
 	const conflicts = ownedLineConflicts(text, carry.owned).filter((id) => !(change && id === change.id && rawOf(text, id) === rawOf(next, id)));
 	if (conflicts.length > 0) return { conflict: conflicts[0] };
-	if (change?.log && !hasLog(next, change.log)) next = appendLogLine(next, date, change.log);
+	if (change?.log && !hasLog(next, redact(change.log))) next = appendLogLine(next, date, redact(change.log));
 
 	const owned = { ...carry.owned };
 	if (change) {
@@ -401,6 +441,7 @@ function createLoopTask(ticketTask: TicketTask, prTask: ReturnType<typeof create
 					maxAttempts: task.input.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
 					model,
 					...(answered ? { decision: answered } : {}),
+					...(state.since ? { sinceHead: state.since } : {}),
 				};
 				const answers = Object.fromEntries(Object.entries(state.answers).filter(([id]) => id !== current.id));
 				await runtime.commit(async (tx) => {
@@ -430,6 +471,18 @@ function createLoopTask(ticketTask: TicketTask, prTask: ReturnType<typeof create
 					epoch: state.epoch,
 					...extra,
 				});
+
+				// The worker's run changed what it must not (document, settings, git config or hooks, a ref, the remote): the loop pauses with the list. The ticket
+				// stays in_progress (the runner's line); `resume` accepts the state and runs the ticket again from the commit it started at. Not a failure.
+				if (outcome.status === "completed" && "integrity" in outcome.result) {
+					const reason = integrityReason("worker", outcome.result.integrity);
+					const change: Change = { id: state.ticketId, status: "in_progress", note: `needs you: ${reason}`, log: `${state.ticketId} needs you: ${reason}`, own: true };
+					const written = writeBack(task.input.docPath, state, change, date);
+					if ("conflict" in written) return pause(runtime, context, "conflict", `doc edited: ${written.conflict}`, state);
+					const { phase: _pick, first: _first, ...carry } = carryOf(written);
+					const next: LaunchState = { ...carry, phase: "launch", ticketId: state.ticketId, ...(outcome.result.startHead ? { since: outcome.result.startHead } : {}) };
+					return pause(runtime, context, "integrity", reason, next);
+				}
 
 				// The worker asked a question: park the ticket and remember the question under a key of its own. A decision is not a failure.
 				if (outcome.status === "completed" && "decision" in outcome.result) {
@@ -526,10 +579,12 @@ export interface Tasks {
 
 /**
  * The three tasks over `deps` (default: real shell and git), the worker definition (default: assets/agents/brigadev-worker.md), and the tools the
- * worker gets besides CodingTools. `prOptions`: the PR loop's git/gh/suite seam, verifier prompt, and the verdict tool (default: real ones).
+ * worker gets besides CodingTools. `prOptions`: the PR loop's git/gh/suite seam, verifier prompt, and the verdict tool (default: real ones). `shell`: the contained
+ * environment and timeout of the ticket's `done` command.
  */
-export function createTasks(deps: TicketDeps = defaultDeps, worker: Worker = loadWorker(), extraTools: readonly ToolRegistration[] = [], prOptions: PrOptions = {}): Tasks {
-	const ticket = createTicketTask(deps, worker, extraTools);
+export function createTasks(deps: TicketDeps = defaultDeps, worker: Worker = loadWorker(), extraTools: readonly ToolRegistration[] = [], prOptions: PrOptions = {}, shell: ShellContext = {}): Tasks {
+	// The integrity snapshot asks the remote with the runner's real environment: the PR loop's git seam (a test's fake gh passes git through).
+	const ticket = createTicketTask(deps, worker, extraTools, shell, prOptions.deps ? asExec(prOptions.deps.exec) : nodeExec);
 	const pr = createPrTask(ticket, prOptions);
 	return { loop: createLoopTask(ticket, pr), ticket, pr };
 }

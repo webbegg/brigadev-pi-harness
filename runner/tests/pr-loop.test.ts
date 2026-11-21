@@ -99,7 +99,8 @@ describe("happy path (A2)", () => {
 		assert.match(worker.prompts[1].system, /read-only/i);
 		assert.match(worker.prompts[1].system, /verify_verdict/);
 		assert.equal(gh.pushes().length, 1);
-		assert.deepEqual(gh.pushes()[0], ["push", "-u", "origin", `HEAD:${FEATURE_BRANCH}`], "never forced");
+		assert.deepEqual(gh.pushes()[0], ["push", "--no-verify", "-u", "origin", `HEAD:${FEATURE_BRANCH}`], "never forced, no hooks");
+		assert.deepEqual(gh.gitRaw.find((args) => args.includes("push"))!.slice(0, 2), ["-c", "core.hooksPath=/dev/null"], "the repository's hooks never run for the runner's push");
 		assert.equal(gh.remoteSha(FEATURE_BRANCH), git(ws.repo, "rev-parse", "HEAD"));
 		assert.equal(gh.creates().length, 1);
 		const [create] = gh.creates();
@@ -184,7 +185,7 @@ describe("CI failure → fix → push again (A3)", () => {
 			check(), // RED: the suite fails while the marker says RED
 			bash("echo ok > marker.txt && echo fixed >> fix1.js"),
 			check(), // GREEN
-			bash('git add -A && git -c commit.gpgsign=false -c core.hooksPath=/dev/null -c user.name=Runner -c user.email=runner@example.com commit -q -m "fix ci"'),
+			bash('git add -A && git commit -q -m "fix ci"'),
 		];
 		const { worker, id } = await begin({ "FIX-1": fix });
 		await asleepAt(id, "wait-ci");
@@ -275,7 +276,7 @@ describe("verify on T2 (A4)", () => {
 	it("the verify conversation cannot write, edit, commit, change git state, or write inside the worktree; it can read and run probes", async () => {
 		const script: Step[] = [
 			{ tool: "write", input: { path: "leak.js", content: "1" } },
-			bash("git -c user.name=x -c user.email=x@x commit --allow-empty -m verify-commit"),
+			bash("git commit --allow-empty -m verify-commit"),
 			bash("echo hi > leaked.js"),
 			bash("git checkout -b other"),
 			bash("ls"),

@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { parseTicketList } from "../../lib/ticket-list.ts";
 import { defaultDeps, type TicketDeps } from "../src/tasks.ts";
-import { commitFile, context, docText, git, isolateEnv, makeWorker, makeWorkspace, openFixtureRunner, readDoc, ticketLine, type FixtureRunner, type Workspace } from "./fixture.ts";
+import { commitFile, context, depsWithHook, docText, git, isolateEnv, makeWorker, makeWorkspace, openFixtureRunner, readDoc, ticketLine, type FixtureRunner, type Workspace } from "./fixture.ts";
 
 let restoreEnv: () => void;
 before(() => {
@@ -33,9 +33,9 @@ function statuses(ws: Workspace): Record<string, string | undefined> {
 	return Object.fromEntries(parseTicketList(readDoc(ws)).tickets.map((t) => [t.id, t.status]));
 }
 
-async function run(worker: ReturnType<typeof makeWorker>, options: { maxAttempts?: number } = {}) {
-	runner = await openFixtureRunner(ws, worker);
-	const id = await runner.start(ws.docPath, options);
+async function run(worker: ReturnType<typeof makeWorker>, options: { maxAttempts?: number; deps?: TicketDeps } = {}) {
+	runner = await openFixtureRunner(ws, worker, { deps: options.deps });
+	const id = await runner.start(ws.docPath, { maxAttempts: options.maxAttempts });
 	// A paused loop sleeps instead of ending (T5): `settle` returns its outcome, or `waiting` when it is parked.
 	return { id, outcome: await runner.settle(id) };
 }
@@ -222,17 +222,19 @@ describe("runner-only start rules (S7, A2)", () => {
 	});
 });
 
+// The user's "meanwhile" edits land through `depsWithHook`: while a ticket's done command runs, after the worker's conversation. An edit of the doc during a
+// worker's conversation is an integrity finding now (B2: the worker could have written it), see tests/integrity.test.ts.
 describe("doc ownership while running (S8, A4)", () => {
 	it("a user edit to the running ticket's line pauses the loop and writes nothing", async () => {
 		writeFileSync(ws.docPath, docText([T1, T2]));
 		const worker = makeWorker({ T1: commitFile("t1.txt"), T2: commitFile("t2.txt") });
 		let edited = "";
-		worker.onPrompt = (prompt) => {
-			if (prompt.ticketId !== "T1") return;
+		const deps = depsWithHook((command) => {
+			if (command !== "test -f t1.txt" || edited) return;
 			edited = readDoc(ws).replace("inline: first", "inline: first (user reworded)");
 			writeFileSync(ws.docPath, edited);
-		};
-		const { outcome } = await run(worker);
+		});
+		const { outcome } = await run(worker, { deps });
 		assert.deepEqual(outcome, { status: "waiting", paused: "doc edited: T1", decisions: [] });
 		assert.equal(readDoc(ws), edited, "nothing was written over the user's edit");
 		assert.deepEqual(worker.prompts.map((p) => p.ticketId), ["T1"]);
@@ -242,12 +244,12 @@ describe("doc ownership while running (S8, A4)", () => {
 		writeFileSync(ws.docPath, docText([T1, T2]));
 		const worker = makeWorker({ T1: commitFile("t1.txt"), T2: commitFile("t2.txt") });
 		let edited = "";
-		worker.onPrompt = (prompt) => {
-			if (prompt.ticketId !== "T2") return;
+		const deps = depsWithHook((command) => {
+			if (command !== "test -f t2.txt" || edited) return;
 			edited = readDoc(ws).replace("inline: first", "inline: first (edited after done)");
 			writeFileSync(ws.docPath, edited);
-		};
-		const { outcome } = await run(worker);
+		});
+		const { outcome } = await run(worker, { deps });
 		assert.deepEqual(outcome, { status: "waiting", paused: "doc edited: T1", decisions: [] });
 		assert.equal(readDoc(ws), edited);
 	});
@@ -255,10 +257,10 @@ describe("doc ownership while running (S8, A4)", () => {
 	it("an edit to a pending ticket is picked up at the next pick", async () => {
 		writeFileSync(ws.docPath, docText([T1, "- T2 [S2] inline: second deps: T1 done: `cat never.txt` — pending"]));
 		const worker = makeWorker({ T1: commitFile("t1.txt"), T2: commitFile("t2.txt") });
-		worker.onPrompt = (prompt) => {
-			if (prompt.ticketId === "T1") writeFileSync(ws.docPath, readDoc(ws).replace("cat never.txt", "test -f t2.txt"));
-		};
-		const { outcome } = await run(worker);
+		const deps = depsWithHook((command) => {
+			if (command === "test -f t1.txt") writeFileSync(ws.docPath, readDoc(ws).replace("cat never.txt", "test -f t2.txt"));
+		});
+		const { outcome } = await run(worker, { deps });
 		assert.equal((outcome as { result: { status: string } }).result.status, "done");
 		assert.deepEqual(statuses(ws), { T1: "done", T2: "done" });
 	});
@@ -267,11 +269,17 @@ describe("doc ownership while running (S8, A4)", () => {
 		writeFileSync(ws.docPath, docText([T1, "- T2 [S2] inline: second deps: T1 done: `test -f t2.txt` — pending"]));
 		const worker = makeWorker({ T1: commitFile("t1.txt"), T2: commitFile("t2.txt") });
 		let reopenedLine = "";
+		let edited = false;
+		const deps = depsWithHook((command) => {
+			if (command === "test -f t2.txt" && !edited) {
+				edited = true;
+				writeFileSync(ws.docPath, readDoc(ws).replace("First behavior.", "First behavior, revised."));
+			}
+		});
 		worker.onPrompt = (prompt) => {
-			if (prompt.ticketId === "T2" && prompt.run === 1) writeFileSync(ws.docPath, readDoc(ws).replace("First behavior.", "First behavior, revised."));
 			if (prompt.ticketId === "T1" && prompt.run === 2) reopenedLine = ticketLine(readDoc(ws), "T1");
 		};
-		const { outcome } = await run(worker);
+		const { outcome } = await run(worker, { deps });
 		assert.deepEqual(worker.prompts.map((p) => p.ticketId), ["T1", "T2", "T1"]);
 		assert.match(reopenedLine, /— in_progress/, "T1 was reopened to pending, then picked again");
 		assert.equal((outcome as { result: { status: string } }).result.status, "done");
@@ -289,10 +297,12 @@ describe("doc ownership while running (S8, A4)", () => {
 			]),
 		);
 		const worker = makeWorker({ T1: commitFile("t1.txt"), T2: commitFile("t2.txt"), T3: commitFile("t3.txt") });
-		worker.onPrompt = (prompt) => {
-			if (prompt.ticketId === "T3") writeFileSync(ws.docPath, readDoc(ws).replace("First behavior.", "First behavior, revised."));
-		};
-		const { outcome } = await run(worker, { maxAttempts: 1 });
+		// T2 fails first, then T3: the edit lands while T3's (the second `cat never.txt`) done command runs.
+		let failures = 0;
+		const deps = depsWithHook((command) => {
+			if (command === "cat never.txt" && ++failures === 2) writeFileSync(ws.docPath, readDoc(ws).replace("First behavior.", "First behavior, revised."));
+		});
+		const { outcome } = await run(worker, { maxAttempts: 1, deps });
 		assert.equal(outcome.status, "waiting");
 		assert.match(ticketLine(readDoc(ws), "T1"), /— pending reopened: S1 changed$/);
 		assert.deepEqual(statuses(ws), { T1: "pending", T2: "blocked", T3: "blocked" });

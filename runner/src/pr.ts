@@ -16,18 +16,24 @@ import { configure, defineTask, SubmissionSettled } from "@earendil-works/pi-dur
 import type { Context } from "@earendil-works/chord/context";
 import type { ModelRef, RunningTask, TaskId, TaskRuntime, ToolRegistration } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
-import { resolveCommand, runCheck } from "../../lib/check.ts";
+import { resolveCommand } from "../../lib/check.ts";
 import { readBranchFacts } from "../../lib/commit-branch.ts";
 import { lookupPr, summarizeChecks, type ChecksSummary, type PrExec } from "../../lib/pr-info.ts";
 import { branchRisk, riskMapFor } from "../../lib/risk-map.ts";
-import { readSettings } from "../../lib/runtime.ts";
+import { readSettings, type BrigadevSettings } from "../../lib/runtime.ts";
 import type { ExecFn } from "../../lib/worktree-snapshot.ts";
+import { worktreeTree } from "../../lib/worktree-tree.ts";
 import { appendLogLine, parseTicketList, writeFileAtomic } from "../../lib/ticket-list.ts";
+import { runContainedCheck } from "./check-run.ts";
+import { defaultContainedEnv } from "./contain.ts";
 import { approves, type AnsweredDecision } from "./decision.ts";
-import { nodeExec } from "./exec.ts";
+import { asExec as execFnOf, nodeExec } from "./exec.ts";
+import { compareIntegrity, integrityReason, takeIntegrity, type Integrity } from "./integrity.ts";
+import { redact } from "./redact.ts";
+import { doneTimeoutMs } from "./shell.ts";
 import { ANSWER, answerCommand, CI_DEADLINE_MS, DECISION_DEADLINE_MS, decisionKey, MERGE, MERGE_DEADLINE_MS, mergeCommand, mergeKey, RESUME, resumeKey } from "./signals.ts";
 import { tailOf } from "./tail.ts";
-import type { OpenDecision, TicketInput, TicketResult, TicketTask } from "./tasks.ts";
+import type { OpenDecision, ShellContext, TicketInput, TicketResult, TicketTask } from "./tasks.ts";
 import { blockersSpec, createVerdictTool, loadVerifier, RoleDoc, VerdictDoc, verdictOf, VERIFY_ROLE, verifyInput, verifyInstructions, type Blocker, type Verifier } from "./verify.ts";
 
 export const PR_TASK = "brigadev.pr-loop";
@@ -50,24 +56,42 @@ export interface SuiteResult {
 	error?: string;
 }
 
-/** Everything the PR loop does outside storage and the worker conversations; tests pass their own `exec` (a fake `gh`, a real git against a local remote). */
+/** What the suite runs with: the pinned settings, the contained environment (it is the agent's code), and the longest it may take. */
+export interface SuiteRun {
+	settings: BrigadevSettings;
+	shellEnv: NodeJS.ProcessEnv;
+	timeoutMs: number;
+}
+
+/**
+ * Everything the PR loop does outside storage and the worker conversations; tests pass their own `exec` (a fake `gh`, a real git against a local remote).
+ * `exec` runs with the runner's real environment (push, ls-remote, gh): nothing the agent wrote runs through it.
+ */
 export interface PrDeps {
 	/** Run `git` or `gh` in `cwd`. */
 	exec: PrExec;
-	/** The full suite in `cwd`, its run recorded as evidence for the runner. */
-	suite(cwd: string, signal?: AbortSignal): Promise<SuiteResult>;
+	/** The full suite in `cwd`, its run recorded as evidence for the runner. It is the agent's code: it runs with `run.shellEnv`. */
+	suite(cwd: string, signal?: AbortSignal, run?: SuiteRun): Promise<SuiteResult>;
 }
 
 export const defaultPrDeps: PrDeps = {
 	exec: nodeExec as unknown as PrExec,
-	async suite(cwd, signal) {
-		const result = await runCheck({}, { cwd, exec: nodeExec, signal, agent: "runner", settings: readSettings() });
+	async suite(cwd, signal, run) {
+		const timeoutMs = run?.timeoutMs ?? doneTimeoutMs(undefined);
+		const result = await runContainedCheck(
+			{ timeoutSeconds: timeoutMs / 1000 },
+			{ cwd, exec: nodeExec, signal, agent: "runner", settings: run?.settings ?? readSettings(), shellEnv: run?.shellEnv ?? defaultContainedEnv(), maxTimeoutMs: timeoutMs },
+		);
 		if (!result.details) return { exitCode: null, tail: "", error: result.text };
 		return { exitCode: result.details.exitCode ?? null, tail: tailOf(result.text) };
 	},
 };
 
 export interface PrOptions {
+	/** The brigadev settings, pinned when the runner opened (default: read once when the task is created). */
+	settings?: BrigadevSettings;
+	/** The contained environment and the timeout of the agent's commands. */
+	shell?: ShellContext;
 	deps?: PrDeps;
 	/** The verify conversation's prompt (default: assets/agents/brigadev-verify.md). */
 	verifier?: Verifier;
@@ -106,6 +130,8 @@ export type PrCarry = {
 	decision?: OpenDecision;
 	rounds: Record<string, number>;
 	answers: Record<string, AnsweredDecision>;
+	/** The last PR comment that could not be posted (redacted), shown by `status`; cleared by the next one that is. */
+	warn?: string;
 };
 
 type PlainPhase = "check" | "verify" | "push" | "open" | "wait-ci" | "ready";
@@ -125,7 +151,7 @@ export type PrState =
 	| ({ phase: "stop"; reason: string; next: Plain } & PrCarry)
 	| ({ phase: "resume"; reason: string; key: string; next: Plain } & PrCarry);
 
-const CARRY_KEYS = ["branch", "sha", "pr", "budget", "fixSeq", "verifyRound", "mergeRound", "waits", "stops", "decision", "rounds", "answers"] as const;
+const CARRY_KEYS = ["branch", "sha", "pr", "budget", "fixSeq", "verifyRound", "mergeRound", "waits", "stops", "decision", "rounds", "answers", "warn"] as const;
 
 /** The carried fields of a state (and nothing else), with a patch applied. */
 function carryOf(state: PrCarry, patch: Partial<PrCarry> = {}): PrCarry {
@@ -224,24 +250,20 @@ function fixTitle(origin: Origin, state: PrCarry): string {
 const GIT_TIMEOUT = 120_000;
 const GH_TIMEOUT = 60_000;
 
-/** The lib rules take the narrower `ExecFn`; a missing exit code (a killed process) reads as a failure. */
-const asExec = (deps: PrDeps): ExecFn => async (command, args, options) => {
-	const result = await deps.exec(command, args, options);
-	return { stdout: result.stdout, stderr: result.stderr, code: result.code ?? 1 };
-};
+/** The lib rules take the narrower `ExecFn`. */
+const asExec = (deps: PrDeps): ExecFn => execFnOf((command, args, options) => deps.exec(command, args, options));
 
-const trimmed = (text: string) => oneLine(tailOf(text)).slice(-300);
+/** One short line of command output, for a comment or a Log line: no credential, no home directory. */
+const trimmed = (text: string) => redact(oneLine(tailOf(text)).slice(-300));
 
 async function gitOut(deps: PrDeps, cwd: string, ...args: string[]): Promise<string | undefined> {
 	const result = await deps.exec("git", args, { cwd, timeout: GIT_TIMEOUT });
 	return result.code === 0 ? result.stdout.trim() : undefined;
 }
 
-/** HEAD and the worktree's changes, as one string: a read-only run leaves it as it was. */
-async function worktreeState(deps: PrDeps, cwd: string): Promise<string> {
-	const head = (await gitOut(deps, cwd, "rev-parse", "HEAD")) ?? "";
-	const status = (await gitOut(deps, cwd, "status", "--porcelain=v1", "--untracked-files=all")) ?? "";
-	return `${head}\n${status}`;
+/** The content of the worktree as one tree id (every file as it is on disk, in a throwaway index): a read-only run leaves it as it was, also in a file that was dirty before. */
+async function worktreeFingerprint(cwd: string): Promise<string> {
+	return (await worktreeTree(cwd)) ?? "";
 }
 
 /** The commits of HEAD that the base does not have (`origin/<base>` when it exists, else the local branch). */
@@ -300,10 +322,10 @@ async function withTempFile<T>(text: string, use: (path: string) => Promise<T>):
 	}
 }
 
-/** One Log line through the doc's atomic write, once: a rerun finds the line and writes nothing. */
+/** One Log line through the doc's atomic write, once: a rerun finds the line and writes nothing. Redacted: a Log line quotes command output. */
 function logLine(docPath: string, date: string, line: string): void {
 	const text = readFileSync(docPath, "utf8");
-	const wanted = oneLine(line);
+	const wanted = oneLine(redact(line));
 	if (text.split("\n").some((existing) => existing.endsWith(`): ${wanted}`))) return;
 	writeFileAtomic(docPath, appendLogLine(text, date, wanted));
 }
@@ -352,6 +374,12 @@ function phase<S extends PrState>(step: Step<S>) {
 /** The PR loop task over its seam (git, gh, the suite), the verifier prompt, and the verdict tool; it creates `brigadev.ticket` children for fixes. */
 export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 	const deps = options.deps ?? defaultPrDeps;
+	// Pinned once: a worker that rewrites brigadev.json (`check.test`, the risk globs) changes nothing for this runner.
+	const settings = options.settings ?? readSettings();
+	const shell = options.shell ?? {};
+	const suiteRun: SuiteRun = { settings, shellEnv: shell.env ?? defaultContainedEnv(), timeoutMs: shell.timeoutMs ?? doneTimeoutMs(settings) };
+	/** The integrity snapshot asks the remote with the real environment, like the PR loop's own git calls. */
+	const integrityExec = asExec(deps);
 	const verifier = options.verifier ?? loadVerifier();
 	const verdictTool = options.verdictTool ?? createVerdictTool();
 
@@ -366,6 +394,18 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 		const pr = state.pr!;
 		logLine(input.docPath, dateOf(runtime), `PR #${pr.number} merged ${short(state.sha)} ${pr.url}`);
 		await finish(runtime, context, { status: "merged", number: pr.number, url: pr.url, sha: state.sha });
+	};
+
+	/**
+	 * One PR comment (redacted). A comment that cannot be posted is a Log line, `PR #n comment failed: <redacted stderr>`, and a warning on the state (`status` shows
+	 * it); it never stops the loop. Returns the warning, or undefined when it was posted.
+	 */
+	const postComment = async (live: Await, runtime: Rt, input: PrInput, number: number, body: string): Promise<string | undefined> => {
+		const result = await live(withTempFile(redact(body), (file) => deps.exec("gh", ["pr", "comment", String(number), "--body-file", file], { cwd: input.cwd, timeout: GH_TIMEOUT })));
+		if (result.code === 0) return undefined;
+		const warning = `PR #${number} comment failed: ${trimmed(result.stderr || result.stdout) || "gh pr comment failed"}`;
+		logLine(input.docPath, dateOf(runtime), warning);
+		return warning;
 	};
 
 	/** A failure to fix: the next fix ticket, with the origin to continue at once it passes. */
@@ -388,7 +428,7 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 			// 1. final-check: the full suite, recorded as evidence by the runner. A failure is fixed.
 			check: phase<Plain>(async (task, runtime, context, live) => {
 				const state = task.state.checkpoint;
-				const suite = await live(deps.suite(task.input.cwd, runtime.signal));
+				const suite = await live(deps.suite(task.input.cwd, runtime.signal, suiteRun));
 				if (suite.error) return stop(runtime, context, state, `the final check could not run: ${trimmed(suite.error)}`, at("check", state));
 				if (suite.exitCode === 0) return go(runtime, context, at("verify", state));
 				await toFix(runtime, context, state, "check", `The final check (the full suite) failed${suite.exitCode === null ? " (killed)" : ` with exit ${suite.exitCode}`}:\n${suite.tail}`);
@@ -398,15 +438,16 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 			verify: phase<Plain>(async (task, runtime, context, live) => {
 				const state = task.state.checkpoint;
 				const { cwd, docPath } = task.input;
-				const risk = await live(branchRisk(asExec(deps), cwd, riskMapFor(readSettings())));
+				const risk = await live(branchRisk(asExec(deps), cwd, riskMapFor(settings)));
 				// An unknown base means the committed changes were not seen: the safe reading is the high tier.
 				const tier = risk && !risk.baseUnknown ? risk.tier : "T2";
 				if (tier !== "T2") return go(runtime, context, at("push", state));
 
 				const round = state.verifyRound + 1;
 				const base = (await live(readBranchFacts(asExec(deps), cwd))).defaultBranch ?? undefined;
-				// The worktree as it is before the run: a read-only run must leave it so.
-				await runtime.memo(`verify.before.${round}`, await live(worktreeState(deps, cwd)), context);
+				// The worktree as it is before the run (a read-only run must leave it so), and what the verifier must not touch (src/integrity.ts).
+				await runtime.memo(`verify.before.${round}`, await live(worktreeFingerprint(cwd)), context);
+				await runtime.memo(`verify.integrity.${round}`, await live(takeIntegrity(cwd, integrityExec, { docPath })), context);
 				const brief = { docPath, branch: state.branch, ...(base ? { base } : {}), round };
 				const key = `verify-${round}`;
 				let conversationId!: string;
@@ -435,8 +476,14 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 				const state = task.state.checkpoint;
 				const { round, key, conversationId } = state;
 				const { cwd, docPath } = task.input;
+				// First what it must not have touched (config and hooks: before any git call that could run one), then the worktree's content.
+				const integrityBefore = await runtime.memo<Integrity>(`verify.integrity.${round}`, context);
+				if (integrityBefore) {
+					const changes = compareIntegrity(integrityBefore, await live(takeIntegrity(cwd, integrityExec, { docPath, previous: integrityBefore })));
+					if (changes.length > 0) return stop(runtime, context, state, integrityReason("verifier", changes), at("verify", state));
+				}
 				const before = await runtime.memo<string>(`verify.before.${round}`, context);
-				if (before !== undefined && before !== (await live(worktreeState(deps, cwd)))) {
+				if (before !== undefined && before !== (await live(worktreeFingerprint(cwd)))) {
 					return stop(runtime, context, state, "the verify run changed the worktree (HEAD or files); it must be read-only", at("verify", state));
 				}
 				const verdict = verdictOf(await runtime.snapshot(VerdictDoc, conversationId as never, context));
@@ -462,7 +509,7 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 					const first = state.failure.split("\n")[0];
 					return stop(runtime, context, state, `${MAX_FIX_ATTEMPTS} fix attempts used; the last failure: ${trimmed(first)}`, at(retryPhase(state.origin), state));
 				}
-				const suite = resolveCommand({ cwd, settings: readSettings() });
+				const suite = resolveCommand({ cwd, settings });
 				if ("error" in suite) return stop(runtime, context, state, `no test command to prove a fix with: ${trimmed(suite.error)}`, at(retryPhase(state.origin), state));
 				const model = task.input.model;
 				const ticketId = state.ticketId ?? `FIX-${state.fixSeq + 1}`;
@@ -496,6 +543,13 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 				const { docPath } = task.input;
 				const { ticketId, origin } = state;
 				const [outcome] = await runtime.outcomes([state.childId as TaskId<TicketResult>], context);
+
+				// The fix worker's run changed what it must not (src/integrity.ts): stop for a person with the list. `resume` accepts the state and starts again at the final
+				// check (the fix's own done check never ran), then verify, push, and CI as usual.
+				if (outcome.status === "completed" && "integrity" in outcome.result) {
+					const carry = without(carryOf(state), "decision");
+					return stop(runtime, context, carry, `${ticketId}: ${integrityReason("worker", outcome.result.integrity)}`, at("check", carry));
+				}
 
 				// The fix worker asked a question: park on its key, like a ticket decision. It used no attempt.
 				if (outcome.status === "completed" && "decision" in outcome.result) {
@@ -552,7 +606,8 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 				const remote = await live(deps.exec("git", ["ls-remote", "origin", `refs/heads/${state.branch}`], { cwd, timeout: GIT_TIMEOUT }));
 				if (remote.code !== 0) return stop(runtime, context, state, `cannot read origin: ${trimmed(remote.stderr)}`, at("push", state));
 				if (remote.stdout.trim().split(/\s+/)[0] !== head) {
-					const pushed = await live(deps.exec("git", ["push", "-u", "origin", `HEAD:${state.branch}`], { cwd, timeout: GIT_TIMEOUT }));
+					// No hook of the repository runs for the runner's push (its config is the agent's to edit), whatever the global config says.
+					const pushed = await live(deps.exec("git", ["-c", "core.hooksPath=/dev/null", "push", "--no-verify", "-u", "origin", `HEAD:${state.branch}`], { cwd, timeout: GIT_TIMEOUT }));
 					if (pushed.code !== 0) return stop(runtime, context, state, `git push was refused or failed: ${trimmed(pushed.stderr || pushed.stdout)}`, at("push", state));
 				}
 				await go(runtime, context, at("open", carryOf(state, { sha: head })));
@@ -567,13 +622,18 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 				if (found.status === "unavailable") return stop(runtime, context, state, "cannot read the pull request: gh is missing, not logged in, or offline", at("open", state));
 				let pr = found.status === "found" ? found.pr : undefined;
 				if (pr && pr.state.toUpperCase() === "CLOSED") return stop(runtime, context, state, `PR #${pr.number} for ${state.branch} is closed`, at("open", state));
+				// R4-003: a merged PR of this branch name ends the loop only when it is the PR of the commit pushed now; an older one (a reused branch name) is not ours.
+				if (pr && pr.state.toUpperCase() === "MERGED") {
+					const view = await live(readLive(deps, cwd, pr.number));
+					if ("error" in view || view.head !== state.sha) return stop(runtime, context, state, `an older PR #${pr.number} for this branch is merged; open a new branch`, at("open", state));
+				}
 				let how = "found";
 				if (!pr) {
 					const base = (await live(readBranchFacts(asExec(deps), cwd))).defaultBranch;
 					if (!base) return stop(runtime, context, state, "cannot determine the default branch (see `git remote set-head origin <branch>`)", at("open", state));
 					if ((await live(commitsAhead(deps, cwd, base))) === 0) return stop(runtime, context, state, `${state.branch} has no commits ahead of ${base}: there is nothing to open a PR for`, at("open", state));
 					const text = readFileSync(docPath, "utf8");
-					const risk = await live(branchRisk(asExec(deps), cwd, riskMapFor(readSettings())));
+					const risk = await live(branchRisk(asExec(deps), cwd, riskMapFor(settings)));
 					const body = prBody(text, risk ? { tier: risk.tier, categories: Object.keys(risk.categories) } : undefined);
 					const created = await live(
 						withTempFile(body, (file) => deps.exec("gh", ["pr", "create", "--base", base, "--head", state.branch, "--title", prTitle(state.branch, text), "--body-file", file], { cwd, timeout: GH_TIMEOUT })),
@@ -630,17 +690,17 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 			// 7. wait-merge: one comment per approval, then park on `brigadev.merge`.
 			ready: phase<Plain>(async (task, runtime, context, live) => {
 				const state = task.state.checkpoint;
-				const { cwd, docPath } = task.input;
+				const { docPath } = task.input;
 				const round = state.mergeRound + 1;
 				const key = mergeKey(round);
 				// Memoized before the comment: a crash between the two loses the comment, it never posts it twice. `status` still shows the command.
+				let warn = state.warn;
 				if ((await runtime.memo<boolean>(`commented.${key}`, context)) === undefined) {
 					await runtime.memo(`commented.${key}`, true, context);
-					const pr = state.pr!;
-					await live(withTempFile(`Ready to merge: run \`${mergeCommand(docPath)}\``, (file) => deps.exec("gh", ["pr", "comment", String(pr.number), "--body-file", file], { cwd, timeout: GH_TIMEOUT })));
+					warn = await postComment(live, runtime, task.input, state.pr!.number, `Ready to merge: run \`${mergeCommand(docPath)}\``);
 				}
 				const until = await runtime.memo<number>(`until.${key}`, runtime.now() + MERGE_DEADLINE_MS, context);
-				await runtime.commit(() => ({ status: "sleeping", signals: [MERGE.key(key)], until, checkpoint: { phase: "merge", key, ...carryOf(state, { mergeRound: round }) } }), context);
+				await runtime.commit(() => ({ status: "sleeping", signals: [MERGE.key(key)], until, checkpoint: { phase: "merge", key, ...carryOf(state, { mergeRound: round, warn }) } }), context);
 			}),
 
 			// The approval arrived: re-read the PR and merge only when it is open, not a draft, still at the pushed commit, and green.
@@ -679,21 +739,17 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 			// needs-you: one PR comment (when a PR exists), one Log line, then park on `resume`. Both are once per stop.
 			stop: phase<Extract<PrState, { phase: "stop" }>>(async (task, runtime, context, live) => {
 				const state = task.state.checkpoint;
-				const { cwd, docPath } = task.input;
+				const { docPath } = task.input;
 				const n = state.stops + 1;
+				let warn = state.warn;
 				if (state.pr && (await runtime.memo<boolean>(`commented.stop.${n}`, context)) === undefined) {
 					await runtime.memo(`commented.stop.${n}`, true, context);
-					const pr = state.pr;
-					await live(
-						withTempFile(`Needs you: ${state.reason}\n\nWhen it is sorted out, run \`brigadev-runner resume ${docPath}\`: the runner continues where it stopped.`, (file) =>
-							deps.exec("gh", ["pr", "comment", String(pr.number), "--body-file", file], { cwd, timeout: GH_TIMEOUT }),
-						),
-					);
+					warn = await postComment(live, runtime, task.input, state.pr.number, `Needs you: ${state.reason}\n\nWhen it is sorted out, run \`brigadev-runner resume ${docPath}\`: the runner continues where it stopped.`);
 				}
 				logLine(docPath, dateOf(runtime), `PR loop needs you (${n}): ${state.reason}`);
 				const key = resumeKey(n);
 				await runtime.commit(
-					() => ({ status: "sleeping", signals: [RESUME.key(key)], checkpoint: { phase: "resume", reason: state.reason, key, next: { ...state.next, stops: n }, ...carryOf(state, { stops: n }) } }),
+					() => ({ status: "sleeping", signals: [RESUME.key(key)], checkpoint: { phase: "resume", reason: state.reason, key, next: { ...state.next, stops: n }, ...carryOf(state, { stops: n, warn }) } }),
 					context,
 				);
 			}),

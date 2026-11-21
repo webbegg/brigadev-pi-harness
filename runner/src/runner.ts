@@ -10,12 +10,17 @@ import { createRegistry, defineExtension, Harness } from "@earendil-works/pi-dur
 import type { HarnessSettings, ModelRef, Report, SetTimer, SignalResult, SignalToken, Storage, TaskId, Tx } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
+import { canonicalPath } from "../../lib/paths.ts";
+import { readSettings } from "../../lib/runtime.ts";
 import { createCheckTool } from "./check-tool.ts";
+import { createContainment } from "./contain.ts";
 import { createAskTool } from "./decision.ts";
+import { LoopStartedDifferently } from "./errors.ts";
 import { guardExtension } from "./guard.ts";
 import { prPhaseLabel, type PrDeps, type PrState } from "./pr.ts";
 import { decisionKey, deliver } from "./signals.ts";
 import { createTasks, defaultDeps, LOOP_TASK, type LoopInput, type LoopResult, type LoopState, type OpenDecision, type TicketDeps } from "./tasks.ts";
+import { doneTimeoutMs } from "./shell.ts";
 import { createVerdictTool, type Verifier } from "./verify.ts";
 import type { Worker } from "./worker.ts";
 
@@ -42,6 +47,8 @@ export interface RunnerOptions {
 	setTimer?: SetTimer;
 	/** Open for reading only (`status`): nothing is recovered, written, or scheduled. The storage must be opened read-only too where it has such an option. */
 	readOnly?: boolean;
+	/** The environment the agent's processes are derived from (default `process.env`): the contained environment removes its credentials (src/contain.ts). */
+	env?: NodeJS.ProcessEnv;
 }
 
 export type LoopOutcome =
@@ -73,6 +80,8 @@ export interface PrStatus {
 	resumeKey?: string;
 	/** The key `merge` is delivered under while the PR loop waits for the merge approval. */
 	mergeKey?: string;
+	/** The last PR comment that could not be posted. */
+	warning?: string;
 }
 
 /** Where a loop is, read from its task record. `paused` and `decisions` come from the checkpoint; a finished loop has neither. */
@@ -94,6 +103,8 @@ export interface LoopStatus {
 	resumeKey?: string;
 	/** The PR loop, while it runs. */
 	pr?: PrStatus;
+	/** What the user asked when the loop was first started (the stored input): `start` cannot change it. */
+	started?: { pr: boolean; cwd: string };
 	/** The merged PR, once the loop ended `merged`. */
 	merged?: { url: string; number: number };
 }
@@ -119,20 +130,28 @@ export interface Runner {
 	close(): Promise<void>;
 }
 
+export { LoopStartedDifferently };
+
 const SETTLE_POLL_MS = 20;
 const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
 
 export async function openRunner(options: RunnerOptions): Promise<Runner> {
 	const context = options.context ?? BACKGROUND_CONTEXT;
 	const cwd = resolve(options.cwd);
-	const checkTool = createCheckTool({ cwd });
+	// B1: the credentials stay with the runner. Everything that runs the agent's code gets this environment; the PR loop's own git/gh calls do not.
+	const containment = createContainment(options.env ?? process.env, { create: options.readOnly !== true });
+	// B2: the brigadev settings (`check.test`, the permission mode, the risk globs) are read once; a worker that rewrites brigadev.json changes nothing for this runner.
+	const pinned = readSettings();
+	const settings = () => pinned;
+	const shell = { env: containment.env, timeoutMs: doneTimeoutMs(pinned) };
+	const checkTool = createCheckTool({ cwd, settings, shellEnv: containment.env, maxTimeoutMs: shell.timeoutMs });
 	const askTool = createAskTool();
 	const verdictTool = createVerdictTool();
-	const { loop, ticket, pr } = createTasks(options.deps ?? defaultDeps, options.worker, [checkTool, askTool], { deps: options.prDeps, verifier: options.verifier, verdictTool });
+	const { loop, ticket, pr } = createTasks(options.deps ?? defaultDeps, options.worker, [checkTool, askTool], { deps: options.prDeps, verifier: options.verifier, verdictTool, settings: pinned, shell }, shell);
 	const registry = createRegistry();
 	registry.install(CodingTools);
 	// S5: every tool call of a worker conversation (nested ones too) goes through the brigadev guard rules.
-	registry.install(guardExtension({ cwd }));
+	registry.install(guardExtension({ cwd, settings }));
 	registry.install(defineExtension({ name: "brigadev-check", tools: [checkTool] }));
 	registry.install(defineExtension({ name: "brigadev-decision", tools: [askTool] }));
 	registry.install(defineExtension({ name: "brigadev-verify", tools: [verdictTool] }));
@@ -144,7 +163,7 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			models: options.models,
 			registry,
 			settings: options.settings,
-			env: (target) => new NodeExecutionEnv({ cwd: target.cwd ?? cwd }),
+			env: (target) => new NodeExecutionEnv({ cwd: target.cwd ?? cwd, shellEnv: containment.env }),
 			onReport: options.onReport,
 			...(options.now ? { now: options.now } : {}),
 			...(options.setTimer ? { setTimer: options.setTimer } : {}),
@@ -187,6 +206,7 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			lastKeys: Object.fromEntries(Object.entries(state.rounds ?? {}).map(([id, round]) => [id, decisionKey(id, round)])),
 			...(state.phase === "resume" ? { resumeKey: state.key } : {}),
 			...(state.phase === "merge" ? { mergeKey: state.key } : {}),
+			...(state.warn ? { warning: state.warn } : {}),
 		};
 	};
 
@@ -196,6 +216,21 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 		async start(docPath, startOptions = {}) {
 			const path = resolve(docPath);
 			const input: LoopInput = { docPath: path, cwd, ...(startOptions.maxAttempts === undefined ? {} : { maxAttempts: startOptions.maxAttempts }), ...(startOptions.pr ? { pr: true } : {}) };
+			// B5/R3-002: a loop that exists keeps the input it was started with. Starting it again with the PR loop switched, or from another worktree, would
+			// silently do something else than what the user asked for (push and open a PR after `--no-pr`; run the guard in a checkout the commits are not in).
+			const existing = await runner.find(path);
+			const stored = existing === undefined ? undefined : ((await harness.getTask(existing, context))?.input as LoopInput | undefined);
+			if (stored) {
+				const storedPr = stored.pr === true;
+				if (storedPr !== (input.pr === true)) {
+					throw new LoopStartedDifferently(
+						`this loop was started ${storedPr ? "with the PR loop" : "with --no-pr (tickets only)"} and that cannot change once it has started. Run \`brigadev-runner start ${path}${storedPr ? "" : " --no-pr"}\` to continue it as it was started.`,
+					);
+				}
+				if (canonicalPath(stored.cwd) !== canonicalPath(cwd)) {
+					throw new LoopStartedDifferently(`this loop was started in ${stored.cwd} (its branch and commits are there) and cannot move to ${cwd}. Run \`brigadev-runner start ${path}\` from ${stored.cwd}.`);
+				}
+			}
 			const taskId = await root.commit(async (tx) => (await findIn(tx, path)) ?? tx.createTask(loop, input, { ownership: { kind: "conversation" } }), context);
 			// Committing a task does not start the scheduler; do it here so the loop runs without anyone waiting on it.
 			harness.resume();
@@ -244,7 +279,8 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			const record = await harness.getTask(taskId, context);
 			if (!record) throw new Error(`no such task ${taskId}`);
 			const docPath = (record.input as LoopInput).docPath;
-			const base = { taskId, docPath, decisions: [] as OpenDecision[], lastKeys: {} as Record<string, string>, epoch: 0 };
+			const started = { pr: (record.input as LoopInput).pr === true, cwd: (record.input as LoopInput).cwd };
+			const base = { taskId, docPath, started, decisions: [] as OpenDecision[], lastKeys: {} as Record<string, string>, epoch: 0 };
 			if (record.state.status === "terminal" || record.state.status === "completing") {
 				const outcome = outcomeOf(record.state.outcome as never);
 				if (outcome.status === "completed") {
@@ -268,7 +304,13 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			return { ...base, ...carried, ...(pr ? { pr } : {}), state: record.state.status === "sleeping" ? "sleeping" : "running" };
 		},
 		deliver: (taskId, token, key, value) => deliver(harness, taskId, token, key, value, context),
-		close: () => harness.close(context),
+		close: async () => {
+			try {
+				await harness.close(context);
+			} finally {
+				containment.dispose();
+			}
+		},
 	};
 	return runner;
 }

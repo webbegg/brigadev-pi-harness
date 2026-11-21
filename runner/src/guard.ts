@@ -13,6 +13,8 @@
 //   once in the ticket's rerun (src/decision.ts `commandApproved`). Nothing else is lifted: never-allowed commands, delivery, the commit gate,
 //   the branch rule, and file rules stay as they are.
 // - Push, merge, publish, and gh pr/release/api writes are always blocked: the runner owns PR delivery.
+// - B1/B3: the credentials are contained by the environment (src/contain.ts) and checked after the fact (src/integrity.ts); this file's string rules and
+//   src/containment-rules.ts are the first layer, best effort: they read commands, not the scripts a command runs.
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { defineExtension, hook, ToolTask } from "@earendil-works/pi-durable";
@@ -28,6 +30,7 @@ import { isPermissionMode, isSensitivePath, PERMISSION_MODE, type PermissionMode
 import { brigadevHome, isRepoDocsPath, repoDocsDir as docsDirOf } from "../../lib/repo-docs.ts";
 import { agentDir, PACKAGE_ROOT, readSettings, type BrigadevSettings } from "../../lib/runtime.ts";
 import type { ExecFn } from "../../lib/worktree-snapshot.ts";
+import { containmentReason, readOnlyExtraReason } from "./containment-rules.ts";
 import { ASK_TOOL, commandApproved } from "./decision.ts";
 import { nodeExec } from "./exec.ts";
 import { RoleDoc, VERIFY_ROLE, VERIFY_TOOLS } from "./verify.ts";
@@ -45,7 +48,7 @@ export interface GuardOptions {
 	tools?: readonly string[];
 	/** The verify conversation's rules: no write or edit, no commit or git change, no bash write inside the worktree (see `readOnlyBashReason`). */
 	readOnly?: boolean;
-	/** The brigadev settings (permission mode, `check.test`); default: `~/.pi/agent/brigadev.json`, re-read on every call. */
+	/** The brigadev settings (permission mode, `check.test`); the runner passes the copy it read when it opened (pinned: a worker that rewrites brigadev.json changes nothing); default: `~/.pi/agent/brigadev.json`, re-read on every call. */
 	settings?: () => BrigadevSettings;
 }
 
@@ -198,7 +201,8 @@ export function readOnlyBashReason(command: string, root: string): string | unde
 		const absolute = canonicalPath(target);
 		if (isInside(root, absolute)) return READ_ONLY_BLOCK(`it writes ${relative(root, absolute) || "."} inside the worktree`);
 	}
-	return undefined;
+	// A git flag that writes or runs a program (`--output`, `--ext-diff`, `--textconv`), or an interpreter with inline code.
+	return readOnlyExtraReason(command);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -273,6 +277,11 @@ export function createGuard(options: GuardOptions) {
 
 		const delivery = deliveryReason(command);
 		if (delivery) return DELIVERY_BLOCK(delivery);
+
+		// B1/B3, the first layer (best effort; the barrier is the contained environment and the integrity check): git config and plumbing, gh api writes in any
+		// spelling, credential variables and stores, a shell fed a heredoc. The worker and the verifier alike. (The verifier's own rules ran first.)
+		const contained = containmentReason(command);
+		if (contained) return contained;
 
 		const alone = commitAloneReason(command);
 		if (alone) return alone;

@@ -4,9 +4,10 @@
 import { defineTool } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord/json";
 import { num, obj, opt, str } from "@earendil-works/pi-schema";
-import { runCheck } from "../../lib/check.ts";
 import { readSettings, type BrigadevSettings } from "../../lib/runtime.ts";
 import type { ExecFn } from "../../lib/worktree-snapshot.ts";
+import { runContainedCheck } from "./check-run.ts";
+import { defaultContainedEnv } from "./contain.ts";
 import { nodeExec } from "./exec.ts";
 import { RUNNER_AGENT } from "./guard.ts";
 
@@ -14,8 +15,12 @@ export interface CheckToolOptions {
 	/** The worktree, used when the conversation has no cwd of its own. */
 	cwd: string;
 	exec?: ExecFn;
-	/** The brigadev settings; default `~/.pi/agent/brigadev.json`, re-read on every call. */
+	/** The brigadev settings, pinned by the caller when the runner opened (a worker that rewrites `brigadev.json` changes nothing); default `~/.pi/agent/brigadev.json`, re-read on every call. */
 	settings?: () => BrigadevSettings;
+	/** The environment the test process gets (default: the contained environment over the current one; see src/contain.ts). */
+	shellEnv?: NodeJS.ProcessEnv;
+	/** Longest a run may take, in ms. */
+	maxTimeoutMs?: number;
 }
 
 const Parameters = obj({
@@ -34,7 +39,8 @@ export function createCheckTool(options: CheckToolOptions) {
 		parameters: Parameters,
 		async execute(args, api, context) {
 			const cwd = (await api.agent(context)).cwd ?? options.cwd;
-			const result = await runCheck(args, { cwd, exec, signal: context.abortSignal, agent: RUNNER_AGENT, settings: settings() });
+			const shellEnv = options.shellEnv ?? defaultContainedEnv();
+			const result = await runContainedCheck(args, { cwd, exec, signal: context.abortSignal, agent: RUNNER_AGENT, settings: settings(), shellEnv, maxTimeoutMs: options.maxTimeoutMs });
 			return {
 				output: [{ type: "text" as const, text: result.text }],
 				// Details are for UIs; a JSON round trip drops the undefined fields the stored shape cannot hold.
