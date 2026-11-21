@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [0.23.0-rc.4] - 2026-11-21
+
+Pre-release.
 
 ### Added
 
