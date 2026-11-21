@@ -76,7 +76,7 @@ Per field, a launch resolves: session profile, default profile, agent frontmatte
 | `alt+g`, `/brigadev:changes` | Uncommitted files and diffs (read-only) |
 | `alt+a`, `/brigadev:runs` | Agents viewer: every subagent run with its thread (read-only) |
 | `/brigadev:ps` | Background processes started with `bg_start` |
-| `/brigadev:web [start\|stop\|status]` | Local web UI for this session: a board of the loop (subagents, checks, commits, your decisions, prompts waiting on you), detail panels, and a composer (send, steer, abort) |
+| `/brigadev:web [start\|open\|stop\|status]` | Local web UI for this session: a board of the loop (subagents, checks, commits, your decisions, prompts waiting on you), detail panels, and a composer (send, steer, abort). `open` prints a new one-time link |
 | `/brigadev:pr` | The current branch's pull request (needs `gh`) |
 | `/brigadev:force-commit`, `/brigadev:yolo-dir` | One-shot commit override; folders where writes run without asking |
 | `/track`, `/review` | Force feature-document tracking; 4R review of a frozen change |
@@ -101,7 +101,14 @@ Profiles live in `~/.pi/agent/brigadev-profiles.json`. Paths, environment variab
 
 ## Web UI
 
-`/brigadev:web` starts a server for the current parent session on `127.0.0.1` (ephemeral port, or `BRIGADEV_WEB_PORT`). It prints a URL with a random token; the session data (`/events`) and every action need it. The page is one static file with no dependencies. It follows the session over SSE and replays what happened before it was opened.
+`/brigadev:web` starts a server for the current parent session on `127.0.0.1` (ephemeral port, or `BRIGADEV_WEB_PORT`). It prints a one-time link; the session data (`/events`) and every action need the session secret the page gets from it. The page is one static file with no dependencies. It follows the session over SSE and replays what happened before it was opened.
+
+How the link works:
+
+- The link carries a single-use `code` (32 random bytes) that is valid for 60 seconds. The page reads it, removes it from the address bar at once, and trades it for a session secret with one `POST /session`. The code authorizes nothing else, and a second use of it is refused.
+- The secret is random, lives in the server's memory and in one JavaScript variable of the page, and travels in an `Authorization: Bearer` header (the page reads the event stream with `fetch`). It is never in the URL, browser storage, a cookie, or the browser's history, and a token in a query string is refused. Each tab has its own secret; `/brigadev:web stop` revokes them all.
+- A reload, a second tab, or a used or expired link has no code, so the page says: "This link was already used or expired. In pi, run /brigadev:web open for a new one." `/brigadev:web open` prints a new link for the running server (starting again does the same), and `status` shows the address without a code. If that message appears on a link you just opened, something else used the code first.
+- What this does not stop: a process of your own user that reads the code in the first milliseconds, before the page does, or that reads the page's memory.
 
 The page is a board with one column per loop step: Explore, Decide, Implement, Check, Commit, and a red **Needs you** column.
 
@@ -137,7 +144,7 @@ Pure logic lives in `lib/` and is covered by `tests/`; extensions in `extensions
 - A read-only child can still write through `bash`.
 - Subagent runs live in the running Pi process: a finished run cannot be resumed, only read from its saved folder (kept 14 days, at most 200).
 - No classifier-based "auto" permission mode.
-- The web UI covers one session per server, and its loop phase is a guess from tool activity. Approving a guard prompt from the browser has the same effect as approving it in the terminal, so keep the URL private.
+- The web UI covers one session per server, and its loop phase is a guess from tool activity. Approving a guard prompt from the browser has the same effect as approving it in the terminal, so open the link only in a browser you trust. Credentials in commands (URLs with a password, `Authorization` headers, token-like strings, password flags) are masked before they reach the page or the bus; this is a best-effort filter.
 - `pi-claude-bridge` runs your Claude Code hooks inside Pi turns: see [docs/claude-bridge.md](docs/claude-bridge.md).
 
 ## License

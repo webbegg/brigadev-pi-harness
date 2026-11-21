@@ -65,6 +65,26 @@ test("tracker: a run starts at authorize, moves on tools, records visited once, 
 	assert.equal(next?.scope, "loop");
 });
 
+test("phaseForTool: a codemode call reads as explore until its nested calls say otherwise", () => {
+	assert.equal(phaseForTool("codemode", "const x = await tools.read({ path: 'a' })"), "explore");
+	assert.equal(phaseForTool("codemode", {}), "explore");
+});
+
+test("tracker: a codemode call does not stall the phase at authorize, and nested calls move it on", () => {
+	const tracker = createPhaseTracker(() => 0);
+	tracker.agentStart();
+	assert.equal(tracker.tool("codemode", "await tools.edit({})")?.phase, "explore");
+	assert.equal(tracker.tool("edit", { path: "a.ts" })?.phase, "implement");
+});
+
+test("tracker: the phase detail is redacted", () => {
+	const tracker = createPhaseTracker(() => 0);
+	tracker.agentStart();
+	const next = tracker.tool("bash", { command: "git push https://me:hunter2@github.com/o/r.git" });
+	assert.equal(next?.phase, "commit");
+	assert.equal(next?.detail, "bash git push https://***@github.com/o/r.git");
+});
+
 test("tracker ignores tools outside a run", () => {
 	const tracker = createPhaseTracker(() => 0);
 	assert.equal(tracker.tool("edit", { path: "a.ts" }), undefined);

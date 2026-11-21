@@ -74,6 +74,29 @@ test("web-log: the number of distinct keys is bounded, oldest first", () => {
 	assert.deepEqual(log.since(0).map((e) => e.key), ["t3", "t4", "t5"]);
 });
 
+test("web-log: one-per-session snapshots (mode, todo, session, phase, run, live) are never evicted by per-item churn", () => {
+	const log = createWebLog();
+	log.append({ type: "brigadev_mode", data: { scope: "mode", mode: "yolo" } });
+	log.append({ type: "brigadev_todo", data: { scope: "todo", todos: [] } });
+	log.append({ type: "brigadev_phase", data: { scope: "loop", phase: "explore" } });
+	log.append({ type: "session", data: { id: "session", project: "p", branch: "b" } });
+	log.append({ type: "run", data: { id: "run", running: true } });
+	log.append({ type: "assistant_live", data: { id: "live", text: "hi", active: true } });
+	for (let i = 0; i < 5000; i++) log.append({ type: "tool", data: { id: `t${i}`, status: "done" } });
+	const types = log.since(0).map((e) => e.type);
+	for (const type of ["brigadev_mode", "brigadev_todo", "brigadev_phase", "session", "run", "assistant_live"]) assert.ok(types.includes(type), `${type} survives a late replay`);
+	assert.ok(types.filter((t) => t === "tool").length <= 2000, "the per-item type stays bounded");
+});
+
+test("web-log: per-item types have their own caps: churn in one does not evict another", () => {
+	const log = createWebLog({ maxKeyed: 4 });
+	for (let i = 0; i < 3; i++) log.append({ type: "brigadev_agent", data: { id: `a${i}` } });
+	log.append({ type: "brigadev_prompt", data: { id: "p1" } });
+	for (let i = 0; i < 50; i++) log.append({ type: "tool", data: { id: `t${i}` } });
+	const count = (type: string) => log.since(0).filter((e) => e.type === type).length;
+	assert.deepEqual([count("brigadev_agent"), count("brigadev_prompt"), count("tool")], [3, 1, 4]);
+});
+
 test("web-log: an explicit key and custom key fields are honored", () => {
 	const log = createWebLog({ keyed: { thing: "name" } });
 	log.append({ type: "thing", data: { name: "x", v: 1 } });

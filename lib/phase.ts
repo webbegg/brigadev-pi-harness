@@ -4,10 +4,13 @@
 import type { Phase, PhaseState } from "./bus.ts";
 import { COMMAND_KIND, classifyCommand } from "./command-classifier.ts";
 import { checkKind } from "./evidence.ts";
+import { redact } from "./redact.ts";
 
 const EXPLORE_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const IMPLEMENT_TOOLS = new Set(["edit", "write"]);
 const DELEGATE_TOOLS = new Set(["subagent", "acp_delegate"]);
+/** Pi's script tool: it calls the other tools, and Pi reports those calls (`parentToolCallId`), which then move the phase themselves. */
+const CODEMODE_TOOL = "codemode";
 
 // Agent names (brigadev agents and acp_delegate roles) by the loop step they serve.
 const AGENT_PHASE: Record<string, Phase> = {
@@ -34,6 +37,8 @@ export function phaseForTool(toolName: string, args: unknown): Phase | undefined
 	if (EXPLORE_TOOLS.has(toolName)) return "explore";
 	if (IMPLEMENT_TOOLS.has(toolName)) return "implement";
 	if (toolName === "ask_user_choice") return "decide";
+	// A script reads and looks before anything else, and a Pi that does not report its nested calls must not leave the phase stuck at authorize.
+	if (toolName === CODEMODE_TOOL) return "explore";
 	if (toolName === "check") return "check";
 	if (DELEGATE_TOOLS.has(toolName)) {
 		const phases = agentsOf(a).map((name) => AGENT_PHASE[name]);
@@ -49,7 +54,8 @@ export function phaseForTool(toolName: string, args: unknown): Phase | undefined
 const describe = (toolName: string, args: unknown): string => {
 	const a = (args && typeof args === "object" ? args : {}) as Record<string, unknown>;
 	const what = [a.path, a.command, a.pattern, a.agent, a.question].find((v): v is string => typeof v === "string");
-	return what ? `${toolName} ${what.split("\n")[0].slice(0, 120)}` : toolName;
+	// The detail goes to the page and the bus: credentials in a command are masked first.
+	return what ? `${toolName} ${redact(what).split("\n")[0].slice(0, 120)}` : toolName;
 };
 
 export interface PhaseTracker {

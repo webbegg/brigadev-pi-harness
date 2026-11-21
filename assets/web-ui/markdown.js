@@ -17,6 +17,10 @@
 	var TABLE_SEP = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
 	var PUNCT = /[!-\/:-@\[-`{-~]/;
 	var WORD = /[\p{L}\p{N}]/u;
+	// What follows a link's `]`: `(href)`, one level of parentheses allowed in the href. Sticky, so it never scans past its own start.
+	var LINK_TAIL = /\(([^\s()]*(?:\([^\s()]*\)[^\s()]*)*)\)/y;
+	// Emphasis nests at most this deep; deeper is plain text (a hostile input cannot recurse the parser to death).
+	var MAX_DEPTH = 32;
 
 	function isBlank(line) { return !line || !line.trim(); }
 	function isTableStart(lines, i) {
@@ -93,9 +97,18 @@
 		return blocks;
 	}
 
-	function inline(text) {
+	function inline(text, depth) {
 		var s = String(text == null ? "" : text);
+		depth = depth || 0;
+		if (depth > MAX_DEPTH) return s ? [{ t: "text", v: s }] : [];
 		var out = [];
+		// Searches are cached per call so an input of many unmatched openers stays linear: the valid emphasis closers of each
+		// delimiter (found once, then binary-searched), and the first `]` after the current `[` with what follows it.
+		var closers = {};
+		var bracket = -1, bracketLink = null;
+		// The first line break after the current `[`, searched forward and only again once passed: a backward search from each `]`
+		// would rescan the whole line for every `[` of a one-line input (quadratic).
+		var newline = -1;
 		var buf = "";
 		function flush() { if (buf) { out.push({ t: "text", v: buf }); buf = ""; } }
 		function push(node) {
@@ -121,9 +134,9 @@
 				var double = s.charAt(i + 1) === ch;
 				var width = double ? 2 : 1;
 				var delim = double ? ch + ch : ch;
-				var end = emphasisClose(s, i, ch, width);
+				var end = emphasisClose(s, i, ch, width, closers);
 				if (end > 0) {
-					push({ t: double ? "b" : "i", c: inline(s.slice(i + width, end)) });
+					push({ t: double ? "b" : "i", c: inline(s.slice(i + width, end), depth + 1) });
 					i = end + width;
 					continue;
 				}
@@ -132,10 +145,23 @@
 				continue;
 			}
 			if (ch === "[") {
-				var link = /^\[([^\]\n]+)\]\(([^\s()]*(?:\([^\s()]*\)[^\s()]*)*)\)/.exec(s.slice(i));
-				if (link && /^https?:\/\//i.test(link[2])) {
-					push({ t: "a", href: link[2], c: inline(link[1]) });
-					i += link[0].length;
+				// The link text runs to the first `]` after this `[`: found once for every `[` before it.
+				if (bracket !== Infinity && bracket <= i) {
+					bracket = s.indexOf("]", i + 1);
+					if (bracket < 0) bracket = Infinity;
+					else {
+						LINK_TAIL.lastIndex = bracket + 1;
+						bracketLink = LINK_TAIL.exec(s);
+					}
+				}
+				// Text of at least one character and no line break, then `(http...)`.
+				if (newline !== Infinity && newline <= i) {
+					newline = s.indexOf("\n", i + 1);
+					if (newline < 0) newline = Infinity;
+				}
+				if (bracket !== Infinity && bracket > i + 1 && newline > bracket && bracketLink && /^https?:\/\//i.test(bracketLink[1])) {
+					push({ t: "a", href: bracketLink[1], c: inline(s.slice(i + 1, bracket), depth + 1) });
+					i = bracket + 1 + bracketLink[0].length;
 					continue;
 				}
 			}
@@ -148,20 +174,32 @@
 
 	// The closing delimiter for an opener at `i`, or -1. An opener is followed by a non-space; an underscore opener and closer
 	// must not touch a letter or digit on their outer side (snake_case stays text); the closer follows a non-space.
-	function emphasisClose(s, i, ch, width) {
+	// Where a delimiter can close, whatever opens it: the positions of `delim` that are not part of a longer run, that do not
+	// follow a space, and (underscore) do not touch a letter or digit on the outside. One pass, ascending.
+	function closersOf(s, ch, width) {
+		var delim = width === 2 ? ch + ch : ch, found = [], at = s.indexOf(delim);
+		while (at >= 0) {
+			var single = width === 1 && (s.charAt(at + 1) === ch || s.charAt(at - 1) === ch);
+			var outerOk = ch !== "_" || !WORD.test(s.charAt(at + width) || " ");
+			if (!single && outerOk && !/\s/.test(s.charAt(at - 1))) found.push(at);
+			at = s.indexOf(delim, at + 1);
+		}
+		return found;
+	}
+	function emphasisClose(s, i, ch, width, closers) {
 		var first = s.charAt(i + width);
 		if (!first || /\s/.test(first) || first === ch) return -1;
 		if (ch === "_" && i > 0 && WORD.test(s.charAt(i - 1))) return -1;
-		var j = i + width + 1;
-		while (j <= s.length - width) {
-			var at = s.indexOf(width === 2 ? ch + ch : ch, j);
-			if (at < 0) return -1;
-			var single = width === 1 && (s.charAt(at + 1) === ch || s.charAt(at - 1) === ch);
-			var outerOk = ch !== "_" || !WORD.test(s.charAt(at + width) || " ");
-			if (!single && outerOk && !/\s/.test(s.charAt(at - 1))) return at;
-			j = at + (single ? 2 : 1);
+		var key = width === 2 ? ch + ch : ch;
+		var list = closers[key] || (closers[key] = closersOf(s, ch, width));
+		// The first closer after the opener's first content character.
+		var from = i + width + 1, lo = 0, hi = list.length;
+		while (lo < hi) {
+			var mid = (lo + hi) >> 1;
+			if (list[mid] < from) lo = mid + 1;
+			else hi = mid;
 		}
-		return -1;
+		return lo < list.length ? list[lo] : -1;
 	}
 
 	root.brigadevMarkdown = { parse: parse, inline: inline };

@@ -1,7 +1,9 @@
 // The web UI's in-memory event log: every event gets a monotonically increasing `seq`, and `since(seq)` replays what
 // a (re)connecting browser missed. Memory is bounded, and a replay stays a consistent snapshot:
 // - a keyed type (a `latest`/`stream` bus channel, or one of the core UI types below) keeps only its newest event
-//   per key, so replaying an old key never shows a stale value;
+//   per key, so replaying an old key never shows a stale value. A per-item type (tool, agent, prompt) has its own cap
+//   per type; a singleton type (one snapshot per session: mode, todo, phase, session, run, live text) has none, so
+//   churn in one type never evicts another;
 // - an unkeyed type (a `live` channel, messages) keeps the last N overall.
 // Pure and dependency-free: the server (lib/web-server.ts) and the extension (extensions/web-ui.ts) share it.
 
@@ -26,7 +28,7 @@ export interface WebEvent {
 export interface WebLogOptions {
 	/** Unkeyed events kept, newest. */
 	maxUnkeyed?: number;
-	/** Distinct (type, key) snapshots kept, newest. */
+	/** Distinct keys kept per per-item type, newest. Singleton types are exempt. */
 	maxKeyed?: number;
 	/** Type → payload field that is its key; merged over the defaults. */
 	keyed?: Record<string, string>;
@@ -34,6 +36,14 @@ export interface WebLogOptions {
 
 /** UI-only event types the extension builds from Pi's core events, and the payload field that keys each. */
 export const CORE_KEYED_TYPES: Record<string, string> = { run: "id", tool: "id", assistant_live: "id", session: "id" };
+/** Of those, the ones with one snapshot per session. */
+export const CORE_SINGLETON_TYPES: readonly string[] = ["run", "assistant_live", "session"];
+
+function singletonTypes(): Set<string> {
+	const types = new Set(CORE_SINGLETON_TYPES);
+	for (const spec of Object.values(CHANNELS)) if (spec.singleton) types.add(spec.as);
+	return types;
+}
 
 function defaultKeyed(): Record<string, string> {
 	const keyed: Record<string, string> = { ...CORE_KEYED_TYPES };
@@ -55,8 +65,9 @@ export function createWebLog(options: WebLogOptions = {}): WebLog {
 	const maxUnkeyed = Math.max(1, options.maxUnkeyed ?? 500);
 	const maxKeyed = Math.max(1, options.maxKeyed ?? 2000);
 	const keyed = { ...defaultKeyed(), ...options.keyed };
-	// Map iteration is insertion order: delete + set moves a key to the newest end.
-	const snapshots = new Map<string, WebEvent>();
+	const singletons = singletonTypes();
+	// Per type, key → newest event. Map iteration is insertion order: delete + set moves a key to the newest end.
+	const snapshots = new Map<string, Map<string, WebEvent>>();
 	const unkeyed: WebEvent[] = [];
 	const listeners = new Set<(event: WebEvent) => void>();
 	let seq = 0;
@@ -74,10 +85,11 @@ export function createWebLog(options: WebLogOptions = {}): WebLog {
 			const key = keyOf(input);
 			const event: WebEvent = { seq: ++seq, at: Date.now(), type: input.type, ...(key !== undefined ? { key } : {}), data: input.data };
 			if (key !== undefined) {
-				const id = JSON.stringify([input.type, key]);
-				snapshots.delete(id);
-				snapshots.set(id, event);
-				while (snapshots.size > maxKeyed) snapshots.delete(snapshots.keys().next().value as string);
+				let ofType = snapshots.get(input.type);
+				if (!ofType) snapshots.set(input.type, (ofType = new Map()));
+				ofType.delete(key);
+				ofType.set(key, event);
+				if (!singletons.has(input.type)) while (ofType.size > maxKeyed) ofType.delete(ofType.keys().next().value as string);
 			} else {
 				unkeyed.push(event);
 				if (unkeyed.length > maxUnkeyed) unkeyed.splice(0, unkeyed.length - maxUnkeyed);
@@ -93,7 +105,7 @@ export function createWebLog(options: WebLogOptions = {}): WebLog {
 		},
 		since(after) {
 			const out: WebEvent[] = [];
-			for (const e of snapshots.values()) if (e.seq > after) out.push(e);
+			for (const ofType of snapshots.values()) for (const e of ofType.values()) if (e.seq > after) out.push(e);
 			for (const e of unkeyed) if (e.seq > after) out.push(e);
 			return out.sort((a, b) => a.seq - b.seq);
 		},

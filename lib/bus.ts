@@ -37,17 +37,19 @@ export interface ChannelSpec {
 	delivery: Delivery;
 	/** Payload field that identifies the snapshot; required for latest and stream. */
 	key?: string;
+	/** One snapshot per session (phase, todo, mode): a consumer that bounds its memory never evicts it. */
+	singleton?: boolean;
 }
 
 /** Outbound channels and how a consumer should keep them. */
 export const CHANNELS: Record<Exclude<Channel, typeof BUS.action>, ChannelSpec> = {
-	[BUS.phase]: { as: "brigadev_phase", delivery: "latest", key: "scope" },
-	[BUS.todo]: { as: "brigadev_todo", delivery: "latest", key: "scope" },
+	[BUS.phase]: { as: "brigadev_phase", delivery: "latest", key: "scope", singleton: true },
+	[BUS.todo]: { as: "brigadev_todo", delivery: "latest", key: "scope", singleton: true },
 	[BUS.check]: { as: "brigadev_check", delivery: "live" },
 	[BUS.agent]: { as: "brigadev_agent", delivery: "stream", key: "id" },
 	[BUS.prompt]: { as: "brigadev_prompt", delivery: "latest", key: "id" },
 	[BUS.guard]: { as: "brigadev_guard", delivery: "live" },
-	[BUS.mode]: { as: "brigadev_mode", delivery: "latest", key: "scope" },
+	[BUS.mode]: { as: "brigadev_mode", delivery: "latest", key: "scope", singleton: true },
 };
 
 /** The steps of the loop in `assets/orchestrator.md`, plus `idle` between runs. */

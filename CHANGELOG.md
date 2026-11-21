@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Security
+
+- Web UI: the long-lived `?token=` URL is gone. `/brigadev:web start` prints a one-time link (a 32-byte `code`, valid 60 s, spent on first use); the page removes the code from the address bar, trades it with `POST /session` for a random session secret, keeps the secret only in a JavaScript variable, and sends it as `Authorization: Bearer` (the event stream is read with `fetch`, resuming with `Last-Event-ID`). A token or secret in a query string is refused; `stop` revokes every secret. Before, the token stayed in the browser's history and was valid for the whole session, so any process of the same user could read it and approve guard prompts. `/brigadev:web open` prints a new link; `status` shows the address without a code.
+- Commands and details that go to the web page or the bus are redacted: credentials in URLs, `Authorization` headers, token-like strings, and password flags (`lib/redact.ts`).
+
+### Fixed
+
+- A guard confirm or `ask_user_choice` that is open when the run is aborted (Esc, the web Abort) now closes in the terminal and the browser and counts as not approved, so a late answer cannot resume an aborted call.
+- The web UI and the dashboard adapter remove their bus listeners at session shutdown, so a reload no longer doubles events and footer segments.
+- The web UI's event replay waits for slow readers instead of cutting the stream at the 4 MB backlog cap; the cap still applies to a live client that stops reading.
+- The web log keeps `mode`, `todo`, `session`, `phase` and the live run state however many tool calls pass; per-item types (tools, agents, prompts) have their own caps.
+- Codemode is activated only when the host Pi has the tool; `/brigadev:codemode` says so when it does not. A `codemode` call counts as explore for the inferred phase until its nested calls (which Pi reports) move it, and the timeline marks them with their parent.
+- `/brigadev:codemode off` also drops `codemode` from the subagents' tool lists at launch.
+- The web page's markdown parser is linear on unmatched `*`, `_` and `[` openers (15k characters took 1.7 s).
+
 ## [0.23.0-rc.4] - 2026-11-21
 
 Pre-release.

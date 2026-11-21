@@ -4,6 +4,7 @@
 
 import { randomUUID } from "node:crypto";
 import { BUS, onAction, publish, type Bus, type PromptState } from "./bus.ts";
+import { redact } from "./redact.ts";
 
 /** The part of Pi's `ctx` that `askConfirm` uses. */
 export interface ConfirmHost {
@@ -43,19 +44,25 @@ interface Race<T> {
 	start(onCancel: (cancel: () => void) => void): Promise<T | null | undefined>;
 }
 
-type Outcome<T> = { kind: "answered"; result: T; by: "tui" | "web" } | { kind: "dismissed" } | { kind: "failed"; error: unknown };
+type Outcome<T> = { kind: "answered"; result: T; by: "tui" | "web" } | { kind: "dismissed"; aborted?: true } | { kind: "failed"; error: unknown };
 
-/** Runs the race; resolves with the first answer, or null when the TUI was dismissed. A failing TUI rejects, after the prompt is closed. */
-function race<T>(bus: Bus, { prompt, fromWeb, toAnswer, start }: Race<T>): Promise<T | null> {
+/**
+ * Runs the race; resolves with the first answer, or null when the TUI was dismissed or the run was aborted (`signal`).
+ * An abort closes both sides at once, so a late answer cannot resume a call the user aborted. A failing TUI rejects, after the prompt is closed.
+ */
+function race<T>(bus: Bus, { prompt, fromWeb, toAnswer, start }: Race<T>, signal?: AbortSignal): Promise<T | null> {
+	if (signal?.aborted) return Promise.resolve(null);
 	return new Promise<T | null>((resolve, reject) => {
 		let settled = false;
 		let cancelTui: (() => void) | undefined;
+		const onAbort = () => settle({ kind: "dismissed", aborted: true });
 		const settle = (outcome: Outcome<T>) => {
 			if (settled) return;
 			settled = true;
 			stop();
-			// The web answered first: close the TUI side; whatever it reports afterwards is ignored.
-			if (outcome.kind === "answered" && outcome.by === "web") closeTui();
+			signal?.removeEventListener("abort", onAbort);
+			// The web answered first, or the run was aborted: close the TUI side; whatever it reports afterwards is ignored.
+			if ((outcome.kind === "answered" && outcome.by === "web") || (outcome.kind === "dismissed" && outcome.aborted)) closeTui();
 			const final: PromptState =
 				outcome.kind === "answered"
 					? { ...prompt, status: "answered", answer: toAnswer(outcome.result), by: outcome.by, at: Date.now() }
@@ -78,6 +85,7 @@ function race<T>(bus: Bus, { prompt, fromWeb, toAnswer, start }: Race<T>): Promi
 		});
 
 		publish(bus, BUS.prompt, { ...prompt, status: "open", at: Date.now() } satisfies PromptState);
+		signal?.addEventListener("abort", onAbort, { once: true });
 		let tui: Promise<T | null | undefined>;
 		try {
 			tui = start((close) => {
@@ -97,31 +105,33 @@ function race<T>(bus: Bus, { prompt, fromWeb, toAnswer, start }: Race<T>): Promi
 }
 
 /**
- * Asks a yes/no question in the TUI and on the bus; the first answer wins. A TUI that is dismissed (Esc) answers false.
+ * Asks a yes/no question in the TUI and on the bus; the first answer wins. A TUI that is dismissed (Esc) answers false,
+ * and so does an aborted `signal` (the run's: Esc, the web Abort), which closes the dialog and the web prompt.
  * With no bus this is the plain dialog.
  */
-export async function askConfirm(bus: Bus | undefined, ctx: ConfirmHost, { source, title, body }: ConfirmSpec): Promise<boolean> {
-	if (!bus) return ctx.ui.confirm(title, body);
+export async function askConfirm(bus: Bus | undefined, ctx: ConfirmHost, { source, title, body }: ConfirmSpec, signal?: AbortSignal): Promise<boolean> {
+	if (!bus) return signal ? ctx.ui.confirm(title, body, { signal }) : ctx.ui.confirm(title, body);
 	const controller = new AbortController();
 	const result = await race<boolean>(bus, {
-		prompt: { id: randomUUID(), kind: "confirm", source, title, body },
+		// The dialog shows the real text; the bus (and so the page) gets it redacted.
+		prompt: { id: randomUUID(), kind: "confirm", source, title: redact(title), body: redact(body) },
 		fromWeb: (value) => (typeof value === "boolean" ? value : undefined),
 		toAnswer: (result) => result,
 		start: (onCancel) => {
 			onCancel(() => controller.abort());
 			return Promise.resolve(ctx.ui.confirm(title, body, { signal: controller.signal })).then((answer) => Boolean(answer));
 		},
-	});
+	}, signal);
 	return result ?? false;
 }
 
 /**
  * Asks a question with options in the TUI and on the bus; the first answer wins. `runTui` shows the component and
  * resolves with its answer (null when dismissed); it hands the race the function that closes the component, which is
- * called when the web answers first. A web answer is an option's label, or free text unless `allowOther` is false.
- * With no bus this is `runTui` alone.
+ * called when the web answers first or `signal` (the run's) aborts, which resolves null. A web answer is an option's label,
+ * or free text unless `allowOther` is false. With no bus this is `runTui` alone.
  */
-export async function askChoice(bus: Bus | undefined, spec: ChoiceSpec, runTui: (onClose: (close: () => void) => void) => Promise<ChoiceAnswer | null>): Promise<ChoiceAnswer | null> {
+export async function askChoice(bus: Bus | undefined, spec: ChoiceSpec, runTui: (onClose: (close: () => void) => void) => Promise<ChoiceAnswer | null>, signal?: AbortSignal): Promise<ChoiceAnswer | null> {
 	if (!bus) return runTui(() => {});
 	return race<ChoiceAnswer>(bus, {
 		prompt: {
@@ -142,5 +152,5 @@ export async function askChoice(bus: Bus | undefined, spec: ChoiceSpec, runTui: 
 		},
 		toAnswer: (result) => result.answer,
 		start: runTui,
-	});
+	}, signal);
 }

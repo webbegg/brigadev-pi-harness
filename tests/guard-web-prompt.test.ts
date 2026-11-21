@@ -42,10 +42,12 @@ interface Dialog {
 }
 
 /** A parent session with a guard; its confirm dialog stays open until the test settles it. */
-async function session(options: { hasUI?: boolean; mode?: "yolo" } = {}) {
+async function session(options: { hasUI?: boolean; mode?: "yolo"; signal?: AbortSignal } = {}) {
 	const pi: FakePi = createFakePi();
 	guard(pi);
 	const ctx: FakeCtx = createFakeCtx({ cwd: project, hasUI: options.hasUI });
+	// Pi's `ctx.signal`: the run's abort signal (Esc, the web Abort button).
+	if (options.signal) (ctx as any).signal = options.signal;
 	const dialogs: Dialog[] = [];
 	(ctx.ui as any).confirm = (title: string, body: string, opts?: { signal?: AbortSignal }) => new Promise<boolean>((resolve) => dialogs.push({ title, body, signal: opts?.signal, resolve }));
 	(ctx.ui as any).select = async () => undefined;
@@ -132,6 +134,35 @@ describe("guard confirm answered from the bus", () => {
 		assert.equal(s.prompts().length, 1);
 		s.dialogs[0].resolve(false);
 		assert.equal((await result)?.block, true);
+	});
+
+	it("an aborted run closes the pending confirm in the TUI and on the bus, blocks the call, and a late web answer has no effect", async () => {
+		const run = new AbortController();
+		const s = await session({ signal: run.signal });
+		const { result } = s.call("bash", { command: "rm -rf build" });
+		const prompt = await s.open();
+		run.abort();
+		const blocked = await result;
+		assert.equal(blocked?.block, true);
+		assert.equal(s.dialogs[0].signal?.aborted, true, "the TUI dialog got the abort");
+		assert.deepEqual([s.prompts().at(-1)!.id, s.prompts().at(-1)!.status], [prompt.id, "dismissed"]);
+		const count = s.prompts().length;
+		s.answer(prompt.id, true);
+		assert.equal(s.prompts().length, count);
+		assert.equal(s.decisions().at(-1)?.action, "block");
+	});
+
+	it("what leaves for the bus is redacted: the decision's subject and the prompt's body (the TUI dialog still shows the real command)", async () => {
+		const s = await session();
+		const { result } = s.call("bash", { command: "rm -rf build && curl -H 'Authorization: Bearer abc.def' https://me:hunter2@x.test --password=hunter2" });
+		const prompt = await s.open();
+		const published = JSON.stringify([s.prompts(), s.decisions()]);
+		for (const leak of ["hunter2", "abc.def"]) assert.ok(!published.includes(leak), `leaked ${leak}`);
+		assert.match(prompt.body ?? "", /rm -rf build/);
+		assert.match(s.decisions()[0].subject ?? "", /https:\/\/\*\*\*@x\.test/);
+		assert.match(s.dialogs[0].body, /hunter2/, "the person at the terminal sees the real command");
+		s.answer(prompt.id, false);
+		await result;
 	});
 
 	it("a hard block publishes a block decision and asks nothing", async () => {

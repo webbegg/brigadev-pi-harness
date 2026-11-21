@@ -36,7 +36,8 @@ import { RECHECK_KEY, resolveAgentRoute, resolveModelRef, type ResolvedRoute } f
 import { costCalculator, currentModelRef, loadAgents, modelCatalog } from "../lib/pi-adapters.ts";
 import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
 import { canonicalPath } from "../lib/paths.ts";
-import { isChildSession } from "../lib/runtime.ts";
+import { redact } from "../lib/redact.ts";
+import { isChildSession, readSettings } from "../lib/runtime.ts";
 import { loadOutputSchema } from "../lib/structured-output.ts";
 import { takeSnapshot } from "../lib/worktree-snapshot.ts";
 import { worktreeTreeResult } from "../lib/worktree-tree.ts";
@@ -135,6 +136,8 @@ const MAX_BUS_TASK = 4000;
 const MAX_BUS_OUTPUT = 20_000;
 const STEP_FIELDS = ["path", "file_path", "command", "pattern", "query", "agent"] as const;
 const capText = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max - 1)}…`);
+/** Text for the bus: credentials masked first, then capped (so a cut never leaves half a token). */
+const busText = (text: string, max: number) => capText(redact(text), max);
 
 /** The child's last tool calls as one-line steps, for a detail view. */
 function recentSteps(r: RunResult): AgentStep[] {
@@ -142,7 +145,7 @@ function recentSteps(r: RunResult): AgentStep[] {
 	return calls.slice(-MAX_BUS_STEPS).map((c) => {
 		const args = (c.arguments ?? {}) as Record<string, unknown>;
 		const field = STEP_FIELDS.find((f) => typeof args[f] === "string" && args[f]);
-		return { tool: capText(String(c.name), 80), summary: field ? capText(String(args[field]).replace(/\s+/g, " ").trim(), 160) : "" };
+		return { tool: capText(String(c.name), 80), summary: field ? busText(String(args[field]).replace(/\s+/g, " ").trim(), 160) : "" };
 	});
 }
 
@@ -156,15 +159,15 @@ function agentState(launchId: number, index: number, r: RunResult, cancellable: 
 		launchId: String(launchId),
 		index,
 		agent: r.agent,
-		task: r.task.split("\n")[0],
-		taskText: capText(r.task, MAX_BUS_TASK),
+		task: redact(r.task.split("\n")[0]),
+		taskText: busText(r.task, MAX_BUS_TASK),
 		steps: steps.length ? steps : undefined,
-		output: live || r.exitCode === -1 ? undefined : capText(output(r), MAX_BUS_OUTPUT),
+		output: live || r.exitCode === -1 ? undefined : busText(output(r), MAX_BUS_OUTPUT),
 		status,
 		model: r.model,
 		thinking: r.thinking,
 		...cardUsage(r),
-		partial: live ? tail(r.partial) : undefined,
+		partial: live ? tail(r.partial === undefined ? undefined : redact(r.partial)) : undefined,
 		runId: r.runId,
 		startedAt: r.startedAt,
 		endedAt: r.endedAt,
@@ -441,7 +444,13 @@ export default function (pi: ExtensionAPI) {
 			usage: emptyTally(),
 			...(routes[i] ? queuedFields(routes[i]!, routeLabel(routes[i]!, profile.name)) : { queued: true }),
 		}));
-		const tasks: LaunchTask[] = resolved.map(({ request, agent }, i) => ({ request, agent: agent!, route: routes[i]!, routeLabel: routeLabel(routes[i]!, profile.name) }));
+		// `/brigadev:codemode off` also covers the children: their tool lists lose codemode (a list that would become empty is left alone: no `--tools` flag would mean every tool).
+		const codemodeOff = readSettings().codemode === false;
+		const withoutCodemode = <A extends { tools?: string[] }>(agent: A): A => {
+			const kept = agent.tools?.filter((tool) => tool !== "codemode");
+			return codemodeOff && kept?.length && kept.length !== agent.tools?.length ? { ...agent, tools: kept } : agent;
+		};
+		const tasks: LaunchTask[] = resolved.map(({ request, agent }, i) => ({ request, agent: withoutCodemode(agent!), route: routes[i]!, routeLabel: routeLabel(routes[i]!, profile.name) }));
 		const hooks: LaunchHooks = { onUpdate: onUpdate as LaunchHooks["onUpdate"] };
 
 		const price = costCalculator(ctx);
@@ -457,7 +466,7 @@ export default function (pi: ExtensionAPI) {
 		const lastStatus = new Map<number, string>();
 		const announce = (index: number, over?: Partial<AgentState>) => {
 			try {
-				const state = agentState(id, index, results[index], cancelTasks.has(`${id}:${index}`), { reason: capText(resolved[index]?.request.reason ?? "", 500) || undefined, ...over });
+				const state = agentState(id, index, results[index], cancelTasks.has(`${id}:${index}`), { reason: busText(resolved[index]?.request.reason ?? "", 500) || undefined, ...over });
 				lastStatus.set(index, state.status);
 				publish(pi.events, BUS.agent, state);
 			} catch {

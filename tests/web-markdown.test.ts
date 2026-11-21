@@ -92,6 +92,37 @@ describe("web markdown: inline", () => {
 		assert.deepEqual(md.inline("ask_user_choice and BRIGADEV_WEB_PORT"), [text("ask_user_choice and BRIGADEV_WEB_PORT")]);
 	});
 
+	// About 120k chars each: a linear parse takes ~10-20 ms, a quadratic one seconds, so the 250 ms bound holds under a loaded machine
+	// and still fails a quadratic path (a 15k input with 50 ms could not tell the two apart under load).
+	it("stays linear on unmatched emphasis, link openers and code spans (each ~120k chars parses in under 250 ms)", () => {
+		const cases: Array<[string, string]> = [
+			["*a ", "*a ".repeat(40_000)],
+			["_a ", "_a ".repeat(40_000)],
+			["**a ", "**a ".repeat(30_000)],
+			["[", "[".repeat(120_000)],
+			["[a ", "[a ".repeat(40_000) + "]"],
+			["[a\\n", "[a\n".repeat(40_000) + "](x)"],
+			["[a](", "[a](x".repeat(24_000)],
+			["`a", "`a".repeat(60_000)],
+			["``a`", "``a`".repeat(30_000)],
+		];
+		for (const [name, source] of cases) {
+			const started = performance.now();
+			md.parse(source);
+			const took = performance.now() - started;
+			assert.ok(took < 250, `${JSON.stringify(name)} x ${source.length} chars took ${took.toFixed(0)} ms`);
+		}
+	});
+
+	it("keeps the output for the cases around the opener search: matches after unmatched openers, links, nesting", () => {
+		assert.deepEqual(md.inline("*a *b*"), [{ t: "i", c: [text("a *b")] }]);
+		assert.deepEqual(md.inline("**a **b**"), [{ t: "b", c: [text("a **b")] }]);
+		assert.deepEqual(md.inline("[a [b](https://x.dev)"), [{ t: "a", href: "https://x.dev", c: [text("a [b")] }]);
+		assert.deepEqual(md.inline("[a\nb](https://x.dev) [c](https://y.dev)"), [text("[a\nb](https://x.dev) "), { t: "a", href: "https://y.dev", c: [text("c")] }]);
+		assert.deepEqual(md.inline("[a](https://x.dev/(b)) tail"), [{ t: "a", href: "https://x.dev/(b)", c: [text("a")] }, text(" tail")]);
+		assert.deepEqual(md.inline("[](https://x.dev)"), [text("[](https://x.dev)")]);
+	});
+
 	it("never throws on any input", () => {
 		for (const s of ["", "**", "``", "[", "[a](", "| |", "```", "-", "1.", "> ", "#".repeat(9), "*_*_*_"]) {
 			assert.doesNotThrow(() => md.parse(s), s);

@@ -3,18 +3,19 @@
 // the brigadev bus (lib/bus.ts) and a few compact core events, and never changes what the agent does: the only
 // ways in are the validated actions of lib/web-server.ts (send a prompt, abort, answer, cancel a subagent).
 
-import { randomBytes } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type Action, BUS, CHANNELS, publish } from "../lib/bus.ts";
 import { basename } from "node:path";
 import { readCurrentBranch } from "../lib/commit-branch.ts";
+import { redact } from "../lib/redact.ts";
 import { isChildSession } from "../lib/runtime.ts";
 import { createWebLog } from "../lib/web-log.ts";
 import { webPage } from "../lib/web-page.ts";
 import { startWebServer, type WebServer } from "../lib/web-server.ts";
 
 const STATUS_KEY = "brigadev-web";
-const USAGE = "Usage: /brigadev:web [start|stop|status]";
+const USAGE = "Usage: /brigadev:web [start|open|stop|status]";
+const LINK_HINT = "one-time link, valid 60 s; /brigadev:web open mints a new one";
 const MAX_MESSAGE_CHARS = 20_000;
 const MAX_SUMMARY_CHARS = 200;
 const LIVE_THROTTLE_MS = 150;
@@ -50,7 +51,8 @@ function summarize(args: unknown): string {
 			.filter((agent): agent is string => typeof agent === "string")
 			.join(", ");
 	}
-	return cap(text.replace(/\s+/g, " ").trim(), MAX_SUMMARY_CHARS);
+	// Credentials in a command are masked before anything leaves for the page (and before the cap can cut one in half).
+	return cap(redact(text).replace(/\s+/g, " ").trim(), MAX_SUMMARY_CHARS);
 }
 
 function configuredPort(): number {
@@ -78,16 +80,27 @@ export default function (pi: ExtensionAPI) {
 			}
 		};
 
-	// The bus: every outbound channel, from load on.
+	// The bus: every outbound channel, from load on. Pi's bus outlives a reload, so each listener is removed at shutdown.
+	const unsubscribers: Array<() => void> = [];
 	for (const [channel, spec] of Object.entries(CHANNELS)) {
-		pi.events.on(channel, (data) => {
+		const off = pi.events.on(channel, (data) => {
 			try {
 				log.append({ type: spec.as, data });
 			} catch {
 				// see above
 			}
 		});
+		if (typeof off === "function") unsubscribers.push(off);
 	}
+	const unsubscribeBus = () => {
+		for (const off of unsubscribers.splice(0)) {
+			try {
+				off();
+			} catch {
+				// already gone
+			}
+		}
+	};
 
 	// Core events, reduced to compact UI events.
 	let messageSeq = 0;
@@ -162,21 +175,23 @@ export default function (pi: ExtensionAPI) {
 	);
 
 	const summaries = new Map<string, string>();
+	/** A call another tool made (a codemode script) names that tool's call, so the timeline can show where it came from. */
+	const parentOf = (event: { parentToolCallId?: string }) => (typeof event.parentToolCallId === "string" ? { parentId: event.parentToolCallId } : {});
 	pi.on(
 		"tool_execution_start",
-		guarded((event: { toolCallId: string; toolName: string; args?: unknown }) => {
+		guarded((event: { toolCallId: string; toolName: string; args?: unknown; parentToolCallId?: string }) => {
 			const summary = summarize(event.args);
 			summaries.set(event.toolCallId, summary);
-			log.append({ type: "tool", data: { id: event.toolCallId, name: cap(String(event.toolName), 80), summary, status: "running", at: Date.now() } });
+			log.append({ type: "tool", data: { id: event.toolCallId, name: cap(String(event.toolName), 80), summary, ...parentOf(event), status: "running", at: Date.now() } });
 		}),
 	);
 	pi.on(
 		"tool_execution_end",
-		guarded((event: { toolCallId: string; toolName: string; isError?: boolean; durationMs?: number }) => {
+		guarded((event: { toolCallId: string; toolName: string; isError?: boolean; durationMs?: number; parentToolCallId?: string }) => {
 			const summary = summaries.get(event.toolCallId) ?? "";
 			summaries.delete(event.toolCallId);
 			const durationMs = typeof event.durationMs === "number" ? event.durationMs : undefined;
-			log.append({ type: "tool", data: { id: event.toolCallId, name: cap(String(event.toolName), 80), summary, status: event.isError ? "error" : "done", durationMs, at: Date.now() } });
+			log.append({ type: "tool", data: { id: event.toolCallId, name: cap(String(event.toolName), 80), summary, ...parentOf(event), status: event.isError ? "error" : "done", durationMs, at: Date.now() } });
 		}),
 	);
 	pi.on("session_start", (_event: unknown, context: unknown) => {
@@ -185,7 +200,10 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on(
 		"session_shutdown",
-		guarded(() => void stop()),
+		guarded(() => {
+			unsubscribeBus();
+			void stop();
+		}),
 	);
 
 	function handleAction(action: Action): void {
@@ -212,7 +230,7 @@ export default function (pi: ExtensionAPI) {
 		if (server) return server;
 		starting ??= (async () => {
 			const html = webPage();
-			return startWebServer({ host: "127.0.0.1", port: configuredPort(), token: randomBytes(32).toString("hex"), html, log, onAction: handleAction });
+			return startWebServer({ host: "127.0.0.1", port: configuredPort(), html, log, onAction: handleAction });
 		})();
 		try {
 			server = await starting;
@@ -231,17 +249,18 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("brigadev:web", {
-		description: "Open the local web UI for this session: start (default), stop, status",
+		description: "Open the local web UI for this session: start (default), open (a new one-time link), stop, status",
 		handler: async (args: string, context: any) => {
 			ctx = context ?? ctx;
 			const sub = (args ?? "").trim().split(/\s+/)[0] || "start";
 			const notify = (message: string, type?: "info" | "warning" | "error") => context.ui.notify(message, type);
-			if (sub === "start") {
-				if (server) return notify(`brigadev web UI already running: ${server.url}`);
+			if (sub === "start" || sub === "open") {
+				// A running server gets a fresh link (the code is single-use); `open` never starts one.
+				if (!server && sub === "open") return notify("brigadev web UI is not running: start it with /brigadev:web start", "warning");
 				try {
 					const running = await start();
 					context.ui.setStatus(STATUS_KEY, `web :${running.port}`);
-					notify(`brigadev web UI: ${running.url}`);
+					notify(`brigadev web UI: ${running.openUrl()} (${LINK_HINT})`);
 				} catch (error) {
 					notify(`brigadev web UI failed to start: ${error instanceof Error ? error.message : String(error)}`, "error");
 				}
@@ -250,7 +269,7 @@ export default function (pi: ExtensionAPI) {
 				context.ui.setStatus(STATUS_KEY, undefined);
 				notify("brigadev web UI stopped");
 			} else if (sub === "status") {
-				notify(server ? `brigadev web UI running: ${server.url}` : "brigadev web UI is not running");
+				notify(server ? `brigadev web UI running: ${server.url} (/brigadev:web open prints a one-time link)` : "brigadev web UI is not running");
 			} else {
 				notify(USAGE, "warning");
 			}

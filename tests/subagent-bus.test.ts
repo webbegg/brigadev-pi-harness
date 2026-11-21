@@ -17,6 +17,7 @@ const line = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
 const usage = { input: 3, output: 4, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
 const message = (extra) => ({ role: "assistant", content: [{ type: "text", text: "" }], provider: "p", model: "m", usage, ...extra });
 const task = String(process.argv.at(-1)).replace(/^## Task\\n/, "");
+if (process.env.ARGV_LOG) process.getBuiltinModule("node:fs").appendFileSync(process.env.ARGV_LOG, JSON.stringify(process.argv) + "\\n");
 line({ type: "session", version: 3, id: "fake", timestamp: new Date().toISOString(), cwd: process.cwd() });
 line({ type: "agent_start" });
 if (task.includes("HANG")) {
@@ -27,7 +28,8 @@ if (task.includes("HANG")) {
 	if (task.includes("TOOLS")) {
 		for (let i = 0; i < 15; i++) line({ type: "message_end", message: message({ content: [{ type: "toolCall", id: "c" + i, name: "read", arguments: { path: "lib/f" + i + ".ts" } }], stopReason: "toolUse" }) });
 	}
-	line({ type: "message_end", message: message({ content: [{ type: "text", text: "all done" }], stopReason: "stop" }) });
+	if (task.includes("LEAK")) line({ type: "message_end", message: message({ content: [{ type: "toolCall", id: "leak", name: "bash", arguments: { command: "curl https://me:hunter2@x.test --password=hunter2" } }], stopReason: "toolUse" }) });
+	line({ type: "message_end", message: message({ content: [{ type: "text", text: task.includes("LEAK") ? "found ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8 in the env" : "all done" }], stopReason: "stop" }) });
 	line({ type: "agent_end", messages: [], willRetry: false });
 	line({ type: "agent_settled", aborted: false });
 }
@@ -134,6 +136,44 @@ describe("brigadev:agent snapshots", () => {
 			assert.deepEqual(last.steps?.at(-1), { tool: "read", summary: "lib/f14.ts" });
 			assert.deepEqual(last.steps?.[0], { tool: "read", summary: "lib/f3.ts" });
 		});
+	});
+
+	it("what a snapshot carries is redacted: the task, the steps and the output", { timeout: 60_000 }, async () => {
+		await withChild(async ({ pi, ctx }) => {
+			const result = await single(pi, ctx, "LEAK use https://me:hunter2@x.test and --password=hunter2\nsecond ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+			assert.notEqual(result.isError, true);
+			const raw = JSON.stringify(snapshots(pi));
+			for (const leak of ["hunter2", "ghp_a1B2"]) assert.ok(!raw.includes(leak), `leaked ${leak}`);
+			const last = snapshots(pi).at(-1)!;
+			assert.equal(last.output, "found *** in the env");
+			assert.equal(last.steps?.at(-1)?.summary, "curl https://***@x.test --password=***");
+			assert.match(last.taskText ?? "", /https:\/\/\*\*\*@x\.test/);
+		});
+	});
+
+	it("/brigadev:codemode off drops codemode from a subagent's tool list at launch; on keeps it", { timeout: 60_000 }, async () => {
+		const settings = path.join(root, "pi-agent", "brigadev.json");
+		const log = path.join(root, "argv.log");
+		process.env.ARGV_LOG = log;
+		const toolsOfLastLaunch = () => {
+			const argv: string[] = JSON.parse(fs.readFileSync(log, "utf8").trim().split("\n").at(-1)!);
+			return argv[argv.indexOf("--tools") + 1].split(",");
+		};
+		try {
+			fs.mkdirSync(path.dirname(settings), { recursive: true });
+			for (const [setting, expected] of [[{ codemode: false }, false], [{}, true], [{ codemode: true }, true]] as const) {
+				fs.writeFileSync(settings, JSON.stringify(setting));
+				await withChild(async ({ pi, ctx }) => {
+					assert.notEqual((await single(pi, ctx, "alpha")).isError, true);
+				});
+				const tools = toolsOfLastLaunch();
+				assert.equal(tools.includes("codemode"), expected, `${JSON.stringify(setting)}: ${tools.join(",")}`);
+				assert.ok(tools.includes("read"), "the agent's other tools stay");
+			}
+		} finally {
+			delete process.env.ARGV_LOG;
+			fs.rmSync(settings, { force: true });
+		}
 	});
 
 	it("a failing bus listener never breaks the launch", { timeout: 60_000 }, async () => {

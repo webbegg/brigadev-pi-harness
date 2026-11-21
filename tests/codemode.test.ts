@@ -35,11 +35,13 @@ after(() => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-function withActiveTools(initial: string[]) {
+/** `installed`: the tools the host Pi has at all (`pi.getAllTools()`); by default a Pi that ships codemode. */
+function withActiveTools(initial: string[], installed: string[] = [...initial, "grep", "find", "ls", "codemode"]) {
 	const pi: any = createFakePi();
 	let active = [...initial];
 	pi.getActiveTools = () => [...active];
 	pi.setActiveTools = (names: string[]) => void (active = [...names]);
+	pi.getAllTools = () => installed.map((name) => ({ name }));
 	return pi;
 }
 
@@ -75,6 +77,51 @@ describe("codemode guidance in the orchestrator prompt", () => {
 		const event = { systemPromptOptions: {} as { appendSystemPrompt?: string } };
 		await s.pi.fire("before_agent_start", event, s.ctx);
 		assert.doesNotMatch(event.systemPromptOptions.appendSystemPrompt ?? "", /## Codemode/);
+	});
+});
+
+describe("codemode is activated only when the host Pi has the tool", () => {
+	async function session(initial: string[], installed: string[] | undefined, setting?: boolean) {
+		writeFileSync(join(agentDir, "brigadev.json"), JSON.stringify(setting === undefined ? {} : { codemode: setting }));
+		const pi = withActiveTools(initial, installed);
+		orchestrator(pi);
+		const ctx = createFakeCtx({ cwd: repo, hasUI: true });
+		await pi.fire("session_start", {}, ctx);
+		const event = { systemPromptOptions: {} as { appendSystemPrompt?: string } };
+		await pi.fire("before_agent_start", event, ctx);
+		return { pi, ctx, prompt: event.systemPromptOptions.appendSystemPrompt ?? "", active: () => pi.getActiveTools() as string[] };
+	}
+
+	it("a Pi without the tool keeps its tools as they were (the search tools still come), and the prompt has no codemode block", async () => {
+		const s = await session(["read", "bash"], ["read", "bash", "grep", "find", "ls"]);
+		assert.deepEqual(s.active().sort(), ["bash", "find", "grep", "ls", "read"]);
+		assert.doesNotMatch(s.prompt, /## Codemode/);
+	});
+
+	it("a Pi without getAllTools is treated as not having it", async () => {
+		writeFileSync(join(agentDir, "brigadev.json"), JSON.stringify({}));
+		const pi = withActiveTools(["read"]);
+		delete pi.getAllTools;
+		orchestrator(pi);
+		await pi.fire("session_start", {}, createFakeCtx({ cwd: repo, hasUI: false }));
+		assert.ok(!pi.getActiveTools().includes("codemode"));
+	});
+
+	it("/brigadev:codemode says so: the setting is on, but the tool is not in this Pi", async () => {
+		const s = await session(["read"], ["read", "grep", "find", "ls"]);
+		await s.pi.commands.get("brigadev:codemode").handler("", s.ctx);
+		assert.match(s.ctx.notifications.at(-1)!.message, /codemode: on \(not available: this Pi has no codemode tool\)/);
+		await s.pi.commands.get("brigadev:codemode").handler("on", s.ctx);
+		assert.match(s.ctx.notifications.at(-1)!.message, /this Pi has no codemode tool/);
+		assert.ok(!s.active().includes("codemode"), "on does not activate what is not there");
+	});
+
+	it("a Pi that has the tool gets it, and the status says active", async () => {
+		const s = await session(["read"], ["read", "grep", "find", "ls", "codemode"]);
+		assert.ok(s.active().includes("codemode"));
+		assert.match(s.prompt, /## Codemode/);
+		await s.pi.commands.get("brigadev:codemode").handler("", s.ctx);
+		assert.match(s.ctx.notifications.at(-1)!.message, /codemode: on \(active in this session\)/);
 	});
 });
 

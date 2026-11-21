@@ -45,6 +45,15 @@ export default function (pi: ExtensionAPI) {
 	if (isChildSession()) return;
 	let enabled = true;
 
+	/** Whether this Pi ships the codemode tool at all (it is registered, active or not); a Pi that cannot say is treated as not having it. */
+	const hostHasCodemode = (): boolean => {
+		try {
+			return typeof pi.getAllTools === "function" && pi.getAllTools().some((tool) => tool.name === CODEMODE_TOOL);
+		} catch {
+			return false;
+		}
+	};
+
 	const publishStatus = (ctx: ExtensionContext) => {
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, enabled ? undefined : "brigadev: harness off");
 	};
@@ -64,7 +73,8 @@ export default function (pi: ExtensionAPI) {
 	 * tool; changes nothing when all are active. With codemode off it is not removed: Pi's own `defaultTools` may enable it.
 	 */
 	const activateParentTools = () => {
-		const wanted = codemodeEnabled() ? [...SEARCH_TOOLS, CODEMODE_TOOL] : SEARCH_TOOLS;
+		// Codemode is only asked for when the host Pi has it; otherwise the tool list is left as it was.
+		const wanted = codemodeEnabled() && hostHasCodemode() ? [...SEARCH_TOOLS, CODEMODE_TOOL] : SEARCH_TOOLS;
 		const active = pi.getActiveTools();
 		if (wanted.every((name) => active.includes(name))) return;
 		pi.setActiveTools([...new Set([...active, ...wanted])]);
@@ -106,12 +116,13 @@ export default function (pi: ExtensionAPI) {
 			const value = args.trim();
 			if (value !== "on" && value !== "off") {
 				const state = codemodeEnabled() ? "on" : "off";
-				const active = pi.getActiveTools().includes(CODEMODE_TOOL) ? "active" : "not active";
-				return ctx.ui.notify(`codemode: ${state} (${active} in this session)\nUsage: /brigadev:codemode on|off`, "info");
+				const where = pi.getActiveTools().includes(CODEMODE_TOOL) ? "active in this session" : hostHasCodemode() ? "not active in this session" : "not available: this Pi has no codemode tool";
+				return ctx.ui.notify(`codemode: ${state} (${where})\nUsage: /brigadev:codemode on|off`, "info");
 			}
 			const on = value === "on";
 			writeSettings({ codemode: on });
 			const active = pi.getActiveTools();
+			if (on && !hostHasCodemode()) return ctx.ui.notify("brigadev codemode on (saved), but this Pi has no codemode tool, so nothing changes in this session", "warning");
 			if (on && !active.includes(CODEMODE_TOOL)) pi.setActiveTools([...active, CODEMODE_TOOL]);
 			if (!on && active.includes(CODEMODE_TOOL)) pi.setActiveTools(active.filter((name) => name !== CODEMODE_TOOL));
 			ctx.ui.notify(`brigadev codemode ${value} (this session and new ones)`, "info");

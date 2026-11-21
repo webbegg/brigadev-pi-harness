@@ -24,6 +24,7 @@ import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISS
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { decidePrGate, opensPrCreate, prCreateDirectory, prGateBlockMessage, prGateDialogText, riskMapFor, UNRESOLVED_DIRECTORY_REASON, type PrGateDecision } from "../lib/pr-gate.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
+import { redact } from "../lib/redact.ts";
 import { branchRisk, type RiskCategory } from "../lib/risk-map.ts";
 import { agentDir, CHILD_ENV, childAllowedSurfaces, isChildSession, PACKAGE_ROOT, readSettings, writeSettings } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
@@ -110,7 +111,8 @@ export default function (pi: ExtensionAPI) {
 		const { toolCallId, toolName, input } = current.event;
 		const fields = (input && typeof input === "object" ? input : {}) as { command?: unknown; path?: unknown };
 		const subject = typeof fields.command === "string" ? fields.command : typeof fields.path === "string" ? fields.path : undefined;
-		publish(pi.events, BUS.guard, { id: randomUUID(), toolCallId, tool: toolName, ...(subject === undefined ? {} : { subject: subject.slice(0, 500) }), action, ...(reason === undefined ? {} : { reason }), at: Date.now() } satisfies GuardDecision);
+		// What goes to the bus (and so the page) is redacted; the TUI dialog keeps the real command.
+		publish(pi.events, BUS.guard, { id: randomUUID(), toolCallId, tool: toolName, ...(subject === undefined ? {} : { subject: redact(subject).slice(0, 500) }), action, ...(reason === undefined ? {} : { reason: redact(reason) }), at: Date.now() } satisfies GuardDecision);
 	};
 
 	/** Asks the user, in the TUI or from the web (first answer wins); without a UI (print mode, subagents) the answer is no. */
@@ -121,7 +123,8 @@ export default function (pi: ExtensionAPI) {
 			current.asked = true;
 			announce(current, "confirm", title);
 		}
-		return askConfirm(pi.events, ctx, { source: "guard", title, body });
+		// The run's abort signal (Esc, the web Abort) closes the dialog and the web prompt, so a late answer cannot resume an aborted call.
+		return askConfirm(pi.events, ctx, { source: "guard", title, body }, ctx.signal);
 	};
 
 	/** Top of the repository that holds `dir` (canonical); `dir` itself when git cannot tell (not a repository, a failure). */

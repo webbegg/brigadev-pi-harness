@@ -265,3 +265,69 @@ describe("askChoice", () => {
 		assert.deepEqual(await askChoice(undefined, choice, async () => ({ answer: "SQLite", wasCustom: false })), { answer: "SQLite", wasCustom: false });
 	});
 });
+
+describe("an aborted run closes a pending prompt", () => {
+	it("askConfirm: abort closes the TUI dialog, publishes dismissed, answers false, and a late web answer does nothing", async () => {
+		const { bus, snapshots, answer } = setup();
+		const tui = tuiConfirm();
+		const run = new AbortController();
+		const result = askConfirm(bus, tui.ctx, spec, run.signal);
+		assert.equal(snapshots[0].status, "open");
+		assert.equal(tui.calls[0].signal?.aborted, false);
+
+		run.abort();
+		assert.equal(await result, false);
+		assert.equal(tui.calls[0].signal?.aborted, true, "the TUI dialog got the abort");
+		assert.deepEqual([snapshots.length, snapshots[1].status, snapshots[1].answer], [2, "dismissed", undefined]);
+
+		answer(snapshots[0].id, true);
+		assert.equal(snapshots.length, 2, "the listener is gone: a late answer has no effect");
+		tui.resolve(true);
+		await tick();
+		assert.equal(snapshots.length, 2);
+	});
+
+	it("askConfirm: a signal that is already aborted asks nothing and answers false", async () => {
+		const { bus, snapshots } = setup();
+		const tui = tuiConfirm();
+		const run = new AbortController();
+		run.abort();
+		assert.equal(await askConfirm(bus, tui.ctx, spec, run.signal), false);
+		assert.equal(tui.calls.length, 0);
+		assert.equal(snapshots.length, 0);
+	});
+
+	it("askConfirm: a settled prompt stops listening to the signal", async () => {
+		const { bus, snapshots } = setup();
+		const tui = tuiConfirm();
+		const run = new AbortController();
+		const result = askConfirm(bus, tui.ctx, spec, run.signal);
+		tui.resolve(true);
+		assert.equal(await result, true);
+		run.abort();
+		assert.equal(snapshots.length, 2);
+	});
+
+	it("askChoice: abort closes the component, resolves null and publishes dismissed; a late web answer does nothing", async () => {
+		const { bus, snapshots, answer } = setup();
+		const tui = tuiChoice();
+		const run = new AbortController();
+		const result = askChoice(bus, choice, tui.run, run.signal);
+		run.abort();
+		assert.equal(await result, null);
+		assert.equal(tui.state.closed, 1);
+		assert.equal(snapshots.at(-1)?.status, "dismissed");
+		const count = snapshots.length;
+		answer(snapshots[0].id, "SQLite");
+		assert.equal(snapshots.length, count);
+	});
+
+	it("askChoice: a signal that is already aborted shows nothing", async () => {
+		const { bus, snapshots } = setup();
+		let shown = 0;
+		const run = new AbortController();
+		run.abort();
+		assert.equal(await askChoice(bus, choice, async () => (shown++, null), run.signal), null);
+		assert.deepEqual([shown, snapshots.length], [0, 0]);
+	});
+});

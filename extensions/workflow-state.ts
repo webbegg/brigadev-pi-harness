@@ -6,13 +6,16 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { BUS, type CheckState, publish, type TodoItem } from "../lib/bus.ts";
 import { installDashboardAdapter } from "../lib/dashboard-adapter.ts";
 import { createPhaseTracker } from "../lib/phase.ts";
+import { redact } from "../lib/redact.ts";
 import { isChildSession } from "../lib/runtime.ts";
 
 export default function (pi: ExtensionAPI) {
 	if (isChildSession()) return;
 	const bus = pi.events;
 	const phase = createPhaseTracker();
-	if (bus) installDashboardAdapter(bus);
+	// Pi's bus outlives a reload: the adapter's listeners go with the session, or the next load would double the footer segments.
+	const removeAdapter = bus ? installDashboardAdapter(bus) : undefined;
+	pi.on("session_shutdown", () => removeAdapter?.());
 
 	pi.on("agent_start", () => publish(bus, BUS.phase, phase.agentStart()));
 	pi.on("agent_end", () => publish(bus, BUS.phase, phase.agentEnd()));
@@ -30,7 +33,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.toolName === "check" && typeof details.command === "string") {
 			const check: CheckState = {
 				id: event.toolCallId,
-				command: details.command,
+				command: redact(details.command),
 				outcome: String(details.outcome ?? "unknown"),
 				exitCode: typeof details.exitCode === "number" ? details.exitCode : undefined,
 				counts: details.counts,

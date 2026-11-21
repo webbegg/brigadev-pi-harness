@@ -39,6 +39,8 @@ function withActiveTools(initial: string[]) {
 	let active = [...initial];
 	pi.setCalls = [] as string[][];
 	pi.getActiveTools = () => [...active];
+	// The host Pi ships codemode (the orchestrator only asks for it then).
+	pi.getAllTools = () => [...new Set([...initial, "grep", "find", "ls", "codemode"])].map((name) => ({ name }));
 	pi.setActiveTools = (names: string[]) => {
 		pi.setCalls.push(names);
 		active = [...names];

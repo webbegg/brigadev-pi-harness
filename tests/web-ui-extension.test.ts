@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { request } from "node:http";
 import { test } from "node:test";
 import webUi from "../extensions/web-ui.ts";
-import { BUS } from "../lib/bus.ts";
+import { BUS, CHANNELS, createBus, type Bus } from "../lib/bus.ts";
 import { createFakeCtx, createFakePi } from "./helpers/fake-pi.ts";
 
 // These tests are about the parent session, whatever shell runs them (a subagent's shell has BRIGADEV_CHILD=1).
@@ -13,12 +13,16 @@ interface Harness {
 	ctx: ReturnType<typeof createFakeCtx> & { aborted: number };
 	sent: Array<{ text: string; options: unknown }>;
 	command: (args?: string) => Promise<void>;
+	/** The latest URL the command printed. */
 	url(): string;
 	port(): number;
 }
 
-function setup(): Harness {
+const URL_RE = /http:\/\/127\.0\.0\.1:\d+\/(\?code=[A-Za-z0-9_-]{43})?/;
+
+function setup(bus?: Bus): Harness {
 	const pi = createFakePi();
+	if (bus) pi.events = bus;
 	const sent: Harness["sent"] = [];
 	(pi as any).sendUserMessage = (text: string, options?: unknown) => void sent.push({ text, options });
 	webUi(pi as any);
@@ -26,9 +30,9 @@ function setup(): Harness {
 	ctx.aborted = 0;
 	(ctx as any).abort = () => void ctx.aborted++;
 	const urlOf = () => {
-		const n = [...ctx.notifications].reverse().find((x) => /http:\/\/127\.0\.0\.1:\d+\/\?token=[0-9a-f]{64}/.test(x.message));
+		const n = [...ctx.notifications].reverse().find((x) => URL_RE.test(x.message));
 		assert.ok(n, `no url notified: ${JSON.stringify(ctx.notifications)}`);
-		return /http:\/\/127\.0\.0\.1:\d+\/\?token=[0-9a-f]{64}/.exec(n.message)![0];
+		return URL_RE.exec(n.message)![0];
 	};
 	return {
 		pi,
@@ -40,23 +44,38 @@ function setup(): Harness {
 	};
 }
 
-const tokenOf = (url: string) => new URL(url).searchParams.get("token")!;
+const codeOf = (url: string) => new URL(url).searchParams.get("code")!;
+const auth = (secret: string) => ({ authorization: `Bearer ${secret}` });
 
-function get(port: number, path: string, headers: Record<string, string> = {}): Promise<{ status: number; body: string }> {
+function get(port: number, path: string, headers: Record<string, string> = {}, method = "GET"): Promise<{ status: number; body: string; headers: Record<string, unknown> }> {
 	return new Promise((resolve, reject) => {
-		const req = request({ host: "127.0.0.1", port, path, headers }, (res) => {
+		// agent: false, so a restart on the same port never reuses a socket of the server that was stopped.
+		const req = request({ host: "127.0.0.1", port, path, headers, method, agent: false }, (res) => {
 			const chunks: Buffer[] = [];
 			res.on("data", (c) => chunks.push(c));
-			res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString() }));
+			res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString(), headers: res.headers }));
 		});
 		req.on("error", reject);
 		req.end();
 	});
 }
 
-function post(port: number, token: string, body: unknown): Promise<number> {
+/** What the page does with the link's code. */
+async function exchange(port: number, code: string): Promise<{ status: number; secret?: string }> {
+	const reply = await get(port, "/session", { "x-brigadev-code": code }, "POST");
+	return { status: reply.status, secret: reply.status === 200 ? JSON.parse(reply.body).secret : undefined };
+}
+
+/** Exchanges the latest printed link for a session secret. */
+async function login(h: Harness): Promise<string> {
+	const reply = await exchange(h.port(), codeOf(h.url()));
+	assert.equal(reply.status, 200);
+	return reply.secret!;
+}
+
+function post(port: number, secret: string, body: unknown): Promise<number> {
 	return new Promise((resolve, reject) => {
-		const req = request({ host: "127.0.0.1", port, method: "POST", path: "/action", headers: { "content-type": "application/json", "x-brigadev-token": token } }, (res) => {
+		const req = request({ host: "127.0.0.1", port, method: "POST", path: "/action", headers: { "content-type": "application/json", ...auth(secret) }, agent: false }, (res) => {
 			res.resume();
 			resolve(res.statusCode ?? 0);
 		});
@@ -66,10 +85,10 @@ function post(port: number, token: string, body: unknown): Promise<number> {
 }
 
 /** Reads the replay of /events (what the log holds now) and closes. */
-function snapshot(port: number, token: string): Promise<any[]> {
+function snapshot(port: number, secret: string): Promise<any[]> {
 	return new Promise((resolve, reject) => {
 		const events: any[] = [];
-		const req = request({ host: "127.0.0.1", port, path: `/events?token=${token}&since=0` }, (res) => {
+		const req = request({ host: "127.0.0.1", port, path: "/events?since=0", headers: auth(secret) }, (res) => {
 			res.setEncoding("utf8");
 			let buffer = "";
 			res.on("data", (chunk: string) => (buffer += chunk));
@@ -116,13 +135,13 @@ test("web-ui: publishes the session's project and branch at start and after each
 	try {
 		await h.pi.fire("session_start", { type: "session_start", reason: "startup" }, ctx);
 		await h.command("");
-		const url = h.url();
-		const first = (await snapshot(h.port(), tokenOf(url))).filter((e) => e.type === "session");
+		const secret = await login(h);
+		const first = (await snapshot(h.port(), secret)).filter((e) => e.type === "session");
 		assert.deepEqual(first.at(-1)?.data, { id: "session", project: "my-proj", branch: "feat/one" });
 		branch = "feat/two";
 		await h.pi.fire("agent_end", { type: "agent_end" }, ctx);
 		await new Promise((resolve) => setTimeout(resolve, 20));
-		const second = (await snapshot(h.port(), tokenOf(url))).filter((e) => e.type === "session");
+		const second = (await snapshot(h.port(), secret)).filter((e) => e.type === "session");
 		assert.equal(second.at(-1)?.data.branch, "feat/two");
 	} finally {
 		await stop(h);
@@ -136,34 +155,66 @@ test("web-ui: never starts a server without the command", async () => {
 	assert.deepEqual(h.ctx.statuses, []);
 });
 
-test("web-ui: start notifies a tokenized loopback url and sets the status; a second start reports the same url", async () => {
+test("web-ui: start prints a one-time link (code in the query, 60 s) and sets the status; the page it serves holds no secret", async () => {
 	const h = setup();
 	try {
 		await h.command("");
 		const url = h.url();
-		assert.match(url, /^http:\/\/127\.0\.0\.1:\d+\/\?token=[0-9a-f]{64}$/);
+		assert.match(url, /^http:\/\/127\.0\.0\.1:\d+\/\?code=[A-Za-z0-9_-]{43}$/);
+		assert.match(h.ctx.notifications.at(-1)!.message, /60 s/);
 		assert.deepEqual(h.ctx.statuses.at(-1), { key: "brigadev-web", text: `web :${h.port()}` });
-		const page = await get(h.port(), `/?token=${tokenOf(url)}`);
+		const page = await get(h.port(), `/?code=${codeOf(url)}`);
 		assert.equal(page.status, 200);
 		assert.match(page.body, /<html/i);
-		const count = h.ctx.notifications.length;
-		await h.command("start");
-		assert.equal(h.ctx.notifications.length, count + 1);
-		assert.equal(h.url(), url, "the running url, not a new server");
+		assert.ok(!page.body.includes(codeOf(url)), "the page does not echo the code");
+		const exchanged = await exchange(h.port(), codeOf(url));
+		assert.equal(exchanged.status, 200);
+		assert.equal((await exchange(h.port(), codeOf(url))).status, 401, "the link works once");
 	} finally {
 		await stop(h);
 	}
 });
 
-test("web-ui: status, stop, and a restart with a fresh token", async () => {
+test("web-ui: open mints a new code for the running server; start while running behaves like open; status shows the url without a code", async () => {
+	const h = setup();
+	try {
+		await h.command("open");
+		assert.match(h.ctx.notifications.at(-1)!.message, /not running/i);
+
+		await h.command("start");
+		const first = h.url();
+		const port = h.port();
+		await h.command("open");
+		const second = h.url();
+		assert.equal(new URL(second).port, String(port), "the same server");
+		assert.notEqual(codeOf(second), codeOf(first));
+		await h.command("start");
+		const third = h.url();
+		assert.equal(new URL(third).port, String(port));
+		assert.notEqual(codeOf(third), codeOf(second));
+		assert.equal(h.ctx.statuses.filter((s) => s.text === `web :${port}`).length >= 1, true);
+
+		// every link works once; minting a new one did not spend or revoke the others
+		for (const url of [first, second, third]) assert.equal((await exchange(port, codeOf(url))).status, 200);
+		assert.equal((await exchange(port, codeOf(second))).status, 401);
+
+		await h.command("status");
+		const status = h.ctx.notifications.at(-1)!.message;
+		assert.match(status, /running/);
+		assert.ok(status.includes(`http://127.0.0.1:${port}/`));
+		assert.ok(!/code=/.test(status), `status shows no code: ${status}`);
+	} finally {
+		await stop(h);
+	}
+});
+
+test("web-ui: status, stop, and a restart with a fresh link", async () => {
 	const h = setup();
 	try {
 		await h.command("status");
 		assert.match(h.ctx.notifications.at(-1)!.message, /not running/i);
 		await h.command("start");
 		const url = h.url();
-		await h.command("status");
-		assert.ok(h.ctx.notifications.at(-1)!.message.includes(url));
 		const port = h.port();
 		await h.command("stop");
 		assert.deepEqual(h.ctx.statuses.at(-1), { key: "brigadev-web", text: undefined });
@@ -171,10 +222,39 @@ test("web-ui: status, stop, and a restart with a fresh token", async () => {
 		await h.command("stop");
 		assert.match(h.ctx.notifications.at(-1)!.message, /not running/i);
 		await h.command("start");
-		assert.notEqual(tokenOf(h.url()), tokenOf(url));
+		assert.notEqual(codeOf(h.url()), codeOf(url));
 		await h.command("bogus");
-		assert.match(h.ctx.notifications.at(-1)!.message, /usage/i);
+		assert.match(h.ctx.notifications.at(-1)!.message, /usage: \/brigadev:web \[start\|open\|stop\|status\]/i);
 	} finally {
+		await stop(h);
+	}
+});
+
+test("web-ui: stop revokes every session secret: after a restart on the same port an old secret is 401", async () => {
+	const probe = setup();
+	await probe.command("start");
+	const free = probe.port();
+	await probe.command("stop");
+	const before = process.env.BRIGADEV_WEB_PORT;
+	process.env.BRIGADEV_WEB_PORT = String(free);
+	const h = setup();
+	try {
+		await h.command("start");
+		const secret = await login(h);
+		await h.command("open");
+		const other = await login(h); // another tab, another link
+		assert.equal(await post(free, secret, { action: "abort" }), 202);
+		assert.equal(await post(free, other, { action: "abort" }), 202);
+		await h.command("stop");
+		await h.command("start");
+		assert.equal(h.port(), free);
+		assert.equal(await post(free, secret, { action: "abort" }), 401);
+		assert.equal(await post(free, other, { action: "abort" }), 401);
+		assert.equal((await get(free, "/events", auth(secret))).status, 401);
+		assert.equal(await post(free, await login(h), { action: "abort" }), 202);
+	} finally {
+		if (before === undefined) delete process.env.BRIGADEV_WEB_PORT;
+		else process.env.BRIGADEV_WEB_PORT = before;
 		await stop(h);
 	}
 });
@@ -205,6 +285,29 @@ test("web-ui: session_shutdown closes the server", async () => {
 	await assert.rejects(get(port, "/"));
 });
 
+test("web-ui: the page keeps the secret in a JS variable only (static check: no storage, cookie, IndexedDB, EventSource or query-string credential)", async () => {
+	const h = setup();
+	try {
+		await h.command("start");
+		const { body: page } = await get(h.port(), "/");
+		for (const forbidden of ["localStorage", "sessionStorage", "document.cookie", "indexedDB", "EventSource", "x-brigadev-token", "?token=", "token="]) {
+			assert.ok(!page.includes(forbidden), `the page uses ${forbidden}`);
+		}
+		// what it does instead
+		assert.match(page, /history\.replaceState/);
+		assert.match(page, /\/session/);
+		assert.match(page, /X-Brigadev-Code/i);
+		assert.match(page, /Bearer /);
+		assert.match(page, /Last-Event-ID/i);
+		assert.ok(page.includes("This link was already used or expired. In pi, run /brigadev:web open for a new one."));
+		// the code is read from `location`, removed from the address bar before anything else uses it
+		assert.ok(page.indexOf("replaceState") < page.indexOf("/session"), "the address is cleaned before the exchange");
+		assert.ok(!/["']\/events\?[^"']*(secret|token|code)/i.test(page), "no credential in the /events query");
+	} finally {
+		await stop(h);
+	}
+});
+
 test("web-ui: bus state from before start is replayable, keyed to the newest snapshot", async () => {
 	const h = setup();
 	try {
@@ -217,7 +320,7 @@ test("web-ui: bus state from before start is replayable, keyed to the newest sna
 		h.pi.events.emit(BUS.mode, { scope: "mode", mode: "default" });
 		h.pi.events.emit(BUS.todo, { scope: "todo", todos: [] });
 		await h.command("start");
-		const events = await snapshot(h.port(), tokenOf(h.url()));
+		const events = await snapshot(h.port(), await login(h));
 		const types = events.map((e) => e.type);
 		assert.deepEqual(types, ["brigadev_agent", "brigadev_phase", "brigadev_check", "brigadev_guard", "brigadev_prompt", "brigadev_mode", "brigadev_todo"]);
 		assert.equal(events[0].data.status, "done");
@@ -245,7 +348,7 @@ test("web-ui: core events become compact run, message and tool events", async ()
 		await pi.fire("tool_execution_end", { toolCallId: "t2", toolName: "bash", result: "FULL", isError: true, durationMs: 5 }, ctx);
 		await pi.fire("agent_end", { type: "agent_end" }, ctx);
 
-		const events = await snapshot(h.port(), tokenOf(h.url()));
+		const events = await snapshot(h.port(), await login(h));
 		const raw = JSON.stringify(events);
 		for (const leak of ["SECRET", "BODY", "RESULT", "OLD", "FULL"]) assert.ok(!raw.includes(leak), `leaked ${leak}`);
 
@@ -272,25 +375,58 @@ test("web-ui: core events become compact run, message and tool events", async ()
 	}
 });
 
+test("web-ui: tool summaries are redacted before they reach the page", async () => {
+	const h = setup();
+	try {
+		await h.command("start");
+		const token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
+		await h.pi.fire("tool_execution_start", { toolCallId: "r1", toolName: "bash", args: { command: `git clone https://me:${token}@github.com/o/r && curl -H "Authorization: Bearer abc.def" x --password=hunter2` } }, h.ctx);
+		await h.pi.fire("tool_execution_end", { toolCallId: "r1", toolName: "bash", isError: false, durationMs: 1 }, h.ctx);
+		const raw = JSON.stringify(await snapshot(h.port(), await login(h)));
+		for (const leak of [token, "me:", "abc.def", "hunter2"]) assert.ok(!raw.includes(leak), `leaked ${leak}`);
+		assert.match(raw, /https:\/\/\*\*\*@github\.com/);
+	} finally {
+		await stop(h);
+	}
+});
+
+test("web-ui: a tool call made inside a codemode script is on the timeline, marked with its parent", async () => {
+	const h = setup();
+	try {
+		await h.command("start");
+		await h.pi.fire("agent_start", { type: "agent_start" }, h.ctx);
+		await h.pi.fire("tool_execution_start", { toolCallId: "c1", toolName: "codemode", args: {} }, h.ctx);
+		await h.pi.fire("tool_execution_start", { toolCallId: "c1/1", parentToolCallId: "c1", toolName: "read", args: { path: "lib/a.ts" } }, h.ctx);
+		await h.pi.fire("tool_execution_end", { toolCallId: "c1/1", parentToolCallId: "c1", toolName: "read", isError: false, durationMs: 3 }, h.ctx);
+		await h.pi.fire("tool_execution_end", { toolCallId: "c1", toolName: "codemode", isError: false, durationMs: 9 }, h.ctx);
+		const tools = (await snapshot(h.port(), await login(h))).filter((e) => e.type === "tool").map((e) => e.data);
+		const nested = tools.find((t) => t.id === "c1/1");
+		const parent = tools.find((t) => t.id === "c1");
+		assert.deepEqual([nested.name, nested.summary, nested.parentId, nested.status], ["read", "lib/a.ts", "c1", "done"]);
+		assert.deepEqual([parent.name, parent.parentId], ["codemode", undefined]);
+	} finally {
+		await stop(h);
+	}
+});
+
 test("web-ui: assistant streaming text is a throttled keyed snapshot cleared at message_end", async () => {
 	const h = setup();
 	try {
 		await h.command("start");
 		const { pi, ctx } = h;
-		const live = () => (pi as any).__live as any;
-		void live;
+		const secret = await login(h);
 		const update = (text: string) => pi.fire("message_update", { type: "message_update", message: { role: "assistant", content: [{ type: "text", text }] }, assistantMessageEvent: { type: "text_delta" } }, ctx);
 		await update("a");
 		await update("ab");
 		await update("abc");
 		await new Promise((r) => setTimeout(r, 260));
-		let events = await snapshot(h.port(), tokenOf(h.url()));
+		let events = await snapshot(h.port(), secret);
 		let lives = events.filter((e) => e.type === "assistant_live");
 		assert.equal(lives.length, 1, "keyed: one snapshot");
 		assert.equal(lives[0].data.text, "abc", "the trailing update is flushed");
 		assert.equal(lives[0].data.active, true);
 		await pi.fire("message_end", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "abc" }] } }, ctx);
-		events = await snapshot(h.port(), tokenOf(h.url()));
+		events = await snapshot(h.port(), secret);
 		lives = events.filter((e) => e.type === "assistant_live");
 		assert.equal(lives.length, 1);
 		assert.equal(lives[0].data.active, false);
@@ -298,7 +434,7 @@ test("web-ui: assistant streaming text is a throttled keyed snapshot cleared at 
 		// user message updates never show as assistant text
 		await pi.fire("message_update", { type: "message_update", message: { role: "user", content: [{ type: "text", text: "u" }] } }, ctx);
 		await new Promise((r) => setTimeout(r, 200));
-		events = await snapshot(h.port(), tokenOf(h.url()));
+		events = await snapshot(h.port(), secret);
 		assert.equal(events.filter((e) => e.type === "assistant_live")[0].data.active, false);
 	} finally {
 		await stop(h);
@@ -309,8 +445,9 @@ test("web-ui: a live bus event reaches an open SSE stream", async () => {
 	const h = setup();
 	try {
 		await h.command("start");
+		const secret = await login(h);
 		const got = await new Promise<any>((resolve, reject) => {
-			const req = request({ host: "127.0.0.1", port: h.port(), path: `/events?token=${tokenOf(h.url())}` }, (res) => {
+			const req = request({ host: "127.0.0.1", port: h.port(), path: "/events", headers: auth(secret) }, (res) => {
 				res.setEncoding("utf8");
 				res.on("data", (chunk: string) => {
 					const m = /^data: (.*)$/m.exec(chunk);
@@ -334,13 +471,13 @@ test("web-ui: prompt actions send a user message: followUp when busy, plain when
 	const h = setup();
 	try {
 		await h.command("start");
-		const [port, token] = [h.port(), tokenOf(h.url())];
+		const [port, secret] = [h.port(), await login(h)];
 		h.ctx.idle = false;
-		assert.equal(await post(port, token, { action: "prompt", text: "busy" }), 202);
-		assert.equal(await post(port, token, { action: "prompt", text: "now", deliverAs: "steer" }), 202);
+		assert.equal(await post(port, secret, { action: "prompt", text: "busy" }), 202);
+		assert.equal(await post(port, secret, { action: "prompt", text: "now", deliverAs: "steer" }), 202);
 		h.ctx.idle = true;
-		assert.equal(await post(port, token, { action: "prompt", text: "idle" }), 202);
-		assert.equal(await post(port, token, { action: "prompt", text: "idle steer", deliverAs: "steer" }), 202);
+		assert.equal(await post(port, secret, { action: "prompt", text: "idle" }), 202);
+		assert.equal(await post(port, secret, { action: "prompt", text: "idle steer", deliverAs: "steer" }), 202);
 		assert.deepEqual(h.sent, [
 			{ text: "busy", options: { deliverAs: "followUp" } },
 			{ text: "now", options: { deliverAs: "steer" } },
@@ -360,7 +497,7 @@ test("web-ui: abort calls the latest ctx's abort", async () => {
 		let laterAborted = 0;
 		later.abort = () => void laterAborted++;
 		await h.pi.fire("agent_start", { type: "agent_start" }, later);
-		assert.equal(await post(h.port(), tokenOf(h.url()), { action: "abort" }), 202);
+		assert.equal(await post(h.port(), await login(h), { action: "abort" }), 202);
 		assert.equal(laterAborted, 1);
 		assert.equal(h.ctx.aborted, 0);
 	} finally {
@@ -372,10 +509,10 @@ test("web-ui: answer and cancel-agent are re-emitted on the bus, validated; inva
 	const h = setup();
 	try {
 		await h.command("start");
-		const [port, token] = [h.port(), tokenOf(h.url())];
-		assert.equal(await post(port, token, { action: "answer", id: "p1", value: "Option A" }), 202);
-		assert.equal(await post(port, token, { action: "cancel-agent", id: "l:0", junk: 1 }), 202);
-		assert.equal(await post(port, token, { action: "answer", id: "p1" }), 400);
+		const [port, secret] = [h.port(), await login(h)];
+		assert.equal(await post(port, secret, { action: "answer", id: "p1", value: "Option A" }), 202);
+		assert.equal(await post(port, secret, { action: "cancel-agent", id: "l:0", junk: 1 }), 202);
+		assert.equal(await post(port, secret, { action: "answer", id: "p1" }), 400);
 		const actions = h.pi.emitted.filter((e) => e.channel === BUS.action).map((e) => e.data);
 		assert.deepEqual(actions, [
 			{ action: "answer", id: "p1", value: "Option A" },
@@ -385,4 +522,47 @@ test("web-ui: answer and cancel-agent are re-emitted on the bus, validated; inva
 	} finally {
 		await stop(h);
 	}
+});
+
+/** A bus that counts its live subscriptions per channel. */
+function countingBus() {
+	const inner = createBus();
+	const live = new Map<string, number>();
+	const bus: Bus = {
+		emit: (channel, data) => inner.emit(channel, data),
+		on(channel, handler) {
+			const off = inner.on(channel, handler);
+			live.set(channel, (live.get(channel) ?? 0) + 1);
+			let done = false;
+			return () => {
+				if (done) return;
+				done = true;
+				off();
+				live.set(channel, (live.get(channel) ?? 1) - 1);
+			};
+		},
+	};
+	return { bus, live: (channel: string) => live.get(channel) ?? 0 };
+}
+
+test("web-ui: session_shutdown removes every bus listener, so a reload on the same bus leaves exactly one", async () => {
+	const counted = countingBus();
+	const channels = Object.keys(CHANNELS);
+	const first = setup(counted.bus);
+	for (const channel of channels) assert.equal(counted.live(channel), 1, `${channel} after the first load`);
+	const second = setup(counted.bus); // a reload: Pi's bus outlives the extension
+	for (const channel of channels) assert.equal(counted.live(channel), 2, `${channel} with both loaded`);
+	await stop(first);
+	for (const channel of channels) assert.equal(counted.live(channel), 1, `${channel} after the first one shut down`);
+
+	// and the one left still feeds its own log, once
+	try {
+		await second.command("start");
+		counted.bus.emit(BUS.guard, { id: "g1", action: "allow", at: 1 });
+		const guards = (await snapshot(second.port(), await login(second))).filter((e) => e.type === "brigadev_guard");
+		assert.equal(guards.length, 1);
+	} finally {
+		await stop(second);
+	}
+	for (const channel of channels) assert.equal(counted.live(channel), 0, `${channel} after both shut down`);
 });

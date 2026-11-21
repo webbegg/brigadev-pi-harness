@@ -278,17 +278,19 @@ body.open .drawer { transform: none; }
 	var MAX_PER_COLUMN = 14;
 	var MAX_TIMELINE = 1000;
 
-	// The token leaves the address bar (history, copied URLs) and lives in this tab's sessionStorage, so a reload still works.
-	var TOKEN = new URLSearchParams(location.search).get("token") || "";
-	try {
-		if (TOKEN) sessionStorage.setItem("brigadev-token", TOKEN);
-		else TOKEN = sessionStorage.getItem("brigadev-token") || "";
-	} catch (e) { /* storage off: the URL token still works for this load */ }
+	// Sign-in. The link carries a one-time code (valid 60 s, spent on first use). It is read here and removed from the
+	// address at once, so neither the browser's history nor a copied URL ever holds it; the page then trades it for a
+	// session secret. The secret lives only in the SECRET variable below: never in browser storage, a cookie, the
+	// address bar or a query string. A reload has no code, so it needs a new link (/brigadev:web open in pi).
+	var SECRET = "";
+	var CODE = new URLSearchParams(location.search).get("code") || "";
 	if (location.search) history.replaceState(null, "", location.pathname);
+	var LINK_MESSAGE = "This link was already used or expired. In pi, run /brigadev:web open for a new one.";
+	var ENDED_MESSAGE = "This session ended (pi stopped the web UI or restarted it). In pi, run /brigadev:web open for a new link.";
 
 	var state = {
 		session: null, phase: null, mode: null, running: false, runNo: 0, live: { active: false, text: "" },
-		timeline: new Map(), agents: new Map(), agentCol: new Map(), prompts: new Map(), promptCol: new Map(),
+		fatal: "", timeline: new Map(), agents: new Map(), agentCol: new Map(), prompts: new Map(), promptCol: new Map(),
 		checks: [], todos: [], guard: [], work: new Map(), commits: new Map(), toolCol: new Map(),
 	};
 	var pending = new Set(); // prompt/agent ids with an action in flight
@@ -412,8 +414,11 @@ body.open .drawer { transform: none; }
 
 	// ---- actions ----
 	function post(body) {
-		return fetch("/action", { method: "POST", headers: { "content-type": "application/json", "x-brigadev-token": TOKEN }, body: JSON.stringify(body) })
-			.then(function (res) { if (res.status !== 202) throw new Error("action rejected (" + res.status + ")"); });
+		return fetch("/action", { method: "POST", headers: { "content-type": "application/json", "Authorization": "Bearer " + SECRET }, body: JSON.stringify(body) })
+			.then(function (res) {
+				if (res.status === 401) { end(ENDED_MESSAGE); throw new Error(ENDED_MESSAGE); }
+				if (res.status !== 202) throw new Error("action rejected (" + res.status + ")");
+			});
 	}
 	function act(key, body, done) {
 		if (key) { pending.add(key); render(); }
@@ -832,11 +837,13 @@ body.open .drawer { transform: none; }
 			}
 			var icon = d.status === "running" ? "●" : d.status === "error" ? "✗" : "✓";
 			return h("div", { class: "tool " + (d.status || "") },
-				h("span", { class: "ico", text: icon }), h("span", { class: "name", text: d.name || "tool" }),
+				h("span", { class: "ico", text: icon }), h("span", { class: "name", text: (d.parentId ? "↳ " : "") + (d.name || "tool"), title: d.parentId ? "called from a script (" + d.parentId + ")" : null }),
 				h("span", { class: "sum", text: d.summary || "", title: d.summary || "" }),
 				d.durationMs != null ? h("span", { class: "dur", text: d.durationMs >= 1000 ? (d.durationMs / 1000).toFixed(1) + "s" : Math.round(d.durationMs) + "ms" }) : null);
 		});
-		$("empty").hidden = !!(items.length || state.live.active);
+		var empty = $("empty");
+		if (state.fatal) { empty.textContent = state.fatal; empty.hidden = false; }
+		else { empty.textContent = "Nothing yet."; empty.hidden = !!(items.length || state.live.active); }
 		var live = $("live");
 		if (state.live.active && state.live.text) {
 			if (!live.firstChild) live.appendChild(h("div", { class: "msg assistant md" }, h("span", { class: "who", text: "assistant · typing…" }), h("div", { class: "t" })));
@@ -894,18 +901,79 @@ body.open .drawer { transform: none; }
 		c.className = "status" + (ok ? "" : " off");
 		c.replaceChildren(h("span", { class: "dot" }), text);
 	}
+	// The page is dead: no code, a spent link, or a revoked secret. Say what to do instead of retrying forever.
+	var over = false;
+	function end(message) {
+		over = true;
+		SECRET = "";
+		state.fatal = message;
+		setConn(message, false);
+		render();
+	}
+	/** Trades the link's code for the session secret; the code is dropped whether or not it worked. */
+	function signIn() {
+		var code = CODE;
+		CODE = "";
+		if (!code) return Promise.reject(new Error(LINK_MESSAGE));
+		return fetch("/session", { method: "POST", headers: { "X-Brigadev-Code": code }, cache: "no-store" }).then(function (res) {
+			if (res.status === 401) throw new Error(LINK_MESSAGE);
+			if (res.status !== 200) throw new Error("Could not sign in (" + res.status + "). In pi, run /brigadev:web open for a new link.");
+			return res.json();
+		}).then(function (body) {
+			if (!body || typeof body.secret !== "string" || !body.secret) throw new Error(LINK_MESSAGE);
+			SECRET = body.secret;
+		});
+	}
+
+	// The event stream, read with fetch so the secret travels in a header (the browser's built-in event-source client cannot send one). It reconnects
+	// with a growing delay and resumes after the last event it folded, with Last-Event-ID.
+	var lastId = 0, delay = 1000;
+	function handleFrame(frame) {
+		var data = [];
+		frame.split("\n").forEach(function (line) {
+			if (line.indexOf("data:") === 0) data.push(line.slice(5).replace(/^ /, ""));
+		});
+		if (!data.length) return;
+		var event;
+		try { event = JSON.parse(data.join("\n")); } catch (e) { return; }
+		if (event && typeof event.seq === "number" && event.seq > lastId) lastId = event.seq;
+		fold(event);
+		render();
+	}
+	function reconnect() {
+		if (over) return;
+		setConn("reconnecting…", false);
+		setTimeout(connect, delay);
+		delay = Math.min(delay * 2, 15000);
+	}
 	function connect() {
-		if (!TOKEN) { setConn("no token: open the URL from /brigadev:web", false); return; }
-		var es = new EventSource("/events?token=" + encodeURIComponent(TOKEN));
-		es.onopen = function () { setConn("live · " + clock(Date.now()), true); };
-		es.onmessage = function (m) {
-			try { fold(JSON.parse(m.data)); } catch (e) { return; }
-			render();
-		};
-		es.onerror = function () { setConn(es.readyState === 2 ? "disconnected: run /brigadev:web" : "reconnecting…", false); };
+		if (over) return;
+		var headers = { "Authorization": "Bearer " + SECRET };
+		if (lastId) headers["Last-Event-ID"] = String(lastId);
+		fetch("/events", { headers: headers, cache: "no-store" }).then(function (res) {
+			if (res.status === 401) { end(ENDED_MESSAGE); return; }
+			if (!res.ok || !res.body) throw new Error("events " + res.status);
+			setConn("live · " + clock(Date.now()), true);
+			delay = 1000;
+			var reader = res.body.getReader(), decoder = new TextDecoder(), buffer = "";
+			function pump() {
+				return reader.read().then(function (chunk) {
+					if (chunk.done) return;
+					buffer += decoder.decode(chunk.value, { stream: true });
+					var at;
+					while ((at = buffer.indexOf("\n\n")) >= 0) {
+						var frame = buffer.slice(0, at);
+						buffer = buffer.slice(at + 2);
+						handleFrame(frame);
+					}
+					return pump();
+				});
+			}
+			return pump();
+		}).then(reconnect, reconnect);
 	}
 	draw();
-	connect();
+	signIn().then(connect, function (e) { end(e && e.message ? e.message : LINK_MESSAGE); });
 })();
 </script>
 </body>

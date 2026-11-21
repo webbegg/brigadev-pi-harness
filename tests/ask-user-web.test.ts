@@ -109,6 +109,20 @@ describe("ask_user_choice on the bus", () => {
 		assert.equal(s.prompts().at(-1)!.status, "dismissed");
 	});
 
+	it("an aborted run (the tool's signal) closes the question in the TUI and the web; a late web answer has no effect", async () => {
+		const s = session();
+		const run = new AbortController();
+		const result = s.pi.tool("ask_user_choice").execute("t1", { question: "Which database?", options }, run.signal, undefined, s.ctx);
+		assert.equal(s.prompts()[0].status, "open");
+		run.abort();
+		const r = await result;
+		assert.equal(r.content[0].text, "The user dismissed the question without answering. Stop and wait for them.");
+		assert.equal(s.prompts().at(-1)!.status, "dismissed");
+		const count = s.prompts().length;
+		s.answer("Postgres");
+		assert.equal(s.prompts().length, count);
+	});
+
 	it("outside the TUI the chat fallback stays and nothing is published", async () => {
 		const s = session();
 		(s.ctx as any).mode = "print";

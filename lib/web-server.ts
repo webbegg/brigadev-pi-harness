@@ -1,9 +1,13 @@
-// The web UI's local HTTP server: one static page, an SSE stream of the event log, and one POST endpoint for actions.
-// It is the only listener the harness opens, so it is strict: loopback only, a random token on every request
-// (constant-time compare), a Host check against DNS rebinding, an Origin check on writes, and security headers.
-// node:http and node:crypto only.
+// The web UI's local HTTP server: one static page, a one-time sign-in, an SSE stream of the event log, and one POST
+// endpoint for actions. It is the only listener the harness opens, so it is strict: loopback only, a Host check
+// against DNS rebinding, an Origin check on writes, security headers, and no long-lived secret in any URL:
+// - the URL the user opens carries a bootstrap `code` (32 random bytes, valid 60 s, spent on first use); it
+//   authorizes nothing but `POST /session`, where the page trades it for a session secret;
+// - the secret is random, lives only in the server's memory and the page's JS variable, and travels in an
+//   `Authorization: Bearer` header; a code or secret in a query string is refused.
+// Codes and secrets are compared in constant time. node:http and node:crypto only.
 
-import { timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import { type Action, parseAction } from "./bus.ts";
@@ -15,36 +19,52 @@ const MAX_SSE_BACKLOG = 4 * 1024 * 1024;
 /** How much of a rejected oversize body is read and discarded before the connection is cut. */
 const MAX_DRAIN_BYTES = 1024 * 1024;
 
+/** How long a bootstrap code can be exchanged. */
+export const CODE_TTL_MS = 60_000;
+/** Unspent codes and live session secrets kept; the oldest go first. */
+const MAX_CODES = 32;
+const MAX_SECRETS = 64;
+/** Query parameters that look like credentials: a request carrying one is refused, whatever else it carries. */
+const CREDENTIAL_PARAMS = ["token", "secret", "code", "access_token", "authorization", "auth", "key"];
+
 export interface WebServerOptions {
 	/** Always loopback; any other value is refused. */
 	host?: string;
 	/** 0 = ephemeral. */
 	port: number;
-	token: string;
 	html: string;
 	log: WebLog;
 	onAction: (action: Action) => void | Promise<void>;
 	/** SSE keep-alive comment interval. */
 	heartbeatMs?: number;
+	/** Unflushed SSE bytes past which a client is too slow to keep (default 4 MB). */
+	maxBacklogBytes?: number;
+	/** The clock for code expiry (default `Date.now`); tests inject one. */
+	now?: () => number;
 }
 
 export interface WebServer {
-	/** `http://127.0.0.1:<port>/?token=<token>`. */
+	/** `http://127.0.0.1:<port>/`: where the page lives. It carries no credential. */
 	url: string;
 	port: number;
+	/** Mints a fresh one-time code and returns `url` with it (`?code=...`). Earlier unspent codes stay valid until their own expiry. */
+	openUrl(): string;
+	/** Stops listening, ends every stream, and forgets every code and secret. */
 	close(): Promise<void>;
 }
 
 const CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
-function tokenMatches(given: string | undefined, expected: string): boolean {
-	const a = Buffer.from(given ?? "", "utf8");
-	const b = Buffer.from(expected, "utf8");
-	if (a.length !== b.length) {
-		timingSafeEqual(b, b);
-		return false;
-	}
-	return timingSafeEqual(a, b);
+const digest = (text: string): Buffer => createHash("sha256").update(text, "utf8").digest();
+
+/** The index of the stored digest equal to `given`, or -1. Compares fixed-size digests against every entry, with no early exit. */
+function findDigest(given: string | undefined, stored: Array<{ digest: Buffer }>): number {
+	const probe = digest(given ?? "");
+	let found = -1;
+	stored.forEach((entry, index) => {
+		if (timingSafeEqual(probe, entry.digest) && found < 0) found = index;
+	});
+	return found;
 }
 
 function setSecurityHeaders(res: ServerResponse): void {
@@ -64,8 +84,12 @@ function reply(res: ServerResponse, status: number, body: unknown, extra: Record
 export async function startWebServer(options: WebServerOptions): Promise<WebServer> {
 	const host = options.host ?? "127.0.0.1";
 	if (host !== "127.0.0.1") throw new Error("the web UI binds 127.0.0.1 only");
-	const { token, html, log, onAction } = options;
+	const { html, log, onAction } = options;
 	const heartbeatMs = options.heartbeatMs ?? 15_000;
+	const maxBacklog = options.maxBacklogBytes ?? MAX_SSE_BACKLOG;
+	const now = options.now ?? Date.now;
+	let codes: Array<{ digest: Buffer; expires: number }> = [];
+	let secrets: Array<{ digest: Buffer }> = [];
 	const streams = new Set<{ res: ServerResponse; stop: () => void }>();
 	const sockets = new Set<Socket>();
 	let port = 0;
@@ -75,11 +99,36 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
 		return h === `127.0.0.1:${port}` || h === `localhost:${port}`;
 	};
 
-	const queryToken = (url: URL): string | undefined => url.searchParams.get("token") ?? undefined;
-	const headerToken = (req: IncomingMessage): string | undefined => {
-		const value = req.headers["x-brigadev-token"];
-		return Array.isArray(value) ? value[0] : value;
+	const hasCredentialQuery = (url: URL): boolean => CREDENTIAL_PARAMS.some((name) => url.searchParams.has(name));
+	const bearer = (req: IncomingMessage): string | undefined => {
+		const value = req.headers.authorization;
+		const match = typeof value === "string" ? /^Bearer ([^\s]+)$/i.exec(value) : null;
+		return match?.[1];
 	};
+	/** A request is signed in when its Bearer header is a live session secret and the URL carries no credential. */
+	const signedIn = (req: IncomingMessage, url: URL): boolean => !hasCredentialQuery(url) && findDigest(bearer(req), secrets) >= 0;
+
+	function mintCode(): string {
+		const code = randomBytes(32).toString("base64url");
+		const at = now();
+		codes = codes.filter((c) => c.expires > at);
+		codes.push({ digest: digest(code), expires: at + CODE_TTL_MS });
+		if (codes.length > MAX_CODES) codes = codes.slice(-MAX_CODES);
+		return code;
+	}
+
+	/** Spends `code` and returns a new session secret, or undefined when it is unknown, spent or expired. */
+	function exchangeCode(code: string | undefined): string | undefined {
+		const at = now();
+		const index = findDigest(code, codes);
+		const entry = index >= 0 ? codes[index] : undefined;
+		codes = codes.filter((c) => c.expires > at && c !== entry);
+		if (!entry || entry.expires <= at) return undefined;
+		const secret = randomBytes(32).toString("base64url");
+		secrets.push({ digest: digest(secret) });
+		if (secrets.length > MAX_SECRETS) secrets = secrets.slice(-MAX_SECRETS);
+		return secret;
+	}
 
 	function serveEvents(req: IncomingMessage, res: ServerResponse, url: URL): void {
 		const fromQuery = Number(url.searchParams.get("since"));
@@ -102,18 +151,60 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
 				streams.delete(stream);
 			},
 		};
+		const frame = (event: WebEvent) => `id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`;
+		// While the replay is still being written, live events wait here (the replay yields to a slow reader, so they cannot go out yet).
+		let replaying = true;
+		const waiting: Array<{ seq: number; text: string }> = [];
+		let waitingBytes = 0;
 		const push = (event: WebEvent) => {
 			if (event.seq <= sent || res.destroyed) return;
+			const text = frame(event);
+			if (replaying) {
+				waiting.push({ seq: event.seq, text });
+				waitingBytes += text.length;
+				if (waitingBytes > maxBacklog) res.destroy();
+				return;
+			}
 			sent = event.seq;
-			res.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
-			if (res.writableLength > MAX_SSE_BACKLOG) res.destroy();
+			res.write(text);
+			if (res.writableLength > maxBacklog) res.destroy();
+		};
+		const drained = () =>
+			new Promise<void>((resolve) => {
+				const done = () => {
+					res.off("drain", done);
+					res.off("close", done);
+					resolve();
+				};
+				res.once("drain", done);
+				res.once("close", done);
+			});
+		/** One frame, in seq order and once; waits for the socket to drain when it is full. */
+		const write = async (seq: number, text: string) => {
+			if (seq <= sent || res.destroyed) return;
+			sent = seq;
+			if (!res.write(text)) await drained();
 		};
 		streams.add(stream);
-		// Subscribe before replaying: both run synchronously, and `sent` drops anything seen twice.
+		// Subscribe before reading the log: nothing appended after this point is missing from both the snapshot and the queue.
 		unsubscribe = log.subscribe(push);
-		for (const event of log.since(sent)) push(event);
+		const backlog = log.since(sent);
+		void (async () => {
+			for (const event of backlog) {
+				if (res.destroyed) return;
+				await write(event.seq, frame(event));
+			}
+			while (waiting.length > 0) {
+				if (res.destroyed) return;
+				const next = waiting.shift()!;
+				waitingBytes -= next.text.length;
+				await write(next.seq, next.text);
+			}
+			// Nothing awaits between the empty check and this line, so no live event slips in between.
+			replaying = false;
+		})().catch(() => res.destroy());
 		heartbeat = setInterval(() => {
-			if (!res.destroyed) res.write(": ping\n\n");
+			if (!res.destroyed && !replaying) res.write(": ping\n\n");
 		}, heartbeatMs);
 		heartbeat.unref();
 		res.on("close", stream.stop);
@@ -176,23 +267,30 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
 			return reply(res, 404, { error: "not found" });
 		}
 		const route = url.pathname;
-		if (route !== "/" && route !== "/events" && route !== "/action") return reply(res, 404, { error: "not found" });
+		if (route !== "/" && route !== "/events" && route !== "/action" && route !== "/session") return reply(res, 404, { error: "not found" });
 
-		if (route === "/action") {
+		if (route === "/action" || route === "/session") {
 			if (req.method !== "POST") return reply(res, 405, { error: "method not allowed" }, { Allow: "POST" });
-			if (!tokenMatches(headerToken(req), token)) return reply(res, 401, { error: "unauthorized" });
+			if (route === "/action" && !signedIn(req, url)) return reply(res, 401, { error: "unauthorized" });
 			const origin = req.headers.origin;
 			if (origin !== undefined && origin !== `http://${req.headers.host}`) return reply(res, 403, { error: "forbidden origin" });
-			return readAction(req, res);
+			if (route === "/action") return readAction(req, res);
+			// The one-time exchange: the code in a header (never the query), spent whether or not it was in time.
+			req.resume();
+			const header = req.headers["x-brigadev-code"];
+			const secret = hasCredentialQuery(url) ? undefined : exchangeCode(Array.isArray(header) ? header[0] : header);
+			if (!secret) return reply(res, 401, { error: "unauthorized" });
+			return reply(res, 200, { secret });
 		}
 
 		if (req.method !== "GET") return reply(res, 405, { error: "method not allowed" }, { Allow: "GET" });
 		if (route === "/events") {
-			if (!tokenMatches(queryToken(url) ?? headerToken(req), token)) return reply(res, 401, { error: "unauthorized" });
+			if (!signedIn(req, url)) return reply(res, 401, { error: "unauthorized" });
 			return serveEvents(req, res, url);
 		}
-		// The page is static and holds no session data, so it needs no token: it strips the token from the address bar
-		// and keeps it in the tab, and a reload must still load it. Everything with data (/events, /action) is gated.
+		// The page is static and holds no session data, so it needs no credential: it trades the `code` in its address for a
+		// secret and keeps that in memory, and a reload (which has no code) must still load it to say what happened.
+		// Everything with data (/events, /action) is gated.
 		res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(html) });
 		res.end(html);
 	});
@@ -214,9 +312,12 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
 
 	let closing: Promise<void> | undefined;
 	return {
-		url: `http://127.0.0.1:${port}/?token=${token}`,
+		url: `http://127.0.0.1:${port}/`,
 		port,
+		openUrl: () => `http://127.0.0.1:${port}/?code=${mintCode()}`,
 		close() {
+			codes = [];
+			secrets = [];
 			closing ??= new Promise<void>((resolve) => {
 				for (const stream of [...streams]) {
 					stream.stop();

@@ -43,7 +43,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Params,
 		executionMode: "sequential",
 
-		async execute(_id, params, _signal, _onUpdate, ctx) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			const labels = params.options.map((o) => o.label);
 			const details = (answer: string | null, wasCustom?: boolean): ChoiceDetails => ({ question: params.question, options: labels, answer, wasCustom });
 
@@ -151,7 +151,7 @@ export default function (pi: ExtensionAPI) {
 						return lines;
 					},
 				};
-			}));
+			}), signal ?? ctx.signal);
 
 			if (!result) return { content: [{ type: "text", text: "The user dismissed the question without answering. Stop and wait for them." }], details: details(null) };
 			if (result.wasCustom) return { content: [{ type: "text", text: `The user answered: ${result.answer}` }], details: details(result.answer, true) };

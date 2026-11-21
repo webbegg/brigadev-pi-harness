@@ -78,6 +78,67 @@ test("workflow-state installs the dashboard adapter: channels declared, probe an
 	assert.ok(probe.modules.some((m) => m.kind === "breadcrumb" && m.namespace === "brigadev"));
 });
 
+test("workflow-state: shutting down removes its dashboard adapter, so a reload on the same bus leaves one footer segment", async () => {
+	const bus = createBus();
+	const load = () => {
+		const pi = createFakePi();
+		pi.events = bus;
+		workflowState(pi as any);
+		return pi;
+	};
+	const footers = (id: string) => {
+		const probe = { modules: [] as any[] };
+		bus.emit("ui:list-modules", probe);
+		return probe.modules.filter((m) => m.kind === "footer-segment" && m.id === id).length;
+	};
+	const ctx = createFakeCtx({ cwd: "/tmp" });
+	const first = load();
+	const second = load(); // a reload: Pi's bus outlives the extension
+	bus.emit(BUS.mode, { scope: "mode", mode: "normal" });
+	assert.equal(footers("mode"), 2, "both adapters answer until the first is shut down");
+	await first.fire("session_shutdown", { type: "session_shutdown" }, ctx);
+	assert.equal(footers("mode"), 1);
+	await second.fire("session_shutdown", { type: "session_shutdown" }, ctx);
+	assert.equal(footers("mode"), 0);
+	await second.fire("session_shutdown", { type: "session_shutdown" }, ctx); // twice is harmless
+});
+
+test("workflow-state: the phase moves on calls made inside a codemode script (Pi reports them with parentToolCallId)", async () => {
+	const pi = createFakePi();
+	workflowState(pi as any);
+	const ctx = createFakeCtx({ cwd: "/tmp" });
+	await pi.fire("agent_start", { type: "agent_start" }, ctx);
+	await pi.fire("tool_execution_start", { toolCallId: "c1", toolName: "codemode", args: {} }, ctx);
+	await pi.fire("tool_execution_start", { toolCallId: "c1/1", parentToolCallId: "c1", toolName: "read", args: { path: "a.ts" } }, ctx);
+	await pi.fire("tool_execution_start", { toolCallId: "c1/2", parentToolCallId: "c1", toolName: "edit", args: { path: "a.ts" } }, ctx);
+	await pi.fire("tool_execution_start", { toolCallId: "c1/3", parentToolCallId: "c1", toolName: "bash", args: { command: "npm test" } }, ctx);
+	assert.deepEqual(on(pi, BUS.phase).map((s) => s.phase), ["authorize", "explore", "implement", "check"]);
+});
+
+test("workflow-state: a codemode call whose nested calls Pi does not report counts as explore, not a stall at authorize", async () => {
+	const pi = createFakePi();
+	workflowState(pi as any);
+	const ctx = createFakeCtx({ cwd: "/tmp" });
+	await pi.fire("agent_start", { type: "agent_start" }, ctx);
+	await pi.fire("tool_execution_start", { toolCallId: "c1", toolName: "codemode", args: {} }, ctx);
+	const phases = on(pi, BUS.phase);
+	assert.equal(phases.at(-1).phase, "explore");
+	assert.equal(phases.at(-1).detail, "codemode");
+});
+
+test("workflow-state: commands and details that leave for the bus are redacted", async () => {
+	const pi = createFakePi();
+	workflowState(pi as any);
+	const ctx = createFakeCtx({ cwd: "/tmp" });
+	await pi.fire("agent_start", { type: "agent_start" }, ctx);
+	await pi.fire("tool_execution_start", { toolCallId: "1", toolName: "bash", args: { command: "git push https://me:hunter2@github.com/o/r.git && npm test --password=hunter2" } }, ctx);
+	await pi.fire("tool_execution_end", { toolCallId: "c", toolName: "check", isError: false, result: { details: { command: "npm test --token=hunter2", outcome: "pass" } } }, ctx);
+	const raw = JSON.stringify(pi.emitted);
+	assert.ok(!raw.includes("hunter2"), raw);
+	assert.match(on(pi, BUS.phase).at(-1).detail, /https:\/\/\*\*\*@github\.com/);
+	assert.equal(on(pi, BUS.check)[0].command, "npm test --token=***");
+});
+
 test("workflow-state stays silent in a subagent", async () => {
 	const previous = process.env.BRIGADEV_CHILD;
 	process.env.BRIGADEV_CHILD = "1";
