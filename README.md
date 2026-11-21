@@ -103,6 +103,8 @@ Profiles live in `~/.pi/agent/brigadev-profiles.json`. Paths, environment variab
 
 `/brigadev:web` starts a server for the current parent session on `127.0.0.1` (ephemeral port, or `BRIGADEV_WEB_PORT`). It prints a one-time link; the session data (`/events`) and every action need the session secret the page gets from it. The page is one static file with no dependencies. It follows the session over SSE and replays what happened before it was opened.
 
+The unattended runner serves the same board for its ticket loop with `brigadev-runner start <doc> --web` (see [runner/README.md](runner/README.md)): tickets and the PR loop are cards, and its decisions, merge approval and pauses are in **Needs you**.
+
 How the link works:
 
 - The link carries a single-use `code` (32 random bytes) that is valid for 60 seconds. The page reads it, removes it from the address bar at once, and trades it for a session secret with one `POST /session`. The code authorizes nothing else, and a second use of it is refused.

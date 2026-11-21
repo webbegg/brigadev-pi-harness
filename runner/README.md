@@ -7,7 +7,7 @@ This package is a separate, private package: the Pi extension in the repo root d
 ## Status: experimental
 
 - `pi-durable` is itself marked experimental and its API changes without notice, so the four `@earendil-works/*` dependencies are pinned to exactly `1.6.0` (Pi 1.5.2 ships pi-ai 1.5.2, which is why this is not part of the root package).
-- Prototype scope (`tasks/durable-runner.md`): the ticket loop (T3), its guard, check tool, and commit gate (T4), and the human gates as durable signals: ticket decisions, command approvals, pause and resume, and the `status`/`answer`/`pause`/`resume` commands (T5). The PR → CI → merge loop with its merge-approval signal (T6, see [The PR loop](#the-pr-loop-s2b-s3-s4)). Not there yet: the board (T7), cost caps, parallel tickets, releases. The **worker** never pushes, merges, or publishes (its guard blocks them); the **runner** does, in deterministic code, only in the PR loop. The agent runs with the user's credentials taken out of its environment and its work is checked before it is trusted: see [Containment](#containment-what-it-stops-and-what-it-cannot); read what it cannot stop before running this unattended on a machine that holds credentials.
+- Prototype scope (`tasks/durable-runner.md`): the ticket loop (T3), its guard, check tool, and commit gate (T4), and the human gates as durable signals: ticket decisions, command approvals, pause and resume, and the `status`/`answer`/`pause`/`resume` commands (T5). The PR → CI → merge loop with its merge-approval signal (T6, see [The PR loop](#the-pr-loop-s2b-s3-s4)). The board that shows the loop and takes your answers in a browser (T7, see [The board](#the-board-s6)). Not there yet: cost caps, parallel tickets, releases. The **worker** never pushes, merges, or publishes (its guard blocks them); the **runner** does, in deterministic code, only in the PR loop. The agent runs with the user's credentials taken out of its environment and its work is checked before it is trusted: see [Containment](#containment-what-it-stops-and-what-it-cannot); read what it cannot stop before running this unattended on a machine that holds credentials.
 
 ## Run
 
@@ -32,7 +32,7 @@ State is stored in `<brigadev home>/<repo>/runner.sqlite` (`~/.brigadev/<repo>/`
 ## Commands
 
 ```sh
-brigadev-runner start  <feature-doc> [--no-pr]                    # run the loop (and the PR loop); returns when it ends or parks on a person
+brigadev-runner start  <feature-doc> [--no-pr] [--web [--port N]]  # run the loop (and the PR loop); returns when it ends or parks on a person (--web: serve the board, stay up)
 brigadev-runner status <feature-doc>                              # read-only
 brigadev-runner answer <feature-doc> <T#> <1..n|text> [--approve]  # answer a parked decision
 brigadev-runner pause  <feature-doc>                              # pause at the next pick
@@ -53,7 +53,7 @@ pi-durable allows one writer per storage. Checked on pi-durable 1.6.0: a second 
 - `answer`, `pause`, and `resume` open a **short-lived Harness that delivers one signal in one commit and closes**, before anything is scheduled (`Harness.signal()` and `wait()` start the scheduler; the runner's `deliver()` commits `tx.signal()` instead). A signal delivered early is kept by the task and consumed the next time the loop looks.
 - `start` takes `runner.sqlite.lock` and refuses a second `start`. The lock is an OS lock that dies with its process, not a file: `<store>.lock` is an SQLite database held in one `BEGIN EXCLUSIVE` transaction (`locking_mode=EXCLUSIVE`, `busy_timeout=0`) until `start` ends, so there is no stale lock to take over and two racing processes cannot both hold it. The holder's pid is written to `<store>.lock.pid` after the lock is taken, for the messages only (`another process` while it is not written yet). `answer`, `pause`, and `resume` refuse (exit 1) while it is held; `status` reads regardless.
 - `start` therefore does **not** wait in the foreground for an answer it could not see: when the loop is asleep on a decision or a pause and nothing can run, it prints where it waits and the commands to use, and exits 1. Answer, then run `start` again; the loop continues from storage (an answer is read at the loop's next pick).
-- Consequence: a user `pause` reaches a loop only through the store, so it takes effect at the first pick after the next `start` (or, in a process that holds the Harness itself, as in the tests, at the next pick of the running loop). There is no remote pause of a running `start`.
+- Consequence: a user `pause` reaches a loop only through the store, so it takes effect at the first pick after the next `start` (or, in a process that holds the Harness itself, as in the tests, at the next pick of the running loop). There is no remote pause of a running `start` through the CLI: with `start --web` the board is the remote, because it delivers inside the process that holds the store (see [The board](#the-board-s6)). The refusal that `answer`, `pause`, `resume`, and `merge` print while a `start` holds the store says so.
 
 ## What the doc must look like
 
@@ -110,7 +110,34 @@ A PR merged by someone else ends the loop `merged` too. The loop's result is `{ 
 
 **What the runner publishes is redacted** (`src/redact.ts`): every PR comment, `## Log` line, and ticket note has credentials in URLs (`https://user:tok@host` becomes `https://***@host`), token-looking strings (`ghp_…`, `github_pat_…`, `sk-ant-…`, 32 or more hex or base64 characters), and the home directory (`~`) removed, because they quote git and gh stderr, suite output, and the local doc path.
 
-Not in the PR loop yet: cost caps (the L8 limits), the board (T7).
+Not in the PR loop yet: cost caps (the L8 limits).
+
+## The board (S6)
+
+`start <feature-doc> --web [--port N]` serves the existing brigadev web UI (`lib/web-server.ts`, `lib/web-page.ts`, `assets/web-ui/`) from the runner process, on `127.0.0.1` only (port: `--port`, else `BRIGADEV_WEB_PORT`, else any free port). The board starts before the loop is scheduled and prints a **one-time link** to stdout (`brigadev board: http://127.0.0.1:<port>/?code=… (one-time link, valid 60 s; ...)`). Open it in a browser you trust. Without `--web` nothing changes.
+
+**What it shows** (`src/board.ts`; the page is in runner mode, which the `session` snapshot's `kind: "runner"` switches on: no composer, the Abort button reads **Pause**, no cancel buttons, the title is `brigadev-runner · <doc>`):
+
+- the ticket list as the Tasks drawer (`brigadev:todo`), the loop phase (implement while a ticket runs, check in final-check, verify, CI and fix, commit for push, open, and the merge wait, close when merged; `decide` while only decisions wait; `idle` when paused or stopped), and one card per ticket that ran or runs: `brigadev-worker`, status `running`, `done`, `failed`, `blocked`, or `needs-you`, the commit, the failure or the park reason, the attempts, and the worker's last tool calls (read from its conversation in the store, newest 60 entries, 8 calls kept), plus `FIX-n` tickets and one `pr` card for the PR loop (phase, PR link, CI state, why it needs you). The CI state is derived from the PR loop's phase: the PR loop keeps no check results in its state, and the merge gate re-reads them anyway. The card statuses `blocked` and `needs-you` are the runner's own words beside the bus's `queued|running|done|failed|cancelled`: the page shows them as text.
+- **Needs you** cards (`brigadev:prompt`, open until the state moves on, then answered or dismissed whoever answered; one answered in the browser is shown answered, one answered with the CLI after a restart is shown dismissed because the board does not know the answer): every open ticket decision (a choice with its options, the recommended mark, and free text; its id is the signal key `decision-<T#>-<n>`), the merge approval while the PR loop waits for it (`Merge PR #n at <short sha>?`, the PR link and the CI state; id = the merge key), a paused loop (`Resume the loop?` with the reason) and a PR loop stop (`Resume the PR loop?`).
+- Everything is sent through `lib/redact.ts` first: reasons, failure output, commands, worker text.
+
+**What it can do.** The page's actions go to the live `Runner` of the `start` (the Harness that holds the store lock), through the same functions as the CLI (`src/control.ts`), so the loop wakes in this process and nothing has to run `start` again:
+
+| Page action | Effect |
+|---|---|
+| answer a decision (an option, or free text) | `answer`: the option's number, or the text; an option whose label starts with `Approve` lifts the denied command for that exact command, once, as with the CLI |
+| Approve the merge | `merge`: the runner re-reads the PR and runs `gh pr merge --merge --match-head-commit <sha>` only when it is open, not a draft, at the pushed commit, and green |
+| Approve resume | `resume` (the loop's pause, or the PR loop's stop) |
+| Pause (the Abort button) | `pause`: at the loop's next pick; refused while paused or while the PR loop runs, as the CLI does |
+| Deny on the merge or resume prompt | nothing: the runner keeps waiting and the prompt stays open |
+| message, cancel a card | refused with 409 and a reason: there is no conversation to message, and a ticket is not cancelled (pause instead) |
+
+An answer to a prompt that is not open now (answered elsewhere, or the loop moved on) is refused with 409 and the page says so, as in the Pi web UI; so is anything the CLI would refuse (`duplicate`, `closed`, `invalid`, a pause while paused). The board cannot approve anything else: it has no action that reaches the worker, the guard, or the doc.
+
+**The process stays up** while the loop waits for a person (that is how the board's answers reach it; the store lock is held), and exits when the loop ends (completed, failed, aborted) after one last publish and a short linger (so an open page shows the end). On SIGINT or SIGTERM it closes the board and the runner cleanly (a second signal kills it) and exits 1: the loop continues from storage on the next `start`. A fresh link: `kill -USR1 <pid>`, or Enter when stdin is a terminal; each prints a new one-time link. The page says so when its link was used or expired.
+
+**Auth and what it does not stop** are the web UI's, unchanged (it is the same server and page): the link's `code` (32 random bytes, 60 s, single use) is exchanged at `POST /session` for a session secret that lives only in the page's JavaScript and travels as `Authorization: Bearer`; Host and Origin are checked, and a code or secret in a query string is refused. The code is printed only to the runner's stdout: it is not written to the store, the doc, the `## Log`, a PR comment, or stderr (`tests/board-cli.test.ts` checks the doc, the commits, and the outputs), and the worker's contained environment holds nothing of it (it is in no variable or argument). Residual risks, as for the web UI: a process of your own user that reads the code before the page uses it (something scraping the terminal, its scrollback or the clipboard) or that reads the browser's or the runner's memory can sign in and then approve a merge or answer a decision. The worker runs with the contained environment and its guard, and nothing it can read holds the code, but it runs in your account like those processes: see [Containment](#containment-what-it-stops-and-what-it-cannot). A merge approval from the board has the same effect as `brigadev-runner merge`, so open the link only in a browser you trust, and prefer a container or a VM account for unattended runs.
 
 ## The worker obeys the guard
 
@@ -157,6 +184,8 @@ For a guarantee run the runner where there is nothing to steal: a container or V
 cd runner
 node --test tests/*.test.ts      # or: npm test
 ```
+
+The board tests (`tests/board.test.ts`, `tests/board-cli.test.ts`) run the adapter and the actions end to end over HTTP on an ephemeral 127.0.0.1 port, with a session secret from the one-time code, against the same fixtures; the page variant is checked by `../tests/web-runner-page.test.ts`.
 
 Tests use pi-ai's scripted faux provider and a temp git repo on a feature branch; no network, no model. The guard, the evidence log, and `brigadev.json` read the environment, so the tests point `BRIGADEV_HOME` and `PI_CODING_AGENT_DIR` at a temp dir (`isolateEnv()` in `tests/fixture.ts`): the real `~/.brigadev` is never written. They take minutes where `git` is slow to spawn, because every scripted commit runs the commit gate (several git calls) on top of a real `git commit`. The persistence tests close the Harness while ticket 1's done command is running (after the worker answered), reopen the same JSONL / SQLite storage, and check ticket 1 is not run again. `tests/decisions.test.ts` parks a decision, closes, reopens (JSONL and SQLite), delivers the answer without scheduling, and resumes; it drives deadlines with the manual clock `fakeClock()` (the Harness `now`/`setTimer` options). `tests/pause.test.ts` and `tests/control.test.ts` cover pause/resume and the CLI commands. A user's "meanwhile" edit of the doc is made through `depsWithHook` (while a done command runs, after the worker's conversation), because a doc change during a conversation is an integrity finding. `tests/contain.test.ts` (the environment of each process that runs the agent's code), the containment table at the end of `tests/guard.test.ts`, `tests/integrity.test.ts` (the snapshot, and the loops parking on a worker's or verifier's doc, settings, hook, ref, remote, and worktree changes), `tests/lock.test.ts` (ten processes racing for a lock left by a dead one, three rounds), and `tests/hardening.test.ts` (redaction, the done timeout, an older merged PR, a failing comment) cover the containment and the warnings. A worker's commit in a test is a plain `git commit` (the guard blocks `git -c`); the identity comes from `GIT_AUTHOR_*`/`GIT_COMMITTER_*` set by `isolateEnv()`.
 

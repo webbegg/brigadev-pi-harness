@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `brigadev-runner start <doc> --web [--port N]` serves the web UI's loop board from the runner process (`BRIGADEV_WEB_PORT` also sets the port). The tickets, the PR loop, and what needs you (ticket decisions, the merge approval, a paused loop) show on the board, and answering, approving the merge, resuming, and pausing work from the browser, in the process that holds the store, so the loop continues without another `start`. The one-time link goes to stdout only; `kill -USR1 <pid>` or Enter prints a new one. The web page has a runner mode (`session` snapshot `kind: "runner"`, optional `doc`): no composer, Pause instead of Abort, no cancel buttons; `webPage({ variant: "runner", pid })` names the runner's signal and terminal in the link messages. `answer`, `pause`, `resume`, and `merge` refusals while a `start` holds the store now point at the board.
+
 ## [0.23.0] - 2026-11-21
 
 The 0.23.0 release: everything in the pre-releases rc.1–rc.4 below (the web UI loop board, the brigadev bus, codemode by default, the durable runner, CI), plus these fixes from the pre-release review.

@@ -17,9 +17,9 @@ import { createContainment } from "./contain.ts";
 import { createAskTool } from "./decision.ts";
 import { LoopStartedDifferently } from "./errors.ts";
 import { guardExtension } from "./guard.ts";
-import { prPhaseLabel, type PrDeps, type PrState } from "./pr.ts";
+import { PR_TASK, prPhaseLabel, type PrDeps, type PrState } from "./pr.ts";
 import { decisionKey, deliver } from "./signals.ts";
-import { createTasks, defaultDeps, LOOP_TASK, type LoopInput, type LoopResult, type LoopState, type OpenDecision, type TicketDeps } from "./tasks.ts";
+import { createTasks, defaultDeps, LOOP_TASK, TICKET_TASK, type LoopInput, type LoopResult, type LoopState, type OpenDecision, type TicketDeps, type TicketInput, type TicketResult, type TicketState } from "./tasks.ts";
 import { doneTimeoutMs } from "./shell.ts";
 import { createVerdictTool, type Verifier } from "./verify.ts";
 import type { Worker } from "./worker.ts";
@@ -71,6 +71,8 @@ export interface PrStatus {
 	asleep: boolean;
 	url?: string;
 	number?: number;
+	/** The commit the branch was last pushed at: what a merge approval is for. */
+	sha?: string;
 	/** Why it stopped (phase needs-you). */
 	reason?: string;
 	/** The open decision of a fix ticket, answered with `answer` like a ticket's. */
@@ -82,6 +84,31 @@ export interface PrStatus {
 	mergeKey?: string;
 	/** The last PR comment that could not be posted. */
 	warning?: string;
+}
+
+/**
+ * One ticket's latest worker run, as the board shows it (`ticketRuns`): live or how it ended, its attempts, and the worker's most recent tool calls read from its
+ * conversation in the store. A ticket that ran again (after a decision, or a `resume`) shows its latest run. `FIX-n` tickets of the PR loop are included.
+ */
+export interface TicketRun {
+	ticketId: string;
+	taskId: TaskId;
+	/** The task has not ended: the worker runs, or the ticket waits for its done check. */
+	live: boolean;
+	/** How the run ended; absent while live. */
+	end?: "commit" | "decision" | "integrity" | "failed" | "aborted";
+	/** The attempt in progress while live; the attempts used when it ended. */
+	attempts: number;
+	maxAttempts: number;
+	commit?: string;
+	/** The failure message of a failed run. */
+	failure?: string;
+	/** The end of the failing done check's output. */
+	outputTail?: string;
+	startedAt?: number;
+	endedAt?: number;
+	/** The worker's last tool calls, oldest first, with their raw arguments (the caller summarizes and redacts them). */
+	steps: Array<{ tool: string; args: unknown }>;
 }
 
 /** Where a loop is, read from its task record. `paused` and `decisions` come from the checkpoint; a finished loop has neither. */
@@ -125,6 +152,8 @@ export interface Runner {
 	 */
 	settle(taskId: TaskId<LoopResult>): Promise<LoopOutcome | Waiting>;
 	status(taskId: TaskId<LoopResult>): Promise<LoopStatus>;
+	/** Every ticket the loop (and its PR loop) ran, newest run per ticket, from storage reads only: it works on any open Runner and commits nothing. */
+	ticketRuns(taskId: TaskId<LoopResult>): Promise<TicketRun[]>;
 	/** Deliver a signal to the loop (or to its PR loop child: `status().pr.taskId`) in one commit, without scheduling anything. */
 	deliver<T>(taskId: TaskId, token: SignalToken<T>, key: string, value: T): Promise<SignalResult>;
 	close(): Promise<void>;
@@ -133,6 +162,9 @@ export interface Runner {
 export { LoopStartedDifferently };
 
 const SETTLE_POLL_MS = 20;
+/** How many of a worker conversation's newest entries are read for its recent tool calls, and how many calls are kept. */
+const STEP_WINDOW_ENTRIES = 60;
+const STEPS_KEPT = 8;
 const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
 
 export async function openRunner(options: RunnerOptions): Promise<Runner> {
@@ -201,6 +233,7 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			phase: prPhaseLabel(state),
 			asleep: child.state.status === "sleeping",
 			...(state.pr ? { url: state.pr.url, number: state.pr.number } : {}),
+			...(state.sha ? { sha: state.sha } : {}),
 			...(state.phase === "stop" || state.phase === "resume" ? { reason: state.reason } : {}),
 			decisions: state.decision ? [state.decision] : [],
 			lastKeys: Object.fromEntries(Object.entries(state.rounds ?? {}).map(([id, round]) => [id, decisionKey(id, round)])),
@@ -208,6 +241,32 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			...(state.phase === "merge" ? { mergeKey: state.key } : {}),
 			...(state.warn ? { warning: state.warn } : {}),
 		};
+	};
+
+	/** The tool calls of a ticket task's latest worker conversation, from the store: the newest entries only, oldest first. A finished task's are read once. */
+	const finishedSteps = new Map<number, TicketRun["steps"]>();
+	const stepsOf = async (taskId: TaskId, finished: boolean): Promise<TicketRun["steps"]> => {
+		const known = finishedSteps.get(taskId);
+		if (finished && known) return known;
+		const steps: TicketRun["steps"] = [];
+		try {
+			const [conversation] = (await options.storage.scanConversations({ ownerTaskId: taskId, order: "descending" }, 1, undefined, context)).items;
+			if (conversation) {
+				const page = await options.storage.scanEntries({ conversationId: conversation.id, order: "descending" }, STEP_WINDOW_ENTRIES, undefined, context);
+				for (const entry of [...page.items].reverse()) {
+					const message = entry.model?.[0];
+					if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+					for (const part of message.content as Array<{ type?: string; name?: string; arguments?: unknown }>) {
+						if (part.type === "toolCall" && typeof part.name === "string") steps.push({ tool: part.name, args: part.arguments });
+					}
+				}
+			}
+		} catch {
+			// Steps are a nicety of the board: a store that cannot answer shows a card without them.
+		}
+		const kept = steps.slice(-STEPS_KEPT);
+		if (finished) finishedSteps.set(taskId, kept);
+		return kept;
 	};
 
 	const runner: Runner = {
@@ -302,6 +361,49 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			if (checkpoint.phase === "resume") return { ...base, ...carried, state: "paused", reason: checkpoint.reason, resumeKey: checkpoint.key };
 			const pr = checkpoint.phase === "pr-record" ? await prStatusOf(checkpoint.childId as TaskId) : undefined;
 			return { ...base, ...carried, ...(pr ? { pr } : {}), state: record.state.status === "sleeping" ? "sleeping" : "running" };
+		},
+		async ticketRuns(taskId) {
+			type Page = Awaited<ReturnType<Storage["scanTasks"]>>;
+			type TaskRow = Page["items"][number];
+			const scan = async (kind: string, each: (record: TaskRow) => void) => {
+				let cursor: Page["next"];
+				do {
+					const page = await options.storage.scanTasks({ kind }, 100, cursor, context);
+					for (const record of page.items) each(record);
+					cursor = page.next;
+				} while (cursor);
+			};
+			// A ticket is the loop's child; a PR loop's fix ticket is the PR loop's.
+			const owners = new Set<number>([taskId]);
+			await scan(PR_TASK, (record) => {
+				if (record.owner === taskId) owners.add(record.id);
+			});
+			const latest = new Map<string, TaskRow>();
+			await scan(TICKET_TASK, (record) => {
+				if (record.owner !== undefined && owners.has(record.owner)) latest.set((record.input as TicketInput).ticketId, record);
+			});
+			return Promise.all(
+				[...latest.values()].map(async (record): Promise<TicketRun> => {
+					const input = record.input as TicketInput;
+					const base = { ticketId: input.ticketId, taskId: record.id as TaskId, maxAttempts: input.maxAttempts, ...(record.startedAt === undefined ? {} : { startedAt: record.startedAt }), ...(record.endedAt === undefined ? {} : { endedAt: record.endedAt }) };
+					if (record.state.status !== "terminal" && record.state.status !== "completing") {
+						const attempt = (record.state.checkpoint as TicketState | undefined)?.attempt ?? 1;
+						return { ...base, live: true, attempts: attempt, steps: await stepsOf(record.id as TaskId, false) };
+					}
+					const outcome = record.state.outcome as { status: string; result?: TicketResult; error?: { message: string; detail?: unknown } };
+					const steps = await stepsOf(record.id as TaskId, true);
+					if (outcome.status === "completed" && outcome.result) {
+						const result = outcome.result;
+						if ("commit" in result) return { ...base, live: false, end: "commit", attempts: result.attempts, commit: result.commit, steps };
+						return { ...base, live: false, end: "decision" in result ? "decision" : "integrity", attempts: result.attempts, steps };
+					}
+					if (outcome.status === "failed") {
+						const detail = outcome.error?.detail as { attempts?: number; outputTail?: string } | undefined;
+						return { ...base, live: false, end: "failed", attempts: detail?.attempts ?? input.maxAttempts, failure: outcome.error?.message, ...(detail?.outputTail ? { outputTail: detail.outputTail } : {}), steps };
+					}
+					return { ...base, live: false, end: "aborted", attempts: 0, steps };
+				}),
+			);
 		},
 		deliver: (taskId, token, key, value) => deliver(harness, taskId, token, key, value, context),
 		close: async () => {

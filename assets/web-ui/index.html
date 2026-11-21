@@ -85,7 +85,7 @@ main { flex: 1; min-height: 0; overflow-y: auto; }
 .kind { font-family: var(--mono); font-size: 12px; color: var(--muted); min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .flag { margin-left: auto; font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; color: var(--muted); }
 .flag.running, .flag.queued { color: var(--active); } .flag.done, .flag.pass, .flag.approved { color: var(--pass); }
-.flag.failed, .flag.fail, .flag.denied, .flag.call { color: var(--human); } .flag.cancelled, .flag.wait { color: var(--changes); }
+.flag.failed, .flag.fail, .flag.denied, .flag.call { color: var(--human); } .flag.cancelled, .flag.wait, .flag.blocked, .flag.needs-you { color: var(--changes); }
 .title { font-size: 13px; line-height: 1.4; margin: 0 0 6px; overflow-wrap: anywhere; }
 .title.code { font-family: var(--mono); font-size: 12px; }
 .tail { font-family: var(--mono); font-size: 11px; color: var(--faint); line-height: 1.45; max-height: 4.4em; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0 2px; }
@@ -219,7 +219,7 @@ body.open .drawer { transform: none; }
 </head>
 <body>
 <header>
-	<h1>brigadev</h1>
+	<h1 id="title">brigadev</h1>
 	<span class="where" id="where"></span>
 	<span class="spacer"></span>
 	<button class="hbtn" id="open-tasks" hidden>Tasks<span class="n" id="n-tasks"></span></button>
@@ -237,7 +237,7 @@ body.open .drawer { transform: none; }
 		<button class="btn" id="steer" title="Interrupt the current run with this message">Steer</button>
 		<button class="btn bad" id="abort" title="Abort the current run">Abort</button>
 	</div>
-	<div class="hints"><span id="totals"></span><span>/brigadev:web stop</span><span>esc closes the panel</span></div>
+	<div class="hints"><span id="totals"></span><span id="stop-hint">/brigadev:web stop</span><span>esc closes the panel</span></div>
 </footer>
 
 <div id="overlay">
@@ -287,6 +287,7 @@ body.open .drawer { transform: none; }
 	if (location.search) history.replaceState(null, "", location.pathname);
 	var LINK_MESSAGE = "This link was already used or expired. In pi, run /brigadev:web open for a new one.";
 	var ENDED_MESSAGE = "This session ended (pi stopped the web UI or restarted it). In pi, run /brigadev:web open for a new link.";
+	var SIGNIN_HINT = "In pi, run /brigadev:web open for a new link.";
 
 	var state = {
 		session: null, phase: null, mode: null, running: false, runNo: 0, live: { active: false, text: "" },
@@ -428,6 +429,9 @@ body.open .drawer { transform: none; }
 			.then(function () { if (key) { pending.delete(key); render(); } });
 	}
 
+	/** The runner serves this page too (`brigadev-runner start --web`): its session snapshot says `kind: "runner"`, and then there is no conversation to talk to. */
+	function isRunner() { return !!(state.session && state.session.kind === "runner"); }
+
 	// ---- where things land ----
 	function stepColumn() { var p = state.phase && state.phase.phase; return STEP_COLUMN[p] || null; }
 	var COMMIT_CMD = /^\s*(git\s+(commit|push|tag|merge|rebase)|gh\s+(pr|release)\s+(create|merge|edit|ready))\b/;
@@ -437,6 +441,7 @@ body.open .drawer { transform: none; }
 		if (/verif|review|audit|lint/.test(n)) return "check";
 		if (/plan|oracle|design/.test(n)) return "decide";
 		if (/explor|research|scout|search/.test(n)) return "explore";
+		if (/^brigadev-pr/.test(n)) return "commit"; // the runner's PR loop
 		if (/work|writ|implement|build|fix/.test(n)) return "implement";
 		return stepColumn() || "implement";
 	}
@@ -522,9 +527,14 @@ body.open .drawer { transform: none; }
 	}
 
 	function drawHeader() {
-		var s = state.session;
+		var s = state.session, runner = isRunner();
 		$("where").replaceChildren();
 		if (s) append($("where"), [h("b", { text: s.project || "" }), s.branch ? " · " + s.branch : ""]);
+		// Runner mode: the composer is hidden (Abort stays, as Pause), and so are the conversation and the Pi command hint.
+		$("title").textContent = runner ? "brigadev-runner · " + (s.doc || "") : "brigadev";
+		["input", "send", "steer", "open-convo", "stop-hint"].forEach(function (id) { $(id).hidden = runner; });
+		$("abort").textContent = runner ? "Pause" : "Abort";
+		$("abort").title = runner ? "Pause the loop at its next pick (a running ticket finishes first)" : "Abort the current run";
 		var mode = $("mode");
 		mode.textContent = "mode " + (state.mode || "–");
 		mode.className = "mode" + (state.mode === "yolo" ? " yolo" : "");
@@ -545,7 +555,7 @@ body.open .drawer { transform: none; }
 			state.running ? h("span", { class: "pulse", "aria-label": "running" }) : h("span", { class: "idle-dot" }),
 			h("span", { class: "step", text: step ? step.charAt(0).toUpperCase() + step.slice(1) : state.running ? "Working" : "Idle" }),
 			p.detail && state.running ? h("span", { class: "detail", text: p.detail }) : null,
-			typing ? h("span", { class: "typing", text: "“" + typing + "”" }) : h("span", { class: "typing", text: state.running ? "" : "Send a message below, or open the conversation." }),
+			typing ? h("span", { class: "typing", text: "“" + typing + "”" }) : h("span", { class: "typing", text: state.running ? "" : isRunner() ? "Nothing is running: the runner waits for you or has finished." : "Send a message below, or open the conversation." }),
 			step ? h("span", { class: "inferred", text: "inferred" }) : null);
 	}
 
@@ -553,14 +563,14 @@ body.open .drawer { transform: none; }
 	function cardsByColumn() {
 		var cols = {};
 		COLUMNS.forEach(function (c) { cols[c.id] = []; });
-		var now = Date.now();
+		var now = Date.now(), runner = isRunner();
 		state.agents.forEach(function (a) {
 			var live = a.status === "running" || a.status === "queued";
 			cols[state.agentCol.get(a.id) || "implement"].push({
 				kind: "agent", id: a.id, at: a.startedAt || 0, agent: a.agent, title: a.task, status: a.status, live: live,
 				model: a.model, tokens: a.tokens, cost: a.cost, elapsed: a.startedAt ? span((a.endedAt || now) - a.startedAt) : "",
 				tail: live ? (a.partial || "").slice(-220) : "", verdict: a.output ? verdictOf(a.output) : null,
-				cancel: a.cancellable && live, busy: pending.has("a:" + a.id),
+				cancel: a.cancellable && live && !runner, busy: pending.has("a:" + a.id),
 			});
 		});
 		state.work.forEach(function (w) {
@@ -712,6 +722,7 @@ body.open .drawer { transform: none; }
 
 	// ---- drawer ----
 	function openView(v) {
+		if (v.kind === "convo" && isRunner()) return; // the runner has no conversation to show
 		view = v;
 		document.body.classList.add("open");
 		var d = $("d-doc"); d._sig = null; d.scrollTop = 0;
@@ -860,8 +871,9 @@ body.open .drawer { transform: none; }
 		state.agents.forEach(function (a) { cost += Number(a.cost || 0); if (a.status === "running") running++; });
 		var open = 0;
 		state.prompts.forEach(function (p) { if (p.status === "open") open++; });
-		$("totals").textContent = [running + " agents running", money(cost) + " in subagents", open ? open + " waiting on you" : ""].filter(Boolean).join(" · ");
-		document.title = (open ? "(" + open + ") " : "") + "brigadev" + (state.session && state.session.project ? " · " + state.session.project : "");
+		var runner = isRunner();
+		$("totals").textContent = (runner ? [running + " tickets running", open ? open + " waiting on you" : ""] : [running + " agents running", money(cost) + " in subagents", open ? open + " waiting on you" : ""]).filter(Boolean).join(" · ");
+		document.title = (open ? "(" + open + ") " : "") + (runner ? "brigadev-runner · " + (state.session.doc || "") : "brigadev" + (state.session && state.session.project ? " · " + state.session.project : ""));
 	}
 
 	function draw() { drawHeader(); drawNow(); drawBoard(); drawTimeline(); drawDrawer(); drawTotals(); }
@@ -919,7 +931,7 @@ body.open .drawer { transform: none; }
 		if (!code) return Promise.reject(new Error(LINK_MESSAGE));
 		return fetch("/session", { method: "POST", headers: { "X-Brigadev-Code": code }, cache: "no-store" }).then(function (res) {
 			if (res.status === 401) throw new Error(LINK_MESSAGE);
-			if (res.status !== 200) throw new Error("Could not sign in (" + res.status + "). In pi, run /brigadev:web open for a new link.");
+			if (res.status !== 200) throw new Error("Could not sign in (" + res.status + "). " + SIGNIN_HINT);
 			return res.json();
 		}).then(function (body) {
 			if (!body || typeof body.secret !== "string" || !body.secret) throw new Error(LINK_MESSAGE);

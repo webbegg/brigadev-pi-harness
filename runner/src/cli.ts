@@ -1,6 +1,8 @@
 // brigadev-runner CLI.
-//   start <feature-doc> [--no-pr]   validate the doc, then run its ticket list durably, then the PR loop (push, PR, CI, fixes, merge approval);
-//                                   `--no-pr` stops after the tickets. Returns when the loop ends or parks on a person
+//   start <feature-doc> [--no-pr] [--web [--port N]]
+//                                   validate the doc, then run its ticket list durably, then the PR loop (push, PR, CI, fixes, merge approval);
+//                                   `--no-pr` stops after the tickets. Returns when the loop ends or parks on a person. With `--web` it serves the loop board
+//                                   (the web UI) on 127.0.0.1 instead and stays up while the loop waits for a person: see below
 //   status <feature-doc>            read-only: the loop's state, each ticket's status, open decisions with the exact answer command
 //   answer <feature-doc> <T#> <1..n|text> [--approve]   answer a parked ticket decision (--approve also approves its command)
 //   pause <feature-doc>             pause at the next pick;  resume <feature-doc>   lift a pause (or a PR loop stop)
@@ -12,6 +14,10 @@
 // signal and closes before anything is scheduled, and they refuse while a `start` holds the store (`runner.sqlite.lock`): a second Harness opening
 // the store would mark the first one's running tasks as crashed. `start` therefore returns when the loop parks on a person, instead of waiting in
 // the foreground for an answer it could not see; run it again after answering.
+//
+// `start --web` is the exception: the board answers inside the process that holds the store, through the same Harness (`src/board.ts`), so it does wait in the
+// foreground. It prints a one-time link to stdout (and only there), exits when the loop ends, and on SIGINT/SIGTERM closes the board and the runner (the loop
+// continues on the next `start`). SIGUSR1, or Enter on a terminal, prints a fresh link.
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -19,6 +25,7 @@ import { pathToFileURL } from "node:url";
 import { onFeatureBranch, readBranchFacts } from "../../lib/commit-branch.ts";
 import { canonicalPath } from "../../lib/paths.ts";
 import { repoDocsDir, repoName } from "../../lib/repo-docs.ts";
+import { serveBoard } from "./board.ts";
 import { hardenGitEnv } from "./contain.ts";
 import { answerDecision, mergeLoop, pauseLoop, resumeLoop, statusText, type ControlResult } from "./control.ts";
 import { validateDoc } from "./doc.ts";
@@ -29,7 +36,8 @@ import { answerCommand, mergeCommand } from "./signals.ts";
 
 export const DEFAULT_MODEL = "claude-sonnet-5-5";
 const USAGE = [
-	"usage: brigadev-runner start <feature-doc> [--no-pr]",
+	"usage: brigadev-runner start <feature-doc> [--no-pr] [--web [--port N]]",
+	"         --web serves the loop board on 127.0.0.1 (port: --port or BRIGADEV_WEB_PORT, default: any free port) and stays up while the loop waits for you",
 	"       brigadev-runner status <feature-doc>",
 	"       brigadev-runner answer <feature-doc> <T#> <1..n|text> [--approve]",
 	"       brigadev-runner pause <feature-doc>",
@@ -153,6 +161,10 @@ export function acquireStore(storePath: string): number | (() => void) {
 
 const holderText = (pid: number) => (pid > 0 ? `pid ${pid}` : "another process");
 
+/** What a refusal says when a `start` holds the store: it may be serving the board, which answers inside that process. */
+const boardHint = (pid: number) =>
+	` If that \`start\` was run with --web, use its board instead: it answers, pauses, resumes, and approves the merge in the running process${pid > 0 ? ` (for a new link run \`kill -USR1 ${pid}\` or press Enter in its terminal)` : ""}.`;
+
 /**
  * Q5: the runner never shares a checkout or a branch with a live Pi session, and never commits on the default branch. It starts only in
  * a linked git worktree (git dir differs from the common dir) on a branch that is not the default or a protected one.
@@ -174,11 +186,140 @@ export async function worktreeRefusal(cwd: string): Promise<string | undefined> 
 	return undefined;
 }
 
+/** What `start --web` does besides running the loop: the board, how long it lingers, and how the process reaches it. */
+export interface WebStart {
+	/** 0 = any free port. */
+	port: number;
+	/** The pid the page's new-link instruction names (default: this process). */
+	pid?: number;
+	/** How long the board stays up after the loop ended, so an open page shows the last state (default 750 ms). */
+	lingerMs?: number;
+	debounceMs?: number;
+	pollMs?: number;
+	/** Stops the wait (SIGINT, SIGTERM): the board closes and the call returns 1 while the loop is left to continue from storage. */
+	signal?: AbortSignal;
+	/** Connects the requests for a fresh link (SIGUSR1, Enter) to `newLink`; returns how to disconnect. */
+	wire?: (newLink: () => void) => () => void;
+}
+
+const exitCodeOf = (outcome: Awaited<ReturnType<Runner["wait"]>>): number => (outcome.status === "completed" && (outcome.result.status === "done" || outcome.result.status === "merged") ? 0 : 1);
+
+/**
+ * `start --web`: the board first (so its link is printed before anything is scheduled), then the loop, and then wait for the loop to end, not for it to park: while it waits
+ * for a person the board is the way to answer, and answering delivers through this process's Harness, so the loop wakes in it.
+ */
+async function startWithBoard(runner: Runner, docPath: string, io: Io, pr: boolean, web: WebStart): Promise<number> {
+	const pid = web.pid ?? process.pid;
+	let served: Awaited<ReturnType<typeof serveBoard>>;
+	try {
+		served = await serveBoard(runner, docPath, { port: web.port, pid, debounceMs: web.debounceMs, pollMs: web.pollMs });
+	} catch (error) {
+		io.err(`cannot start the board: ${error instanceof Error ? error.message : String(error)}`);
+		return 1;
+	}
+	// The link goes to this process's stdout and nowhere else: not the store, a PR comment, the doc, or the Log.
+	const newLink = () => io.out(`brigadev board: ${served.server.openUrl()} (one-time link, valid 60 s; \`kill -USR1 ${pid}\` or Enter prints a new one)`);
+	newLink();
+	const unwire = web.wire?.(newLink);
+	try {
+		let id: Awaited<ReturnType<Runner["start"]>>;
+		try {
+			id = await runner.start(docPath, { pr });
+		} catch (error) {
+			if (!(error instanceof LoopStartedDifferently)) throw error;
+			io.err(`Refusing to start: ${error.message}`);
+			return 1;
+		}
+		const ended = runner.wait(id);
+		ended.catch(() => {}); // the runner closes under it when the wait is interrupted
+		const interrupted = new Promise<"interrupted">((resolve) => {
+			if (web.signal?.aborted) resolve("interrupted");
+			else web.signal?.addEventListener("abort", () => resolve("interrupted"), { once: true });
+		});
+		const outcome = await Promise.race([ended, interrupted]);
+		if (outcome === "interrupted") {
+			io.err(`interrupted: the board is closed and the loop is left where it is. Run \`brigadev-runner start ${docPath}\` to continue it from storage.`);
+			return 1;
+		}
+		await served.board.refresh();
+		if ((web.lingerMs ?? 750) > 0) await sleep(web.lingerMs ?? 750);
+		io.out(JSON.stringify(outcome, null, 2));
+		return exitCodeOf(outcome);
+	} finally {
+		unwire?.();
+		await served.close();
+	}
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** The process as `wireLinkRequests` uses it (tests pass a fake). */
+export interface LinkHost {
+	on(event: "SIGUSR1", listener: () => void): unknown;
+	off(event: "SIGUSR1", listener: () => void): unknown;
+	stdin?: { isTTY?: boolean; on(event: "data", listener: () => void): unknown; off(event: "data", listener: () => void): unknown; resume(): unknown; pause(): unknown };
+}
+
+/**
+ * A fresh one-time link on SIGUSR1, and on Enter when stdin is a terminal (a pipe is never read: it may be a script's). Returns how to release both.
+ * A platform without SIGUSR1 keeps Enter.
+ */
+export function wireLinkRequests(newLink: () => void, host: LinkHost = process as unknown as LinkHost): () => void {
+	const onSignal = () => newLink();
+	let signalWired = false;
+	try {
+		host.on("SIGUSR1", onSignal);
+		signalWired = true;
+	} catch {
+		// No SIGUSR1 here.
+	}
+	const stdin = host.stdin;
+	const onData = () => newLink();
+	const reading = stdin?.isTTY === true;
+	if (reading) {
+		stdin!.on("data", onData);
+		stdin!.resume();
+	}
+	return () => {
+		if (signalWired) host.off("SIGUSR1", onSignal);
+		if (reading) {
+			stdin!.off("data", onData);
+			stdin!.pause();
+		}
+	};
+}
+
+/** The process as `watchInterrupt` uses it. */
+export interface SignalHost {
+	on(event: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+	off(event: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+}
+
+/**
+ * SIGINT and SIGTERM abort the returned signal, once: the handlers are removed at the first, so a second signal while the runner closes takes the default (the
+ * process ends). `dispose` removes them without a signal.
+ */
+export function watchInterrupt(host: SignalHost = process): { signal: AbortSignal; dispose(): void } {
+	const controller = new AbortController();
+	const dispose = () => {
+		host.off("SIGINT", stop);
+		host.off("SIGTERM", stop);
+	};
+	const stop = () => {
+		dispose();
+		controller.abort();
+	};
+	host.on("SIGINT", stop);
+	host.on("SIGTERM", stop);
+	return { signal: controller.signal, dispose };
+}
+
 /**
  * Run the loop for a doc until it ends or parks. Parked (asleep on a decision or a pause, nothing runnable): print where it waits and how to
- * answer, and return 1; the loop continues from storage the next time `start` runs.
+ * answer, and return 1; the loop continues from storage the next time `start` runs. With `web`, serve the board and wait for the loop to end instead (see `startWithBoard`).
  */
-export async function startLoop(runner: Runner, docPath: string, io: Io, options: { pr?: boolean } = {}): Promise<number> {
+export async function startLoop(runner: Runner, docPath: string, io: Io, options: { pr?: boolean; web?: WebStart } = {}): Promise<number> {
+	if (options.web) return startWithBoard(runner, docPath, io, options.pr === true, options.web);
 	let id: Awaited<ReturnType<Runner["start"]>>;
 	try {
 		id = await runner.start(docPath, { pr: options.pr === true });
@@ -200,7 +341,7 @@ export async function startLoop(runner: Runner, docPath: string, io: Io, options
 		io.out(`Parked, nothing is running. After answering, then run \`brigadev-runner start ${docPath}\` again: the loop continues from storage.`);
 		return 1;
 	}
-	return outcome.status === "completed" && (outcome.result.status === "done" || outcome.result.status === "merged") ? 0 : 1;
+	return exitCodeOf(outcome);
 }
 
 async function loadRunnerModules() {
@@ -249,7 +390,7 @@ async function control(command: string, args: string[], env: Env, io: Io, cwd: s
 	if (command !== "status") {
 		const held = acquireStore(storePath);
 		if (typeof held === "number") {
-			io.err(`a \`brigadev-runner start\` is running on this store (${holderText(held)}). \`${command}\` opens the store too, which is unsafe beside it: wait until \`start\` parks or ends, or stop it, then run \`${command}\` again.`);
+			io.err(`a \`brigadev-runner start\` is running on this store (${holderText(held)}). \`${command}\` opens the store too, which is unsafe beside it: wait until \`start\` parks or ends, or stop it, then run \`${command}\` again.${boardHint(held)}`);
 			return 1;
 		}
 		release = held;
@@ -289,15 +430,48 @@ async function runControl(
 	}
 }
 
+/** A port number from 0 to 65535 written as digits, else undefined. */
+const portOf = (text: string): number | undefined => (/^\d{1,5}$/.test(text) && Number(text) <= 65535 ? Number(text) : undefined);
+
+/** `start`'s arguments: the doc and anything unknown stay positional (so an unknown flag is a usage error as before); `bad` is a `--port` without a valid number. */
+function parseStartArgs(rest: string[]): { positional: string[]; noPr: boolean; web: boolean; port?: number; bad: boolean } {
+	const positional: string[] = [];
+	let noPr = false;
+	let web = false;
+	let port: number | undefined;
+	let bad = false;
+	for (let i = 0; i < rest.length; i += 1) {
+		const arg = rest[i];
+		if (arg === "--no-pr") noPr = true;
+		else if (arg === "--web") web = true;
+		else if (arg === "--port" || arg.startsWith("--port=")) {
+			const value = arg === "--port" ? rest[++i] : arg.slice("--port=".length);
+			port = value === undefined ? undefined : portOf(value);
+			if (port === undefined) bad = true;
+		} else positional.push(arg);
+	}
+	return { positional, noPr, web, ...(port === undefined ? {} : { port }), bad };
+}
+
 export async function main(args: string[], env: Env = process.env, io: Io = { out: console.log, err: console.error }, cwd = process.cwd()): Promise<number> {
 	const [command, ...rest] = args;
 	if (command === "status" || command === "answer" || command === "pause" || command === "resume" || command === "merge") return control(command, rest, env, io, cwd);
 
-	const noPr = rest.includes("--no-pr");
-	const [docArg, ...extra] = rest.filter((arg) => arg !== "--no-pr");
-	if (command !== "start" || !docArg || extra.length > 0) {
+	const parsed = parseStartArgs(rest);
+	const [docArg, ...extra] = parsed.positional;
+	if (command !== "start" || !docArg || extra.length > 0 || parsed.bad || (parsed.port !== undefined && !parsed.web)) {
 		io.err(USAGE);
 		return 2;
+	}
+	const noPr = parsed.noPr;
+	let webPort = 0;
+	if (parsed.web) {
+		const chosen = parsed.port ?? (env.BRIGADEV_WEB_PORT === undefined || env.BRIGADEV_WEB_PORT === "" ? 0 : portOf(env.BRIGADEV_WEB_PORT));
+		if (chosen === undefined) {
+			io.err("BRIGADEV_WEB_PORT must be a port number from 0 to 65535 (0: any free port).");
+			return 2;
+		}
+		webPort = chosen;
 	}
 	const docPath = resolve(cwd, docArg);
 	let text: string;
@@ -349,9 +523,12 @@ export async function main(args: string[], env: Env = process.env, io: Io = { ou
 			model: { provider: "anthropic", modelId: env.BRIGADEV_RUNNER_MODEL || DEFAULT_MODEL },
 			onReport: (report) => io.err(`report: ${report.kind}: ${(report.error as Error | undefined)?.message ?? ""}`),
 		});
+		const interrupt = parsed.web ? watchInterrupt() : undefined;
 		try {
-			return await startLoop(runner, docPath, io, { pr: !noPr });
+			const web: WebStart | undefined = parsed.web ? { port: webPort, signal: interrupt!.signal, wire: (newLink) => wireLinkRequests(newLink) } : undefined;
+			return await startLoop(runner, docPath, io, { pr: !noPr, ...(web ? { web } : {}) });
 		} finally {
+			interrupt?.dispose();
 			await runner.close();
 		}
 	} finally {
