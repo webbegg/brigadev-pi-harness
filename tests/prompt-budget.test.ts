@@ -16,6 +16,8 @@ const root = join(import.meta.dirname, "..");
 const bytes = (s: string) => Buffer.byteLength(s, "utf8");
 
 const ORCHESTRATOR_MAX_BYTES = 2_600;
+// Measured 623 bytes; appended after the orchestrator prompt while codemode is active.
+const CODEMODE_MAX_BYTES = 700;
 const SKILL_DESCRIPTION_MAX_CHARS = 120;
 const MODEL_VISIBLE_SKILLS_MAX = 6;
 const MODE_LINE_MAX_BYTES = 220;
@@ -72,6 +74,11 @@ describe("prompt budget", () => {
 	it(`keeps the orchestrator prompt under ${ORCHESTRATOR_MAX_BYTES} bytes`, () => {
 		const size = bytes(readFileSync(join(root, "assets", "orchestrator.md"), "utf8"));
 		assert.ok(size <= ORCHESTRATOR_MAX_BYTES, `orchestrator.md is ${size} bytes`);
+	});
+
+	it(`keeps the codemode block under ${CODEMODE_MAX_BYTES} bytes`, () => {
+		const size = bytes(readFileSync(join(root, "assets", "codemode.md"), "utf8"));
+		assert.ok(size <= CODEMODE_MAX_BYTES, `codemode.md is ${size} bytes`);
 	});
 
 	it(`keeps model-visible skill descriptions under ${SKILL_DESCRIPTION_MAX_CHARS} chars`, () => {

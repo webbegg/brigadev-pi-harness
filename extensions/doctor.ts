@@ -71,7 +71,7 @@ export default function (pi: ExtensionAPI) {
 			if (!profiles.exists) mark(true, "profiles: none yet (/brigadev:profile init)");
 			else mark(profiles.problems.length === 0, `profiles: ${Object.keys(profiles.file.profiles).length} in ${profilesPath()}, default ${profiles.file.active ?? "none"}${profiles.problems.length ? ` — ${profiles.problems.join("; ")}` : ""}`);
 			const settings = readSettings();
-			mark(true, `settings: ${settingsPath()} (default mode ${settings.defaultMode ?? "normal"}, bridge pricing ${settings.bridgePricing === false ? "off" : "on"}, footer ${settings.ui?.footer === false ? "off" : "on"}, compact tool rows ${settings.ui?.compactTools === false ? "off" : "on"})`);
+			mark(true, `settings: ${settingsPath()} (default mode ${settings.defaultMode ?? "normal"}, codemode ${settings.codemode === false ? "off" : "on"}, bridge pricing ${settings.bridgePricing === false ? "off" : "on"}, footer ${settings.ui?.footer === false ? "off" : "on"}, compact tool rows ${settings.ui?.compactTools === false ? "off" : "on"})`);
 			for (const warning of riskWarnings(settings.risk)) mark(false, `risk: ${warning}`);
 			mark(true, describeContextControl(resolveContextSettings((settings as Record<string, unknown>).context), lastCompaction(), Date.now()));
 			if (typeof pi.getAllTools === "function") {

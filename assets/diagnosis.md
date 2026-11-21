@@ -11,6 +11,7 @@ Before any hypothesis, run one command that fails because of this bug, and show 
 - Best seam first: a failing test, then a script or CLI call with a fixture, a request against a dev server, a replayed captured input, a throwaway harness, and bisection or old-vs-new diffing when the bug appeared between two states.
 - It must assert the user's exact symptom, not "runs without error", and be fast, deterministic, and runnable unattended. For a flaky bug, loop it until the failure rate is debuggable.
 - A recognised test or check command is recorded in the evidence log automatically, and the PR body quotes the failing run as the RED. Run it as the command itself; a pipe is fine, but `||` or `;` after it records the run as unknown.
+- A CI failure: with `codemode`, fetch the log (`gh run view <id> --log-failed`) inside one script and return only the failing steps and errors, not the whole log.
 - No loop possible: stop, list what you tried, and ask for access, a redacted artifact, or permission for temporary instrumentation. Do not guess.
 
 ## 2. Minimise

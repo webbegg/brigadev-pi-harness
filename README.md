@@ -68,6 +68,7 @@ Per field, a launch resolves: session profile, default profile, agent frontmatte
 | `/brigadev:status` | Version, paths, repo docs folder |
 | `/brigadev:doctor` | Diagnostics and warnings (competing tools, large tool definitions, bridge hooks) |
 | `/brigadev:mode [normal\|yolo\|default <mode>\|status]` | Permission mode for this session or the default |
+| `/brigadev:codemode [on\|off]` | Pi's `codemode` tool in the parent session, on by default; saved for new sessions |
 | `alt+w`, `/brigadev:start [workflow]` | Workflow menu |
 | `/brigadev:profile …` | Model routing profiles |
 | `/brigadev:cost` | Session cost by model and agent, cache hit rate, subscription usage windows |
@@ -90,6 +91,7 @@ Also: `/brigadev:agents`, `/brigadev:harness on|off`, `/brigadev:ui footer on|of
 | --- | --- |
 | `defaultMode` | `normal` (default) or `yolo` for new sessions |
 | `secureYoloDirs` | Folders outside the project where the parent's `write`/`edit` skip the question (`/brigadev:yolo-dir`) |
+| `codemode` | `false` stops the harness from enabling Pi's `codemode` tool in the parent session (`/brigadev:codemode`) |
 | `bridgePricing` | `false` stops pricing zero-cost `claude-bridge` turns at the API list price |
 | `ui.footer`, `ui.compactTools` | `false` turns off the status bar or the one-line tool rows |
 | `check.test` | Test command for the `check` tool; detected from the project when absent |

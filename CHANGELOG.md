@@ -4,6 +4,9 @@
 
 ### Added
 
+- The parent session activates Pi's built-in `codemode` tool at start, next to `grep`, `find`, and `ls`. `/brigadev:codemode on|off` turns it on or off now and for new sessions (`codemode` in `brigadev.json`); off leaves a `codemode` enabled by Pi's own `defaultTools` alone. Tool calls made from codemode scripts still pass the guard.
+- While `codemode` is active, the parent's prompt gains a short block (`assets/codemode.md`): run an explore batch as one parallel script that returns only the needed lines, and gather git/PR/CI state (`gh pr checks`, `gh run view --log-failed`) into one digest. `diagnosis.md` says the same for CI failures.
+- `brigadev-explore`, `review-4r`, and `brigadev-verify` list `codemode` and say when to use it. The worker does not.
 - Feature-document tickets carry `deps:` (the tickets they need) and `done:` (the check that proves them), documented in `odd-tracking.md`. `lib/ticket-list.ts` parses the `## Tasks` list, validates it for an unattended run (missing `done:`, unknown deps, duplicates, cycles), picks ready tickets, writes a status or a `## Log` line back without touching other lines, detects edits to lines a runner owns and changed specs, and writes files atomically.
 - `runner/`: `brigadev-runner`, a separate package on `@earendil-works/pi-durable` (prototype). It runs a feature doc's ticket list unattended in a linked worktree, one fresh worker conversation per ticket, and survives restarts. Decisions, command approvals, pause and resume are durable signals (`brigadev-runner status | answer | pause | resume | merge`). When every ticket is done, a PR loop runs: final check, read-only verify on T2 branches, push (never forced), open the PR, wait for CI with up to 3 fix tickets, and merge only after `brigadev-runner merge <doc>`. Workers run without the user's credentials, and the doc, settings, git config, hooks and refs are checked around every conversation; any change parks the loop. See `runner/README.md`, including what containment cannot stop.
 - CI: `.github/workflows/test.yml` runs `npm test` and the runner suite on Node 22 and 24 for every pull request and push to `main`.
@@ -12,6 +15,10 @@
 
 - The `check` tool reads Node's TAP summary (`# pass N`), which Node 22 prints when output is piped; before, Node 22 runs had no counts.
 - The guard's trusted temp folders list only folders that exist (`/private/tmp` is macOS only).
+
+### Security
+
+- A subagent may call only its own tools (its active `tools:` list). A codemode script could otherwise reach tools that are callable without being active, such as MCP tools.
 
 ## [0.23.0-rc.3] - 2026-11-20
 
