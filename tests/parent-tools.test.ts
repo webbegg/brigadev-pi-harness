@@ -1,6 +1,6 @@
 // S6: the parent session has Pi's grep, find, and ls, and the guard decides their `path` like a read.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -39,6 +39,8 @@ function withActiveTools(initial: string[]) {
 	let active = [...initial];
 	pi.setCalls = [] as string[][];
 	pi.getActiveTools = () => [...active];
+	// The host Pi ships codemode (the orchestrator only asks for it then).
+	pi.getAllTools = () => [...new Set([...initial, "grep", "find", "ls", "codemode"])].map((name) => ({ name }));
 	pi.setActiveTools = (names: string[]) => {
 		pi.setCalls.push(names);
 		active = [...names];
@@ -60,7 +62,7 @@ describe("parent search tools", () => {
 		const pi = withActiveTools(["read", "bash", "edit", "write", "other_pkg_tool"]);
 		orchestrator(pi);
 		await pi.fire("session_start", {}, createFakeCtx({ cwd: repo, hasUI: false }));
-		assert.deepEqual(new Set(pi.getActiveTools()), new Set(["read", "bash", "edit", "write", "other_pkg_tool", "grep", "find", "ls"]));
+		assert.deepEqual(new Set(pi.getActiveTools()), new Set(["read", "bash", "edit", "write", "other_pkg_tool", "grep", "find", "ls", "codemode"]));
 	});
 
 	it("sets the tools once: a second session start or a turn changes nothing", async () => {
@@ -78,6 +80,68 @@ describe("parent search tools", () => {
 		asChild(() => orchestrator(pi));
 		await pi.fire("session_start", {}, createFakeCtx({ cwd: repo, hasUI: false }));
 		assert.equal(pi.setCalls.length, 0);
+	});
+});
+
+describe("codemode on by default", () => {
+	const settingsFile = () => join(agentDir, "brigadev.json");
+	const setSetting = (value: unknown) => writeFileSync(settingsFile(), JSON.stringify(value === undefined ? {} : { codemode: value }));
+	const savedSetting = () => JSON.parse(readFileSync(settingsFile(), "utf8")).codemode;
+
+	async function started(initial: string[]) {
+		const pi = withActiveTools(initial);
+		orchestrator(pi);
+		const ctx: any = createFakeCtx({ cwd: repo, hasUI: true });
+		const notes: string[] = [];
+		ctx.ui.notify = (text: string) => notes.push(text);
+		await pi.fire("session_start", {}, ctx);
+		return { pi, ctx, notes, run: (args: string) => pi.commands.get("brigadev:codemode").handler(args, ctx) };
+	}
+
+	it("activates codemode at session start unless the setting turns it off", async () => {
+		setSetting(undefined);
+		assert.ok((await started(["read"])).pi.getActiveTools().includes("codemode"));
+		setSetting(true);
+		assert.ok((await started(["read"])).pi.getActiveTools().includes("codemode"));
+		setSetting(false);
+		assert.ok(!(await started(["read"])).pi.getActiveTools().includes("codemode"));
+	});
+
+	it("with the setting off, leaves codemode enabled by Pi's own settings alone", async () => {
+		setSetting(false);
+		assert.ok((await started(["read", "codemode"])).pi.getActiveTools().includes("codemode"));
+	});
+
+	it("/brigadev:codemode off saves the setting and removes the tool now; on brings both back", async () => {
+		setSetting(undefined);
+		const s = await started(["read", "bash"]);
+		await s.run("off");
+		assert.equal(savedSetting(), false);
+		assert.deepEqual(new Set(s.pi.getActiveTools()), new Set(["read", "bash", "grep", "find", "ls"]));
+		assert.match(s.notes.at(-1) ?? "", /codemode off/);
+		await s.run("on");
+		assert.equal(savedSetting(), true);
+		assert.ok(s.pi.getActiveTools().includes("codemode"));
+		assert.match(s.notes.at(-1) ?? "", /codemode on/);
+	});
+
+	it("/brigadev:codemode without on|off reports the state and the usage, and changes nothing", async () => {
+		setSetting(undefined);
+		const s = await started(["read"]);
+		const calls = s.pi.setCalls.length;
+		await s.run("");
+		await s.run("maybe");
+		assert.equal(s.pi.setCalls.length, calls);
+		assert.match(s.notes.at(-1) ?? "", /codemode: on[\s\S]*Usage: \/brigadev:codemode on\|off/);
+	});
+
+	it("a child session gets no codemode and no command", async () => {
+		setSetting(undefined);
+		const pi = withActiveTools(["read"]);
+		asChild(() => orchestrator(pi));
+		await pi.fire("session_start", {}, createFakeCtx({ cwd: repo, hasUI: false }));
+		assert.ok(!pi.getActiveTools().includes("codemode"));
+		assert.equal(pi.commands.get("brigadev:codemode"), undefined);
 	});
 });
 

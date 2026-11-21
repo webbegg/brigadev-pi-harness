@@ -68,6 +68,7 @@ Per field, a launch resolves: session profile, default profile, agent frontmatte
 | `/brigadev:status` | Version, paths, repo docs folder |
 | `/brigadev:doctor` | Diagnostics and warnings (competing tools, large tool definitions, bridge hooks) |
 | `/brigadev:mode [normal\|yolo\|default <mode>\|status]` | Permission mode for this session or the default |
+| `/brigadev:codemode [on\|off]` | Pi's `codemode` tool in the parent session, on by default; saved for new sessions |
 | `alt+w`, `/brigadev:start [workflow]` | Workflow menu |
 | `/brigadev:profile …` | Model routing profiles |
 | `/brigadev:cost` | Session cost by model and agent, cache hit rate, subscription usage windows |
@@ -75,6 +76,7 @@ Per field, a launch resolves: session profile, default profile, agent frontmatte
 | `alt+g`, `/brigadev:changes` | Uncommitted files and diffs (read-only) |
 | `alt+a`, `/brigadev:runs` | Agents viewer: every subagent run with its thread (read-only) |
 | `/brigadev:ps` | Background processes started with `bg_start` |
+| `/brigadev:web [start\|open\|stop\|status]` | Local web UI for this session: a board of the loop (subagents, checks, commits, your decisions, prompts waiting on you), detail panels, and a composer (send, steer, abort). `open` prints a new one-time link |
 | `/brigadev:pr` | The current branch's pull request (needs `gh`) |
 | `/brigadev:force-commit`, `/brigadev:yolo-dir` | One-shot commit override; folders where writes run without asking |
 | `/track`, `/review` | Force feature-document tracking; 4R review of a frozen change |
@@ -89,12 +91,44 @@ Also: `/brigadev:agents`, `/brigadev:harness on|off`, `/brigadev:ui footer on|of
 | --- | --- |
 | `defaultMode` | `normal` (default) or `yolo` for new sessions |
 | `secureYoloDirs` | Folders outside the project where the parent's `write`/`edit` skip the question (`/brigadev:yolo-dir`) |
+| `codemode` | `false` stops the harness from enabling Pi's `codemode` tool in the parent session (`/brigadev:codemode`) |
 | `bridgePricing` | `false` stops pricing zero-cost `claude-bridge` turns at the API list price |
 | `ui.footer`, `ui.compactTools` | `false` turns off the status bar or the one-line tool rows |
 | `check.test` | Test command for the `check` tool; detected from the project when absent |
 | `context.enabled`, `context.compactAt`, `context.idleCompactMinutes`, `context.idleCompactMin` | Automatic compaction: at 160,000 tokens at a turn boundary, or on a request after 60 idle minutes with at least 100,000 tokens; `enabled: false` turns it off |
 
 Profiles live in `~/.pi/agent/brigadev-profiles.json`. Paths, environment variables, and agent overrides: [docs/configuration.md](docs/configuration.md).
+
+## Web UI
+
+`/brigadev:web` starts a server for the current parent session on `127.0.0.1` (ephemeral port, or `BRIGADEV_WEB_PORT`). It prints a one-time link; the session data (`/events`) and every action need the session secret the page gets from it. The page is one static file with no dependencies. It follows the session over SSE and replays what happened before it was opened.
+
+How the link works:
+
+- The link carries a single-use `code` (32 random bytes) that is valid for 60 seconds. The page reads it, removes it from the address bar at once, and trades it for a session secret with one `POST /session`. The code authorizes nothing else, and a second use of it is refused.
+- The secret is random, lives in the server's memory and in one JavaScript variable of the page, and travels in an `Authorization: Bearer` header (the page reads the event stream with `fetch`). It is never in the URL, browser storage, a cookie, or the browser's history, and a token in a query string is refused. Each tab has its own secret; `/brigadev:web stop` revokes them all.
+- A reload, a second tab, or a used or expired link has no code, so the page says: "This link was already used or expired. In pi, run /brigadev:web open for a new one." `/brigadev:web open` prints a new link for the running server (starting again does the same), and `status` shows the address without a code. If that message appears on a link you just opened, something else used the code first.
+- What this does not stop: a process of your own user that reads the code before the page uses it, or that reads the page's memory. The code is live from the moment pi prints it until the page loads, so that is seconds, not milliseconds (for example, something scraping your terminal or clipboard). If another process wins, the page shows the message above; run `/brigadev:web stop` and start again. A session secret lasts until `stop`, even after its tab closes.
+- An answer to a prompt that already closed (answered in the terminal, or its run aborted) is refused, and the page says so.
+
+The page is a board with one column per loop step: Explore, Decide, Implement, Check, Commit, and a red **Needs you** column.
+
+- Every subagent run, check, commit, choice you made, and batch of the main agent's own tool calls is a card in the step where it happened.
+- Cards show status, verdict, model, tokens, cost, and elapsed time; a running card pulses and can be cancelled.
+- Guard confirmations and `ask_user_choice` questions wait in **Needs you** and can be answered there.
+- Clicking a card opens a side panel: a subagent's output, recent tool calls, and full task; a check's counts; the conversation. The message box stays usable while the panel is open.
+
+The extensions publish their state as snapshots on the brigadev bus, which is typed `brigadev:*` channels on `pi.events` ([lib/bus.ts](lib/bus.ts)):
+
+- the loop phase, inferred from tool activity and labeled as inferred;
+- todos and check results;
+- subagent tasks;
+- open and settled prompts;
+- guard decisions and the permission mode.
+
+Guard confirmations and `ask_user_choice` can be answered in the terminal or the browser. The first answer wins and the other dialog closes.
+
+The same channels feed [pi-agent-dashboard](https://github.com/BlackBeltTechnology/pi-agent-dashboard) when it is installed. They are declared for its event forwarding, along with a loop breadcrumb and footer segments. Its own prompt bus shows guard dialogs.
 
 ## Development
 
@@ -111,6 +145,7 @@ Pure logic lives in `lib/` and is covered by `tests/`; extensions in `extensions
 - A read-only child can still write through `bash`.
 - Subagent runs live in the running Pi process: a finished run cannot be resumed, only read from its saved folder (kept 14 days, at most 200).
 - No classifier-based "auto" permission mode.
+- The web UI covers one session per server, and its loop phase is a guess from tool activity. Approving a guard prompt from the browser has the same effect as approving it in the terminal, so open the link only in a browser you trust. Credentials in commands (URLs with a password, `Authorization` headers, token-like strings, password flags) are masked before they reach the page or the bus; this is a best-effort filter.
 - `pi-claude-bridge` runs your Claude Code hooks inside Pi turns: see [docs/claude-bridge.md](docs/claude-bridge.md).
 
 ## License

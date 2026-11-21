@@ -5,7 +5,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { AgentDefinition } from "./agents.ts";
-import { failed, finalText, isUnfinished, output, runStatus, type RunResult } from "./run-status.ts";
+import { failed, finalText, isUnfinished, output, runStatus, USER_CANCEL, type RunResult } from "./run-status.ts";
 import { emptyTally } from "./cost.ts";
 import { buildChildTask, type ActiveWriter, type LaunchRequest, type SkillRef } from "./delegation.ts";
 import type { ResolvedRoute } from "./model-routing.ts";
@@ -17,8 +17,11 @@ import { diffSnapshots, outsideSurfaces, type Snapshot } from "./worktree-snapsh
 const OUTSIDE_WARNING = "files changed outside the writers' allowed edit surfaces";
 const CANCELLED_TEXT = "Cancelled before it started.";
 
-/** A placeholder that never started (aborted while queued): neither a success nor a child failure. */
+/** A task that never started (aborted while queued) or that the user stopped: neither a success nor a child failure. */
 const cancelled = (r: RunResult) => runStatus(r) === "cancelled";
+
+/** What the parent reads of a cancelled task: who stopped it, and whether it had started. */
+const cancelledText = (r: RunResult) => (r.cancelledBy === "user" ? `Cancelled by the user${r.startedAt === undefined ? " before it started" : ""}.` : CANCELLED_TEXT);
 
 /**
  * A model that ran out of quota, credit or rate limit. There is no fallback model: the agent's one model
@@ -65,11 +68,11 @@ export function toResult(mode: Details["mode"], { details, warnings }: Launched)
 	if (mode === "single") {
 		const r = details.results[0];
 		// A task cancelled while queued is an error that says so, not an empty success.
-		if (cancelled(r)) return { content: [{ type: "text", text: `Agent cancelled: ${CANCELLED_TEXT}${warningText}` }], details, isError: true };
+		if (cancelled(r)) return { content: [{ type: "text", text: `Agent cancelled: ${cancelledText(r)}${warningText}` }], details, isError: true };
 		return { content: [{ type: "text", text: (failed(r) ? `Agent ${r.stopReason ?? "failed"}: ` : "") + taskOutput(r) + warningText }], details, isError: failed(r) };
 	}
 	const ok = details.results.filter((r) => !failed(r) && !cancelled(r)).length;
-	const sections = details.results.map((r) => (cancelled(r) ? `### [${r.agent}] cancelled\n\n${CANCELLED_TEXT}` : `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${taskOutput(r)}`));
+	const sections = details.results.map((r) => (cancelled(r) ? `### [${r.agent}] cancelled\n\n${cancelledText(r)}` : `### [${r.agent}] ${failed(r) ? "failed" : "completed"}\n\n${taskOutput(r)}`));
 	return { content: [{ type: "text", text: `Parallel: ${ok}/${details.results.length} succeeded\n\n${sections.join("\n\n---\n\n")}${warningText}` }], details };
 }
 
@@ -100,6 +103,8 @@ export interface TaskView {
 	update(index: number, result: RunResult): void;
 	/** The task ended (any outcome): settle its row and the running count. */
 	finish(index: number, result: RunResult): void;
+	/** The task settled without ever starting (the user cancelled it while it waited for a slot): no `start` or `finish` follows. */
+	skipped?(index: number, result: RunResult): void;
 }
 
 export interface LaunchDeps {
@@ -127,6 +132,11 @@ export interface LaunchInput {
 	results: RunResult[];
 	signal?: AbortSignal;
 	hooks: LaunchHooks;
+	/**
+	 * Called once, before the first await, with the function that cancels one task by its index: it ends only that task
+	 * (killed while running, never started while queued) and returns false for an unknown or settled one.
+	 */
+	exposeCancel?: (cancel: (index: number) => boolean) => void;
 }
 
 /**
@@ -134,11 +144,26 @@ export interface LaunchInput {
  * await. Each writer stays registered until its own task ends, and the launch
  * settles (or throws the first task error) only after every task has settled, so
  * sibling children never run unregistered and never hold slots after the launch ends.
- * An abort throws: the sync tool call ends with it.
+ * An abort of the launch throws: the sync tool call ends with it. A task the user cancels settles as cancelled and
+ * is neither an error nor a reason to stop its siblings.
  */
 export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<Launched> {
 	const { mode, tasks, results, signal, hooks } = input;
 	const now = deps.now ?? Date.now;
+
+	// One controller per task, combined with the launch's signal: aborting the launch ends every task, cancelling one ends only it.
+	const controllers = tasks.map(() => new AbortController());
+	const taskSignals = controllers.map((c) => (signal ? AbortSignal.any([signal, c.signal]) : c.signal));
+	const cancelRequested = tasks.map(() => false);
+	// The task's run ended (or it never started): a cancel no longer applies.
+	const ended = tasks.map(() => false);
+	input.exposeCancel?.((index) => {
+		if (!Number.isInteger(index) || index < 0 || index >= tasks.length || ended[index] || cancelRequested[index] || signal?.aborted) return false;
+		cancelRequested[index] = true;
+		controllers[index].abort(USER_CANCEL);
+		return true;
+	});
+	const cancelledByUser = (index: number) => cancelRequested[index] && !signal?.aborted;
 
 	const emit = () => {
 		const done = results.filter((r) => r.exitCode !== -1).length;
@@ -179,22 +204,34 @@ export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<L
 			results[index] = { agent: agent.name, task: request.task, exitCode: -1, messages: [], stderr: "", usage: emptyTally(), model: route.model, thinking: route.thinking, route: routeLabel, inherited: route.modelSource === "parent", startedAt };
 			deps.view.attempt(index, results[index]);
 			emit();
-			results[index] = await deps.runAgent({
-				index,
-				taskText: text,
-				route,
-				routeLabel,
-				signal,
-				onUpdate: (partial) => {
-					Object.assign(partial, { startedAt });
-					results[index] = partial;
-					deps.view.update(index, partial);
-					emit();
-				},
-			});
+			// The runner, not the request, decides: a cancel that lands after the child finished leaves its result alone.
+			let killedForCancel = false;
+			try {
+				results[index] = await deps.runAgent({
+					index,
+					taskText: text,
+					route,
+					routeLabel,
+					signal: taskSignals[index],
+					onUpdate: (partial) => {
+						if (ended[index]) return;
+						Object.assign(partial, { startedAt });
+						results[index] = partial;
+						deps.view.update(index, partial);
+						emit();
+					},
+				});
+			} catch (error) {
+				ended[index] = true;
+				// A child killed for the user's cancel may reject instead of resolving: that is the cancellation, not a failure.
+				if (!cancelledByUser(index)) throw error;
+				killedForCancel = true;
+			}
+			ended[index] = true;
 			Object.assign(results[index], { startedAt, endedAt: now() });
+			if (cancelledByUser(index) && (killedForCancel || results[index].cancelled)) Object.assign(results[index], { cancelled: true, cancelledBy: "user" });
 			// One model per agent: a quota or limit failure is not retried elsewhere, and is said out loud.
-			if (limitFailed(results[index])) warnings.push(`${agent.name}: ${results[index].model ?? route.model ?? "its model"} hit a quota or rate limit. No other model was tried; wait for the limit to reset or route this agent to another model with /brigadev:profile set`);
+			else if (limitFailed(results[index])) warnings.push(`${agent.name}: ${results[index].model ?? route.model ?? "its model"} hit a quota or rate limit. No other model was tried; wait for the limit to reset or route this agent to another model with /brigadev:profile set`);
 		} finally {
 			results[index].endedAt ??= now();
 			deps.view.finish(index, results[index]);
@@ -212,9 +249,15 @@ export async function runLaunch(input: LaunchInput, deps: LaunchDeps): Promise<L
 			try {
 				let release: () => void;
 				try {
-					release = await deps.slots.acquire(signal);
+					release = await deps.slots.acquire(taskSignals[index]);
 				} catch {
-					throw new Error("Subagent was aborted");
+					if (!cancelledByUser(index)) throw new Error("Subagent was aborted");
+					// Cancelled while it waited: it never starts, and nothing else is affected.
+					ended[index] = true;
+					Object.assign(results[index], { endedAt: now(), cancelled: true, cancelledBy: "user" });
+					deps.view.skipped?.(index, results[index]);
+					emit();
+					return;
 				}
 				try {
 					await runTask(task, index);

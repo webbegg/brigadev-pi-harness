@@ -8,6 +8,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Editor, type EditorTheme, Key, matchesKey, Text, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { askChoice } from "../lib/human-prompt.ts";
 import { isChildSession } from "../lib/runtime.ts";
 
 interface ChoiceDetails {
@@ -42,7 +43,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Params,
 		executionMode: "sequential",
 
-		async execute(_id, params, _signal, _onUpdate, ctx) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			const labels = params.options.map((o) => o.label);
 			const details = (answer: string | null, wasCustom?: boolean): ChoiceDetails => ({ question: params.question, options: labels, answer, wasCustom });
 
@@ -59,7 +60,10 @@ export default function (pi: ExtensionAPI) {
 			const recommended = params.recommended && params.recommended >= 1 && params.recommended <= params.options.length ? params.recommended - 1 : -1;
 			const allOptions: DisplayOption[] = [...params.options, ...(params.allowOther === false ? [] : [{ label: "Something else…", isOther: true }])];
 
-			const result = await ctx.ui.custom<{ answer: string; wasCustom: boolean } | null>((tui, theme, _kb, done) => {
+			// The TUI component and a web answer race (first wins); a web answer closes the component through its captured `done`.
+			const spec = { source: "ask", question: params.question, options: params.options, recommended: recommended >= 0 ? recommended + 1 : undefined, allowOther: params.allowOther };
+			const result = await askChoice(pi.events, spec, (onClose) => ctx.ui.custom<{ answer: string; wasCustom: boolean } | null>((tui, theme, _kb, done) => {
+				onClose(() => done(null));
 				let index = recommended >= 0 ? recommended : 0;
 				let editing = false;
 				let cached: string[] | undefined;
@@ -147,7 +151,7 @@ export default function (pi: ExtensionAPI) {
 						return lines;
 					},
 				};
-			});
+			}), signal ?? ctx.signal);
 
 			if (!result) return { content: [{ type: "text", text: "The user dismissed the question without answering. Stop and wait for them." }], details: details(null) };
 			if (result.wasCustom) return { content: [{ type: "text", text: `The user answered: ${result.answer}` }], details: details(result.answer, true) };

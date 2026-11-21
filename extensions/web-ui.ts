@@ -1,0 +1,289 @@
+// `/brigadev:web`: a local web UI for the parent session. The server starts only with the command (never in a
+// child, never on load), but the log is fed from load on, so state from before `start` is replayable. It observes
+// the brigadev bus (lib/bus.ts) and a few compact core events, and never changes what the agent does: the only
+// ways in are the validated actions of lib/web-server.ts (send a prompt, abort, answer, cancel a subagent).
+
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type Action, BUS, CHANNELS, publish } from "../lib/bus.ts";
+import { basename } from "node:path";
+import { readCurrentBranch } from "../lib/commit-branch.ts";
+import { redact } from "../lib/redact.ts";
+import { isChildSession } from "../lib/runtime.ts";
+import { createWebLog } from "../lib/web-log.ts";
+import { webPage } from "../lib/web-page.ts";
+import { ActionRefused, startWebServer, type WebServer } from "../lib/web-server.ts";
+
+const STATUS_KEY = "brigadev-web";
+const USAGE = "Usage: /brigadev:web [start|open|stop|status]";
+const LINK_HINT = "one-time link, valid 60 s; /brigadev:web open mints a new one";
+const MAX_MESSAGE_CHARS = 20_000;
+const MAX_SUMMARY_CHARS = 200;
+const LIVE_THROTTLE_MS = 150;
+/** Tool argument fields worth a one-line summary, in order. Bodies (content, oldText, ...) are never forwarded. */
+const SUMMARY_FIELDS = ["path", "file_path", "command", "pattern", "agent", "question"] as const;
+
+/** The text parts of a message, thinking and tool calls left out. */
+function textOf(message: unknown): string {
+	const content = (message as { content?: unknown } | undefined)?.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part): part is { type: "text"; text: string } => part?.type === "text" && typeof part.text === "string")
+		.map((part) => part.text)
+		.join("\n");
+}
+
+const cap = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max - 1)}…`);
+
+function summarize(args: unknown): string {
+	if (!args || typeof args !== "object") return "";
+	const a = args as Record<string, unknown>;
+	let text = "";
+	for (const field of SUMMARY_FIELDS) {
+		if (typeof a[field] === "string" && a[field]) {
+			text = a[field] as string;
+			break;
+		}
+	}
+	if (!text && Array.isArray(a.tasks)) {
+		text = a.tasks
+			.map((t) => (t as { agent?: unknown })?.agent)
+			.filter((agent): agent is string => typeof agent === "string")
+			.join(", ");
+	}
+	// Credentials in a command are masked before anything leaves for the page (and before the cap can cut one in half).
+	return cap(redact(text).replace(/\s+/g, " ").trim(), MAX_SUMMARY_CHARS);
+}
+
+function configuredPort(): number {
+	const raw = process.env.BRIGADEV_WEB_PORT;
+	if (!raw) return 0;
+	const port = Number(raw);
+	return Number.isInteger(port) && port >= 0 && port <= 65535 ? port : 0;
+}
+
+export default function (pi: ExtensionAPI) {
+	if (isChildSession()) return;
+	const log = createWebLog();
+	let ctx: any;
+	let server: WebServer | undefined;
+	let starting: Promise<WebServer> | undefined;
+
+	const guarded =
+		<E>(fn: (event: E) => void) =>
+		(event: E, context: unknown) => {
+			ctx = context ?? ctx;
+			try {
+				fn(event);
+			} catch {
+				// A UI is an observer: its failure must not change what the agent does.
+			}
+		};
+
+	// The bus: every outbound channel, from load on. Pi's bus outlives a reload, so each listener is removed at shutdown.
+	const unsubscribers: Array<() => void> = [];
+	// The prompts open right now (their last `brigadev:prompt` said `open`): an answer to any other id is refused with 409, so the page
+	// learns that a prompt it still shows was answered in the terminal or dismissed by an abort.
+	const openPrompts = new Set<string>();
+	for (const [channel, spec] of Object.entries(CHANNELS)) {
+		const off = pi.events.on(channel, (data) => {
+			try {
+				if (channel === BUS.prompt && data && typeof (data as { id?: unknown }).id === "string") {
+					const { id, status } = data as { id: string; status?: unknown };
+					if (status === "open") openPrompts.add(id);
+					else openPrompts.delete(id);
+				}
+				log.append({ type: spec.as, data });
+			} catch {
+				// see above
+			}
+		});
+		if (typeof off === "function") unsubscribers.push(off);
+	}
+	const unsubscribeBus = () => {
+		for (const off of unsubscribers.splice(0)) {
+			try {
+				off();
+			} catch {
+				// already gone
+			}
+		}
+	};
+
+	// Core events, reduced to compact UI events.
+	let messageSeq = 0;
+	let liveActive = false;
+	let liveText: string | undefined;
+	let liveTimer: NodeJS.Timeout | undefined;
+	let liveAt = 0;
+	const flushLive = () => {
+		if (liveTimer) clearTimeout(liveTimer);
+		liveTimer = undefined;
+		if (liveText === undefined) return;
+		liveAt = Date.now();
+		liveActive = true;
+		log.append({ type: "assistant_live", data: { id: "live", text: liveText, active: true } });
+		liveText = undefined;
+	};
+	const endLive = () => {
+		if (liveTimer) clearTimeout(liveTimer);
+		liveTimer = undefined;
+		liveText = undefined;
+		if (!liveActive) return;
+		liveActive = false;
+		log.append({ type: "assistant_live", data: { id: "live", text: "", active: false } });
+	};
+
+	pi.on(
+		"agent_start",
+		guarded(() => log.append({ type: "run", data: { id: "run", running: true, at: Date.now() } })),
+	);
+	// Where the session works: the page's header. The branch is read again after each run (the agent may switch it).
+	const publishSession = async () => {
+		try {
+			const cwd = typeof ctx?.cwd === "string" ? ctx.cwd : process.cwd();
+			const branch = await readCurrentBranch((command, args, options) => pi.exec(command, args, options), cwd);
+			log.append({ type: "session", data: { id: "session", project: basename(cwd), branch } });
+		} catch {
+			// The header just lacks it.
+		}
+	};
+	pi.on(
+		"agent_end",
+		guarded(() => {
+			endLive();
+			log.append({ type: "run", data: { id: "run", running: false, at: Date.now() } });
+			void publishSession();
+		}),
+	);
+	pi.on(
+		"message_update",
+		guarded((event: { message?: { role?: string } }) => {
+			if (event.message?.role !== "assistant") return;
+			const text = textOf(event.message);
+			liveText = text.length > MAX_MESSAGE_CHARS ? `…${text.slice(-MAX_MESSAGE_CHARS)}` : text;
+			const wait = liveAt + LIVE_THROTTLE_MS - Date.now();
+			if (wait <= 0) return flushLive();
+			if (!liveTimer) {
+				liveTimer = setTimeout(flushLive, wait);
+				liveTimer.unref();
+			}
+		}),
+	);
+	pi.on(
+		"message_end",
+		guarded((event: { message?: { role?: string } }) => {
+			const role = event.message?.role;
+			if (role !== "user" && role !== "assistant") return;
+			if (role === "assistant") endLive();
+			const text = textOf(event.message).trim();
+			if (!text) return;
+			log.append({ type: "message", data: { id: `m${++messageSeq}`, role, text: cap(text, MAX_MESSAGE_CHARS), at: Date.now() } });
+		}),
+	);
+
+	const summaries = new Map<string, string>();
+	/** A call another tool made (a codemode script) names that tool's call, so the timeline can show where it came from. */
+	const parentOf = (event: { parentToolCallId?: string }) => (typeof event.parentToolCallId === "string" ? { parentId: event.parentToolCallId } : {});
+	pi.on(
+		"tool_execution_start",
+		guarded((event: { toolCallId: string; toolName: string; args?: unknown; parentToolCallId?: string }) => {
+			const summary = summarize(event.args);
+			summaries.set(event.toolCallId, summary);
+			log.append({ type: "tool", data: { id: event.toolCallId, name: cap(String(event.toolName), 80), summary, ...parentOf(event), status: "running", at: Date.now() } });
+		}),
+	);
+	pi.on(
+		"tool_execution_end",
+		guarded((event: { toolCallId: string; toolName: string; isError?: boolean; durationMs?: number; parentToolCallId?: string }) => {
+			const summary = summaries.get(event.toolCallId) ?? "";
+			summaries.delete(event.toolCallId);
+			const durationMs = typeof event.durationMs === "number" ? event.durationMs : undefined;
+			log.append({ type: "tool", data: { id: event.toolCallId, name: cap(String(event.toolName), 80), summary, ...parentOf(event), status: event.isError ? "error" : "done", durationMs, at: Date.now() } });
+		}),
+	);
+	pi.on("session_start", (_event: unknown, context: unknown) => {
+		ctx = context ?? ctx;
+		return publishSession();
+	});
+	pi.on(
+		"session_shutdown",
+		guarded(() => {
+			unsubscribeBus();
+			void stop();
+		}),
+	);
+
+	function handleAction(action: Action): void {
+		switch (action.action) {
+			case "prompt": {
+				if (!ctx) throw new Error("no session yet");
+				const idle = ctx.isIdle();
+				pi.sendUserMessage(action.text, idle ? undefined : { deliverAs: action.deliverAs ?? "followUp" });
+				return;
+			}
+			case "abort":
+				if (!ctx) throw new Error("no session yet");
+				ctx.abort();
+				return;
+			case "answer":
+				if (!openPrompts.has(action.id)) throw new ActionRefused("this prompt is no longer open: it was answered elsewhere or its run was aborted");
+				publish(pi.events, BUS.action, action);
+				return;
+			case "cancel-agent":
+				// Other extensions own prompts and subagents; they listen on the bus.
+				publish(pi.events, BUS.action, action);
+				return;
+		}
+	}
+
+	async function start(): Promise<WebServer> {
+		if (server) return server;
+		starting ??= (async () => {
+			const html = webPage();
+			return startWebServer({ host: "127.0.0.1", port: configuredPort(), html, log, onAction: handleAction });
+		})();
+		try {
+			server = await starting;
+			return server;
+		} finally {
+			starting = undefined;
+		}
+	}
+
+	async function stop(): Promise<boolean> {
+		const running = server;
+		server = undefined;
+		if (!running) return false;
+		await running.close();
+		return true;
+	}
+
+	pi.registerCommand("brigadev:web", {
+		description: "Open the local web UI for this session: start (default), open (a new one-time link), stop, status",
+		handler: async (args: string, context: any) => {
+			ctx = context ?? ctx;
+			const sub = (args ?? "").trim().split(/\s+/)[0] || "start";
+			const notify = (message: string, type?: "info" | "warning" | "error") => context.ui.notify(message, type);
+			if (sub === "start" || sub === "open") {
+				// A running server gets a fresh link (the code is single-use); `open` never starts one.
+				if (!server && sub === "open") return notify("brigadev web UI is not running: start it with /brigadev:web start", "warning");
+				try {
+					const running = await start();
+					context.ui.setStatus(STATUS_KEY, `web :${running.port}`);
+					notify(`brigadev web UI: ${running.openUrl()} (${LINK_HINT})`);
+				} catch (error) {
+					notify(`brigadev web UI failed to start: ${error instanceof Error ? error.message : String(error)}`, "error");
+				}
+			} else if (sub === "stop") {
+				if (!(await stop())) return notify("brigadev web UI is not running");
+				context.ui.setStatus(STATUS_KEY, undefined);
+				notify("brigadev web UI stopped");
+			} else if (sub === "status") {
+				notify(server ? `brigadev web UI running: ${server.url} (/brigadev:web open prints a one-time link)` : "brigadev web UI is not running");
+			} else {
+				notify(USAGE, "warning");
+			}
+		},
+	});
+}

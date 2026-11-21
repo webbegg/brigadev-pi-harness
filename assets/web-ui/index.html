@@ -1,0 +1,982 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>brigadev</title>
+<style>
+:root {
+	color-scheme: dark;
+	--bg: #14151b; --panel: #1a1c24; --card: #20222c; --card-hover: #252835; --line: #2b2e3b;
+	--text: #e4e5ea; --muted: #868ba0; --faint: #5b6075;
+	--active: #8be9fd; --pass: #50fa7b; --changes: #ffb86c; --human: #ff5555; --done: #bd93f9;
+	--mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+	background: var(--bg); color: var(--text); display: flex; flex-direction: column;
+	font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased;
+}
+button { font: inherit; color: inherit; cursor: pointer; }
+button:disabled { opacity: .45; cursor: default; }
+.mono { font-family: var(--mono); }
+
+/* Header */
+header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 18px 28px 10px; }
+h1 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -.01em; }
+.where { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.where b { color: var(--text); font-weight: 500; }
+.spacer { flex: 1; }
+.hbtn { background: none; border: 1px solid var(--line); border-radius: 7px; padding: 3px 10px; font-size: 12px; color: var(--muted); }
+.hbtn:hover { color: var(--text); border-color: var(--muted); }
+.hbtn .n { color: var(--text); margin-left: 4px; font-family: var(--mono); }
+.mode { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 6px; color: var(--muted); border: 1px solid var(--line); }
+.mode.yolo { color: var(--changes); border-color: color-mix(in srgb, var(--changes) 45%, transparent); }
+.status { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--pass); margin-right: 6px; vertical-align: 1px; }
+.status.off { color: var(--human); } .status.off .dot { background: var(--human); }
+
+/* Now line */
+.now {
+	display: flex; align-items: center; gap: 10px; margin: 0 28px; padding: 9px 14px; min-height: 40px;
+	background: var(--panel); border: 1px solid var(--line); border-radius: 10px; cursor: pointer; min-width: 0;
+}
+.now:hover { border-color: var(--muted); }
+.now .step { font-weight: 600; white-space: nowrap; }
+.now .detail { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 0; }
+.now .typing { font-size: 12.5px; color: var(--faint); font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+.now .inferred { margin-left: auto; font-size: 11px; color: var(--faint); font-family: var(--mono); white-space: nowrap; }
+.pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--active); flex: none; animation: pulse 1.6s ease-in-out infinite; }
+.idle-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+
+/* Board */
+main { flex: 1; min-height: 0; overflow-y: auto; }
+.board { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; padding: 18px 28px 28px; align-items: start; }
+.col { min-width: 0; }
+.col-head { display: flex; align-items: baseline; gap: 8px; padding: 0 2px 10px; border-bottom: 1px solid var(--line); margin-bottom: 12px; position: relative; }
+.col-head h2 { margin: 0; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.col-head .who { font-size: 11px; color: var(--faint); font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.col-head .count { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.col:not(:last-child):not(:nth-last-child(2)) .col-head::after { content: "›"; position: absolute; right: -11px; top: -3px; color: var(--faint); font-size: 16px; }
+.col.unvisited h2 { color: var(--muted); }
+.col.current .col-head { border-bottom-color: var(--active); }
+.col.current h2 { color: var(--active); }
+.col.human .col-head { border-bottom-color: color-mix(in srgb, var(--human) 55%, transparent); }
+.col.human h2 { color: var(--human); }
+.empty { color: var(--faint); font-size: 12px; padding: 4px 2px; }
+.older { color: var(--faint); font-size: 11px; font-family: var(--mono); padding: 2px; }
+
+/* Cards */
+.card {
+	display: block; width: 100%; text-align: left; color: inherit; background: var(--card); border: 1px solid var(--line);
+	border-radius: 10px; padding: 11px 12px 10px; margin-bottom: 10px; transition: background .15s, border-color .15s, transform .15s;
+}
+.card.click { cursor: pointer; }
+.card.click:hover { background: var(--card-hover); transform: translateY(-1px); }
+.card:focus-visible { outline: 2px solid var(--active); outline-offset: 2px; }
+.card.live { border-color: color-mix(in srgb, var(--active) 40%, var(--line)); }
+.card.human { border-color: var(--human); box-shadow: 0 0 0 1px color-mix(in srgb, var(--human) 40%, transparent), 0 8px 24px -12px color-mix(in srgb, var(--human) 60%, transparent); }
+.card.settled { opacity: .78; }
+.card.bad { border-color: color-mix(in srgb, var(--human) 45%, var(--line)); }
+.card-top { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; min-width: 0; }
+.card-top .pulse { width: 7px; height: 7px; }
+.kind { font-family: var(--mono); font-size: 12px; color: var(--muted); min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.flag { margin-left: auto; font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; color: var(--muted); }
+.flag.running, .flag.queued { color: var(--active); } .flag.done, .flag.pass, .flag.approved { color: var(--pass); }
+.flag.failed, .flag.fail, .flag.denied, .flag.call { color: var(--human); } .flag.cancelled, .flag.wait { color: var(--changes); }
+.title { font-size: 13px; line-height: 1.4; margin: 0 0 6px; overflow-wrap: anywhere; }
+.title.code { font-family: var(--mono); font-size: 12px; }
+.tail { font-family: var(--mono); font-size: 11px; color: var(--faint); line-height: 1.45; max-height: 4.4em; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0 2px; }
+.steps { font-family: var(--mono); font-size: 11px; color: var(--muted); margin: 2px 0; }
+.steps div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.steps .t { color: var(--faint); }
+.meta { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 7px; font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+.chips { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+.chip { font-family: var(--mono); font-size: 10px; padding: 2px 7px; border-radius: 4px; border: 1px dashed var(--faint); color: var(--faint); }
+.chip.pass { border: 1px solid transparent; color: var(--pass); background: color-mix(in srgb, var(--pass) 14%, transparent); }
+.chip.warn { border: 1px solid transparent; color: var(--changes); background: color-mix(in srgb, var(--changes) 16%, transparent); }
+.chip.fail { border: 1px solid transparent; color: var(--human); background: color-mix(in srgb, var(--human) 16%, transparent); }
+.chip.info { border: 1px solid transparent; color: var(--active); background: color-mix(in srgb, var(--active) 12%, transparent); }
+.chip.wait { animation: breathe 1.6s ease-in-out infinite; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 9px; }
+.btn { border-radius: 6px; padding: 4px 12px; font-size: 12.5px; border: 1px solid var(--line); background: var(--panel); }
+.btn:hover:not(:disabled) { border-color: var(--muted); }
+.btn.good { color: var(--pass); border-color: color-mix(in srgb, var(--pass) 45%, transparent); background: color-mix(in srgb, var(--pass) 10%, transparent); }
+.btn.bad { color: var(--human); border-color: color-mix(in srgb, var(--human) 45%, transparent); background: color-mix(in srgb, var(--human) 10%, transparent); }
+.btn.small { padding: 1px 8px; font-size: 11px; }
+.opt { display: block; width: 100%; text-align: left; margin-top: 6px; padding: 6px 9px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel); }
+.opt:hover:not(:disabled) { border-color: var(--active); }
+.opt .rec { color: var(--changes); font-size: 11px; margin-left: 6px; }
+.opt .d { display: block; color: var(--muted); font-size: 11.5px; }
+.free { display: flex; gap: 6px; margin-top: 7px; }
+input, textarea { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 5px 9px; }
+input:focus, textarea:focus { outline: 1px solid var(--active); border-color: var(--active); }
+.free input { flex: 1; min-width: 0; font-size: 12.5px; }
+.body { font-family: var(--mono); font-size: 11.5px; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 9em; overflow: auto; margin: 2px 0 0; }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+@keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .pulse, .chip.wait { animation: none; } .card.click:hover { transform: none; } }
+
+/* Composer */
+footer { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 28px 12px; position: relative; z-index: 2; }
+.compose { display: flex; gap: 8px; align-items: flex-end; }
+.compose textarea { flex: 1; resize: vertical; min-height: 40px; max-height: 40vh; }
+.compose .btn { height: 34px; }
+.btn.primary { color: var(--bg); background: var(--active); border-color: var(--active); font-weight: 600; }
+.hints { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 7px; font-family: var(--mono); font-size: 11px; color: var(--faint); }
+
+/* Drawer */
+.scrim { position: fixed; inset: 0 0 var(--fh, 0) 0; background: rgba(5, 6, 10, .55); opacity: 0; pointer-events: none; transition: opacity .2s; }
+.drawer {
+	position: fixed; top: 0; right: 0; bottom: var(--fh, 0); width: min(920px, 100vw); background: var(--panel); border-left: 1px solid var(--line);
+	display: grid; grid-template-rows: auto 1fr; transform: translateX(100%); transition: transform .25s ease;
+}
+body.open .scrim { opacity: 1; pointer-events: auto; }
+body.open .drawer { transform: none; }
+.d-head { padding: 18px 24px 14px; border-bottom: 1px solid var(--line); position: relative; }
+.d-head .kind { font-size: 12px; white-space: normal; }
+.d-head h3 { margin: 4px 44px 2px 0; font-size: 16px; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+.close { position: absolute; top: 14px; right: 16px; width: 32px; height: 32px; border-radius: 8px; border: 1px solid var(--line); background: none; color: var(--muted); font-size: 18px; line-height: 1; }
+.close:hover { color: var(--text); border-color: var(--muted); }
+.d-body { display: grid; grid-template-columns: 170px minmax(0, 1fr); min-height: 0; }
+.d-body.single { grid-template-columns: minmax(0, 1fr); }
+.d-body.single .nav { display: none; }
+.nav { border-right: 1px solid var(--line); padding: 14px 10px; overflow-y: auto; }
+.nav button { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: none; border: 0; border-radius: 6px; padding: 5px 8px; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.nav button:hover { background: var(--card); color: var(--text); }
+.nav button.on { background: var(--card-hover); color: var(--text); }
+.v { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); flex: none; }
+.v.good { background: var(--pass); } .v.warn { background: var(--changes); } .v.stop { background: var(--human); } .v.live { background: var(--active); }
+.doc { overflow-y: auto; padding: 20px 28px 60px; min-width: 0; }
+.verdict { display: inline-block; font-family: var(--mono); font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 6px; margin-bottom: 14px; }
+.verdict.good { color: var(--pass); background: color-mix(in srgb, var(--pass) 14%, transparent); }
+.verdict.warn { color: var(--changes); background: color-mix(in srgb, var(--changes) 16%, transparent); }
+.verdict.stop { color: var(--human); background: color-mix(in srgb, var(--human) 16%, transparent); }
+.note { color: var(--faint); font-size: 13px; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 12.5px; margin: 0 0 16px; }
+.kv dt { color: var(--faint); font-family: var(--mono); font-size: 11.5px; }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.list-row { display: flex; gap: 10px; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.list-row .mark { width: 1.2em; flex: none; text-align: center; font-family: var(--mono); color: var(--muted); }
+.list-row.done .mark { color: var(--pass); } .list-row.in_progress .mark { color: var(--active); }
+.list-row.done .txt { color: var(--muted); }
+.list-row .sub { color: var(--faint); font-size: 11.5px; font-family: var(--mono); }
+
+/* Conversation */
+#timeline { display: flex; flex-direction: column; gap: 8px; }
+.msg { max-width: 92%; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line); overflow-wrap: anywhere; }
+.msg.user { align-self: flex-end; background: color-mix(in srgb, var(--active) 9%, var(--card)); border-color: color-mix(in srgb, var(--active) 25%, var(--line)); white-space: pre-wrap; }
+.msg.assistant { align-self: flex-start; background: var(--card); }
+.msg .who { display: block; font-size: 11px; color: var(--faint); margin-bottom: 3px; font-family: var(--mono); }
+.tool { display: flex; gap: 8px; align-items: baseline; padding: 1px 6px; color: var(--muted); font-family: var(--mono); font-size: 12px; min-width: 0; }
+.tool .ico { width: 1em; text-align: center; flex: none; }
+.tool.running .ico { color: var(--active); animation: pulse 1s infinite; }
+.tool.done .ico { color: var(--pass); } .tool.error .ico { color: var(--human); }
+.tool .name { color: var(--text); flex: none; }
+.tool .sum { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+.tool .dur { flex: none; font-size: 11px; color: var(--faint); }
+#live { margin-top: 8px; }
+#live .msg { border-style: dashed; }
+
+/* Rendered markdown */
+.md { line-height: 1.6; }
+.md .t > :first-child, .md > :first-child, .md > .who + * { margin-top: 0; }
+.md > :last-child, .md .t > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md blockquote, .md pre, .md table { margin: 0 0 .75em; }
+.md p, .md li, .md blockquote, .md td, .md th { white-space: pre-wrap; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { line-height: 1.3; margin: 1.2em 0 .45em; }
+.md h1 { font-size: 18px; } .md h2 { font-size: 15px; } .md h3, .md h4, .md h5, .md h6 { font-size: 13.5px; color: var(--muted); }
+.md ul, .md ol { padding-left: 1.3em; }
+.md li { margin: .15em 0; }
+.md li.task { list-style: none; margin-left: -1.3em; }
+.md li.task input { margin: 0 .5em 0 0; vertical-align: -1px; }
+.md code { font-family: var(--mono); font-size: 12px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+.md pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; white-space: pre; }
+.md pre code { background: none; padding: 0; }
+.md blockquote { border-left: 2px solid var(--line); padding-left: 12px; color: var(--muted); }
+.md a { color: var(--active); }
+.md table { border-collapse: collapse; font-size: 13px; display: block; overflow-x: auto; }
+.md th, .md td { border: 1px solid var(--line); padding: 4px 9px; text-align: left; vertical-align: top; }
+.md th { background: var(--card); }
+.md hr { border: 0; border-top: 1px solid var(--line); }
+
+#toast { position: fixed; bottom: 96px; left: 50%; transform: translateX(-50%); background: color-mix(in srgb, var(--human) 18%, var(--panel)); border: 1px solid var(--human); color: var(--text); padding: 7px 14px; border-radius: 8px; font-size: 13px; display: none; z-index: 10; }
+
+@media (max-width: 1200px) { .board { grid-template-columns: repeat(3, minmax(0, 1fr)); row-gap: 26px; } .col-head::after { display: none; } }
+@media (max-width: 700px) {
+	header, .board, footer { padding-left: 14px; padding-right: 14px; }
+	.now { margin: 0 14px; }
+	.board { grid-template-columns: 1fr; }
+	.d-body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+	.nav { border-right: 0; border-bottom: 1px solid var(--line); display: flex; gap: 4px; overflow-x: auto; padding: 8px; }
+	.nav button { width: auto; white-space: nowrap; }
+	.doc { padding: 16px 14px 48px; }
+}
+</style>
+</head>
+<body>
+<header>
+	<h1>brigadev</h1>
+	<span class="where" id="where"></span>
+	<span class="spacer"></span>
+	<button class="hbtn" id="open-tasks" hidden>Tasks<span class="n" id="n-tasks"></span></button>
+	<button class="hbtn" id="open-guard">Guard log<span class="n" id="n-guard"></span></button>
+	<button class="hbtn" id="open-convo">Conversation</button>
+	<span class="mode" id="mode">mode –</span>
+	<span class="status" id="conn"><span class="dot"></span>connecting…</span>
+</header>
+<div class="now" id="now" role="button" tabindex="0" title="Open the conversation"></div>
+<main><div class="board" id="board"></div></main>
+<footer>
+	<div class="compose">
+		<textarea id="input" rows="1" placeholder="Message the agent… (Ctrl/Cmd+Enter to send)"></textarea>
+		<button class="btn primary" id="send" title="Send; queued as a follow-up while the agent is running">Send</button>
+		<button class="btn" id="steer" title="Interrupt the current run with this message">Steer</button>
+		<button class="btn bad" id="abort" title="Abort the current run">Abort</button>
+	</div>
+	<div class="hints"><span id="totals"></span><span>/brigadev:web stop</span><span>esc closes the panel</span></div>
+</footer>
+
+<div id="overlay">
+	<div class="scrim" data-close></div>
+	<aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="d-title">
+		<div class="d-head">
+			<div class="kind" id="d-kind"></div>
+			<h3 id="d-title"></h3>
+			<button class="close" data-close aria-label="Close">×</button>
+		</div>
+		<div class="d-body" id="d-body">
+			<nav class="nav" id="d-nav"></nav>
+			<article class="doc" id="d-doc"></article>
+			<article class="doc" id="convo" hidden>
+				<div id="timeline"></div>
+				<div id="live"></div>
+				<p class="note" id="empty">Nothing yet.</p>
+			</article>
+		</div>
+	</aside>
+</div>
+<div id="toast" role="alert"></div>
+<!-- @inline markdown.js -->
+<script>
+"use strict";
+(function () {
+	// The loop's columns. Each card lands in one at first sight and stays there.
+	var COLUMNS = [
+		{ id: "explore", label: "Explore", who: "read · research" },
+		{ id: "decide", label: "Decide", who: "plan · your choices" },
+		{ id: "implement", label: "Implement", who: "edits · workers" },
+		{ id: "check", label: "Check", who: "tests · verify · review" },
+		{ id: "commit", label: "Commit", who: "git · PR" },
+		{ id: "you", label: "Needs you", who: "your call", cls: "human" },
+	];
+	var STEPS = ["authorize", "explore", "decide", "implement", "check", "commit", "close"];
+	var STEP_COLUMN = { authorize: "explore", explore: "explore", decide: "decide", implement: "implement", check: "check", commit: "commit", close: "commit" };
+	var MAX_PER_COLUMN = 14;
+	var MAX_TIMELINE = 1000;
+
+	// Sign-in. The link carries a one-time code (valid 60 s, spent on first use). It is read here and removed from the
+	// address at once, so neither the browser's history nor a copied URL ever holds it; the page then trades it for a
+	// session secret. The secret lives only in the SECRET variable below: never in browser storage, a cookie, the
+	// address bar or a query string. A reload has no code, so it needs a new link (/brigadev:web open in pi).
+	var SECRET = "";
+	var CODE = new URLSearchParams(location.search).get("code") || "";
+	if (location.search) history.replaceState(null, "", location.pathname);
+	var LINK_MESSAGE = "This link was already used or expired. In pi, run /brigadev:web open for a new one.";
+	var ENDED_MESSAGE = "This session ended (pi stopped the web UI or restarted it). In pi, run /brigadev:web open for a new link.";
+
+	var state = {
+		session: null, phase: null, mode: null, running: false, runNo: 0, live: { active: false, text: "" },
+		fatal: "", timeline: new Map(), agents: new Map(), agentCol: new Map(), prompts: new Map(), promptCol: new Map(),
+		checks: [], todos: [], guard: [], work: new Map(), commits: new Map(), toolCol: new Map(),
+	};
+	var pending = new Set(); // prompt/agent ids with an action in flight
+	var view = null; // the open drawer: { kind: "agent" | "check" | "convo" | "tasks" | "guard", id?, tab? }
+
+	// ---- tiny DOM helpers: text only goes in through textContent, never innerHTML ----
+	function h(tag, props) {
+		var el = document.createElement(tag);
+		if (props) for (var k in props) {
+			var v = props[k];
+			if (v === undefined || v === null || v === false) continue;
+			if (k === "class") el.className = v;
+			else if (k === "text") el.textContent = String(v);
+			else if (k === "title") el.title = String(v);
+			else if (k.slice(0, 2) === "on") el.addEventListener(k.slice(2), v);
+			else if (k === "disabled") el.disabled = !!v;
+			else el.setAttribute(k, String(v));
+		}
+		for (var i = 2; i < arguments.length; i++) append(el, arguments[i]);
+		return el;
+	}
+	function append(el, c) {
+		if (c === undefined || c === null || c === false) return;
+		if (Array.isArray(c)) { c.forEach(function (x) { append(el, x); }); return; }
+		el.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+	}
+	function $(id) { return document.getElementById(id); }
+	function time(at) { return at ? new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""; }
+	function clock(at) { return new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
+	function span(ms) {
+		if (!(ms >= 0)) return "";
+		if (ms < 1000) return "<1s";
+		var s = Math.floor(ms / 1000);
+		if (s < 60) return s + "s";
+		var m = Math.floor(s / 60);
+		return m < 60 ? m + "m" + (m < 10 ? String(s % 60).padStart(2, "0") + "s" : "") : Math.floor(m / 60) + "h" + String(m % 60).padStart(2, "0") + "m";
+	}
+	function tokens(n) { return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n || 0); }
+	function money(n) { return "$" + Number(n || 0).toFixed(2); }
+	function stop(fn) { return function (e) { e.stopPropagation(); fn(e); }; }
+	function toast(message) {
+		var el = $("toast");
+		el.textContent = String(message);
+		el.style.display = "block";
+		clearTimeout(toast.t);
+		toast.t = setTimeout(function () { el.style.display = "none"; }, 5000);
+	}
+
+	// Keeps `parent`'s children in the order of `items`, rebuilding only the ones whose signature changed.
+	function reconcile(parent, items, keyOf, build) {
+		var existing = new Map();
+		Array.prototype.forEach.call(parent.children, function (el) { if (el._key !== undefined) existing.set(el._key, el); });
+		var seen = new Set(), prev = null;
+		items.forEach(function (item) {
+			var key = keyOf(item), sig = JSON.stringify(item), el = existing.get(key);
+			if (!el || el._sig !== sig) {
+				var next = build(item);
+				next._key = key; next._sig = sig;
+				if (el) el.replaceWith(next);
+				el = next;
+			}
+			seen.add(key);
+			var expected = prev ? prev.nextElementSibling : parent.firstElementChild;
+			if (expected !== el) parent.insertBefore(el, expected);
+			prev = el;
+		});
+		existing.forEach(function (el, key) { if (!seen.has(key)) el.remove(); });
+		Array.prototype.slice.call(parent.children).forEach(function (el) { if (el._key === undefined) el.remove(); });
+	}
+
+	// ---- markdown: the parser's tree becomes DOM nodes through h(), so text never becomes markup ----
+	var MD = window.brigadevMarkdown;
+	function mdInline(nodes) {
+		return nodes.map(function (n) {
+			if (n.t === "code") return h("code", { text: n.v });
+			if (n.t === "b") return h("strong", null, mdInline(n.c));
+			if (n.t === "i") return h("em", null, mdInline(n.c));
+			if (n.t === "a" && /^https?:\/\//i.test(n.href)) return h("a", { href: n.href, target: "_blank", rel: "noopener noreferrer" }, mdInline(n.c));
+			return document.createTextNode(String(n.v != null ? n.v : ""));
+		});
+	}
+	function mdBlock(b) {
+		switch (b.t) {
+			case "h": return h("h" + Math.min(6, Math.max(1, b.level | 0)), null, mdInline(b.c));
+			case "code": return h("pre", { title: b.lang || null }, h("code", { text: b.text }));
+			case "hr": return h("hr");
+			case "quote": return h("blockquote", null, mdInline(b.c));
+			case "ul": case "ol":
+				return h(b.t, b.t === "ol" && b.start !== 1 ? { start: b.start } : null, b.items.map(function (it) {
+					var box = it.check === null ? null : h("input", { type: "checkbox", disabled: true });
+					if (box) box.checked = it.check;
+					return h("li", { class: box ? "task" : null }, box, mdInline(it.c));
+				}));
+			case "table":
+				return h("table", null,
+					h("thead", null, h("tr", null, b.head.map(function (c) { return h("th", null, mdInline(c)); }))),
+					h("tbody", null, b.rows.map(function (row) { return h("tr", null, row.map(function (c) { return h("td", null, mdInline(c)); })); })));
+			default: return h("p", null, mdInline(b.c || []));
+		}
+	}
+	/** Markdown as DOM nodes; plain text when the parser is missing or fails. */
+	function markdown(text) {
+		var wrap = document.createDocumentFragment();
+		try {
+			if (!MD) throw new Error("no parser");
+			MD.parse(text).forEach(function (b) { wrap.appendChild(mdBlock(b)); });
+		} catch (e) {
+			wrap.replaceChildren(h("p", { text: text }));
+		}
+		return wrap;
+	}
+	/** A verdict line at the top of a result (Status: PASS, VERDICT: CHANGES, ...) and its tone. */
+	function verdictOf(text) {
+		var first = String(text || "").split("\n")[0].replace(/[*_`#]/g, "").trim();
+		if (first.length > 80) return null;
+		if (/\b(UNVERIFIED|CHANGES|NEEDS[- ]INFO|PARTIAL|WARN(ING)?S?)\b/i.test(first)) return { line: first, tone: "warn" };
+		if (/\b(FAIL(ED)?|BLOCKED|BLOCKERS?|REJECT(ED)?|ESCALATE)\b/i.test(first)) return { line: first, tone: "stop" };
+		if (/\b(PASS(ED)?|VERIFIED|APPROVED?|READY|OK|DONE)\b/i.test(first)) return { line: first, tone: "good" };
+		return null;
+	}
+
+	// ---- actions ----
+	function post(body) {
+		return fetch("/action", { method: "POST", headers: { "content-type": "application/json", "Authorization": "Bearer " + SECRET }, body: JSON.stringify(body) })
+			.then(function (res) {
+				if (res.status === 401) { end(ENDED_MESSAGE); throw new Error(ENDED_MESSAGE); }
+				// 409: the action no longer applies (a prompt answered in the terminal or closed by an abort); the server says why.
+				if (res.status === 409) return res.json().then(function (b) { throw new Error((b && b.error) || "no longer applies"); }, function () { throw new Error("no longer applies"); });
+				if (res.status !== 202) throw new Error("action rejected (" + res.status + ")");
+			});
+	}
+	function act(key, body, done) {
+		if (key) { pending.add(key); render(); }
+		post(body).then(function () { if (done) done(); }, function (e) { toast(e.message || e); })
+			.then(function () { if (key) { pending.delete(key); render(); } });
+	}
+
+	// ---- where things land ----
+	function stepColumn() { var p = state.phase && state.phase.phase; return STEP_COLUMN[p] || null; }
+	var COMMIT_CMD = /^\s*(git\s+(commit|push|tag|merge|rebase)|gh\s+(pr|release)\s+(create|merge|edit|ready))\b/;
+	var TEST_CMD = /\b(npm\s+(run\s+)?test|node\s+--test|pytest|cargo\s+test|go\s+test|vitest|jest|make\s+test)\b/;
+	function agentColumn(name) {
+		var n = String(name || "").toLowerCase();
+		if (/verif|review|audit|lint/.test(n)) return "check";
+		if (/plan|oracle|design/.test(n)) return "decide";
+		if (/explor|research|scout|search/.test(n)) return "explore";
+		if (/work|writ|implement|build|fix/.test(n)) return "implement";
+		return stepColumn() || "implement";
+	}
+	/** A tool call of the main agent: its column, "commit" for its own card, or null when another card shows it. */
+	function toolColumn(name, summary) {
+		if (/^(subagent|ask_user_choice|todo|check|compress|decompress|acp_\w+|bg_\w+)$/.test(name)) return null;
+		if (/^(read|grep|find|ls|glob|web_?search|fetch|search_context)$/.test(name)) return "explore";
+		if (/^(edit|write|multi_?edit|apply_patch)$/.test(name)) return "implement";
+		if (name === "bash") {
+			if (COMMIT_CMD.test(summary)) return "commit";
+			if (TEST_CMD.test(summary)) return "check";
+		}
+		return stepColumn() || "explore";
+	}
+
+	// ---- folding events into state ----
+	function fold(event) {
+		if (!event || typeof event.type !== "string") return;
+		var d = event.data || {};
+		switch (event.type) {
+			case "session": state.session = d; break;
+			case "brigadev_phase": state.phase = d; break;
+			case "brigadev_mode": state.mode = d.mode || null; break;
+			case "run": state.running = !!d.running; break;
+			case "assistant_live": state.live = { active: !!d.active, text: String(d.text || "") }; break;
+			case "message":
+				// A user message starts a turn: the main agent's work after it groups under that turn (replays keep messages, unlike run events).
+				if (d.role === "user" && !state.timeline.has("m:" + d.id)) state.runNo++;
+				putTimeline("m:" + d.id, event.seq, "message", d);
+				break;
+			case "tool": putTimeline("t:" + d.id, event.seq, "tool", d); foldWork(d); break;
+			case "brigadev_agent":
+				if (!d.id) break;
+				if (!state.agentCol.has(d.id)) state.agentCol.set(d.id, agentColumn(d.agent));
+				state.agents.set(d.id, d);
+				break;
+			case "brigadev_prompt":
+				if (!d.id) break;
+				if (d.status !== "open" && !state.promptCol.has(d.id)) {
+					state.promptCol.set(d.id, d.kind === "choice" ? "decide" : COMMIT_CMD.test(d.body || "") ? "commit" : stepColumn() || "implement");
+				}
+				state.prompts.set(d.id, d);
+				break;
+			case "brigadev_check": state.checks.unshift(d); state.checks.length = Math.min(state.checks.length, 40); break;
+			case "brigadev_guard": state.guard.unshift(d); state.guard.length = Math.min(state.guard.length, 200); break;
+			case "brigadev_todo": state.todos = Array.isArray(d.todos) ? d.todos : []; break;
+		}
+	}
+	function putTimeline(key, seq, kind, data) {
+		var old = state.timeline.get(key);
+		state.timeline.set(key, { key: key, seq: old ? old.seq : seq, kind: kind, data: data });
+		if (state.timeline.size > MAX_TIMELINE) state.timeline.delete(state.timeline.keys().next().value);
+	}
+	/** The main agent's own tool calls, grouped per run and column into one "work" card (commits get their own). */
+	function foldWork(d) {
+		var name = String(d.name || ""), summary = String(d.summary || "");
+		if (!state.toolCol.has(d.id)) state.toolCol.set(d.id, toolColumn(name, summary));
+		var col = state.toolCol.get(d.id);
+		if (!col) return;
+		if (col === "commit" && name === "bash") {
+			var prev = state.commits.get(d.id);
+			state.commits.set(d.id, { id: d.id, cmd: summary, status: d.status, at: prev ? prev.at : d.at || Date.now(), durationMs: d.durationMs });
+			return;
+		}
+		var key = state.runNo + ":" + col;
+		var w = state.work.get(key);
+		if (!w) { w = { key: key, col: col, run: state.runNo, counts: {}, recent: [], calls: new Map(), first: d.at || Date.now(), at: 0 }; state.work.set(key, w); }
+		if (!w.calls.has(d.id)) {
+			w.counts[name] = (w.counts[name] || 0) + 1;
+			w.recent.push({ id: d.id, name: name, summary: summary });
+			if (w.recent.length > 4) w.recent.shift();
+		}
+		w.calls.set(d.id, d.status);
+		w.at = d.at || Date.now();
+	}
+
+	// ---- rendering ----
+	var scheduled = false;
+	function render() {
+		if (scheduled) return;
+		scheduled = true;
+		requestAnimationFrame(function () { scheduled = false; draw(); });
+	}
+
+	function drawHeader() {
+		var s = state.session;
+		$("where").replaceChildren();
+		if (s) append($("where"), [h("b", { text: s.project || "" }), s.branch ? " · " + s.branch : ""]);
+		var mode = $("mode");
+		mode.textContent = "mode " + (state.mode || "–");
+		mode.className = "mode" + (state.mode === "yolo" ? " yolo" : "");
+		var todos = state.todos || [];
+		$("open-tasks").hidden = !todos.length;
+		$("n-tasks").textContent = todos.length ? todos.filter(function (t) { return /^(done|completed)$/.test(t.status); }).length + "/" + todos.length : "";
+		$("n-guard").textContent = state.guard.length ? String(state.guard.length) : "";
+	}
+
+	function drawNow() {
+		var p = state.phase || {}, now = $("now");
+		var step = state.running && p.phase && p.phase !== "idle" ? p.phase : null;
+		var typing = state.live.active && state.live.text ? state.live.text.replace(/[*_`#>|]+/g, "").replace(/\s+/g, " ").trim().slice(-220) : "";
+		var sig = JSON.stringify([step, p.detail, typing, state.running]);
+		if (now._sig === sig) return;
+		now._sig = sig;
+		now.replaceChildren(
+			state.running ? h("span", { class: "pulse", "aria-label": "running" }) : h("span", { class: "idle-dot" }),
+			h("span", { class: "step", text: step ? step.charAt(0).toUpperCase() + step.slice(1) : state.running ? "Working" : "Idle" }),
+			p.detail && state.running ? h("span", { class: "detail", text: p.detail }) : null,
+			typing ? h("span", { class: "typing", text: "“" + typing + "”" }) : h("span", { class: "typing", text: state.running ? "" : "Send a message below, or open the conversation." }),
+			step ? h("span", { class: "inferred", text: "inferred" }) : null);
+	}
+
+	// One view model per card: plain data, so reconcile can tell when it changed.
+	function cardsByColumn() {
+		var cols = {};
+		COLUMNS.forEach(function (c) { cols[c.id] = []; });
+		var now = Date.now();
+		state.agents.forEach(function (a) {
+			var live = a.status === "running" || a.status === "queued";
+			cols[state.agentCol.get(a.id) || "implement"].push({
+				kind: "agent", id: a.id, at: a.startedAt || 0, agent: a.agent, title: a.task, status: a.status, live: live,
+				model: a.model, tokens: a.tokens, cost: a.cost, elapsed: a.startedAt ? span((a.endedAt || now) - a.startedAt) : "",
+				tail: live ? (a.partial || "").slice(-220) : "", verdict: a.output ? verdictOf(a.output) : null,
+				cancel: a.cancellable && live, busy: pending.has("a:" + a.id),
+			});
+		});
+		state.work.forEach(function (w) {
+			var running = 0;
+			w.calls.forEach(function (st) { if (st === "running") running++; });
+			cols[w.col].push({
+				kind: "work", id: w.key, at: w.first, run: w.run, live: running > 0 && state.running,
+				counts: Object.keys(w.counts).map(function (k) { return w.counts[k] + " " + k; }).join(" · "),
+				recent: w.recent.map(function (r) { return { name: r.name, summary: r.summary }; }), last: time(w.at),
+			});
+		});
+		state.commits.forEach(function (c) {
+			cols.commit.push({ kind: "commit", id: c.id, at: c.at, cmd: c.cmd, status: c.status, when: time(c.at) });
+		});
+		state.checks.forEach(function (c) {
+			cols.check.push({ kind: "check", id: c.id, at: c.at, cmd: c.command, outcome: String(c.outcome || ""), counts: c.counts, dur: c.durationMs != null ? span(c.durationMs) : "", when: time(c.at) });
+		});
+		state.prompts.forEach(function (p) {
+			var open = p.status === "open";
+			cols[open ? "you" : state.promptCol.get(p.id) || "implement"].push({
+				kind: "prompt", id: p.id, at: p.at || 0, open: open, p: p, busy: pending.has("p:" + p.id),
+			});
+		});
+		Object.keys(cols).forEach(function (k) { cols[k].sort(function (a, b) { return (b.at || 0) - (a.at || 0); }); });
+		return cols;
+	}
+
+	function drawBoard() {
+		var board = $("board"), cols = cardsByColumn();
+		var p = state.phase || {}, visited = Array.isArray(p.visited) ? p.visited : [];
+		var current = state.running ? STEP_COLUMN[p.phase] : null;
+		var visitedCols = new Set(visited.map(function (s) { return STEP_COLUMN[s]; }));
+		reconcile(board, COLUMNS, function (c) { return c.id; }, function (c) {
+			var list = h("div", { class: "cards" });
+			var col = h("section", { class: "col " + (c.cls || "") },
+				h("div", { class: "col-head" }, h("h2", { text: c.label }), h("span", { class: "who", text: c.who }), h("span", { class: "count" })),
+				list);
+			col._list = list;
+			return col;
+		});
+		Array.prototype.forEach.call(board.children, function (colEl) {
+			var c = COLUMNS.find(function (x) { return x.id === colEl._key; });
+			var items = cols[c.id];
+			colEl.className = "col " + (c.cls || "") + (current === c.id ? " current" : "") + (c.id !== "you" && !visitedCols.has(c.id) && !items.length ? " unvisited" : "");
+			colEl.querySelector(".count").textContent = items.length ? String(items.length) : "";
+			var shown = items.slice(0, MAX_PER_COLUMN);
+			var rows = shown.length ? shown : [{ kind: "empty", id: "empty" }];
+			if (items.length > shown.length) rows = rows.concat([{ kind: "older", id: "older", n: items.length - shown.length }]);
+			reconcile(colEl._list, rows, function (i) { return i.kind + ":" + i.id; }, buildCard);
+		});
+	}
+
+	function buildCard(i) {
+		switch (i.kind) {
+			case "empty": return h("div", { class: "empty", text: "—" });
+			case "older": return h("div", { class: "older", text: "+" + i.n + " older" });
+			case "agent": return agentCard(i);
+			case "work": return workCard(i);
+			case "commit": return commitCard(i);
+			case "check": return checkCard(i);
+			case "prompt": return i.open ? openPromptCard(i) : settledPromptCard(i);
+		}
+		return h("div");
+	}
+	function clickable(el, open) {
+		el.classList.add("click");
+		el.tabIndex = 0;
+		el.addEventListener("click", function (e) { if (!e.target.closest("button, input, a")) open(); });
+		el.addEventListener("keydown", function (e) { if ((e.key === "Enter" || e.key === " ") && e.target === el) { e.preventDefault(); open(); } });
+		return el;
+	}
+	function agentCard(i) {
+		var bad = i.status === "failed";
+		var el = h("article", { class: "card" + (i.live ? " live" : "") + (bad ? " bad" : "") + (!i.live && !bad ? " settled" : "") },
+			h("div", { class: "card-top" }, i.live ? h("span", { class: "pulse" }) : null, h("span", { class: "kind", text: i.agent }), h("span", { class: "flag " + i.status, text: i.status })),
+			h("p", { class: "title", text: i.title || "" }),
+			i.tail ? h("div", { class: "tail", text: i.tail }) : null,
+			i.verdict ? h("div", { class: "chips" }, h("span", { class: "chip " + ({ good: "pass", warn: "warn", stop: "fail" })[i.verdict.tone], text: i.verdict.line })) : null,
+			h("div", { class: "meta" }, [i.model ? h("span", { text: String(i.model).split("/").pop() }) : null, h("span", { text: tokens(i.tokens) + " tok" }), h("span", { text: money(i.cost) }), i.elapsed ? h("span", { text: i.elapsed }) : null]),
+			i.cancel ? h("div", { class: "actions" }, h("button", { class: "btn bad small", text: "Cancel", disabled: i.busy, onclick: stop(function () { act("a:" + i.id, { action: "cancel-agent", id: i.id }); }) })) : null);
+		return clickable(el, function () { openView({ kind: "agent", id: i.id }); });
+	}
+	function workCard(i) {
+		var el = h("article", { class: "card" + (i.live ? " live" : " settled") },
+			h("div", { class: "card-top" }, i.live ? h("span", { class: "pulse" }) : null, h("span", { class: "kind", text: "main agent" + (i.run ? " · turn " + i.run : "") }), h("span", { class: "flag", text: i.last })),
+			h("p", { class: "title", text: i.counts }),
+			h("div", { class: "steps" }, i.recent.map(function (r) { return h("div", { title: r.summary }, h("span", { class: "t", text: r.name + " " }), r.summary); })));
+		return clickable(el, function () { openView({ kind: "convo" }); });
+	}
+	function commitCard(i) {
+		var flag = i.status === "running" ? "running" : i.status === "error" ? "failed" : "done";
+		var el = h("article", { class: "card" + (i.status === "running" ? " live" : "") + (i.status === "error" ? " bad" : " settled") },
+			h("div", { class: "card-top" }, i.status === "running" ? h("span", { class: "pulse" }) : null, h("span", { class: "kind", text: /^\s*gh\b/.test(i.cmd) ? "github" : "git" }), h("span", { class: "flag " + flag, text: flag === "done" ? i.when : flag })),
+			h("p", { class: "title code", text: i.cmd }));
+		return clickable(el, function () { openView({ kind: "convo" }); });
+	}
+	function countChips(counts) {
+		if (!counts || typeof counts !== "object") return [];
+		return Object.keys(counts).map(function (k) {
+			var n = counts[k], tone = /fail/i.test(k) ? (n ? "fail" : "") : /pass/i.test(k) ? "pass" : "";
+			return h("span", { class: "chip " + tone, text: k + " " + n });
+		});
+	}
+	function checkCard(i) {
+		var pass = /^pass/i.test(i.outcome);
+		var el = h("article", { class: "card" + (pass ? " settled" : " bad") },
+			h("div", { class: "card-top" }, h("span", { class: "kind", text: "check" }), h("span", { class: "flag " + (pass ? "pass" : "fail"), text: i.outcome || "?" })),
+			h("p", { class: "title code", text: i.cmd }),
+			h("div", { class: "chips" }, countChips(i.counts)),
+			h("div", { class: "meta" }, i.dur ? h("span", { text: i.dur }) : null, h("span", { text: i.when })));
+		return clickable(el, function () { openView({ kind: "check", id: i.id }); });
+	}
+	function openPromptCard(i) {
+		var p = i.p, busy = i.busy;
+		var answer = function (value) { act("p:" + p.id, { action: "answer", id: p.id, value: value }); };
+		var parts = [];
+		if (p.kind === "confirm") {
+			parts.push(h("div", { class: "actions" },
+				h("button", { class: "btn good", text: "Approve", disabled: busy, onclick: function () { answer(true); } }),
+				h("button", { class: "btn bad", text: "Deny", disabled: busy, onclick: function () { answer(false); } })));
+		} else {
+			(p.options || []).forEach(function (o, idx) {
+				parts.push(h("button", { class: "opt", disabled: busy, onclick: function () { answer(o.label); } },
+					h("span", { text: o.label }), p.recommended === idx + 1 ? h("span", { class: "rec", text: "★ recommended" }) : null,
+					o.description ? h("span", { class: "d", text: o.description }) : null));
+			});
+			if (p.allowOther !== false) {
+				var input = h("input", { type: "text", placeholder: "Other…", maxlength: "2000" });
+				var send = function () { var v = input.value.trim(); if (v) answer(v); };
+				input.addEventListener("keydown", function (e) { if (e.key === "Enter") send(); });
+				parts.push(h("div", { class: "free" }, input, h("button", { class: "btn", text: "Send", disabled: busy, onclick: send })));
+			}
+		}
+		return h("article", { class: "card human" },
+			h("div", { class: "card-top" }, h("span", { class: "kind", text: p.source || "prompt" }), h("span", { class: "flag call", text: "your call" })),
+			h("p", { class: "title", text: p.title }),
+			p.body ? h("div", { class: "body", text: p.body }) : null,
+			parts);
+	}
+	function settledPromptCard(i) {
+		var p = i.p;
+		var ans = typeof p.answer === "boolean" ? (p.answer ? "approved" : "denied") : p.answer == null ? "dismissed" : String(p.answer);
+		var flag = typeof p.answer === "boolean" ? ans : p.answer == null ? "wait" : "done";
+		return h("article", { class: "card settled" },
+			h("div", { class: "card-top" }, h("span", { class: "kind", text: (p.kind === "choice" ? "you chose" : p.source || "prompt") }), h("span", { class: "flag " + flag, text: typeof p.answer === "boolean" ? ans : time(p.at) })),
+			h("p", { class: "title", text: p.title }),
+			h("div", { class: "chips" }, typeof p.answer === "boolean" ? null : h("span", { class: "chip info", text: ans }), p.by ? h("span", { class: "chip", text: "in the " + (p.by === "web" ? "browser" : "terminal") }) : null));
+	}
+
+	// ---- drawer ----
+	function openView(v) {
+		view = v;
+		document.body.classList.add("open");
+		var d = $("d-doc"); d._sig = null; d.scrollTop = 0;
+		render();
+	}
+	function closeView() {
+		view = null;
+		document.body.classList.remove("open");
+	}
+	function drawDrawer() {
+		if (!view) return;
+		var convo = view.kind === "convo";
+		$("convo").hidden = !convo;
+		$("d-doc").hidden = convo;
+		if (convo) {
+			$("d-body").className = "d-body single";
+			$("d-nav").replaceChildren();
+			$("d-kind").textContent = state.running ? "main agent · running" : "main agent · idle";
+			$("d-title").textContent = "Conversation";
+			return;
+		}
+		var content = view.kind === "agent" ? agentDoc() : view.kind === "check" ? checkDoc() : view.kind === "tasks" ? tasksDoc() : guardDoc();
+		if (!content) { closeView(); return; }
+		$("d-kind").textContent = content.kind;
+		$("d-title").textContent = content.title;
+		$("d-body").className = "d-body" + (content.tabs ? "" : " single");
+		$("d-nav").replaceChildren.apply($("d-nav"), (content.tabs || []).map(function (t) {
+			return h("button", { class: t.id === content.tab ? "on" : "", onclick: function () { view.tab = t.id; $("d-doc")._sig = null; $("d-doc").scrollTop = 0; render(); } },
+				h("span", { class: "v " + (t.tone || "") }), t.label);
+		}));
+		var doc = $("d-doc"), sig = JSON.stringify(content.sig);
+		if (doc._sig === sig) return;
+		doc._sig = sig;
+		doc.replaceChildren(content.build());
+	}
+	function kv(pairs) {
+		return h("dl", { class: "kv" }, pairs.filter(function (p) { return p[1] != null && p[1] !== ""; }).map(function (p) { return [h("dt", { text: p[0] }), h("dd", { text: String(p[1]) })]; }));
+	}
+	function agentDoc() {
+		var a = state.agents.get(view.id);
+		if (!a) return null;
+		var live = a.status === "running" || a.status === "queued";
+		var verdict = a.output ? verdictOf(a.output) : null;
+		var tabs = [
+			{ id: "output", label: "Output", tone: live ? "live" : a.status === "failed" ? "stop" : verdict ? verdict.tone : a.status === "done" ? "good" : "warn" },
+			{ id: "activity", label: "Activity", tone: live ? "live" : "" },
+			{ id: "task", label: "Task" },
+		];
+		var tab = view.tab || (live ? "activity" : "output");
+		var elapsed = a.startedAt ? span((a.endedAt || Date.now()) - a.startedAt) : "";
+		return {
+			kind: [a.agent, a.status, a.model, tokens(a.tokens) + " tok", money(a.cost), elapsed].filter(Boolean).join(" · "),
+			title: a.task, tabs: tabs, tab: tab,
+			sig: [tab, a.status, a.output, a.partial, a.steps, a.taskText, a.reason],
+			build: function () {
+				var wrap = h("div", { class: "md" });
+				if (tab === "task") {
+					append(wrap, kv([["agent", a.agent], ["model", a.model], ["thinking", a.thinking], ["reason", a.reason], ["run", a.runId]]));
+					append(wrap, markdown(a.taskText || a.task || ""));
+				} else if (tab === "activity") {
+					if (a.steps && a.steps.length) append(wrap, h("div", { class: "steps" }, a.steps.map(function (s) { return h("div", { title: s.summary }, h("span", { class: "t", text: s.tool + " " }), s.summary); })));
+					else append(wrap, h("p", { class: "note", text: a.status === "queued" ? "Waiting for a slot." : "No tool calls yet." }));
+					if (a.partial) append(wrap, [h("h3", { text: "Writing" }), markdown(a.partial)]);
+				} else if (a.output) {
+					if (verdict) append(wrap, h("div", { class: "verdict " + verdict.tone, text: verdict.line }));
+					append(wrap, markdown(verdict ? a.output.split("\n").slice(1).join("\n") : a.output));
+				} else {
+					append(wrap, h("p", { class: "note", text: live ? "Still running: the output appears when it ends." : "No output." }));
+				}
+				return wrap;
+			},
+		};
+	}
+	function checkDoc() {
+		var c = state.checks.find(function (x) { return x.id === view.id; });
+		if (!c) return null;
+		return {
+			kind: "check · " + c.outcome + (c.durationMs != null ? " · " + span(c.durationMs) : "") + " · " + time(c.at), title: c.command,
+			sig: [c.id, c.at],
+			build: function () {
+				return h("div", { class: "md" }, h("div", { class: "verdict " + (/^pass/i.test(c.outcome) ? "good" : "stop"), text: String(c.outcome).toUpperCase() }),
+					kv([["command", c.command], ["exit code", c.exitCode], ["duration", c.durationMs != null ? span(c.durationMs) : ""], ["at", clock(c.at)]]),
+					h("div", { class: "chips" }, countChips(c.counts)));
+			},
+		};
+	}
+	function tasksDoc() {
+		var marks = { done: "✓", completed: "✓", in_progress: "▸", pending: "○", blocked: "■", dropped: "×" };
+		var todos = state.todos || [];
+		return {
+			kind: "tasks · " + $("n-tasks").textContent, title: "Tasks", sig: [todos],
+			build: function () {
+				if (!todos.length) return h("p", { class: "note", text: "No tasks." });
+				return h("div", null, todos.map(function (t) {
+					return h("div", { class: "list-row " + t.status }, h("span", { class: "mark", text: marks[t.status] || "○" }),
+						h("span", { class: "txt" }, h("span", { class: "sub", text: t.id + "  " }), t.text, t.note ? h("div", { class: "sub", text: t.note }) : null));
+				}));
+			},
+		};
+	}
+	function guardDoc() {
+		return {
+			kind: "guard · " + state.guard.length + " decisions", title: "Guard log", sig: [state.guard.length, state.guard[0] && state.guard[0].id],
+			build: function () {
+				if (!state.guard.length) return h("p", { class: "note", text: "No guard decisions yet." });
+				return h("div", null, state.guard.map(function (g) {
+					return h("div", { class: "list-row" }, h("span", { class: "chip " + (g.action === "block" ? "fail" : g.action === "confirm" ? "warn" : "pass"), text: g.action }),
+						h("span", { class: "txt" }, h("span", { class: "mono", text: (g.tool || "") + " " }), g.subject || "", g.reason ? h("div", { class: "sub", text: g.reason }) : null),
+						h("span", { class: "sub", text: time(g.at) }));
+				}));
+			},
+		};
+	}
+
+	function drawTimeline() {
+		var convo = $("convo");
+		var stick = convo.scrollHeight - convo.scrollTop - convo.clientHeight < 80;
+		var items = Array.from(state.timeline.values()).sort(function (a, b) { return a.seq - b.seq; });
+		reconcile($("timeline"), items, function (i) { return i.key; }, function (i) {
+			var d = i.data;
+			if (i.kind === "message") {
+				var user = d.role === "user";
+				return h("div", { class: "msg " + (user ? "user" : "assistant md") },
+					h("span", { class: "who", text: (user ? "you" : "assistant") + (d.at ? " · " + time(d.at) : "") }), user ? String(d.text || "") : markdown(String(d.text || "")));
+			}
+			var icon = d.status === "running" ? "●" : d.status === "error" ? "✗" : "✓";
+			return h("div", { class: "tool " + (d.status || "") },
+				h("span", { class: "ico", text: icon }), h("span", { class: "name", text: (d.parentId ? "↳ " : "") + (d.name || "tool"), title: d.parentId ? "called from a script (" + d.parentId + ")" : null }),
+				h("span", { class: "sum", text: d.summary || "", title: d.summary || "" }),
+				d.durationMs != null ? h("span", { class: "dur", text: d.durationMs >= 1000 ? (d.durationMs / 1000).toFixed(1) + "s" : Math.round(d.durationMs) + "ms" }) : null);
+		});
+		var empty = $("empty");
+		if (state.fatal) { empty.textContent = state.fatal; empty.hidden = false; }
+		else { empty.textContent = "Nothing yet."; empty.hidden = !!(items.length || state.live.active); }
+		var live = $("live");
+		if (state.live.active && state.live.text) {
+			if (!live.firstChild) live.appendChild(h("div", { class: "msg assistant md" }, h("span", { class: "who", text: "assistant · typing…" }), h("div", { class: "t" })));
+			var body = live.querySelector(".t");
+			if (body._text !== state.live.text) { body._text = state.live.text; body.replaceChildren(markdown(state.live.text)); }
+		} else live.replaceChildren();
+		if (stick) convo.scrollTop = convo.scrollHeight;
+	}
+
+	function drawTotals() {
+		var running = 0, cost = 0;
+		state.agents.forEach(function (a) { cost += Number(a.cost || 0); if (a.status === "running") running++; });
+		var open = 0;
+		state.prompts.forEach(function (p) { if (p.status === "open") open++; });
+		$("totals").textContent = [running + " agents running", money(cost) + " in subagents", open ? open + " waiting on you" : ""].filter(Boolean).join(" · ");
+		document.title = (open ? "(" + open + ") " : "") + "brigadev" + (state.session && state.session.project ? " · " + state.session.project : "");
+	}
+
+	function draw() { drawHeader(); drawNow(); drawBoard(); drawTimeline(); drawDrawer(); drawTotals(); }
+	// Elapsed times move while anything runs.
+	setInterval(function () {
+		var any = state.running;
+		state.agents.forEach(function (a) { if (a.status === "running") any = true; });
+		if (any) render();
+	}, 1000);
+
+	// ---- wiring ----
+	// The panel stops above the composer, so you can type while reading it.
+	function footerHeight() { document.documentElement.style.setProperty("--fh", document.querySelector("footer").offsetHeight + "px"); }
+	if (window.ResizeObserver) new ResizeObserver(footerHeight).observe(document.querySelector("footer"));
+	footerHeight();
+	document.addEventListener("click", function (e) { if (e.target.closest("[data-close]")) closeView(); });
+	document.addEventListener("keydown", function (e) { if (e.key === "Escape" && view) closeView(); });
+	$("now").addEventListener("click", function () { openView({ kind: "convo" }); });
+	$("now").addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openView({ kind: "convo" }); } });
+	$("open-convo").addEventListener("click", function () { openView({ kind: "convo" }); });
+	$("open-tasks").addEventListener("click", function () { openView({ kind: "tasks" }); });
+	$("open-guard").addEventListener("click", function () { openView({ kind: "guard" }); });
+
+	function sendText(mode) {
+		var box = $("input"), text = box.value.trim();
+		if (!text) return;
+		var body = { action: "prompt", text: text };
+		if (mode === "steer") body.deliverAs = "steer";
+		else if (state.running) body.deliverAs = "followUp";
+		act(null, body, function () { box.value = ""; });
+	}
+	$("send").addEventListener("click", function () { sendText("send"); });
+	$("steer").addEventListener("click", function () { sendText("steer"); });
+	$("abort").addEventListener("click", function () { act(null, { action: "abort" }); });
+	$("input").addEventListener("keydown", function (e) { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendText("send"); } });
+
+	function setConn(text, ok) {
+		var c = $("conn");
+		c.className = "status" + (ok ? "" : " off");
+		c.replaceChildren(h("span", { class: "dot" }), text);
+	}
+	// The page is dead: no code, a spent link, or a revoked secret. Say what to do instead of retrying forever.
+	var over = false;
+	function end(message) {
+		over = true;
+		SECRET = "";
+		state.fatal = message;
+		setConn(message, false);
+		render();
+	}
+	/** Trades the link's code for the session secret; the code is dropped whether or not it worked. */
+	function signIn() {
+		var code = CODE;
+		CODE = "";
+		if (!code) return Promise.reject(new Error(LINK_MESSAGE));
+		return fetch("/session", { method: "POST", headers: { "X-Brigadev-Code": code }, cache: "no-store" }).then(function (res) {
+			if (res.status === 401) throw new Error(LINK_MESSAGE);
+			if (res.status !== 200) throw new Error("Could not sign in (" + res.status + "). In pi, run /brigadev:web open for a new link.");
+			return res.json();
+		}).then(function (body) {
+			if (!body || typeof body.secret !== "string" || !body.secret) throw new Error(LINK_MESSAGE);
+			SECRET = body.secret;
+		});
+	}
+
+	// The event stream, read with fetch so the secret travels in a header (the browser's built-in event-source client cannot send one). It reconnects
+	// with a growing delay and resumes after the last event it folded, with Last-Event-ID.
+	var lastId = 0, delay = 1000;
+	function handleFrame(frame) {
+		var data = [];
+		frame.split("\n").forEach(function (line) {
+			if (line.indexOf("data:") === 0) data.push(line.slice(5).replace(/^ /, ""));
+		});
+		if (!data.length) return;
+		var event;
+		try { event = JSON.parse(data.join("\n")); } catch (e) { return; }
+		if (event && typeof event.seq === "number" && event.seq > lastId) lastId = event.seq;
+		fold(event);
+		render();
+	}
+	function reconnect() {
+		if (over) return;
+		setConn("reconnecting…", false);
+		setTimeout(connect, delay);
+		delay = Math.min(delay * 2, 15000);
+	}
+	function connect() {
+		if (over) return;
+		var headers = { "Authorization": "Bearer " + SECRET };
+		if (lastId) headers["Last-Event-ID"] = String(lastId);
+		fetch("/events", { headers: headers, cache: "no-store" }).then(function (res) {
+			if (res.status === 401) { end(ENDED_MESSAGE); return; }
+			if (!res.ok || !res.body) throw new Error("events " + res.status);
+			setConn("live · " + clock(Date.now()), true);
+			delay = 1000;
+			var reader = res.body.getReader(), decoder = new TextDecoder(), buffer = "";
+			function pump() {
+				return reader.read().then(function (chunk) {
+					if (chunk.done) return;
+					buffer += decoder.decode(chunk.value, { stream: true });
+					var at;
+					while ((at = buffer.indexOf("\n\n")) >= 0) {
+						var frame = buffer.slice(0, at);
+						buffer = buffer.slice(at + 2);
+						handleFrame(frame);
+					}
+					return pump();
+				});
+			}
+			return pump();
+		}).then(reconnect, reconnect);
+	}
+	draw();
+	signIn().then(connect, function (e) { end(e && e.message ? e.message : LINK_MESSAGE); });
+})();
+</script>
+</body>
+</html>

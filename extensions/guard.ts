@@ -6,20 +6,25 @@
  * Subagents load this file explicitly (`-e`), so it must work standalone.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
+import { BUS, publish, type GuardDecision, type ModeState } from "../lib/bus.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
 import { appendEvidence, branchSlug, evaluateCommitGate, evidenceFile, forceRecord, gateDialog, readEvidence, type ForceRecord } from "../lib/evidence.ts";
 import { checkRefusal, resolveCommand } from "../lib/check.ts";
+import { askConfirm } from "../lib/human-prompt.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, sensitiveWords, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { decidePrGate, opensPrCreate, prCreateDirectory, prGateBlockMessage, prGateDialogText, riskMapFor, UNRESOLVED_DIRECTORY_REASON, type PrGateDecision } from "../lib/pr-gate.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
+import { redact } from "../lib/redact.ts";
 import { branchRisk, type RiskCategory } from "../lib/risk-map.ts";
 import { agentDir, CHILD_ENV, childAllowedSurfaces, isChildSession, PACKAGE_ROOT, readSettings, writeSettings } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
@@ -81,18 +86,45 @@ export default function (pi: ExtensionAPI) {
 		}
 		outsideGrants.clear();
 		publishStatus(ctx);
+		publishMode();
 	};
 
 	const setMode = (next: PermissionMode, ctx: ExtensionContext) => {
 		mode = next;
 		pi.appendEntry(MODE_ENTRY, { mode });
 		publishStatus(ctx);
+		publishMode();
 	};
 
-	/** Asks the user; without a UI (print mode, subagents) the answer is no. */
+	/** The mode on the brigadev bus (a UI shows it); the parent only. */
+	const publishMode = () => {
+		if (!isChild) publish(pi.events, BUS.mode, { scope: "mode", mode } satisfies ModeState);
+	};
+
+	/** The tool call being judged, so a confirm and its outcome are published with the call's id. */
+	interface Judging {
+		event: { toolCallId: string; toolName: string; input: unknown };
+		asked: boolean;
+	}
+	const judging = new AsyncLocalStorage<Judging>();
+	const announce = (current: Judging, action: GuardDecision["action"], reason?: string) => {
+		const { toolCallId, toolName, input } = current.event;
+		const fields = (input && typeof input === "object" ? input : {}) as { command?: unknown; path?: unknown };
+		const subject = typeof fields.command === "string" ? fields.command : typeof fields.path === "string" ? fields.path : undefined;
+		// What goes to the bus (and so the page) is redacted; the TUI dialog keeps the real command.
+		publish(pi.events, BUS.guard, { id: randomUUID(), toolCallId, tool: toolName, ...(subject === undefined ? {} : { subject: redact(subject).slice(0, 500) }), action, ...(reason === undefined ? {} : { reason: redact(reason) }), at: Date.now() } satisfies GuardDecision);
+	};
+
+	/** Asks the user, in the TUI or from the web (first answer wins); without a UI (print mode, subagents) the answer is no. */
 	const confirm = async (ctx: ExtensionContext, title: string, body: string): Promise<boolean> => {
 		if (isChild || !ctx.hasUI) return false;
-		return ctx.ui.confirm(title, body);
+		const current = judging.getStore();
+		if (current) {
+			current.asked = true;
+			announce(current, "confirm", title);
+		}
+		// The run's abort signal (Esc, the web Abort) closes the dialog and the web prompt, so a late answer cannot resume an aborted call.
+		return askConfirm(pi.events, ctx, { source: "guard", title, body }, ctx.signal);
 	};
 
 	/** Top of the repository that holds `dir` (canonical); `dir` itself when git cannot tell (not a repository, a failure). */
@@ -134,7 +166,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (!isChild && ctx.hasUI) {
 			const dialog = gateDialog(decision.reason, command);
-			if (await ctx.ui.confirm(dialog.title, dialog.body)) return { settle: () => log("dialog") };
+			if (await confirm(ctx, dialog.title, dialog.body)) return { settle: () => log("dialog") };
 		}
 		return { reason: decision.reason, settle: () => {} };
 	};
@@ -233,7 +265,12 @@ export default function (pi: ExtensionAPI) {
 		return { message: { customType: MODE_NOTICE, content: MODE_PROMPT[mode], display: false, details: { mode } } };
 	});
 
-	pi.on("tool_call", async (event, ctx) => {
+	const decideToolCall = async (event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> => {
+		// A subagent's active tools are its agent's `tools:` list. A codemode script can also call tools that are callable without being active
+		// (MCP tools, `codemode`/`deferred` exposure), so a subagent's call to any tool outside that list is blocked.
+		if (isChild && typeof pi.getActiveTools === "function" && !pi.getActiveTools().includes(event.toolName)) {
+			return { block: true, reason: `Blocked by brigadev guard: ${process.env[CHILD_ENV.AGENT] ?? "this agent"} may only call its own tools, and ${event.toolName} is not one of them.` };
+		}
 		// `bash` and `bg_start` (a background shell process) are one path: same classification, same permission rules,
 		// same evidence-log and commit-gate rules. `bg_start` adds its working directory, decided like a write into it.
 		// `check` runs a command through `bash -c`: it is decided as a bash call of the command that will run.
@@ -307,6 +344,16 @@ export default function (pi: ExtensionAPI) {
 		if (!rawPath) return undefined;
 		const absolute = canonicalPath(resolve(ctx.cwd, expandHome(rawPath)));
 		return checkPath(event.toolName, rawPath, absolute, isWrite, ctx, isSearch);
+	};
+
+	// A block, or a call the user was asked about, is published as a guard decision; a silently allowed call is not.
+	pi.on("tool_call", async (event, ctx) => {
+		if (isChild) return decideToolCall(event, ctx);
+		const current: Judging = { event, asked: false };
+		const result = await judging.run(current, () => decideToolCall(event, ctx));
+		if (result?.block) announce(current, "block", result.reason);
+		else if (current.asked) announce(current, "allow");
+		return result;
 	});
 
 	// Pi's grep, find, and ls list whatever sits under their path (grep runs `rg --hidden`): a search rooted above a secret

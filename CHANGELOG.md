@@ -2,10 +2,80 @@
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-21
+
+The 0.23.0 release: everything in the pre-releases rc.1–rc.4 below (the web UI loop board, the brigadev bus, codemode by default, the durable runner, CI), plus these fixes from the pre-release review.
+
+### Security
+
+- Web UI: the long-lived `?token=` URL is gone. `/brigadev:web start` prints a one-time link (a 32-byte `code`, valid 60 s, spent on first use); the page removes the code from the address bar, trades it with `POST /session` for a random session secret, keeps the secret only in a JavaScript variable, and sends it as `Authorization: Bearer` (the event stream is read with `fetch`, resuming with `Last-Event-ID`). A token or secret in a query string is refused; `stop` revokes every secret. Before, the token stayed in the browser's history and was valid for the whole session, so any process of the same user could read it and approve guard prompts. `/brigadev:web open` prints a new link; `status` shows the address without a code.
+- Commands and details that go to the web page or the bus are redacted: credentials in URLs, `Authorization` headers, token-like strings, and password flags (`lib/redact.ts`).
+
+### Fixed
+
+- A guard confirm or `ask_user_choice` that is open when the run is aborted (Esc, the web Abort) now closes in the terminal and the browser and counts as not approved, so a late answer cannot resume an aborted call. A web answer to a prompt that is no longer open gets 409, and the page shows why.
+- The web UI and the dashboard adapter remove their bus listeners at session shutdown, so a reload no longer doubles events and footer segments.
+- The web UI's event replay waits for slow readers instead of cutting the stream at the 4 MB backlog cap; the cap still applies to a live client that stops reading.
+- The web log keeps `mode`, `todo`, `session`, `phase` and the live run state however many tool calls pass; per-item types (tools, agents, prompts) have their own caps.
+- Codemode is activated only when the host Pi has the tool; `/brigadev:codemode` says so when it does not. A `codemode` call counts as explore for the inferred phase until its nested calls (which Pi reports) move it, and the timeline marks them with their parent.
+- `/brigadev:codemode off` also drops `codemode` from the subagents' tool lists at launch.
+- The web page's markdown parser is linear on unmatched `*`, `_` and `[` openers (15k characters took 1.7 s).
+
+## [0.23.0-rc.4] - 2026-11-21
+
+Pre-release.
+
 ### Added
 
+- The parent session activates Pi's built-in `codemode` tool at start, next to `grep`, `find`, and `ls`. `/brigadev:codemode on|off` turns it on or off now and for new sessions (`codemode` in `brigadev.json`); off leaves a `codemode` enabled by Pi's own `defaultTools` alone. Tool calls made from codemode scripts still pass the guard.
+- While `codemode` is active, the parent's prompt gains a short block (`assets/codemode.md`): run an explore batch as one parallel script that returns only the needed lines, and gather git/PR/CI state (`gh pr checks`, `gh run view --log-failed`) into one digest. `diagnosis.md` says the same for CI failures.
+- `brigadev-explore`, `review-4r`, and `brigadev-verify` list `codemode` and say when to use it. The worker does not.
 - Feature-document tickets carry `deps:` (the tickets they need) and `done:` (the check that proves them), documented in `odd-tracking.md`. `lib/ticket-list.ts` parses the `## Tasks` list, validates it for an unattended run (missing `done:`, unknown deps, duplicates, cycles), picks ready tickets, writes a status or a `## Log` line back without touching other lines, detects edits to lines a runner owns and changed specs, and writes files atomically.
 - `runner/`: `brigadev-runner`, a separate package on `@earendil-works/pi-durable` (prototype). It runs a feature doc's ticket list unattended in a linked worktree, one fresh worker conversation per ticket, and survives restarts. Decisions, command approvals, pause and resume are durable signals (`brigadev-runner status | answer | pause | resume | merge`). When every ticket is done, a PR loop runs: final check, read-only verify on T2 branches, push (never forced), open the PR, wait for CI with up to 3 fix tickets, and merge only after `brigadev-runner merge <doc>`. Workers run without the user's credentials, and the doc, settings, git config, hooks and refs are checked around every conversation; any change parks the loop. See `runner/README.md`, including what containment cannot stop.
+- CI: `.github/workflows/test.yml` runs `npm test` and the runner suite on Node 22 and 24 for every pull request and push to `main`.
+
+### Fixed
+
+- The `check` tool reads Node's TAP summary (`# pass N`), which Node 22 prints when output is piped; before, Node 22 runs had no counts.
+- The guard's trusted temp folders list only folders that exist (`/private/tmp` is macOS only).
+
+### Security
+
+- A subagent may call only its own tools (its active `tools:` list). A codemode script could otherwise reach tools that are callable without being active, such as MCP tools.
+
+## [0.23.0-rc.3] - 2026-11-20
+
+### Changed
+
+- Web UI redesigned as a loop board: one column per loop step plus a red **Needs you** column for open guard and `ask_user_choice` prompts. Subagent runs, checks, commits, your choices and the main agent's tool calls are cards in the step where they happened, with status, verdict, model, tokens, cost and elapsed time. A card opens a side panel (output, activity, task; check details; the conversation; tasks; guard log) that leaves the message box usable.
+- `brigadev:agent` snapshots also carry the whole task, the launch reason, the child's last 12 tool calls, and the output once settled. The web UI also receives the session's project and branch.
+
+## [0.23.0-rc.2] - 2026-11-20
+
+Pre-release.
+
+### Fixed
+
+- Web UI: assistant messages render as markdown: headings, emphasis, code, lists and task lists, quotes, tables, and http(s) links. The parser (`assets/web-ui/markdown.js`) returns a tree that the page turns into DOM nodes, so agent text never becomes HTML.
+- Web UI: scrollbars follow the dark theme.
+
+## [0.23.0-rc.1] - 2026-11-20
+
+Pre-release.
+
+### Added
+
+- `/brigadev:web [start|stop|status]`: a local web UI for the current session on `127.0.0.1`, ephemeral port or `BRIGADEV_WEB_PORT`. `/events` and `/action` require a random token, which the page removes from the address bar. The page is one static file with no dependencies, and it replays the session history over SSE. It shows:
+  - the loop steps and the conversation with tool rows;
+  - subagent cards with per-task cancel;
+  - guard and `ask_user_choice` prompts that can be answered from the browser;
+  - checks, todos and guard decisions;
+  - a composer to send, steer and abort.
+- The brigadev bus (`lib/bus.ts`): typed `brigadev:*` channels on `pi.events` for the loop phase, todos, checks, subagent tasks, prompts, guard decisions and the permission mode. Publishing never throws, and actions coming back from the browser are validated.
+- The inferred loop phase (`lib/phase.ts`, `extensions/workflow-state.ts`): authorize, explore, decide, implement, check, commit or close, guessed from tool activity and labeled as inferred.
+- Guard confirmations and `ask_user_choice` can be answered in the terminal or the browser. The first answer wins and the other dialog closes.
+- Cancelling one subagent task: a queued task never starts and a running one is stopped, while its siblings and the launch go on. The result reads "Cancelled by the user". A cancel that lands after the child finished keeps its result.
+- pi-agent-dashboard adapter: when the dashboard is installed, the bus channels are declared for its event forwarding, and the harness adds a loop breadcrumb and footer segments.
 
 ## [0.22.0] - 2026-11-19
 
