@@ -105,7 +105,8 @@ function tally(text: string): Record<string, number> {
 
 function nodeCounts(output: string): Counts | undefined {
 	const value = (label: string) => {
-		const match = new RegExp(`^ℹ ${label} (\\d+)\\s*$`, "m").exec(output);
+		// `ℹ pass 5` (spec reporter, a terminal) or `# pass 5` (TAP: Node 22's default when stdout is a pipe).
+		const match = new RegExp(`^(?:ℹ|#) ${label} (\\d+)\\s*$`, "m").exec(output);
 		return match ? Number(match[1]) : undefined;
 	};
 	const pass = value("pass");

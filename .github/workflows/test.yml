@@ -1,0 +1,61 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  harness:
+    name: npm test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.x is the engines floor (>=22.19: unflagged type stripping, module.registerHooks); 24.x is the current LTS.
+        node: ["22.x", "24.x"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # Test fixtures create commits in scratch repositories.
+      - run: git config --global user.name "ci" && git config --global user.email "ci@example.invalid" && git config --global init.defaultBranch main
+      # No install: the Pi packages are peer dependencies, answered by tests/helpers/pi-stubs in the tests.
+      - run: npm test
+
+  runner:
+    name: runner tests (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22.x", "24.x"]
+    steps:
+      - uses: actions/checkout@v4
+      # The steps below run only on branches that have the runner package (runner/); a job-level `if` cannot read the checkout.
+      - id: has
+        run: test -f runner/package-lock.json && echo "runner=true" >> "$GITHUB_OUTPUT" || echo "runner=false" >> "$GITHUB_OUTPUT"
+      - if: steps.has.outputs.runner == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: runner/package-lock.json
+      - if: steps.has.outputs.runner == 'true'
+        run: git config --global user.name "ci" && git config --global user.email "ci@example.invalid" && git config --global init.defaultBranch main
+      - if: steps.has.outputs.runner == 'true'
+        working-directory: runner
+        run: npm ci --ignore-scripts
+      - if: steps.has.outputs.runner == 'true'
+        working-directory: runner
+        run: node --test tests/*.test.ts

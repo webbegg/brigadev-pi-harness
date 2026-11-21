@@ -156,10 +156,17 @@ describe("lookupPr", () => {
 	});
 
 	it("gives up when exec never answers", async () => {
-		const started = Date.now();
-		const result = await lookupPr(() => new Promise(() => {}), "/r", 30);
-		assert.deepEqual(result, { status: "unavailable" });
-		assert.ok(Date.now() - started < 2000);
+		// lookupPr's give-up timer is unref'd (it must not hold Pi open), and this exec holds no handle: keep the loop alive meanwhile,
+		// or Node 22's runner sees an empty event loop and cancels the file ("Promise resolution is still pending").
+		const keepAlive = setTimeout(() => {}, 5000);
+		try {
+			const started = Date.now();
+			const result = await lookupPr(() => new Promise(() => {}), "/r", 30);
+			assert.deepEqual(result, { status: "unavailable" });
+			assert.ok(Date.now() - started < 2000);
+		} finally {
+			clearTimeout(keepAlive);
+		}
 	});
 });
 

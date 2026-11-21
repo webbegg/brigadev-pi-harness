@@ -121,6 +121,8 @@ describe("parseCounts", () => {
 
 	it("ignores colors and finds nothing in unrelated output", () => {
 		assert.deepEqual(parseCounts("\u001b[32mℹ pass 2\u001b[0m\nℹ fail 0"), { pass: 2, fail: 0 });
+		// Node 22 prints TAP when stdout is not a terminal (the check tool's pipe, CI).
+		assert.deepEqual(parseCounts("1..7\n# tests 7\n# suites 2\n# pass 5\n# fail 1\n# cancelled 0\n# skipped 1\n# todo 0\n# duration_ms 120.5"), { pass: 5, fail: 1, skipped: 1 });
 		assert.equal(parseCounts("hello\nworld"), undefined);
 		assert.equal(parseCounts(""), undefined);
 	});
