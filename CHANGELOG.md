@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-21
+
+The 0.23.0 release: everything in the pre-releases rc.1–rc.4 below (the web UI loop board, the brigadev bus, codemode by default, the durable runner, CI), plus these fixes from the pre-release review.
+
 ### Security
 
 - Web UI: the long-lived `?token=` URL is gone. `/brigadev:web start` prints a one-time link (a 32-byte `code`, valid 60 s, spent on first use); the page removes the code from the address bar, trades it with `POST /session` for a random session secret, keeps the secret only in a JavaScript variable, and sends it as `Authorization: Bearer` (the event stream is read with `fetch`, resuming with `Last-Event-ID`). A token or secret in a query string is refused; `stop` revokes every secret. Before, the token stayed in the browser's history and was valid for the whole session, so any process of the same user could read it and approve guard prompts. `/brigadev:web open` prints a new link; `status` shows the address without a code.
