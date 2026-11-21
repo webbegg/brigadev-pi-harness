@@ -40,6 +40,8 @@ export interface TicketBrief {
 	docPath: string;
 	attempt: number;
 	maxAttempts: number;
+	/** What to do, when the ticket has no line in the doc (a PR loop fix ticket): the failure to fix, or the verifier's blockers. */
+	spec?: string;
 	/** The previous attempt's failure, with the tail of the check output. */
 	failure?: string;
 	/** A decision this ticket parked on, with the user's answer: the rerun's brief. */
@@ -78,6 +80,7 @@ export function workerInstructions(worker: Worker, brief: TicketBrief): string {
 		`- feature document: ${brief.docPath}`,
 		`- attempt: ${brief.attempt} of ${brief.maxAttempts}`,
 	];
+	if (brief.spec) lines.push("", "## Spec", brief.spec);
 	if (brief.decision) lines.push("", ...decisionSection(brief.decision));
 	if (brief.failure) lines.push("", "## Previous attempt failed", brief.failure);
 	return lines.join("\n");

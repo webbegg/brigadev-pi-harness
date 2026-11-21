@@ -14,21 +14,23 @@
 //   the branch rule, and file rules stay as they are.
 // - Push, merge, publish, and gh pr/release/api writes are always blocked: the runner owns PR delivery.
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { defineExtension, hook, ToolTask } from "@earendil-works/pi-durable";
 import type { ToolHookCall } from "@earendil-works/pi-durable";
+import { extractWriteTargets } from "../../lib/bash-writes.ts";
 import { basename, blankHeredocs, classifyCommand, COMMAND_KIND, SHELLS, tokenize, unwrap } from "../../lib/command-classifier.ts";
 import { checkRefusal, resolveCommand } from "../../lib/check.ts";
 import { onFeatureBranch, readBranchFacts, type BranchFacts } from "../../lib/commit-branch.ts";
 import { evaluateCommitGate } from "../../lib/evidence.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, isProtectedPath, sensitiveWords, shellCallOf } from "../../lib/guard-rules.ts";
-import { canonicalPath, expandHome } from "../../lib/paths.ts";
+import { canonicalPath, expandHome, isInside } from "../../lib/paths.ts";
 import { isPermissionMode, isSensitivePath, PERMISSION_MODE, type PermissionMode } from "../../lib/permission-policy.ts";
 import { brigadevHome, isRepoDocsPath, repoDocsDir as docsDirOf } from "../../lib/repo-docs.ts";
 import { agentDir, PACKAGE_ROOT, readSettings, type BrigadevSettings } from "../../lib/runtime.ts";
 import type { ExecFn } from "../../lib/worktree-snapshot.ts";
 import { ASK_TOOL, commandApproved } from "./decision.ts";
 import { nodeExec } from "./exec.ts";
+import { RoleDoc, VERIFY_ROLE, VERIFY_TOOLS } from "./verify.ts";
 
 /** The agent name on evidence records the worker's `check` calls write. */
 export const RUNNER_AGENT = "runner-worker";
@@ -39,8 +41,10 @@ export interface GuardOptions {
 	/** The worktree root: the project root of every file rule, and where commands run. */
 	cwd: string;
 	exec?: ExecFn;
-	/** Tool names the conversation may call, besides which nothing runs (default: the worker's tools). Others still get the rules of their own kind. */
+	/** Tool names the conversation may call, besides which nothing runs (default: the worker's tools; the verifier's when `readOnly`). Others still get the rules of their own kind. */
 	tools?: readonly string[];
+	/** The verify conversation's rules: no write or edit, no commit or git change, no bash write inside the worktree (see `readOnlyBashReason`). */
+	readOnly?: boolean;
 	/** The brigadev settings (permission mode, `check.test`); default: `~/.pi/agent/brigadev.json`, re-read on every call. */
 	settings?: () => BrigadevSettings;
 }
@@ -173,13 +177,39 @@ export function commitAloneReason(command: string): string | undefined {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// The verifier is read-only
+
+/** git subcommands a read-only run may use: none changes the repository (no stash, worktree, checkout, branch, config, remote, fetch, push). */
+const READ_ONLY_GIT = new Set(["status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "ls-tree", "blame", "grep", "cat-file", "describe", "merge-base", "shortlog", "name-rev", "diff-tree", "show-ref", "for-each-ref"]);
+
+const READ_ONLY_BLOCK = (what: string): string =>
+	`Blocked by brigadev guard: the verifier is read-only (${what}). It never edits, commits, or changes git state; run probes in a scratch copy outside the worktree.`;
+
+/** Why a read-only conversation may not run this bash command, or undefined: a commit, a git command outside the read-only set, or a literal write inside the worktree. Best effort for bash, as in the extension. */
+export function readOnlyBashReason(command: string, root: string): string | undefined {
+	if (classifyCommand(command).some((match) => match.commit)) return READ_ONLY_BLOCK("git commit");
+	for (const segment of flatSegments(command)) {
+		if ("opaque" in segment) return READ_ONLY_BLOCK(`${segment.opaque} cannot be inspected`);
+		if (basename(segment.argv[0]) !== "git") continue;
+		const sub = gitSubcommand(segment.argv.slice(1));
+		if (sub === undefined || !READ_ONLY_GIT.has(sub)) return READ_ONLY_BLOCK(`git ${sub ?? "…"} may change the repository`);
+	}
+	for (const target of extractWriteTargets(command, root)) {
+		const absolute = canonicalPath(target);
+		if (isInside(root, absolute)) return READ_ONLY_BLOCK(`it writes ${relative(root, absolute) || "."} inside the worktree`);
+	}
+	return undefined;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 
 /** The rules, as one function of a tool call. `decide` returns the reason to block the call, or undefined to let it run. */
 export function createGuard(options: GuardOptions) {
 	const root = canonicalPath(options.cwd);
 	const exec = options.exec ?? nodeExec;
 	const settings = options.settings ?? readSettings;
-	const tools = options.tools ?? WORKER_TOOLS;
+	const readOnly = options.readOnly ?? false;
+	const tools = options.tools ?? (readOnly ? VERIFY_TOOLS : WORKER_TOOLS);
 
 	// The docs folder of the worktree's repo costs a git call: ask once per brigadev home (the repo name does not change during a run).
 	let docs: { home: string; dir: string } | undefined;
@@ -206,8 +236,8 @@ export function createGuard(options: GuardOptions) {
 			projectRoot: root,
 			docsDir: () => repoDocsDir(root),
 			sensitive: isSensitivePath(absolute),
-			readOnly: false,
 			surfaces: undefined,
+			readOnly,
 			agent: RUNNER_AGENT,
 		});
 		if (decision.action === "block") return decision.reason;
@@ -234,6 +264,10 @@ export function createGuard(options: GuardOptions) {
 	 */
 	const decideShell = async (command: string, approved?: (command: string) => Promise<boolean>): Promise<string | undefined> => {
 		const branchFacts = branchFactsOnce();
+		if (readOnly) {
+			const reason = readOnlyBashReason(command, root);
+			if (reason) return reason;
+		}
 		// Nobody forges a recorded test result: the evidence log is written only by the recorder.
 		if (command.includes("evidence") && bashWritesEvidence(command, [join(repoDocsDir(root), "evidence")])) return EVIDENCE_BLOCK;
 
@@ -292,13 +326,18 @@ export function createGuard(options: GuardOptions) {
 /** The pi-durable extension: the guard as a `beforeTool` hook on every tool call of the conversations that select it. A throw would block too; a failure here blocks with its reason. */
 export function guardExtension(options: GuardOptions) {
 	const guard = createGuard(options);
+	// A conversation whose `RoleDoc` says verify is decided by the read-only rules instead.
+	const verifier = createGuard({ ...options, tools: undefined, readOnly: true });
 	return defineExtension({
 		name: "brigadev-guard",
 		hooks: [
 			hook(ToolTask, {
 				beforeTool: async (call, api, context) => {
 					try {
-						const reason = await guard.decide(call, (command) => commandApproved(api, call, command, context));
+						// A role that cannot be read fails closed: the call must pass both rule sets.
+						const role = await (async () => (await api.snapshot(RoleDoc, api.conversationId, context))?.role ?? "")().catch(() => undefined);
+						const workerReason = role === VERIFY_ROLE ? undefined : await guard.decide(call, (command) => commandApproved(api, call, command, context));
+						const reason = workerReason ?? (role === VERIFY_ROLE || role === undefined ? await verifier.decide(call) : undefined);
 						return reason === undefined ? undefined : { block: reason };
 					} catch (error) {
 						return { block: `Blocked by brigadev guard: could not decide (${error instanceof Error ? error.message : String(error)})` };

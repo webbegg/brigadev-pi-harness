@@ -20,8 +20,12 @@ import {
 } from "../../lib/ticket-list.ts";
 import { ApprovalDoc, approves, DecisionDoc, decisionOf, type AnsweredDecision, type Decision } from "./decision.ts";
 import { validateDoc } from "./doc.ts";
-import { ANSWER, DECISION_DEADLINE_MS, decisionKey, PAUSE, pauseKey, RESUME, resumeKey } from "./signals.ts";
+import { createPrTask, type PrOptions, type PrResult } from "./pr.ts";
+import { ANSWER, answerCommand, DECISION_DEADLINE_MS, decisionKey, PAUSE, pauseKey, RESUME, resumeKey } from "./signals.ts";
+import { tailOf } from "./tail.ts";
 import { loadWorker, workerInput, workerInstructions, type TicketBrief, type Worker } from "./worker.ts";
+
+export { answerCommand, tailOf };
 
 export const LOOP_TASK = "brigadev.ticket-loop";
 export const TICKET_TASK = "brigadev.ticket";
@@ -64,15 +68,6 @@ export const defaultDeps: TicketDeps = {
 		}),
 };
 
-const TAIL_LINES = 40;
-const TAIL_CHARS = 4000;
-
-export function tailOf(output: string): string {
-	const lines = output.trimEnd().split("\n");
-	const tail = lines.slice(-TAIL_LINES).join("\n");
-	return tail.length > TAIL_CHARS ? tail.slice(-TAIL_CHARS) : tail;
-}
-
 // ---------------------------------------------------------------------------------------------------------------------
 // brigadev.ticket
 
@@ -85,6 +80,8 @@ export type TicketInput = {
 	done: string;
 	/** Linked spec IDs, for the worker's brief. */
 	specs: string[];
+	/** What to do, for a ticket with no line in the doc (a PR loop fix ticket): the worker's brief carries it as `## Spec`. */
+	spec?: string;
 	maxAttempts: number;
 	model: ModelRef;
 	/** The decision this ticket parked on in an earlier run, with the user's answer: the brief carries it, and an approved command is lifted in the first attempt's conversation only. */
@@ -106,6 +103,8 @@ function workerTools(worker: Worker, extra: readonly ToolRegistration[]) {
 	return available.filter((tool) => wanted.includes(tool.name));
 }
 
+export type TicketTask = ReturnType<typeof createTicketTask>;
+
 function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly ToolRegistration[]) {
 	return defineTask<TicketInput, TicketState, TicketResult>({
 		name: TICKET_TASK,
@@ -118,7 +117,7 @@ function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly
 				// The HEAD this ticket started from, memoized so a rerun (or a later attempt) compares against the same one.
 				if ((await runtime.memo<string>("startHead", context)) === undefined) await runtime.memo("startHead", await deps.head(input.cwd, runtime.signal), context);
 
-				const brief: TicketBrief = { ticketId: input.ticketId, title: input.title, specs: input.specs, done: input.done, docPath: input.docPath, attempt, maxAttempts: input.maxAttempts, failure, decision: input.decision };
+				const brief: TicketBrief = { ticketId: input.ticketId, title: input.title, specs: input.specs, ...(input.spec ? { spec: input.spec } : {}), done: input.done, docPath: input.docPath, attempt, maxAttempts: input.maxAttempts, failure, decision: input.decision };
 				// One worker conversation per attempt, owned by this task and found again by position after a rerun.
 				let conversationId!: string;
 				await runtime.commit(async (tx) => {
@@ -203,7 +202,8 @@ function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly
 // ---------------------------------------------------------------------------------------------------------------------
 // brigadev.ticket-loop
 
-export type LoopInput = { docPath: string; cwd: string; maxAttempts?: number };
+/** `pr`: when no ticket is left to run, launch the PR loop (final check, verify, push, PR, CI, merge approval, merge). Default false: the loop ends `done`. */
+export type LoopInput = { docPath: string; cwd: string; maxAttempts?: number; pr?: boolean };
 
 /** Runner-owned ticket lines as the runner last wrote them (S8). */
 type Owned = Record<string, string>;
@@ -222,16 +222,26 @@ type PickState = { phase: "pick"; first: boolean } & Carry;
 type LaunchState = { phase: "launch"; ticketId: string } & Carry;
 type RecordState = { phase: "record"; ticketId: string; childId: string; done: string } & Carry;
 type Working = PickState | LaunchState | RecordState;
+/** With every ticket done and `pr` set: launch the PR loop, then wait for it. The PR loop is a child task; it parks and resumes on its own signals. */
+type PrLaunchState = { phase: "pr" } & Carry;
+type PrRecordState = { phase: "pr-record"; childId: string } & Carry;
 
 export type PauseKind = "user" | "conflict" | "failures";
 
 /** The loop asleep on its resume signal (no deadline); `next` is the state it continues with, its epoch already past this pause. */
 export type PausedState = { phase: "resume"; kind: PauseKind; reason: string; key: string; next: Working };
 
-export type LoopState = Working | PausedState;
+export type LoopState = Working | PausedState | PrLaunchState | PrRecordState;
 
-/** The loop ends `done` or `stalled`; a pause or an open decision is a sleep, not an end (A2, A4). */
-export type LoopResult = { status: "done"; tickets: Array<{ id: string; status: string }> } | { status: "stalled"; waiting: string[] };
+/**
+ * The loop ends `done` (no PR loop), `stalled`, `merged` (the PR loop merged the PR) or `pr-failed` (the PR loop task itself failed or was aborted);
+ * a pause, an open decision, and a PR loop's "needs you" are sleeps, not ends.
+ */
+export type LoopResult =
+	| { status: "done"; tickets: Array<{ id: string; status: string }> }
+	| { status: "stalled"; waiting: string[] }
+	| { status: "merged"; url: string; number: number; tickets: Array<{ id: string; status: string }> }
+	| { status: "pr-failed"; reason: string; tickets: Array<{ id: string; status: string }> };
 
 type Change = { id: string; status: TicketStatus; note: string; log?: string; own: boolean };
 type WriteBack = { conflict: string } | { text: string; owned: Owned; baseline: string };
@@ -242,11 +252,8 @@ const oneLine = (text: string) => text.replace(/\s+/g, " ").trim();
 /** A question as one doc line: the ticket line's status regex reads the last ` — <status>`, so a dash in the text must not look like one. */
 const lineText = (text: string) => oneLine(text).replaceAll(" — ", " - ");
 
-/** The brigadev-runner command that answers a ticket's decision, as the ticket line and `status` print it (`<1..n|text>` is the user's to fill in). */
-export const answerCommand = (docPath: string, ticketId: string): string => `brigadev-runner answer ${docPath} ${ticketId} <1..n|text>`;
-
 /** A state saved before a field existed reads with its default. */
-function withDefaults<T extends Working>(state: T): T {
+function withDefaults<T extends Carry>(state: T): T {
 	return { ...state, decisions: state.decisions ?? [], rounds: state.rounds ?? {}, answers: state.answers ?? {}, epoch: state.epoch ?? 0 };
 }
 
@@ -285,7 +292,7 @@ function writeBack(docPath: string, carry: Pick<Carry, "owned" | "baseline">, ch
 	return { text: next, owned, baseline: next };
 }
 
-function createLoopTask(ticketTask: ReturnType<typeof createTicketTask>) {
+function createLoopTask(ticketTask: TicketTask, prTask: ReturnType<typeof createPrTask>) {
 	return defineTask<LoopInput, LoopState, LoopResult>({
 		name: LOOP_TASK,
 		version: 1,
@@ -358,6 +365,8 @@ function createLoopTask(ticketTask: ReturnType<typeof createTicketTask>) {
 					return runtime.commit(() => ({ status: "sleeping", signals, until, checkpoint: { phase: "pick", first: false, ...carry } }), context);
 				}
 				const open = list.tickets.filter((ticket) => ticket.status !== "done" && ticket.status !== "dropped");
+				// Every ticket is done or dropped and nothing is parked: the PR loop is the last phase.
+				if (open.length === 0 && task.input.pr) return run({ phase: "pr", ...carry });
 				if (open.length === 0) return end({ status: "done", tickets: list.tickets.map((ticket) => ({ id: ticket.id, status: ticket.status ?? "pending" })) });
 				return end({ status: "stalled", waiting: [...new Set(open.map((ticket) => ticket.id))] });
 			},
@@ -466,6 +475,30 @@ function createLoopTask(ticketTask: ReturnType<typeof createTicketTask>) {
 				await runtime.commit(() => ({ status: "running", checkpoint: carryOf(written, { failed }) }), context);
 			},
 
+			// Every ticket is done: create the PR loop child and wait for it. One commit creates the child and records its id, so a crash never
+			// launches a second one: after a reopen this phase is not rerun, `pr-record` is.
+			pr: async (task, runtime, context) => {
+				const state = withDefaults(task.state.checkpoint);
+				const model = (await runtime.agent(context)).model;
+				if (!model) return runtime.commit(() => ({ status: "terminal", outcome: { status: "failed", error: { message: "the loop's conversation has no model configured" } } }), context);
+				await runtime.commit(async (tx) => {
+					const childId = await tx.createTask(prTask, { docPath: task.input.docPath, cwd: task.input.cwd, model }, { ownership: { kind: "task", taskId: task.id } });
+					return { status: "waiting", checkpoint: { phase: "pr-record", childId, owned: state.owned, baseline: state.baseline, failed: state.failed, decisions: state.decisions, rounds: state.rounds, answers: state.answers, epoch: state.epoch }, on: [childId], policy: "allSettled" };
+				}, context);
+			},
+
+			// The PR loop ended: fold its outcome into the loop's.
+			"pr-record": async (task, runtime, context) => {
+				const state = withDefaults(task.state.checkpoint);
+				const [outcome] = await runtime.outcomes([state.childId as TaskId<PrResult>], context);
+				const tickets = parseTicketList(readFileSync(task.input.docPath, "utf8")).tickets.map((ticket) => ({ id: ticket.id, status: ticket.status ?? "pending" }));
+				const result: LoopResult =
+					outcome.status === "completed"
+						? { status: "merged", url: outcome.result.url, number: outcome.result.number, tickets }
+						: { status: "pr-failed", reason: outcome.status === "failed" ? outcome.error.message : `PR loop ${outcome.status}`, tickets };
+				await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result } }), context);
+			},
+
 			// After a pause: `resume` was delivered. Continue with the state saved at the pause; a conflict is checked again by that phase.
 			resume: async (task, runtime, context) => {
 				const { next } = task.state.checkpoint;
@@ -487,11 +520,16 @@ function pause(runtime: TaskRuntime<LoopInput, LoopState, LoopResult, object>, c
 
 export interface Tasks {
 	loop: ReturnType<typeof createLoopTask>;
-	ticket: ReturnType<typeof createTicketTask>;
+	ticket: TicketTask;
+	pr: ReturnType<typeof createPrTask>;
 }
 
-/** The two tasks over `deps` (default: real shell and git), the worker definition (default: assets/agents/brigadev-worker.md), and the tools the worker gets besides CodingTools. */
-export function createTasks(deps: TicketDeps = defaultDeps, worker: Worker = loadWorker(), extraTools: readonly ToolRegistration[] = []): Tasks {
+/**
+ * The three tasks over `deps` (default: real shell and git), the worker definition (default: assets/agents/brigadev-worker.md), and the tools the
+ * worker gets besides CodingTools. `prOptions`: the PR loop's git/gh/suite seam, verifier prompt, and the verdict tool (default: real ones).
+ */
+export function createTasks(deps: TicketDeps = defaultDeps, worker: Worker = loadWorker(), extraTools: readonly ToolRegistration[] = [], prOptions: PrOptions = {}): Tasks {
 	const ticket = createTicketTask(deps, worker, extraTools);
-	return { loop: createLoopTask(ticket), ticket };
+	const pr = createPrTask(ticket, prOptions);
+	return { loop: createLoopTask(ticket, pr), ticket, pr };
 }

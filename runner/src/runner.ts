@@ -13,8 +13,10 @@ import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { createCheckTool } from "./check-tool.ts";
 import { createAskTool } from "./decision.ts";
 import { guardExtension } from "./guard.ts";
+import { prPhaseLabel, type PrDeps, type PrState } from "./pr.ts";
 import { decisionKey, deliver } from "./signals.ts";
 import { createTasks, defaultDeps, LOOP_TASK, type LoopInput, type LoopResult, type LoopState, type OpenDecision, type TicketDeps } from "./tasks.ts";
+import { createVerdictTool, type Verifier } from "./verify.ts";
 import type { Worker } from "./worker.ts";
 
 export interface RunnerOptions {
@@ -26,7 +28,11 @@ export interface RunnerOptions {
 	model: ModelRef;
 	/** Shell and git effects of the ticket task; tests pass their own. */
 	deps?: TicketDeps;
+	/** git, gh, and the suite of the PR loop; tests pass a fake `gh` and a real git against a local remote. */
+	prDeps?: PrDeps;
 	worker?: Worker;
+	/** The verify conversation's prompt (default: assets/agents/brigadev-verify.md). */
+	verifier?: Verifier;
 	/** pi-durable run policy (retry, progress intervals, ...); defaults otherwise. */
 	settings?: HarnessSettings;
 	context?: Context;
@@ -43,8 +49,31 @@ export type LoopOutcome =
 	| { status: "failed"; error: { message: string; detail?: unknown } }
 	| { status: "aborted" | "orphaned" | "faulted"; reason?: string; error?: { message: string } };
 
-/** What `settle()` returns while the loop is parked: asleep on a person (open decisions) or on `resume` (`paused`), with nothing left to run in this process. */
-export type Waiting = { status: "waiting"; paused?: string; decisions: string[] };
+/**
+ * What `settle()` returns while the loop is parked: asleep on a person (open decisions, a merge approval, a PR loop stop) or on `resume` (`paused`), with
+ * nothing left to run in this process. `pr` is set while the PR loop is the one parked. A CI wait is not parked: its poll is a timer of this process.
+ */
+export type Waiting = { status: "waiting"; paused?: string; decisions: string[]; pr?: { phase: string; url?: string; reason?: string } };
+
+/** The PR loop child, as `status` shows it. */
+export interface PrStatus {
+	taskId: TaskId;
+	/** final-check, verify, push, open, wait-ci, `fix <n>`, wait-merge, needs-you. */
+	phase: string;
+	/** The task is asleep (a poll timer, a signal wait), not between phases. */
+	asleep: boolean;
+	url?: string;
+	number?: number;
+	/** Why it stopped (phase needs-you). */
+	reason?: string;
+	/** The open decision of a fix ticket, answered with `answer` like a ticket's. */
+	decisions: OpenDecision[];
+	lastKeys: Record<string, string>;
+	/** The key `resume` is delivered under while the PR loop waits in needs-you. */
+	resumeKey?: string;
+	/** The key `merge` is delivered under while the PR loop waits for the merge approval. */
+	mergeKey?: string;
+}
 
 /** Where a loop is, read from its task record. `paused` and `decisions` come from the checkpoint; a finished loop has neither. */
 export interface LoopStatus {
@@ -63,6 +92,10 @@ export interface LoopStatus {
 	epoch: number;
 	/** The key `resume` is delivered under while paused. */
 	resumeKey?: string;
+	/** The PR loop, while it runs. */
+	pr?: PrStatus;
+	/** The merged PR, once the loop ended `merged`. */
+	merged?: { url: string; number: number };
 }
 
 export interface Runner {
@@ -70,7 +103,7 @@ export interface Runner {
 	/** The resolved repo directory workers run in. */
 	cwd: string;
 	/** Start the loop for a doc. Idempotent per doc path: a second call returns the same task, also after a restart. Enables scheduling. */
-	start(docPath: string, options?: { maxAttempts?: number }): Promise<TaskId<LoopResult>>;
+	start(docPath: string, options?: { maxAttempts?: number; pr?: boolean }): Promise<TaskId<LoopResult>>;
 	/** The loop already started for a doc, or undefined. Starts nothing. */
 	find(docPath: string): Promise<TaskId<LoopResult> | undefined>;
 	/** Wait for the loop's outcome. Enables scheduling, so after a reopen this also resumes interrupted work. Does not return for a loop that sleeps: see `settle`. */
@@ -81,12 +114,12 @@ export interface Runner {
 	 */
 	settle(taskId: TaskId<LoopResult>): Promise<LoopOutcome | Waiting>;
 	status(taskId: TaskId<LoopResult>): Promise<LoopStatus>;
-	/** Deliver a signal to the loop in one commit, without scheduling anything. */
-	deliver<T>(taskId: TaskId<LoopResult>, token: SignalToken<T>, key: string, value: T): Promise<SignalResult>;
+	/** Deliver a signal to the loop (or to its PR loop child: `status().pr.taskId`) in one commit, without scheduling anything. */
+	deliver<T>(taskId: TaskId, token: SignalToken<T>, key: string, value: T): Promise<SignalResult>;
 	close(): Promise<void>;
 }
 
-const POLL_MS = 20;
+const SETTLE_POLL_MS = 20;
 const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
 
 export async function openRunner(options: RunnerOptions): Promise<Runner> {
@@ -94,14 +127,16 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 	const cwd = resolve(options.cwd);
 	const checkTool = createCheckTool({ cwd });
 	const askTool = createAskTool();
-	const { loop, ticket } = createTasks(options.deps ?? defaultDeps, options.worker, [checkTool, askTool]);
+	const verdictTool = createVerdictTool();
+	const { loop, ticket, pr } = createTasks(options.deps ?? defaultDeps, options.worker, [checkTool, askTool], { deps: options.prDeps, verifier: options.verifier, verdictTool });
 	const registry = createRegistry();
 	registry.install(CodingTools);
 	// S5: every tool call of a worker conversation (nested ones too) goes through the brigadev guard rules.
 	registry.install(guardExtension({ cwd }));
 	registry.install(defineExtension({ name: "brigadev-check", tools: [checkTool] }));
 	registry.install(defineExtension({ name: "brigadev-decision", tools: [askTool] }));
-	registry.install(defineExtension({ name: "brigadev-runner", tasks: [loop, ticket] }));
+	registry.install(defineExtension({ name: "brigadev-verify", tools: [verdictTool] }));
+	registry.install(defineExtension({ name: "brigadev-runner", tasks: [loop, ticket, pr] }));
 
 	const harness = await Harness.open(
 		options.storage,
@@ -137,12 +172,30 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 		return outcome as LoopOutcome;
 	};
 
+	/** The PR loop child of a loop that waits for it; undefined once it ended (the loop folds its outcome next). */
+	const prStatusOf = async (childId: TaskId): Promise<PrStatus | undefined> => {
+		const child = await harness.getTask(childId, context);
+		if (!child || child.state.status === "terminal" || child.state.status === "completing") return undefined;
+		const state = child.state.checkpoint as PrState;
+		return {
+			taskId: childId,
+			phase: prPhaseLabel(state),
+			asleep: child.state.status === "sleeping",
+			...(state.pr ? { url: state.pr.url, number: state.pr.number } : {}),
+			...(state.phase === "stop" || state.phase === "resume" ? { reason: state.reason } : {}),
+			decisions: state.decision ? [state.decision] : [],
+			lastKeys: Object.fromEntries(Object.entries(state.rounds ?? {}).map(([id, round]) => [id, decisionKey(id, round)])),
+			...(state.phase === "resume" ? { resumeKey: state.key } : {}),
+			...(state.phase === "merge" ? { mergeKey: state.key } : {}),
+		};
+	};
+
 	const runner: Runner = {
 		harness,
 		cwd,
 		async start(docPath, startOptions = {}) {
 			const path = resolve(docPath);
-			const input: LoopInput = { docPath: path, cwd, ...(startOptions.maxAttempts === undefined ? {} : { maxAttempts: startOptions.maxAttempts }) };
+			const input: LoopInput = { docPath: path, cwd, ...(startOptions.maxAttempts === undefined ? {} : { maxAttempts: startOptions.maxAttempts }), ...(startOptions.pr ? { pr: true } : {}) };
 			const taskId = await root.commit(async (tx) => (await findIn(tx, path)) ?? tx.createTask(loop, input, { ownership: { kind: "conversation" } }), context);
 			// Committing a task does not start the scheduler; do it here so the loop runs without anyone waiting on it.
 			harness.resume();
@@ -170,14 +223,21 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 				const record = await harness.getTask(taskId, context);
 				if (!record) throw new Error(`no such task ${taskId}`);
 				if (record.state.status === "terminal") return outcomeOf(record.state.outcome as never);
-				// Asleep, and nothing in this process can run now: parked. Twice in a row, so a hand-over between phases is not mistaken for it.
-				if (record.state.status === "sleeping" && !harness.wake().active) quiet += 1;
+				// Asleep (or waiting on a child that is), and nothing in this process can run now: parked. Twice in a row, so a hand-over between phases is not mistaken for it.
+				if ((record.state.status === "sleeping" || record.state.status === "waiting") && !harness.wake().active) quiet += 1;
 				else quiet = 0;
 				if (quiet >= 2) {
 					const current = await runner.status(taskId);
-					return { status: "waiting", ...(current.state === "paused" ? { paused: current.reason } : {}), decisions: current.decisions.map((decision) => decision.ticketId) };
+					// A CI poll is a timer of this process, not a person: keep waiting for it.
+					if (current.pr?.phase === "wait-ci") {
+						quiet = 0;
+					} else {
+						const asks = [...current.decisions, ...(current.pr?.decisions ?? [])].map((decision) => decision.ticketId);
+						const where = current.pr ? { pr: { phase: current.pr.phase, ...(current.pr.url ? { url: current.pr.url } : {}), ...(current.pr.reason ? { reason: current.pr.reason } : {}) } } : {};
+						return { status: "waiting", ...(current.state === "paused" ? { paused: current.reason } : {}), decisions: asks, ...where };
+					}
 				}
-				await sleep(POLL_MS);
+				await sleep(SETTLE_POLL_MS);
 			}
 		},
 		async status(taskId) {
@@ -188,7 +248,10 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			if (record.state.status === "terminal" || record.state.status === "completing") {
 				const outcome = outcomeOf(record.state.outcome as never);
 				if (outcome.status === "completed") {
-					return outcome.result.status === "done" ? { ...base, state: "done" } : { ...base, state: "stalled", waiting: outcome.result.waiting };
+					const result = outcome.result;
+					if (result.status === "merged") return { ...base, state: "done", merged: { url: result.url, number: result.number } };
+					if (result.status === "pr-failed") return { ...base, state: "failed", reason: result.reason };
+					return result.status === "done" ? { ...base, state: "done" } : { ...base, state: "stalled", waiting: result.waiting };
 				}
 				if (outcome.status === "failed") return { ...base, state: "failed", reason: outcome.error.message };
 				return { ...base, state: "aborted" };
@@ -201,7 +264,8 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 				epoch: working.epoch ?? 0,
 			};
 			if (checkpoint.phase === "resume") return { ...base, ...carried, state: "paused", reason: checkpoint.reason, resumeKey: checkpoint.key };
-			return { ...base, ...carried, state: record.state.status === "sleeping" ? "sleeping" : "running" };
+			const pr = checkpoint.phase === "pr-record" ? await prStatusOf(checkpoint.childId as TaskId) : undefined;
+			return { ...base, ...carried, ...(pr ? { pr } : {}), state: record.state.status === "sleeping" ? "sleeping" : "running" };
 		},
 		deliver: (taskId, token, key, value) => deliver(harness, taskId, token, key, value, context),
 		close: () => harness.close(context),

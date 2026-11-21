@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import type { SignalResult } from "@earendil-works/pi-durable";
 import { parseTicketList } from "../../lib/ticket-list.ts";
 import type { Runner } from "./runner.ts";
-import { ANSWER, PAUSE, pauseKey, RESUME, signalExit, signalLine } from "./signals.ts";
+import { ANSWER, MERGE, mergeCommand, PAUSE, pauseKey, RESUME, signalExit, signalLine } from "./signals.ts";
 
 export interface ControlResult {
 	code: 0 | 1 | 2;
@@ -32,9 +32,15 @@ export async function answerDecision(runner: Runner, docPath: string, ticketId: 
 	const loop = await liveLoop(runner, docPath);
 	if ("failure" in loop) return loop.failure;
 	const { id, status } = loop;
-	const open = status.decisions.find((decision) => decision.ticketId === ticketId);
+	// A fix ticket's question (FIX-n) belongs to the PR loop task, which holds the signal wait; a ticket's, to the loop.
+	const loopOpen = status.decisions.find((decision) => decision.ticketId === ticketId);
+	const prOpen = status.pr?.decisions.find((decision) => decision.ticketId === ticketId);
+	const prKey = status.pr?.lastKeys[ticketId];
+	const inPr = prOpen !== undefined || (loopOpen === undefined && status.lastKeys[ticketId] === undefined && prKey !== undefined);
+	const target = inPr && status.pr ? status.pr.taskId : id;
+	const open = prOpen ?? loopOpen;
 	// An answered or expired decision is no longer open, but its key is still the one to answer: the signal says `duplicate` or `closed`.
-	const key = open?.key ?? status.lastKeys[ticketId];
+	const key = open?.key ?? (inPr ? prKey : status.lastKeys[ticketId]);
 	if (key === undefined) return failure(signalLine("not_found", `no decision for ${ticketId}`), 1, "not_found");
 
 	let value: { choice: string; option?: number; approve?: boolean };
@@ -52,7 +58,7 @@ export async function answerDecision(runner: Runner, docPath: string, ticketId: 
 	}
 	if (options.approve) value.approve = true;
 
-	const result = await runner.deliver(id, ANSWER, key, value);
+	const result = await runner.deliver(target, ANSWER, key, value);
 	switch (result) {
 		case "delivered":
 			return { code: 0, result, text: `${signalLine(result, said)}${options.approve ? " (command approved)" : ""}\n${startAgain(docPath)}` };
@@ -72,6 +78,7 @@ export async function pauseLoop(runner: Runner, docPath: string): Promise<Contro
 	if ("failure" in loop) return loop.failure;
 	const { id, status } = loop;
 	if (status.state === "paused") return failure(`already paused: ${status.reason}. Resume with \`brigadev-runner resume ${docPath}\`.`);
+	if (status.pr) return failure(`the PR loop is running (${status.pr.phase}): a pause is read at a ticket pick, and no ticket is left. It parks by itself when it needs you.`);
 	const result = await runner.deliver(id, PAUSE, pauseKey(status.epoch), { by: "cli" });
 	if (result === "delivered") return { code: 0, result, text: signalLine(result, "pause requested: the loop pauses at its next pick (a running ticket finishes first)") };
 	return failure(signalLine(result, result === "duplicate" ? "pause already requested" : "the pause request was refused"), signalExit(result) === 2 ? 2 : 1, result);
@@ -81,10 +88,42 @@ export async function resumeLoop(runner: Runner, docPath: string): Promise<Contr
 	const loop = await liveLoop(runner, docPath);
 	if ("failure" in loop) return loop.failure;
 	const { id, status } = loop;
-	if (status.state !== "paused" || status.resumeKey === undefined) return failure(`not paused: the loop is ${status.state}`);
-	const result = await runner.deliver(id, RESUME, status.resumeKey, { by: "cli" });
+	// The PR loop's own stop (needs-you) is lifted through its task; the ticket loop's pause through the loop's.
+	const parked = status.state !== "paused" && status.pr?.resumeKey !== undefined ? status.pr : undefined;
+	if (!parked && (status.state !== "paused" || status.resumeKey === undefined)) {
+		return failure(`not paused: the loop is ${status.state}${status.pr ? ` (PR loop: ${status.pr.phase})` : ""}`);
+	}
+	const result = parked ? await runner.deliver(parked.taskId, RESUME, parked.resumeKey!, { by: "cli" }) : await runner.deliver(id, RESUME, status.resumeKey!, { by: "cli" });
 	if (result === "delivered") return { code: 0, result, text: `${signalLine(result, "resume requested")}\n${startAgain(docPath)}` };
 	return failure(signalLine(result, result === "duplicate" ? "resume already requested" : "the resume request was refused"), signalExit(result) === 2 ? 2 : 1, result);
+}
+
+/**
+ * `merge`: the user's approval to merge the PR, delivered to the PR loop while it waits for it. The runner then re-reads the PR and merges only when it is
+ * open, not a draft, still at the pushed commit, and green. `duplicate` and `closed` (a second approval; the 24 h deadline, or the loop ended) are final
+ * answers, like an answer's.
+ */
+export async function mergeLoop(runner: Runner, docPath: string): Promise<ControlResult> {
+	const loop = await liveLoop(runner, docPath);
+	if ("failure" in loop) return loop.failure;
+	const { status } = loop;
+	const pr = status.pr;
+	if (!pr || pr.mergeKey === undefined) {
+		return failure(`not waiting for a merge approval: ${pr ? `the PR loop is at ${pr.phase}` : "the loop has not reached the PR loop"}. \`brigadev-runner status ${docPath}\` says where it is.`);
+	}
+	const result = await runner.deliver(pr.taskId, MERGE, pr.mergeKey, { by: "cli" });
+	switch (result) {
+		case "delivered":
+			return { code: 0, result, text: `${signalLine(result, `merge approved for ${pr.url ?? "the PR"}`)}\n${startAgain(docPath)} The runner re-reads the PR first: it merges only when the PR is open, not a draft, at the pushed commit, and green.` };
+		case "duplicate":
+			return failure(signalLine(result, "the merge was already approved"), 1, result);
+		case "closed":
+			return failure(signalLine(result, "the merge approval is closed: its 24 h deadline passed, or the loop ended"), 1, result);
+		case "invalid":
+			return failure(signalLine(result, "the approval was refused"), 2, result);
+		default:
+			return failure(signalLine(result, `no merge approval is awaited by ${docPath}`), 1, result);
+	}
 }
 
 /** Read-only: the loop's state, every ticket's status from the doc, and each open decision with its options and the exact answer command. */
@@ -107,7 +146,11 @@ export async function statusText(runner: Runner, docPath: string): Promise<Contr
 			lines.push(`loop: failed: ${status.reason}`);
 			break;
 		default:
-			lines.push(`loop: ${status.state}`);
+			lines.push(`loop: ${status.state}${status.merged ? ` (merged ${status.merged.url})` : ""}`);
+	}
+	if (status.pr) {
+		lines.push(`pr: ${status.pr.phase}${status.pr.url ? `  ${status.pr.url}` : ""}`);
+		if (status.pr.reason) lines.push(`  needs you: ${status.pr.reason}`);
 	}
 	lines.push("tickets:");
 	try {
@@ -115,12 +158,13 @@ export async function statusText(runner: Runner, docPath: string): Promise<Contr
 	} catch (error) {
 		lines.push(`  (cannot read ${docPath}: ${(error as Error).message})`);
 	}
-	for (const decision of status.decisions) {
+	for (const decision of [...status.decisions, ...(status.pr?.decisions ?? [])]) {
 		lines.push("", `decision ${decision.ticketId}: ${decision.question}`);
 		decision.options.forEach((option, index) => lines.push(`  ${index + 1}. ${option.label}${decision.recommended === index + 1 ? " (recommended)" : ""}${option.description ? ` — ${option.description}` : ""}`));
 		if (decision.command !== null) lines.push(`  command to approve: ${decision.command} (an option starting with "Approve", or --approve, lets the rerun run it once)`);
 		lines.push(`  answer: brigadev-runner answer ${docPath} ${decision.ticketId} <1..${decision.options.length}|text>`, `  deadline: ${new Date(decision.until).toISOString()}`);
 	}
-	if (status.state === "paused") lines.push("", `resume: brigadev-runner resume ${docPath}`);
+	if (status.state === "paused" || status.pr?.resumeKey !== undefined) lines.push("", `resume: brigadev-runner resume ${docPath}`);
+	if (status.pr?.mergeKey !== undefined) lines.push("", `merge: ${mergeCommand(docPath)}`);
 	return { code: 0, text: lines.join("\n") };
 }

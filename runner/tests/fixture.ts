@@ -9,6 +9,7 @@ import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall, type FauxPr
 import { MemoryStorage } from "@earendil-works/pi-durable";
 import type { Report, Storage } from "@earendil-works/pi-durable";
 import { openRunner, type Runner } from "../src/runner.ts";
+import type { PrDeps } from "../src/pr.ts";
 import type { TicketDeps } from "../src/tasks.ts";
 
 export const context = BACKGROUND_CONTEXT;
@@ -212,7 +213,8 @@ export function makeWorker(scripts: Record<string, string | Step[] | ((run: numb
 	};
 	const step = (ctx: { messages: Array<{ role: string; content?: unknown; isError?: boolean }> }) => {
 		const user = ctx.messages.filter((m) => m.role === "user").map((m) => text(m.content)).join("\n");
-		const ticketId = /Implement ticket (T\d+[A-Za-z0-9.]*)/.exec(user)?.[1] ?? "?";
+		// A ticket (`T3`), a PR loop fix ticket (`FIX-1`), or the PR loop's verify conversation (`VERIFY`).
+		const ticketId = /Implement ticket ((?:T|FIX-)\d+[A-Za-z0-9.]*)/.exec(user)?.[1] ?? (/Verify the changes of branch/.test(user) ? "VERIFY" : "?");
 		const last = ctx.messages.at(-1);
 		if (last?.role === "toolResult") {
 			worker.results.push({ ticketId, text: text(last.content), isError: last.isError === true });
@@ -252,7 +254,7 @@ export type FixtureRunner = Runner & { reports: Report[] };
 export async function openFixtureRunner(
 	ws: Workspace,
 	worker: Worker,
-	options: { storage?: Storage; deps?: TicketDeps; clock?: ReturnType<typeof fakeClock> } = {},
+	options: { storage?: Storage; deps?: TicketDeps; prDeps?: PrDeps; clock?: ReturnType<typeof fakeClock> } = {},
 ): Promise<FixtureRunner> {
 	const { models, model } = modelsFor(worker);
 	const reports: Report[] = [];
@@ -263,6 +265,7 @@ export async function openFixtureRunner(
 		cwd: ws.repo,
 		model,
 		deps: options.deps,
+		prDeps: options.prDeps,
 		now: options.clock?.now,
 		setTimer: options.clock?.setTimer,
 		settings: { progress: { partialIntervalMs: 0, outputIntervalMs: 0, persistWithinMs: 0 } },

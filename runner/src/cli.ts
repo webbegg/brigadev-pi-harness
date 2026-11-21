@@ -1,8 +1,10 @@
 // brigadev-runner CLI.
-//   start <feature-doc>             validate the doc, then run its ticket list durably; returns when the loop ends or parks on a person
+//   start <feature-doc> [--no-pr]   validate the doc, then run its ticket list durably, then the PR loop (push, PR, CI, fixes, merge approval);
+//                                   `--no-pr` stops after the tickets. Returns when the loop ends or parks on a person
 //   status <feature-doc>            read-only: the loop's state, each ticket's status, open decisions with the exact answer command
 //   answer <feature-doc> <T#> <1..n|text> [--approve]   answer a parked ticket decision (--approve also approves its command)
-//   pause <feature-doc>             pause at the next pick;  resume <feature-doc>   lift a pause
+//   pause <feature-doc>             pause at the next pick;  resume <feature-doc>   lift a pause (or a PR loop stop)
+//   merge <feature-doc>             approve the merge of the PR the PR loop opened (it re-checks the PR before merging)
 // Exit codes: 0 loop done / signal delivered; 1 refused, failed, paused, stalled, parked, or a final signal answer (duplicate, closed, not_found);
 // 2 usage or an invalid answer.
 //
@@ -16,19 +18,20 @@ import { pathToFileURL } from "node:url";
 import { onFeatureBranch, readBranchFacts } from "../../lib/commit-branch.ts";
 import { canonicalPath } from "../../lib/paths.ts";
 import { repoDocsDir, repoName } from "../../lib/repo-docs.ts";
-import { answerDecision, pauseLoop, resumeLoop, statusText, type ControlResult } from "./control.ts";
+import { answerDecision, mergeLoop, pauseLoop, resumeLoop, statusText, type ControlResult } from "./control.ts";
 import { validateDoc } from "./doc.ts";
 import { nodeExec } from "./exec.ts";
 import type { Runner } from "./runner.ts";
-import { answerCommand } from "./tasks.ts";
+import { answerCommand, mergeCommand } from "./signals.ts";
 
 export const DEFAULT_MODEL = "claude-sonnet-5-5";
 const USAGE = [
-	"usage: brigadev-runner start <feature-doc>",
+	"usage: brigadev-runner start <feature-doc> [--no-pr]",
 	"       brigadev-runner status <feature-doc>",
 	"       brigadev-runner answer <feature-doc> <T#> <1..n|text> [--approve]",
 	"       brigadev-runner pause <feature-doc>",
 	"       brigadev-runner resume <feature-doc>",
+	"       brigadev-runner merge <feature-doc>",
 ].join("\n");
 
 export interface Io {
@@ -111,18 +114,21 @@ export async function worktreeRefusal(cwd: string): Promise<string | undefined> 
  * Run the loop for a doc until it ends or parks. Parked (asleep on a decision or a pause, nothing runnable): print where it waits and how to
  * answer, and return 1; the loop continues from storage the next time `start` runs.
  */
-export async function startLoop(runner: Runner, docPath: string, io: Io): Promise<number> {
-	const id = await runner.start(docPath);
+export async function startLoop(runner: Runner, docPath: string, io: Io, options: { pr?: boolean } = {}): Promise<number> {
+	const id = await runner.start(docPath, { pr: options.pr === true });
 	const outcome = await runner.settle(id);
 	io.out(JSON.stringify(outcome, null, 2));
 	if (outcome.status === "waiting") {
 		const status = await runner.status(id);
-		for (const decision of status.decisions) io.out(`${decision.ticketId} needs a decision: ${answerCommand(docPath, decision.ticketId)}`);
+		for (const decision of [...status.decisions, ...(status.pr?.decisions ?? [])]) io.out(`${decision.ticketId} needs a decision: ${answerCommand(docPath, decision.ticketId)}`);
 		if (outcome.paused !== undefined) io.out(`paused: ${outcome.paused}. Resume with: brigadev-runner resume ${docPath}`);
+		if (status.pr) io.out(`PR loop: ${status.pr.phase}${status.pr.url ? ` ${status.pr.url}` : ""}`);
+		if (status.pr?.mergeKey !== undefined) io.out(`Ready to merge. Approve with: ${mergeCommand(docPath)}`);
+		if (status.pr?.resumeKey !== undefined) io.out(`needs you: ${status.pr.reason}. Resume with: brigadev-runner resume ${docPath}`);
 		io.out(`Parked, nothing is running. After answering, then run \`brigadev-runner start ${docPath}\` again: the loop continues from storage.`);
 		return 1;
 	}
-	return outcome.status === "completed" && outcome.result.status === "done" ? 0 : 1;
+	return outcome.status === "completed" && (outcome.result.status === "done" || outcome.result.status === "merged") ? 0 : 1;
 }
 
 async function loadRunnerModules() {
@@ -134,7 +140,7 @@ async function loadRunnerModules() {
 	return { createModels, openNodeSqliteStorage, openRunner };
 }
 
-/** `status`, `answer`, `pause`, `resume`: no worker, no API key, no scheduling. */
+/** `status`, `answer`, `pause`, `resume`, `merge`: no worker, no API key, no scheduling. */
 async function control(command: string, args: string[], env: Env, io: Io, cwd: string): Promise<number> {
 	const approve = args.includes("--approve");
 	const positional = args.filter((arg) => arg !== "--approve");
@@ -202,6 +208,7 @@ async function runControl(
 		if (command === "status") result = await statusText(runner, docPath);
 		else if (command === "answer") result = await answerDecision(runner, docPath, ticketId, choice, { approve });
 		else if (command === "pause") result = await pauseLoop(runner, docPath);
+		else if (command === "merge") result = await mergeLoop(runner, docPath);
 		else result = await resumeLoop(runner, docPath);
 		(result.code === 0 ? io.out : io.err)(result.text);
 		return result.code;
@@ -212,10 +219,11 @@ async function runControl(
 
 export async function main(args: string[], env: Env = process.env, io: Io = { out: console.log, err: console.error }, cwd = process.cwd()): Promise<number> {
 	const [command, ...rest] = args;
-	if (command === "status" || command === "answer" || command === "pause" || command === "resume") return control(command, rest, env, io, cwd);
+	if (command === "status" || command === "answer" || command === "pause" || command === "resume" || command === "merge") return control(command, rest, env, io, cwd);
 
-	const [docArg] = rest;
-	if (command !== "start" || !docArg || rest.length > 1) {
+	const noPr = rest.includes("--no-pr");
+	const [docArg, ...extra] = rest.filter((arg) => arg !== "--no-pr");
+	if (command !== "start" || !docArg || extra.length > 0) {
 		io.err(USAGE);
 		return 2;
 	}
@@ -270,7 +278,7 @@ export async function main(args: string[], env: Env = process.env, io: Io = { ou
 			onReport: (report) => io.err(`report: ${report.kind}: ${(report.error as Error | undefined)?.message ?? ""}`),
 		});
 		try {
-			return await startLoop(runner, docPath, io);
+			return await startLoop(runner, docPath, io, { pr: !noPr });
 		} finally {
 			await runner.close();
 		}

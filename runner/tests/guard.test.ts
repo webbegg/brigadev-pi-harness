@@ -276,3 +276,47 @@ describe("the hook reaches nested calls (call.parent) inside the Harness (A1)", 
 		assert.match(JSON.stringify(nested[1].structuredOutput), /nested-ok/);
 	});
 });
+
+// T6 (A4): the verify conversation's rules. Its calls are decided by a read-only guard: `read`, `bash`, and the verdict tool only; nothing writes inside the worktree.
+const READ_ONLY = /verifier is read-only/;
+const VERIFY_CASES: Case[] = [
+	{ name: "read a file", call: () => ({ name: "read", arguments: { path: "README.md" } }), expect: "allow" },
+	{ name: "read a secret still blocked", call: () => ({ name: "read", arguments: { path: ".env" } }), expect: /may hold secrets/ },
+	{ name: "the verdict tool", call: () => ({ name: "verify_verdict", arguments: {} }), expect: "allow" },
+	{ name: "write is not a verifier tool", call: () => ({ name: "write", arguments: { path: "a.ts", content: "x" } }), expect: /unknown tool write/ },
+	{ name: "edit is not a verifier tool", call: () => ({ name: "edit", arguments: { path: "a.ts", edits: [] } }), expect: /unknown tool edit/ },
+	{ name: "check and ask_user_choice are worker tools", call: () => ({ name: "check", arguments: {} }), expect: /unknown tool check/ },
+	{ name: "git commit", call: () => bash("git commit -m x"), expect: READ_ONLY },
+	{ name: "git commit --allow-empty in bash -c", call: () => bash("bash -c 'git commit --allow-empty -m x'"), expect: READ_ONLY },
+	{ name: "git add", call: () => bash("git add -A"), expect: READ_ONLY },
+	{ name: "git checkout", call: () => bash("git checkout -b other"), expect: READ_ONLY },
+	{ name: "git stash", call: () => bash("git stash"), expect: READ_ONLY },
+	{ name: "git worktree add", call: () => bash("git worktree add ../w"), expect: READ_ONLY },
+	{ name: "git -C . reset", call: () => bash("git -C . reset --hard"), expect: READ_ONLY },
+	{ name: "a redirect into the worktree", call: () => bash("echo x > a.ts"), expect: READ_ONLY },
+	{ name: "tee into the worktree", call: () => bash("echo x | tee src/a.ts"), expect: READ_ONLY },
+	{ name: "cp into the worktree", call: () => bash("cp /etc/hosts ./hosts.copy"), expect: READ_ONLY },
+	{ name: "git push is blocked", call: () => bash("git push"), expect: READ_ONLY },
+	{ name: "git status && git diff", call: () => bash("git status && git diff main...HEAD"), expect: "allow" },
+	{ name: "git log", call: () => bash("git log --oneline -5"), expect: "allow" },
+	{ name: "npm test", call: () => bash("npm test"), expect: "allow" },
+	{ name: "a scratch copy outside the worktree", call: () => bash("S=$(mktemp -d) && rsync -a --exclude .git ./ \"$S/work/\" && echo hi > /tmp/brigadev-verify-probe.txt"), expect: "allow" },
+];
+
+describe("verify guard: read-only (A4)", { concurrency: 8 }, () => {
+	before(() => {
+		env.settings({});
+		ws = makeWorkspace();
+	});
+	after(() => ws.cleanup());
+	for (const entry of VERIFY_CASES) {
+		it(`${entry.expect === "allow" ? "allows" : "blocks"}: ${entry.name}`, async () => {
+			const reason = await createGuard({ cwd: ws.repo, readOnly: true, settings: () => ({}) }).decide(entry.call());
+			if (entry.expect === "allow") assert.equal(reason, undefined);
+			else {
+				assert.ok(reason !== undefined, "blocked");
+				assert.match(reason, entry.expect);
+			}
+		});
+	}
+});
