@@ -96,7 +96,8 @@ describe("check tool", () => {
 		const out = text(await run({ command: "node --test", focus: "pass.test.js" }));
 		const file = /full output: (\S+)/.exec(out)?.[1];
 		assert.ok(file && existsSync(file), `no output file in: ${out}`);
-		assert.match(readFileSync(file, "utf8"), /ℹ pass 2/);
+		// Spec reporter (`ℹ pass 2`) or TAP (`# pass 2`, Node 22's default when output is piped).
+		assert.match(readFileSync(file, "utf8"), /^(?:ℹ|#) pass 2$/m);
 	});
 
 	it("reports FAIL with the counts and the failing tail, and records a failing run", async () => {
