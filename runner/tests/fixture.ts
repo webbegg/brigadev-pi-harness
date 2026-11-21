@@ -168,7 +168,9 @@ export function depsWithHook(hook: (command: string) => void): TicketDeps {
 }
 
 /** A manual clock for a Harness: `now` and `setTimer` go to the runner; `advance(ms)` moves time and fires the timers that came due. */
-export function fakeClock(start = Date.parse("2026-11-20T10:00:00Z")) {
+// Starts at the real time: a deadline the runner sets on this clock is read with the real clock by a CLI command in another process
+// (`merge`, `answer`), so a fixed start date turns into a closed deadline 24 h after it.
+export function fakeClock(start = Date.now()) {
 	let time = start;
 	let timers: Array<{ at: number; callback: () => void }> = [];
 	return {
