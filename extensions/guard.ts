@@ -37,7 +37,20 @@ const MODE_NOTICE = "brigadev-mode-notice";
 /** Tools that search under a `path` argument; the guard decides that path like a read. */
 const SEARCH_TOOLS = new Set(["grep", "find", "ls"]);
 
+/**
+ * Node opens an unauthenticated inspector on 127.0.0.1 when the process gets SIGUSR1 and has no listener for it. The agent's bash could then send it to Pi
+ * (`kill -USR1 <pi pid>`) and run code inside Pi, past this guard. One listener per process (a reload loads this module again: the mark is on `process`).
+ */
+const NO_INSPECTOR = Symbol.for("brigadev.noInspectorOnSigusr1");
+function keepInspectorClosed(): void {
+	const host = process as NodeJS.Process & { [NO_INSPECTOR]?: boolean };
+	if (process.platform === "win32" || host[NO_INSPECTOR]) return;
+	host[NO_INSPECTOR] = true;
+	process.on("SIGUSR1", () => {});
+}
+
 export default function (pi: ExtensionAPI) {
+	keepInspectorClosed();
 	const isChild = isChildSession();
 	let mode: PermissionMode = PERMISSION_MODE.NORMAL;
 	// Per-session grants for directories outside the project root.

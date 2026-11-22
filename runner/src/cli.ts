@@ -34,6 +34,11 @@ import { LoopStartedDifferently } from "./errors.ts";
 import type { Runner } from "./runner.ts";
 import { answerCommand, mergeCommand } from "./signals.ts";
 
+// Node opens an unauthenticated inspector on 127.0.0.1 when the process gets SIGUSR1, unless a listener is installed. Any process of the user, the worker's
+// own bash included (`kill -USR1 $PPID`), could then run code in the runner with the environment the containment keeps from the worker (tokens, the gh login).
+// So the runner always holds a SIGUSR1 listener, from the moment this module loads; `npm start` also passes `--disable-sigusr1`.
+if (process.platform !== "win32") process.on("SIGUSR1", () => {});
+
 export const DEFAULT_MODEL = "claude-sonnet-5-5";
 const USAGE = [
 	"usage: brigadev-runner start <feature-doc> [--no-pr] [--web [--port N]]",

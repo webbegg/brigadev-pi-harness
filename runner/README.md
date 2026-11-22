@@ -23,8 +23,8 @@ git worktree add ../<repo>-runner -b <branch>
 export ANTHROPIC_API_KEY=...
 # optional: BRIGADEV_RUNNER_MODEL (default claude-sonnet-5-5)
 cd ../<repo>-runner
-node <path-to>/runner/src/cli.ts start ~/.brigadev/<repo>/tasks/<feature>.md            # tickets, then the PR loop
-node <path-to>/runner/src/cli.ts start ~/.brigadev/<repo>/tasks/<feature>.md --no-pr    # tickets only
+node --disable-sigusr1 <path-to>/runner/src/cli.ts start ~/.brigadev/<repo>/tasks/<feature>.md            # tickets, then the PR loop
+node --disable-sigusr1 <path-to>/runner/src/cli.ts start ~/.brigadev/<repo>/tasks/<feature>.md --no-pr    # tickets only
 ```
 
 State is stored in `<brigadev home>/<repo>/runner.sqlite` (`~/.brigadev/<repo>/` unless `BRIGADEV_HOME` is set; `<repo>` is the main checkout's folder name, shared by every worktree, like the feature documents and the evidence). Running `start` again for the same doc finds the same loop task and continues it. What the loop was started with is fixed: `start` with the other `--no-pr` choice, or from another worktree than the loop's, exits 1 and says how the loop was started (it would otherwise push and open a PR after `--no-pr`, or run the guard in a checkout the commits are not in). Exit codes: 0 every ticket done (and, with the PR loop, the PR merged), 1 refused, failed, stalled, or parked (waiting for a decision, a resume, or the merge approval), 2 usage.
@@ -175,6 +175,7 @@ The worker and the verifier run bash in the user's account, with the user's cred
 - **Anything after the fact.** The integrity check is detective: a push, a ref change, or a planted hook has already happened when it is reported. The runner parks and says what changed; it does not undo. Only `origin`'s refs are read, and only the listed state is compared.
 - **A user's edit during a worker run.** Any change of the feature document during a worker's conversation parks the loop, yours included.
 - **Forged evidence.** A script can write the evidence log: the commit gate is quality control, not a security boundary.
+- **Other Node processes of yours.** SIGUSR1 opens Node's unauthenticated inspector in any Node process without a listener for it. The runner holds one, and `npm start` passes `--disable-sigusr1`, but `npm` itself is a Node process with the runner's environment: start the runner with `node --disable-sigusr1 <path-to>/runner/src/cli.ts start …`, not through npm. The agent can still signal your other Node processes (MCP servers, editors, a Pi started through `npx`).
 
 For a guarantee run the runner where there is nothing to steal: a container or VM, or an OS account with no credentials, with `gh` and git configured for the runner only. That is the recommended way to run it unattended.
 

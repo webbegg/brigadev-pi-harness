@@ -6,6 +6,10 @@
 
 - `brigadev-runner start <doc> --web [--port N]` serves the web UI's loop board from the runner process (`BRIGADEV_WEB_PORT` also sets the port). The tickets, the PR loop, and what needs you (ticket decisions, the merge approval, a paused loop) show on the board, and answering, approving the merge, resuming, and pausing work from the browser, in the process that holds the store, so the loop continues without another `start`. The one-time link goes to stdout only; `kill -USR1 <pid>` or Enter prints a new one. The web page has a runner mode (`session` snapshot `kind: "runner"`, optional `doc`): no composer, Pause instead of Abort, no cancel buttons; `webPage({ variant: "runner", pid })` names the runner's signal and terminal in the link messages. `answer`, `pause`, `resume`, and `merge` refusals while a `start` holds the store now point at the board.
 
+### Security
+
+- SIGUSR1 no longer opens Node's inspector in Pi (the guard installs a listener when it loads) or in `brigadev-runner` (its CLI holds one, and `npm start` passes `--disable-sigusr1`). Before, the agent's bash could send `kill -USR1` to its parent and get an unauthenticated debugger on 127.0.0.1: in Pi, code running past the guard; in the runner, code running with the credentials the containment keeps from the worker. To debug Pi, start it with `--inspect`; SIGUSR1 no longer opens the inspector once the guard has loaded. Run the runner with `node --disable-sigusr1` rather than `npm start`, whose own npm process is still open to the signal.
+
 ## [0.23.0] - 2026-11-21
 
 The 0.23.0 release: everything in the pre-releases rc.1–rc.4 below (the web UI loop board, the brigadev bus, codemode by default, the durable runner, CI), plus these fixes from the pre-release review.
