@@ -7,7 +7,7 @@
 	"type": "module",
 	"scripts": {
 		"test": "node --test tests/*.test.ts",
-		"start": "node src/cli.ts start"
+		"start": "node --disable-sigusr1 src/cli.ts start"
 	},
 	"dependencies": {
 		"@earendil-works/chord": "1.6.0",

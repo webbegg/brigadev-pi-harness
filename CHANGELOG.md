@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Security
+
+- SIGUSR1 no longer opens Node's inspector in Pi (the guard installs a listener when it loads) or in `brigadev-runner` (its CLI holds one, and `npm start` passes `--disable-sigusr1`). Before, the agent's bash could send `kill -USR1` to its parent and get an unauthenticated debugger on 127.0.0.1: in Pi, code running past the guard; in the runner, code running with the credentials the containment keeps from the worker.
+
 ## [0.23.0] - 2026-11-21
 
 The 0.23.0 release: everything in the pre-releases rc.1–rc.4 below (the web UI loop board, the brigadev bus, codemode by default, the durable runner, CI), plus these fixes from the pre-release review.
