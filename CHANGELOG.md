@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-22
+
+The durable runner's own loop board (`start --web`), hardened against the worker it supervises, and a fix that keeps SIGUSR1 from opening Node's inspector in Pi or the runner (in 0.23.0 a child process could get an unauthenticated debugger in its parent: upgrade).
+
 ### Added
 
 - `brigadev-runner start <doc> --web [--port N]` serves the web UI's loop board from the runner process (`BRIGADEV_WEB_PORT` also sets the port). The tickets, the PR loop, and what needs you (ticket decisions, the merge approval, a paused loop) show on the board, and answering, approving the merge, resuming, and pausing work from the browser, in the process that holds the store, so the loop continues without another `start`. `--web` needs stdin and stdout to be terminals (exit 2 otherwise, before anything starts) and refuses inside tmux, screen or zellij unless `--web-in-multiplexer` is given (exit 2 with the reason, a warning with the override), and in the background of its terminal (`start --web &`: reading the terminal there would stop the process with SIGTTIN; exit 2, run it in the foreground). The one-time link is written to that terminal only, and a fresh one comes only from Enter there (no signal prints one). The web page has a runner mode (`session` snapshot `kind: "runner"`, optional `doc`): no composer, Pause instead of Abort, no cancel buttons; parked tickets show as `needs-you` or `blocked`; a prompt the loop moved past closes as "no longer current" (an optional `reason` on a dismissed `PromptState`, shown in place of "dismissed"); `webPage({ variant: "runner" })` tells a signed-out user to press Enter in the runner's terminal for a new link. `answer`, `pause`, `resume`, and `merge` refusals while a `start` holds the store now point at the board.
