@@ -14,13 +14,14 @@ import { readSettings } from "../../lib/runtime.ts";
 import { createCheckTool } from "./check-tool.ts";
 import { createContainment } from "./contain.ts";
 import { createAskTool } from "./decision.ts";
+import { DEFAULT_CAP, LedgerDoc, setCap, validCap } from "./cost.ts";
 import { LoopStartedDifferently } from "./errors.ts";
 import { ReapingExecutionEnv, verifyReaping } from "./reaping-env.ts";
 import { guardExtension } from "./guard.ts";
 import { PR_TASK, prPhaseLabel, type PrDeps, type PrState } from "./pr.ts";
 import { RunsCache } from "./runs-cache.ts";
 import { decisionKey, deliver } from "./signals.ts";
-import { createTasks, defaultDeps, LOOP_TASK, TICKET_TASK, type LoopInput, type LoopResult, type LoopState, type OpenDecision, type TicketDeps, type TicketInput, type TicketResult, type TicketState } from "./tasks.ts";
+import { createTasks, defaultDeps, LOOP_TASK, TICKET_TASK, type LoopInput, type PauseKind, type LoopResult, type LoopState, type OpenDecision, type TicketDeps, type TicketInput, type TicketResult, type TicketState } from "./tasks.ts";
 import { doneTimeoutMs } from "./shell.ts";
 import { createVerdictTool, type Verifier } from "./verify.ts";
 import type { Worker } from "./worker.ts";
@@ -81,6 +82,8 @@ export interface PrStatus {
 	lastKeys: Record<string, string>;
 	/** The key `resume` is delivered under while the PR loop waits in needs-you. */
 	resumeKey?: string;
+	/** The stop is the loop's cost cap: only `resume --cap` lifts it. */
+	costCap?: boolean;
 	/** The key `merge` is delivered under while the PR loop waits for the merge approval. */
 	mergeKey?: string;
 	/** The last PR comment that could not be posted. */
@@ -108,6 +111,8 @@ export interface TicketRun {
 	outputTail?: string;
 	startedAt?: number;
 	endedAt?: number;
+	/** What the ticket's worker conversations cost, in dollars (`pi.usage`, every attempt). */
+	cost?: number;
 	/** The worker's last tool calls, oldest first, with their raw arguments (the caller summarizes and redacts them). */
 	steps: Array<{ tool: string; args: unknown }>;
 }
@@ -119,6 +124,10 @@ export interface LoopStatus {
 	state: "running" | "sleeping" | "paused" | "done" | "stalled" | "failed" | "aborted";
 	/** Why it is paused, why it failed, or what it is waiting on. */
 	reason?: string;
+	/** Why it is paused: `cost` is the cost cap (only `resume --cap` lifts it). */
+	kind?: PauseKind;
+	/** What the loop's conversations cost so far (`pi.usage`, failed attempts included) and its cap, in dollars. */
+	cost?: { spent: number; cap: number };
 	/** The ticket IDs a stalled loop waits on. */
 	waiting?: string[];
 	/** Open decisions, with their options, deadlines, and keys. */
@@ -141,8 +150,11 @@ export interface Runner {
 	harness: Harness;
 	/** The resolved repo directory workers run in. */
 	cwd: string;
-	/** Start the loop for a doc. Idempotent per doc path: a second call returns the same task, also after a restart. Enables scheduling. */
-	start(docPath: string, options?: { maxAttempts?: number; pr?: boolean }): Promise<TaskId<LoopResult>>;
+	/**
+	 * Start the loop for a doc. Idempotent per doc path: a second call returns the same task, also after a restart. Enables scheduling. `cap` is the loop's dollar cost cap
+	 * (a positive number; default $5): stored durably with the loop, kept by a start without it, changed by a start with it (read by the next boundary: not by a conversation already running).
+	 */
+	start(docPath: string, options?: { maxAttempts?: number; pr?: boolean; cap?: number }): Promise<TaskId<LoopResult>>;
 	/** The loop already started for a doc, or undefined. Starts nothing. */
 	find(docPath: string): Promise<TaskId<LoopResult> | undefined>;
 	/** Wait for the loop's outcome. Enables scheduling, so after a reopen this also resumes interrupted work. Does not return for a loop that sleeps: see `settle`. */
@@ -155,8 +167,11 @@ export interface Runner {
 	status(taskId: TaskId<LoopResult>): Promise<LoopStatus>;
 	/** Every ticket the loop (and its PR loop) ran, newest run per ticket, from storage reads only: it works on any open Runner and commits nothing. */
 	ticketRuns(taskId: TaskId<LoopResult>): Promise<TicketRun[]>;
-	/** Deliver a signal to the loop (or to its PR loop child: `status().pr.taskId`) in one commit, without scheduling anything. */
-	deliver<T>(taskId: TaskId, token: SignalToken<T>, key: string, value: T): Promise<SignalResult>;
+	/**
+	 * Deliver a signal to the loop (or to its PR loop child: `status().pr.taskId`) in one commit, without scheduling anything. With `cap`, the loop's cost cap is set to `dollars`
+	 * in the same commit when (and only when) the signal is delivered.
+	 */
+	deliver<T>(taskId: TaskId, token: SignalToken<T>, key: string, value: T, options?: { cap?: { loop: TaskId; dollars: number } }): Promise<SignalResult>;
 	close(): Promise<void>;
 }
 
@@ -187,7 +202,7 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 	const checkTool = createCheckTool({ cwd, settings, shellEnv: containment.env, maxTimeoutMs: shell.timeoutMs });
 	const askTool = createAskTool();
 	const verdictTool = createVerdictTool();
-	const { loop, ticket, pr } = createTasks(options.deps ?? defaultDeps, options.worker, [checkTool, askTool], { deps: options.prDeps, verifier: options.verifier, verdictTool, settings: pinned, shell }, shell);
+	const { loop, ticket, pr, meter } = createTasks(options.deps ?? defaultDeps, options.worker, [checkTool, askTool], { deps: options.prDeps, verifier: options.verifier, verdictTool, settings: pinned, shell }, shell);
 	const registry = createRegistry();
 	registry.install(CodingTools);
 	// S5: every tool call of a worker conversation (nested ones too) goes through the brigadev guard rules.
@@ -244,6 +259,7 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			...(state.pr ? { url: state.pr.url, number: state.pr.number } : {}),
 			...(state.sha ? { sha: state.sha } : {}),
 			...(state.phase === "stop" || state.phase === "resume" ? { reason: state.reason } : {}),
+			...((state.phase === "stop" || state.phase === "resume") && state.cost === true ? { costCap: true } : {}),
 			decisions: state.decision ? [state.decision] : [],
 			lastKeys: Object.fromEntries(Object.entries(state.rounds ?? {}).map(([id, round]) => [id, decisionKey(id, round)])),
 			...(state.phase === "resume" ? { resumeKey: state.key } : {}),
@@ -295,10 +311,21 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 		}
 	};
 
+	/** What a ticket task's worker conversations cost (every attempt's, from their `pi.usage`); 0 when a read fails (a card shows what it can). */
+	const costOf = async (taskId: TaskId): Promise<number> => {
+		try {
+			let total = 0;
+			for (const conversation of (await options.storage.scanConversations({ ownerTaskId: taskId }, 100, undefined, context)).items) total += await meter.conversation(harness, conversation.id, context);
+			return total;
+		} catch {
+			return 0;
+		}
+	};
+
 	/** One ticket task as a run: live (its steps are read now) or finished (the caller keeps it). */
 	const runOf = async (record: TaskRow): Promise<TicketRun> => {
 		const input = record.input as TicketInput;
-		const base = { ticketId: input.ticketId, taskId: record.id as TaskId, maxAttempts: input.maxAttempts, ...(record.startedAt === undefined ? {} : { startedAt: record.startedAt }), ...(record.endedAt === undefined ? {} : { endedAt: record.endedAt }) };
+		const base = { ticketId: input.ticketId, taskId: record.id as TaskId, maxAttempts: input.maxAttempts, cost: await costOf(record.id as TaskId), ...(record.startedAt === undefined ? {} : { startedAt: record.startedAt }), ...(record.endedAt === undefined ? {} : { endedAt: record.endedAt }) };
 		if (record.state.status !== "terminal" && record.state.status !== "completing") {
 			const attempt = (record.state.checkpoint as TicketState | undefined)?.attempt ?? 1;
 			return { ...base, live: true, attempts: attempt, steps: await stepsOf(record.id as TaskId) };
@@ -322,6 +349,7 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 		cwd,
 		async start(docPath, startOptions = {}) {
 			const path = resolve(docPath);
+			if (startOptions.cap !== undefined && !validCap(startOptions.cap)) throw new RangeError("the cost cap must be a positive number of dollars");
 			const input: LoopInput = { docPath: path, cwd, ...(startOptions.maxAttempts === undefined ? {} : { maxAttempts: startOptions.maxAttempts }), ...(startOptions.pr ? { pr: true } : {}) };
 			// B5/R3-002: a loop that exists keeps the input it was started with. Starting it again with the PR loop switched, or from another worktree, would
 			// silently do something else than what the user asked for (push and open a PR after `--no-pr`; run the guard in a checkout the commits are not in).
@@ -338,7 +366,13 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 					throw new LoopStartedDifferently(`this loop was started in ${stored.cwd} (its branch and commits are there) and cannot move to ${cwd}. Run \`brigadev-runner start ${path}\` from ${stored.cwd}.`);
 				}
 			}
-			const taskId = await root.commit(async (tx) => (await findIn(tx, path)) ?? tx.createTask(loop, input, { ownership: { kind: "conversation" } }), context);
+			// The cap lives in the loop's ledger (src/cost.ts), not in its input: a later `start --cap` changes it, and a start without one keeps the stored one.
+			const taskId = await root.commit(async (tx) => {
+				const id = (await findIn(tx, path)) ?? (await tx.createTask(loop, input, { ownership: { kind: "conversation" } }));
+				const ledger = await tx.doc(LedgerDoc, String(id), { cap: startOptions.cap ?? DEFAULT_CAP });
+				if (startOptions.cap !== undefined) ledger.cap = startOptions.cap;
+				return id;
+			}, context);
 			// Committing a task does not start the scheduler; do it here so the loop runs without anyone waiting on it.
 			harness.resume();
 			return taskId;
@@ -387,7 +421,8 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			if (!record) throw new Error(`no such task ${taskId}`);
 			const docPath = (record.input as LoopInput).docPath;
 			const started = { pr: (record.input as LoopInput).pr === true, cwd: (record.input as LoopInput).cwd };
-			const base = { taskId, docPath, started, decisions: [] as OpenDecision[], lastKeys: {} as Record<string, string>, epoch: 0 };
+			const cost = await meter.read(harness, String(taskId), context);
+			const base = { taskId, docPath, started, cost, decisions: [] as OpenDecision[], lastKeys: {} as Record<string, string>, epoch: 0 };
 			if (record.state.status === "terminal" || record.state.status === "completing") {
 				const outcome = outcomeOf(record.state.outcome as never);
 				if (outcome.status === "completed") {
@@ -406,7 +441,7 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 				lastKeys: Object.fromEntries(Object.entries(working.rounds ?? {}).map(([id, round]) => [id, decisionKey(id, round)])),
 				epoch: working.epoch ?? 0,
 			};
-			if (checkpoint.phase === "resume") return { ...base, ...carried, state: "paused", reason: checkpoint.reason, resumeKey: checkpoint.key };
+			if (checkpoint.phase === "resume") return { ...base, ...carried, state: "paused", reason: checkpoint.reason, kind: checkpoint.kind, resumeKey: checkpoint.key };
 			const pr = checkpoint.phase === "pr-record" ? await prStatusOf(checkpoint.childId as TaskId) : undefined;
 			return { ...base, ...carried, ...(pr ? { pr } : {}), state: record.state.status === "sleeping" ? "sleeping" : "running" };
 		},
@@ -445,7 +480,8 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			runsCache.settle(loop);
 			return [...latest.values()];
 		},
-		deliver: (taskId, token, key, value) => deliver(harness, taskId, token, key, value, context),
+		deliver: (taskId, token, key, value, deliverOptions) =>
+			deliver(harness, taskId, token, key, value, context, deliverOptions?.cap ? (tx) => setCap(tx, String(deliverOptions.cap!.loop), deliverOptions.cap!.dollars) : undefined),
 		close: async () => {
 			try {
 				await harness.close(context);

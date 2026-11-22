@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `brigadev-runner` has a dollar cost cap per loop: `start <doc> --cap <dollars>` (default $5, a positive number; stored with the loop, so a reopen keeps it, and a later `start` without `--cap` keeps it). The spend is the sum of the costs `pi.usage` records for every conversation the loop owns (ticket attempts, verify, fix tickets; failed attempts count; usage a provider does not report is not counted). It is checked before each ticket attempt, verify and fix ticket: at or over the cap the loop parks needs-you (`cost cap reached: $5.12 of $5.00 spent`; `status`, the PR comment and the board's Needs you column show it), and inside a running conversation the guard blocks every further tool call, so the run in progress can overshoot only by the responses it makes before it answers. `brigadev-runner resume <doc> --cap <dollars>` (or the board's cost-cap prompt) continues with a cap above the spend; a cap at or below the spend is refused, and so is a plain `resume` there unless `start --cap` already raised the cap above the spend. `status` prints `spend $X of $Y`, and the board shows it with each ticket's own spend.
+
 ## [0.24.0] - 2026-11-22
 
 The durable runner's own loop board (`start --web`), hardened against the worker it supervises, and a fix that keeps SIGUSR1 from opening Node's inspector in Pi or the runner (in 0.23.0 a child process could get an unauthenticated debugger in its parent: upgrade).

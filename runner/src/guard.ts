@@ -31,6 +31,7 @@ import { brigadevHome, isRepoDocsPath, repoDocsDir as docsDirOf } from "../../li
 import { agentDir, PACKAGE_ROOT, readSettings, type BrigadevSettings } from "../../lib/runtime.ts";
 import type { ExecFn } from "../../lib/worktree-snapshot.ts";
 import { containmentReason, readOnlyExtraReason } from "./containment-rules.ts";
+import { costBlock } from "./cost.ts";
 import { ASK_TOOL, commandApproved } from "./decision.ts";
 import { nodeExec } from "./exec.ts";
 import { RoleDoc, VERIFY_ROLE, VERIFY_TOOLS } from "./verify.ts";
@@ -342,6 +343,9 @@ export function guardExtension(options: GuardOptions) {
 		hooks: [
 			hook(ToolTask, {
 				beforeTool: async (call, api, context) => {
+					// The loop's cost cap (src/cost.ts): once its spend is at the cap, no further call of this conversation runs, so the run ends quickly.
+					const capped = await costBlock(call, api, context);
+					if (capped !== undefined) return { block: capped };
 					try {
 						// A role that cannot be read fails closed: the call must pass both rule sets.
 						const role = await (async () => (await api.snapshot(RoleDoc, api.conversationId, context))?.role ?? "")().catch(() => undefined);

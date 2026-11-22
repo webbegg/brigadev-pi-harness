@@ -4,6 +4,7 @@
 import { readFileSync } from "node:fs";
 import type { SignalResult } from "@earendil-works/pi-durable";
 import { parseTicketList } from "../../lib/ticket-list.ts";
+import { dollars, reached } from "./cost.ts";
 import type { Runner } from "./runner.ts";
 import { ANSWER, MERGE, mergeCommand, PAUSE, pauseKey, RESUME, signalExit, signalLine } from "./signals.ts";
 
@@ -100,7 +101,11 @@ export async function pauseLoop(runner: Runner, docPath: string): Promise<Contro
 	return failure(signalLine(result, result === "duplicate" ? "pause already requested" : "the pause request was refused"), signalExit(result) === 2 ? 2 : 1, result);
 }
 
-export async function resumeLoop(runner: Runner, docPath: string, expect?: Expect): Promise<ControlResult> {
+/**
+ * `resume`. A stop at the loop's cost cap is lifted only with a higher cap (`options.cap`, dollars): it must be above the spend, else nothing is delivered (exit 2); a plain resume
+ * there is refused with the hint, and `--cap` anywhere else is refused. The new cap is written in the commit that delivers the resume.
+ */
+export async function resumeLoop(runner: Runner, docPath: string, expect?: Expect, options: { cap?: number } = {}): Promise<ControlResult> {
 	const loop = await liveLoop(runner, docPath);
 	if ("failure" in loop) return loop.failure;
 	const { id, status } = loop;
@@ -111,8 +116,22 @@ export async function resumeLoop(runner: Runner, docPath: string, expect?: Expec
 	}
 	const key = parked ? parked.resumeKey! : status.resumeKey!;
 	if (expect && key !== expect.key) return stale(`the resume prompt ${expect.key} was replaced by ${key}`);
-	const result = await runner.deliver(parked ? parked.taskId : id, RESUME, key, { by: "cli" });
-	if (result === "delivered") return { code: 0, result, text: `${signalLine(result, "resume requested")}\n${startAgain(docPath)}` };
+	const atCap = parked ? parked.costCap === true : status.kind === "cost";
+	const spent = status.cost?.spent ?? 0;
+	if (options.cap !== undefined && !atCap) return failure(`not a cost-cap park: --cap applies only when the loop stopped at its cost cap (${parked ? parked.reason : status.reason}); nothing was delivered`, 2);
+	const storedCap = status.cost?.cap ?? 0;
+	if (atCap) {
+		// A cap already above the spend (raised by `start --cap`) lets a plain resume through: it would not stop again at once.
+		if (options.cap === undefined && reached(spent, storedCap)) {
+			return failure(
+				`${parked ? parked.reason : status.reason}. A plain resume would stop again at once: raise the cap with \`brigadev-runner resume ${docPath} --cap <dollars>\` (the cap is ${dollars(storedCap)}); nothing was delivered`,
+				2,
+			);
+		}
+		if (options.cap !== undefined && reached(spent, options.cap)) return failure(`the new cap ${dollars(options.cap)} must be above the spend ${dollars(spent)}; nothing was delivered`, 2);
+	}
+	const result = await runner.deliver(parked ? parked.taskId : id, RESUME, key, { by: "cli" }, atCap && options.cap !== undefined ? { cap: { loop: id, dollars: options.cap } } : undefined);
+	if (result === "delivered") return { code: 0, result, text: `${signalLine(result, atCap ? `resume requested with cost cap ${dollars(options.cap ?? storedCap)} (spent ${dollars(spent)})` : "resume requested")}\n${startAgain(docPath)}` };
 	return failure(signalLine(result, result === "duplicate" ? "resume already requested" : "the resume request was refused"), signalExit(result) === 2 ? 2 : 1, result);
 }
 
@@ -169,6 +188,7 @@ export async function statusText(runner: Runner, docPath: string): Promise<Contr
 		default:
 			lines.push(`loop: ${status.state}${status.merged ? ` (merged ${status.merged.url})` : ""}`);
 	}
+	if (status.cost) lines.push(`spend ${dollars(status.cost.spent)} of ${dollars(status.cost.cap)}`);
 	if (status.pr) {
 		lines.push(`pr: ${status.pr.phase}${status.pr.url ? `  ${status.pr.url}` : ""}`);
 		if (status.pr.reason) lines.push(`  needs you: ${status.pr.reason}`);
@@ -186,7 +206,7 @@ export async function statusText(runner: Runner, docPath: string): Promise<Contr
 		if (decision.command !== null) lines.push(`  command to approve: ${decision.command} (an option starting with "Approve", or --approve, lets the rerun run it once)`);
 		lines.push(`  answer: brigadev-runner answer ${docPath} ${decision.ticketId} <1..${decision.options.length}|text>`, `  deadline: ${new Date(decision.until).toISOString()}`);
 	}
-	if (status.state === "paused" || status.pr?.resumeKey !== undefined) lines.push("", `resume: brigadev-runner resume ${docPath}`);
+	if (status.state === "paused" || status.pr?.resumeKey !== undefined) lines.push("", `resume: brigadev-runner resume ${docPath}${status.kind === "cost" || status.pr?.costCap === true ? " --cap <dollars>" : ""}`);
 	if (status.pr?.mergeKey !== undefined) lines.push("", `merge: ${mergeCommand(docPath)}`);
 	return { code: 0, text: lines.join("\n") };
 }

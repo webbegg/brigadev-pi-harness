@@ -25,6 +25,7 @@ import { asExec, nodeExec } from "./exec.ts";
 import { redact } from "./redact.ts";
 import { branchOf, compareIntegrity, integrityReason, takeIntegrity, type Integrity } from "./integrity.ts";
 import { defaultContainedEnv } from "./contain.ts";
+import { capMessage, CostMeter, reached, track, type GuardState } from "./cost.ts";
 import { createPrTask, type PrOptions, type PrResult } from "./pr.ts";
 import { DEFAULT_DONE_TIMEOUT_MINUTES, runShell } from "./shell.ts";
 import { ANSWER, answerCommand, DECISION_DEADLINE_MS, decisionKey, PAUSE, pauseKey, RESUME, resumeKey } from "./signals.ts";
@@ -98,15 +99,22 @@ export type TicketInput = {
 	decision?: AnsweredDecision;
 	/** The HEAD an earlier run of this ticket started from (it parked on an integrity change and the user resumed): "the worker committed" is measured from it, not from now. */
 	sinceHead?: string;
+	/** The loop task this ticket belongs to (its cost cap and the ledger of its conversations: src/cost.ts). Absent: no cap. */
+	loop?: string;
 };
 
 export type TicketState = { phase: "start"; attempt: number; failure?: string } | { phase: "check"; attempt: number; key: string; conversationId: string };
 
 /**
  * Finished (`commit`), the worker asked a question (`decision`: it uses no attempt, so `attempts` counts the ones before it), or the worker's run changed what it must
- * not (`integrity`, src/integrity.ts: the done check was not run; `startHead` is where the ticket started, for the rerun after `resume`).
+ * not (`integrity`, src/integrity.ts: the done check was not run; `startHead` is where the ticket started, for the rerun after `resume`), or the loop's spend is at its
+ * cap before an attempt (`capped`: no worker conversation was started; `resume --cap` runs the ticket again from `startHead`).
  */
-export type TicketResult = { commit: string; outputTail: string; attempts: number } | { decision: Decision; attempts: number } | { integrity: string[]; attempts: number; startHead: string };
+export type TicketResult =
+	| { commit: string; outputTail: string; attempts: number }
+	| { decision: Decision; attempts: number }
+	| { integrity: string[]; attempts: number; startHead: string }
+	| { capped: { spent: number; cap: number }; attempts: number; startHead: string };
 
 /**
  * Tools the runner can give the worker: the worker's tool list restricted to what pi-durable's CodingTools provides, plus the
@@ -123,7 +131,7 @@ export type TicketTask = ReturnType<typeof createTicketTask>;
 /** The beforeKey of the snapshot taken before an attempt's worker conversation. */
 const integrityKey = (attempt: number) => `integrity.before.${attempt}`;
 
-function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly ToolRegistration[], shell: ShellContext, exec: ExecFn) {
+function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly ToolRegistration[], shell: ShellContext, exec: ExecFn, meter: CostMeter) {
 	return defineTask<TicketInput, TicketState, TicketResult>({
 		name: TICKET_TASK,
 		version: 1,
@@ -134,6 +142,17 @@ function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly
 				const { attempt, failure } = task.state.checkpoint;
 				// The HEAD this ticket started from, memoized so a rerun (or a later attempt) compares against the same one.
 				if ((await runtime.memo<string>("startHead", context)) === undefined) await runtime.memo("startHead", input.sinceHead ?? (await deps.head(input.cwd, runtime.signal)), context);
+				// The cost cap, before this attempt spends anything: the loop's spend so far (every earlier attempt included, failed ones too) against its cap.
+				let guard: GuardState | undefined;
+				if (input.loop) {
+					const spend = await meter.read(runtime, input.loop, context);
+					if (reached(spend.spent, spend.cap)) {
+						const startHead = (await runtime.memo<string>("startHead", context)) ?? "";
+						await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { capped: spend, attempts: attempt - 1, startHead } } }), context);
+						return;
+					}
+					guard = { cap: spend.cap, base: spend.spent };
+				}
 				// What the worker must not touch, as it is before its run (compared in `check`, before the done check is trusted). Memoized: a rerun keeps the first.
 				if ((await runtime.memo<Integrity>(integrityKey(attempt), context)) === undefined) await runtime.memo(integrityKey(attempt), await takeIntegrity(input.cwd, exec, { docPath: input.docPath }), context);
 
@@ -151,6 +170,8 @@ function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly
 					// The approval of a decision's command lives on the conversation the guard decides for: durable (it survives a reopen) and scoped
 					// to this ticket (only its conversations carry it). Only the first attempt's: the approval is for one run of the command.
 					if (attempt === 1 && input.decision?.approved && input.decision.command !== null) (await tx.doc(ApprovalDoc, created.id)).command = input.decision.command;
+					// In the commit that creates it: listed in the loop's ledger, and the cap it runs under (its tools are blocked once the loop's spend reaches it).
+					if (guard && input.loop) await track(tx, input.loop, created.id, guard);
 					conversationId = created.id;
 					return undefined;
 				}, context);
@@ -265,7 +286,7 @@ type Working = PickState | LaunchState | RecordState;
 type PrLaunchState = { phase: "pr" } & Carry;
 type PrRecordState = { phase: "pr-record"; childId: string } & Carry;
 
-export type PauseKind = "user" | "conflict" | "failures" | "integrity";
+export type PauseKind = "user" | "conflict" | "failures" | "integrity" | "cost";
 
 /** The loop asleep on its resume signal (no deadline); `next` is the state it continues with, its epoch already past this pause. */
 export type PausedState = { phase: "resume"; kind: PauseKind; reason: string; key: string; next: Working };
@@ -332,7 +353,7 @@ function writeBack(docPath: string, carry: Pick<Carry, "owned" | "baseline">, ch
 	return { text: next, owned, baseline: next };
 }
 
-function createLoopTask(ticketTask: TicketTask, prTask: ReturnType<typeof createPrTask>) {
+function createLoopTask(ticketTask: TicketTask, prTask: ReturnType<typeof createPrTask>, meter: CostMeter) {
 	return defineTask<LoopInput, LoopState, LoopResult>({
 		name: LOOP_TASK,
 		version: 1,
@@ -427,6 +448,9 @@ function createLoopTask(ticketTask: TicketTask, prTask: ReturnType<typeof create
 				// A parked ticket (blocked) is launched only with its answer; otherwise the user changed it since the pick.
 				const launchable = current && (current.status === "pending" || current.status === "in_progress" || (current.status === "blocked" && answered !== undefined));
 				if (!launchable) return backToPick({ ...state, answers: Object.fromEntries(Object.entries(state.answers).filter(([id]) => id !== state.ticketId)) });
+				// The cost cap, before the ticket's first attempt: at or over it the loop parks needs-you (`resume --cap` continues), the ticket still as it was.
+				const spend = await meter.read(runtime, String(task.id), context);
+				if (reached(spend.spent, spend.cap)) return pause(runtime, context, "cost", capMessage(spend.spent, spend.cap), state);
 				const change: Change = { id: current.id, status: "in_progress", note: "", own: true, ...(answered ? { log: `${current.id} answered: ${lineText(answered.answer)}` } : {}) };
 				const written = writeBack(task.input.docPath, state, change, date);
 				if ("conflict" in written) return pause(runtime, context, "conflict", `doc edited: ${written.conflict}`, state);
@@ -440,6 +464,7 @@ function createLoopTask(ticketTask: TicketTask, prTask: ReturnType<typeof create
 					specs: current.specs,
 					maxAttempts: task.input.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
 					model,
+					loop: String(task.id),
 					...(answered ? { decision: answered } : {}),
 					...(state.since ? { sinceHead: state.since } : {}),
 				};
@@ -482,6 +507,18 @@ function createLoopTask(ticketTask: TicketTask, prTask: ReturnType<typeof create
 					const { phase: _pick, first: _first, ...carry } = carryOf(written);
 					const next: LaunchState = { ...carry, phase: "launch", ticketId: state.ticketId, ...(outcome.result.startHead ? { since: outcome.result.startHead } : {}) };
 					return pause(runtime, context, "integrity", reason, next);
+				}
+
+				// The loop's spend reached its cap before an attempt: like an integrity change, the loop parks with the ticket still in_progress, and `resume --cap` runs it
+				// again from the commit it started at (with a fresh attempt count). Not a failure.
+				if (outcome.status === "completed" && "capped" in outcome.result) {
+					const reason = capMessage(outcome.result.capped.spent, outcome.result.capped.cap);
+					const change: Change = { id: state.ticketId, status: "in_progress", note: `needs you: ${reason}`, log: `${state.ticketId} needs you: ${reason}`, own: true };
+					const written = writeBack(task.input.docPath, state, change, date);
+					if ("conflict" in written) return pause(runtime, context, "conflict", `doc edited: ${written.conflict}`, state);
+					const { phase: _pick, first: _first, ...carry } = carryOf(written);
+					const next: LaunchState = { ...carry, phase: "launch", ticketId: state.ticketId, ...(outcome.result.startHead ? { since: outcome.result.startHead } : {}) };
+					return pause(runtime, context, "cost", reason, next);
 				}
 
 				// The worker asked a question: park the ticket and remember the question under a key of its own. A decision is not a failure.
@@ -535,7 +572,7 @@ function createLoopTask(ticketTask: TicketTask, prTask: ReturnType<typeof create
 				const model = (await runtime.agent(context)).model;
 				if (!model) return runtime.commit(() => ({ status: "terminal", outcome: { status: "failed", error: { message: "the loop's conversation has no model configured" } } }), context);
 				await runtime.commit(async (tx) => {
-					const childId = await tx.createTask(prTask, { docPath: task.input.docPath, cwd: task.input.cwd, model }, { ownership: { kind: "task", taskId: task.id } });
+					const childId = await tx.createTask(prTask, { docPath: task.input.docPath, cwd: task.input.cwd, model, loop: String(task.id) }, { ownership: { kind: "task", taskId: task.id } });
 					return { status: "waiting", checkpoint: { phase: "pr-record", childId, owned: state.owned, baseline: state.baseline, failed: state.failed, decisions: state.decisions, rounds: state.rounds, answers: state.answers, epoch: state.epoch }, on: [childId], policy: "allSettled" };
 				}, context);
 			},
@@ -575,6 +612,8 @@ export interface Tasks {
 	loop: ReturnType<typeof createLoopTask>;
 	ticket: TicketTask;
 	pr: ReturnType<typeof createPrTask>;
+	/** Reads a loop's spend (src/cost.ts); the runner's `status` and board read through the same one. */
+	meter: CostMeter;
 }
 
 /**
@@ -584,7 +623,8 @@ export interface Tasks {
  */
 export function createTasks(deps: TicketDeps = defaultDeps, worker: Worker = loadWorker(), extraTools: readonly ToolRegistration[] = [], prOptions: PrOptions = {}, shell: ShellContext = {}): Tasks {
 	// The integrity snapshot asks the remote with the runner's real environment: the PR loop's git seam (a test's fake gh passes git through).
-	const ticket = createTicketTask(deps, worker, extraTools, shell, prOptions.deps ? asExec(prOptions.deps.exec) : nodeExec);
-	const pr = createPrTask(ticket, prOptions);
-	return { loop: createLoopTask(ticket, pr), ticket, pr };
+	const meter = new CostMeter();
+	const ticket = createTicketTask(deps, worker, extraTools, shell, prOptions.deps ? asExec(prOptions.deps.exec) : nodeExec, meter);
+	const pr = createPrTask(ticket, { ...prOptions, meter });
+	return { loop: createLoopTask(ticket, pr, meter), ticket, pr, meter };
 }

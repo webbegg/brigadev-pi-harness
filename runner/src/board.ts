@@ -23,6 +23,7 @@ import { createWebLog, type WebLog } from "../../lib/web-log.ts";
 import { webPage } from "../../lib/web-page.ts";
 import { ActionRefused, startWebServer, type WebServer } from "../../lib/web-server.ts";
 import { answerDecision, mergeLoop, pauseLoop, resumeLoop, type ControlResult } from "./control.ts";
+import { dollars } from "./cost.ts";
 import { nodeExec } from "./exec.ts";
 import { redact as redactRunner } from "./redact.ts";
 import type { LoopResult, LoopStatus, Runner, TicketRun } from "./runner.ts";
@@ -55,7 +56,28 @@ function redactBounded(text: string, limit: number): string {
 const redact = (text: string): string => redactBounded(text, RAW_LIMIT);
 
 /** What answering a prompt does: the control it maps to, with the identity (`key`, and the merge's head `sha`) the prompt was shown with. */
-type Target = { kind: "decision"; ticketId: string; labels: string[]; key: string } | { kind: "merge"; key: string; sha?: string } | { kind: "resume"; scope: "loop" | "pr"; key: string };
+type Target =
+	| { kind: "decision"; ticketId: string; labels: string[]; key: string }
+	| { kind: "merge"; key: string; sha?: string }
+	/** `cost`: a stop at the cost cap, answered with a new cap: the option labels, and the spend and increments (dollars) they stand for. */
+	| { kind: "resume"; scope: "loop" | "pr"; key: string; cost?: { labels: string[]; spent: number; increments: number[] } };
+
+/** The raises the board offers at the cost cap, besides an amount typed in. */
+const CAP_RAISES = [5, 10];
+/** A typed-in new cap: dollars, with an optional `$`. */
+const capAmount = (text: string): number | undefined => {
+	const match = /^\$?\s*(\d+\.?\d*|\.\d+)$/.exec(text.trim());
+	return match && Number(match[1]) > 0 ? Number(match[1]) : undefined;
+};
+
+/** The prompt of a stop at the cost cap: raise the cap by $5 or $10 over the spend, or type the new cap. */
+function capPrompt(id: string, scope: "loop" | "pr", reason: string, spent: number): BoardView["prompts"][number] {
+	const labels = CAP_RAISES.map((raise) => `+$${raise} (cap ${dollars(spent + raise)})`);
+	return {
+		state: { id, kind: "choice", source: "runner", title: `Raise the cost cap and resume the ${scope === "pr" ? "PR loop" : "loop"}?`, body: reason, options: labels.map((label) => ({ label })), allowOther: true, status: "open", at: 0 },
+		target: { kind: "resume", scope, key: id, cost: { labels: labels.map(redact), spent, increments: CAP_RAISES } },
+	};
+}
 
 export interface BoardView {
 	session: SessionState;
@@ -152,7 +174,7 @@ function ticketCard(id: string, ticket: Ticket | undefined, run: TicketRun | und
 		...(output ? { output: cap(output, MAX_OUTPUT) } : {}),
 		status: status as AgentState["status"],
 		tokens: 0,
-		cost: 0,
+		cost: run?.cost ?? 0,
 		...(run?.startedAt === undefined ? {} : { startedAt: run.startedAt }),
 		...(run?.endedAt === undefined ? {} : { endedAt: run.endedAt }),
 		cancellable: false,
@@ -223,6 +245,13 @@ function phaseOf(status: LoopStatus | undefined, runningTickets: string[]): { ph
 	return { phase: "implement" };
 }
 
+/** The loop's spend and cap, as the last words of the phase's detail. */
+function withSpend(phase: { phase: Phase; detail?: string }, status: LoopStatus | undefined): { phase: Phase; detail?: string } {
+	if (!status?.cost) return phase;
+	const spend = `spend ${dollars(status.cost.spent)} of ${dollars(status.cost.cap)}`;
+	return { ...phase, detail: phase.detail ? `${phase.detail} — ${spend}` : spend };
+}
+
 /** The whole board for one moment: plain data from plain inputs, so the mapping is testable without a Harness. */
 export function viewOf(input: ViewInput): BoardView {
 	const { status, tickets, runs } = input;
@@ -282,9 +311,11 @@ export function viewOf(input: ViewInput): BoardView {
 		});
 	}
 	if (status?.state === "paused" && status.resumeKey !== undefined) {
-		prompts.push({ state: { id: status.resumeKey, kind: "confirm", source: "runner", title: "Resume the loop?", body: status.reason ?? "", status: "open", at: 0 }, target: { kind: "resume", scope: "loop", key: status.resumeKey } });
+		if (status.kind === "cost") prompts.push(capPrompt(status.resumeKey, "loop", status.reason ?? "", status.cost?.spent ?? 0));
+		else prompts.push({ state: { id: status.resumeKey, kind: "confirm", source: "runner", title: "Resume the loop?", body: status.reason ?? "", status: "open", at: 0 }, target: { kind: "resume", scope: "loop", key: status.resumeKey } });
 	} else if (prStatus?.resumeKey !== undefined) {
-		prompts.push({ state: { id: prStatus.resumeKey, kind: "confirm", source: "runner", title: "Resume the PR loop?", body: prStatus.reason ?? "", status: "open", at: 0 }, target: { kind: "resume", scope: "pr", key: prStatus.resumeKey } });
+		if (prStatus.costCap) prompts.push(capPrompt(prStatus.resumeKey, "pr", prStatus.reason ?? "", status?.cost?.spent ?? 0));
+		else prompts.push({ state: { id: prStatus.resumeKey, kind: "confirm", source: "runner", title: "Resume the PR loop?", body: prStatus.reason ?? "", status: "open", at: 0 }, target: { kind: "resume", scope: "pr", key: prStatus.resumeKey } });
 	}
 
 	// Parked on a person: the loop sleeps on decisions or a pause, the PR loop waits for a merge approval, a stop, or a fix ticket's question.
@@ -294,7 +325,7 @@ export function viewOf(input: ViewInput): BoardView {
 	return {
 		session: { id: "session", project: input.project, branch: input.branch, kind: "runner", doc: input.doc },
 		todo: { scope: "todo", todos: tickets.map((ticket) => ({ id: ticket.id, text: oneLine(ticket.title) || ticket.id, status: ticket.status ?? "pending", ...(ticket.note ? { note: cap(oneLine(ticket.note), 300) } : {}) })) },
-		phase: phaseOf(status, runningTickets),
+		phase: withSpend(phaseOf(status, runningTickets), status),
 		running,
 		agents,
 		prompts,
@@ -365,14 +396,16 @@ export async function createBoard(options: BoardOptions): Promise<Board> {
 	};
 
 	async function compute(): Promise<BoardView> {
-		loopId ??= await runner.find(docPath);
-		const status = loopId === undefined ? undefined : await runner.status(loopId);
-		const runs = loopId === undefined ? [] : await runner.ticketRuns(loopId);
+		// The doc first, then the loop: the loop writes a ticket's line (`needs you: decision`) a moment before it commits the decision, so a status read after the doc
+		// shows the decision whenever the doc shows the line (the other order can show a card that needs you beside a loop that does not yet).
 		try {
 			tickets = parseTicketList(readFileSync(docPath, "utf8")).tickets;
 		} catch {
 			// The doc is mid-write or gone: keep the last list.
 		}
+		loopId ??= await runner.find(docPath);
+		const status = loopId === undefined ? undefined : await runner.status(loopId);
+		const runs = loopId === undefined ? [] : await runner.ticketRuns(loopId);
 		return viewOf({ project: basename(runner.cwd), branch: await currentBranch(), doc: basename(docPath), status, tickets, runs });
 	}
 
@@ -508,6 +541,13 @@ export async function createBoard(options: BoardOptions): Promise<Board> {
 					// A label the page shows is the option's number (as the CLI takes it); anything else is free text, which the CLI also takes.
 					const index = target.labels.indexOf(action.value);
 					result = await answerDecision(runner, docPath, target.ticketId, index >= 0 ? String(index + 1) : action.value.trim(), { expect: { key: target.key } });
+				} else if (target.kind === "resume" && target.cost) {
+					if (typeof action.value !== "string") throw new ActionRefused("choose one of the options, or write the new cap in dollars");
+					// A label the page shows is a raise over the spend; anything else is the new cap itself, in dollars.
+					const index = target.cost.labels.indexOf(action.value);
+					const amount = index >= 0 ? Math.round((target.cost.spent + target.cost.increments[index]) * 100) / 100 : capAmount(action.value);
+					if (amount === undefined) throw new ActionRefused("write the new cap as an amount in dollars, for example 20");
+					result = await resumeLoop(runner, docPath, { key: target.key }, { cap: amount });
 				} else {
 					if (typeof action.value !== "boolean") throw new ActionRefused("this asks yes or no: approve or deny");
 					// Deny is no answer: the runner keeps waiting, and the prompt stays open.
