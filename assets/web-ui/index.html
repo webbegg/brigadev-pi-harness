@@ -712,7 +712,7 @@ body.open .drawer { transform: none; }
 	}
 	function settledPromptCard(i) {
 		var p = i.p;
-		var ans = typeof p.answer === "boolean" ? (p.answer ? "approved" : "denied") : p.answer == null ? "dismissed" : String(p.answer);
+		var ans = typeof p.answer === "boolean" ? (p.answer ? "approved" : "denied") : p.answer == null ? (p.reason ? String(p.reason) : "dismissed") : String(p.answer);
 		var flag = typeof p.answer === "boolean" ? ans : p.answer == null ? "wait" : "done";
 		return h("article", { class: "card settled" },
 			h("div", { class: "card-top" }, h("span", { class: "kind", text: (p.kind === "choice" ? "you chose" : p.source || "prompt") }), h("span", { class: "flag " + flag, text: typeof p.answer === "boolean" ? ans : time(p.at) })),

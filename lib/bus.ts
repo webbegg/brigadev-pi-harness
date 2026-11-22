@@ -158,6 +158,8 @@ export interface PromptState {
 	status: PromptStatus;
 	/** confirm: boolean; choice: the label or free text. */
 	answer?: boolean | string;
+	/** dismissed only: why it closed, shown in place of "dismissed" (the runner board: `no longer current`, the loop moved on). */
+	reason?: string;
 	by?: "tui" | "web";
 	at: number;
 }

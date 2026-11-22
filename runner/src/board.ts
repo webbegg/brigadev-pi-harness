@@ -424,12 +424,13 @@ export async function createBoard(options: BoardOptions): Promise<Board> {
 			open.set(state.id, { state: shown, sig, target });
 			publish("brigadev_prompt", state.id, shown);
 		}
-		// What was open and is not now: the state moved on, whoever answered. An answer through this board is known; one through the CLI is not.
+		// What was open and is not now: the state moved on (a new decision round, a new PR head, the loop stopped). An answer through this board is known; anything else
+		// closes as no longer current (with the board up, `start` holds the store, so the CLI cannot answer).
 		for (const [id, entry] of [...open]) {
 			if (current.has(entry.sig)) continue;
 			open.delete(id);
 			const web = answered.get(entry.sig);
-			publish("brigadev_prompt", id, web ? { ...entry.state, status: "answered", answer: web.value, by: "web", at: web.at } : { ...entry.state, status: "dismissed", at });
+			publish("brigadev_prompt", id, web ? { ...entry.state, status: "answered", answer: web.value, by: "web", at: web.at } : { ...entry.state, status: "dismissed", reason: "no longer current", at });
 		}
 	}
 
