@@ -16,8 +16,8 @@ const TOKENS: RegExp[] = [
 	/(?<![A-Za-z0-9+/])(?=[A-Za-z0-9+/]*\d)(?=[A-Za-z0-9+/]*[a-z])(?=[A-Za-z0-9+/]*[A-Z])[A-Za-z0-9+][A-Za-z0-9+/]{31,}={0,2}/g,
 ];
 
-/** `https://user:token@host/` becomes `https://***@host/`. */
-const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
+/** `https://user:token@host/` becomes `https://***@host/`. The scheme is bounded (as in lib/redact.ts): tried from every word boundary of a long `a.a.a.` run it was quadratic. */
+const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@]+@/gi;
 
 /** `text` with credentials in URLs, token-looking strings, and the home directory removed. */
 export function redact(text: string, home: string = homedir()): string {

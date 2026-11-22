@@ -15,6 +15,19 @@ export interface ControlResult {
 }
 
 const failure = (text: string, code: 1 | 2 = 1, result?: SignalResult): ControlResult => ({ code, text, ...(result ? { result } : {}) });
+
+/**
+ * What a caller that showed a person a prompt says that prompt was (R1-001): the key it named, and for the merge the head commit it showed. The control acts only when the state it
+ * reads itself, in the same call that delivers, still is that: a prompt that moved on (a new decision round, a new push, a new pause) is refused and nothing is delivered. The
+ * CLI passes none and acts on what is open now.
+ */
+export interface Expect {
+	key: string;
+	/** The commit the merge approval was shown for (the PR loop's pushed head). */
+	sha?: string;
+}
+
+const stale = (what: string): ControlResult => failure(`no longer current: ${what}; nothing was delivered`);
 const startAgain = (docPath: string) => `Run \`brigadev-runner start ${docPath}\` to continue the loop (answers are picked up when it starts).`;
 
 /** The loop for a doc and its status, or the failure to report: never started, or finished (a final `closed`). */
@@ -28,7 +41,7 @@ async function liveLoop(runner: Runner, docPath: string) {
 	return { id, status };
 }
 
-export async function answerDecision(runner: Runner, docPath: string, ticketId: string, choice: string, options: { approve?: boolean } = {}): Promise<ControlResult> {
+export async function answerDecision(runner: Runner, docPath: string, ticketId: string, choice: string, options: { approve?: boolean; expect?: Expect } = {}): Promise<ControlResult> {
 	const loop = await liveLoop(runner, docPath);
 	if ("failure" in loop) return loop.failure;
 	const { id, status } = loop;
@@ -39,6 +52,9 @@ export async function answerDecision(runner: Runner, docPath: string, ticketId: 
 	const inPr = prOpen !== undefined || (loopOpen === undefined && status.lastKeys[ticketId] === undefined && prKey !== undefined);
 	const target = inPr && status.pr ? status.pr.taskId : id;
 	const open = prOpen ?? loopOpen;
+	if (options.expect && open?.key !== options.expect.key) {
+		return stale(open ? `${ticketId} moved on to ${open.key} (the answer was for ${options.expect.key})` : `${ticketId}'s decision ${options.expect.key} is not open any more`);
+	}
 	// An answered or expired decision is no longer open, but its key is still the one to answer: the signal says `duplicate` or `closed`.
 	const key = open?.key ?? (inPr ? prKey : status.lastKeys[ticketId]);
 	if (key === undefined) return failure(signalLine("not_found", `no decision for ${ticketId}`), 1, "not_found");
@@ -84,7 +100,7 @@ export async function pauseLoop(runner: Runner, docPath: string): Promise<Contro
 	return failure(signalLine(result, result === "duplicate" ? "pause already requested" : "the pause request was refused"), signalExit(result) === 2 ? 2 : 1, result);
 }
 
-export async function resumeLoop(runner: Runner, docPath: string): Promise<ControlResult> {
+export async function resumeLoop(runner: Runner, docPath: string, expect?: Expect): Promise<ControlResult> {
 	const loop = await liveLoop(runner, docPath);
 	if ("failure" in loop) return loop.failure;
 	const { id, status } = loop;
@@ -93,7 +109,9 @@ export async function resumeLoop(runner: Runner, docPath: string): Promise<Contr
 	if (!parked && (status.state !== "paused" || status.resumeKey === undefined)) {
 		return failure(`not paused: the loop is ${status.state}${status.pr ? ` (PR loop: ${status.pr.phase})` : ""}`);
 	}
-	const result = parked ? await runner.deliver(parked.taskId, RESUME, parked.resumeKey!, { by: "cli" }) : await runner.deliver(id, RESUME, status.resumeKey!, { by: "cli" });
+	const key = parked ? parked.resumeKey! : status.resumeKey!;
+	if (expect && key !== expect.key) return stale(`the resume prompt ${expect.key} was replaced by ${key}`);
+	const result = await runner.deliver(parked ? parked.taskId : id, RESUME, key, { by: "cli" });
 	if (result === "delivered") return { code: 0, result, text: `${signalLine(result, "resume requested")}\n${startAgain(docPath)}` };
 	return failure(signalLine(result, result === "duplicate" ? "resume already requested" : "the resume request was refused"), signalExit(result) === 2 ? 2 : 1, result);
 }
@@ -103,13 +121,16 @@ export async function resumeLoop(runner: Runner, docPath: string): Promise<Contr
  * open, not a draft, still at the pushed commit, and green. `duplicate` and `closed` (a second approval; the 24 h deadline, or the loop ended) are final
  * answers, like an answer's.
  */
-export async function mergeLoop(runner: Runner, docPath: string): Promise<ControlResult> {
+export async function mergeLoop(runner: Runner, docPath: string, expect?: Expect): Promise<ControlResult> {
 	const loop = await liveLoop(runner, docPath);
 	if ("failure" in loop) return loop.failure;
 	const { status } = loop;
 	const pr = status.pr;
 	if (!pr || pr.mergeKey === undefined) {
 		return failure(`not waiting for a merge approval: ${pr ? `the PR loop is at ${pr.phase}` : "the loop has not reached the PR loop"}. \`brigadev-runner status ${docPath}\` says where it is.`);
+	}
+	if (expect && (pr.mergeKey !== expect.key || (expect.sha !== undefined && pr.sha !== expect.sha))) {
+		return stale(pr.mergeKey !== expect.key ? `the merge approval ${expect.key} was replaced by ${pr.mergeKey}` : `the PR head moved (the approval was for ${expect.sha?.slice(0, 7)}, it is ${pr.sha?.slice(0, 7) ?? "unknown"} now)`);
 	}
 	const result = await runner.deliver(pr.taskId, MERGE, pr.mergeKey, { by: "cli" });
 	switch (result) {

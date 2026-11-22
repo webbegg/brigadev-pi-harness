@@ -15,6 +15,43 @@ import { defaultDeps, type TicketDeps } from "../src/tasks.ts";
 export const context = BACKGROUND_CONTEXT;
 
 /**
+ * Whether `pid` is a live process (a zombie awaiting its parent's wait is not). The signal-0 probe decides existence, so a slim image without `ps` still answers; only
+ * a pid that exists is looked at for the zombie state, from /proc where there is one (Linux), else from `ps` (macOS), and without either it counts as live.
+ * A pid that is not a positive integer (a marker that was never captured) is never live here, and the callers assert they captured one.
+ */
+export function live(pid: number): boolean {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EPERM") return false; // ESRCH: no such process
+	}
+	try {
+		// `pid (comm) S ...`: the state follows the last `)`, as the name may hold one.
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		return !/^[Zx]/i.test(stat.slice(stat.lastIndexOf(")") + 2));
+	} catch {
+		// No /proc (macOS) or the process went in between.
+	}
+	try {
+		const stat = execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+		return stat !== "" && !stat.startsWith("Z");
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT"; // no `ps` at all: it exists (signal 0 said so); ps exits 1 for a process that is gone
+	}
+}
+
+/** Poll (bounded) until `pid` is gone; true when it is. */
+export async function goneWithin(pid: number, ms: number): Promise<boolean> {
+	const end = Date.now() + ms;
+	while (Date.now() < end) {
+		if (!live(pid)) return true;
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+	return !live(pid);
+}
+
+/**
  * A plain commit: the guard blocks `git -c` and `git config` (B1), so the identity comes from the environment (`isolateGitEnv` sets it), signing is off
  * through `GIT_CONFIG_GLOBAL=/dev/null`, and hooks are off through the contained environment of the worker's shell.
  */

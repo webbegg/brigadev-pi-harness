@@ -70,6 +70,19 @@ export interface PhaseState {
 	detail?: string;
 }
 
+/**
+ * The web page's `session` snapshot (a core UI event, not a bus channel; key `id`): where the session works, for the page header. The Pi extension sends
+ * `project` and `branch`. The brigadev runner's board (`brigadev-runner start --web`) adds `kind: "runner"`, which switches the page to runner mode (no composer,
+ * Abort reads Pause, no cancel buttons), and `doc`, the feature document's file name for the page title. Both are optional: a snapshot without them is a Pi session.
+ */
+export interface SessionState {
+	id: "session";
+	project?: string;
+	branch?: string | null;
+	kind?: "runner";
+	doc?: string;
+}
+
 export interface TodoItem {
 	id: string;
 	text: string;
@@ -145,6 +158,8 @@ export interface PromptState {
 	status: PromptStatus;
 	/** confirm: boolean; choice: the label or free text. */
 	answer?: boolean | string;
+	/** dismissed only: why it closed, shown in place of "dismissed" (the runner board: `no longer current`, the loop moved on). */
+	reason?: string;
 	by?: "tui" | "web";
 	at: number;
 }
