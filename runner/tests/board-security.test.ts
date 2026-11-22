@@ -107,11 +107,11 @@ describe("the verify's attack on the board (H6)", () => {
 		assert.equal(background.length, 1, "the background script was started");
 		stray.push(...background);
 		assert.equal(await goneWithin(background[0], 5_000), true, "and it is dead after the call that started it");
+		// It is dead (the pid was captured from the call's own output and is gone), so what it logged is final; the check below is at the end of the test, after the rest of the run.
 		const settled = existsSync(bgLog) ? readFileSync(bgLog, "utf8") : "";
-		await new Promise((resolve) => setTimeout(resolve, 300));
-		assert.equal(existsSync(bgLog) ? readFileSync(bgLog, "utf8") : "", settled, "it logs nothing after the call");
 
 		const logs = [fgLog, bgLog].map((path) => (existsSync(path) ? readFileSync(path, "utf8") : ""));
+		assert.equal(logs[1], settled, "it logs nothing after the call");
 		assert.match(logs[0], /usr1 \d+/, "the script did send SIGUSR1 to the runner, which survived it");
 		for (const log of logs) assert.ok(!/GOT|ACTION/.test(log), `the script got a link or acted on the board: ${log}`);
 		assert.equal(out.filter((line) => LINK.test(line)).length, 1, "no fresh link was printed for a signal");

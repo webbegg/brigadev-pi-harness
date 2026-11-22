@@ -169,6 +169,7 @@ describe("the adapter (R1): the loop's state as events of the web log", () => {
 		assert.equal(answered.code, 0, answered.text);
 		const closed = await until(() => (prompts(log)[prompt.id].status !== "open" ? prompts(log)[prompt.id] : undefined), "the prompt to close");
 		assert.equal(closed.status, "dismissed", "answered elsewhere: the board does not know the answer");
+		assert.equal(closed.reason, "no longer current", "the page says the loop moved on, not that the prompt was dropped");
 		assert.equal((await runner.wait(id)).status, "completed");
 	});
 });

@@ -15,7 +15,7 @@ import { createCheckTool } from "./check-tool.ts";
 import { createContainment } from "./contain.ts";
 import { createAskTool } from "./decision.ts";
 import { LoopStartedDifferently } from "./errors.ts";
-import { ReapingExecutionEnv } from "./reaping-env.ts";
+import { ReapingExecutionEnv, verifyReaping } from "./reaping-env.ts";
 import { guardExtension } from "./guard.ts";
 import { PR_TASK, prPhaseLabel, type PrDeps, type PrState } from "./pr.ts";
 import { RunsCache } from "./runs-cache.ts";
@@ -171,9 +171,13 @@ const FIRST_SCAN_PAGE = 2;
 const MAX_SCAN_PAGE = 100;
 const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
 
+/** H4's hook into pi-durable is checked once per process (a trivial command through the real environment), at start-up, so an upgrade that breaks it fails here. */
+let reapingChecked: Promise<void> | undefined;
+
 export async function openRunner(options: RunnerOptions): Promise<Runner> {
 	const context = options.context ?? BACKGROUND_CONTEXT;
 	const cwd = resolve(options.cwd);
+	if (options.readOnly !== true) await (reapingChecked ??= verifyReaping(new ReapingExecutionEnv({ cwd }), context));
 	// B1: the credentials stay with the runner. Everything that runs the agent's code gets this environment; the PR loop's own git/gh calls do not.
 	const containment = createContainment(options.env ?? process.env, { create: options.readOnly !== true });
 	// B2: the brigadev settings (`check.test`, the permission mode, the risk globs) are read once; a worker that rewrites brigadev.json changes nothing for this runner.

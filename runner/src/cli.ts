@@ -19,7 +19,10 @@
 // foreground. It prints a one-time link to stdout (and only there), exits when the loop ends, and on SIGINT/SIGTERM closes the board and the runner (the loop
 // continues on the next `start`). Enter on the runner's own terminal prints a fresh link; nothing else does (no signal: any process of the user, the worker's bash
 // included, could send one). `--web` therefore refuses unless stdin and stdout are both terminals (exit 2, before anything starts), and inside tmux, screen or zellij
-// unless `--web-in-multiplexer` says so: a pane can be read (`capture-pane`) and typed into (`send-keys`) by any process of the user.
+// unless `--web-in-multiplexer` says so: a pane can be read (`capture-pane`) and typed into (`send-keys`) by any process of the user. It also refuses in the background of
+// its terminal (`start --web &`): reading the terminal from there would stop the process (SIGTTIN) while it holds the store.
+// (Ctrl-Z and `bg` later is the shell's own job control: the runner stops when it reads, and `fg` resumes it.)
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -43,10 +46,10 @@ if (process.platform !== "win32") process.on("SIGUSR1", () => {});
 
 export const DEFAULT_MODEL = "claude-sonnet-5-5";
 const USAGE = [
-	"usage: brigadev-runner start <feature-doc> [--no-pr] [--web [--port N]]",
+	"usage: brigadev-runner start <feature-doc> [--no-pr] [--web [--port N] [--web-in-multiplexer]]",
 	"         --web serves the loop board on 127.0.0.1 (port: --port or BRIGADEV_WEB_PORT, default: any free port) and stays up while the loop waits for you;",
 	"         it needs stdin and stdout to be a terminal (the one-time link is printed there, a new one on Enter) and refuses inside tmux, screen or zellij",
-	"         unless --web-in-multiplexer",
+	"         unless --web-in-multiplexer, and in the foreground of that terminal (not with `&`)",
 	"       brigadev-runner status <feature-doc>",
 	"       brigadev-runner answer <feature-doc> <T#> <1..n|text> [--approve]",
 	"       brigadev-runner pause <feature-doc>",
@@ -456,13 +459,60 @@ function parseStartArgs(rest: string[]): { positional: string[]; noPr: boolean; 
 	return { positional, noPr, web, inMultiplexer, ...(port === undefined ? {} : { port }), bad };
 }
 
-/** Whether the process's stdin and stdout are terminals (tests pass their own). */
+/** Whether the process's stdin and stdout are terminals, and whether it is in the background of its terminal (tests pass their own). */
 export interface Terminal {
 	stdinIsTTY: boolean;
 	stdoutIsTTY: boolean;
+	/** Asked only by `--web`, once, after the terminal checks. Absent: not in the background. */
+	inBackground?: () => boolean;
 }
 
-const processTerminal = (): Terminal => ({ stdinIsTTY: process.stdin.isTTY === true, stdoutIsTTY: process.stdout.isTTY === true });
+/** A process's own group and the foreground group of its controlling terminal (`tpgid`: 0, -1, or absent when it has none). */
+export interface GroupFacts {
+	pgid: number;
+	tpgid: number;
+}
+
+/** R4-003: in the background when both groups are known and the terminal's foreground group is another one. Not knowing is not a reason to refuse. */
+export const isBackground = (facts: GroupFacts | undefined): boolean => facts !== undefined && facts.pgid > 0 && facts.tpgid > 0 && facts.pgid !== facts.tpgid;
+
+/** `pgrp` and `tpgid` from the text of /proc/<pid>/stat: `pid (comm) state ppid pgrp session tty_nr tpgid ...`; `comm` may hold spaces and `)`, so the fields start after the last one. */
+export function parseProcStat(stat: string): GroupFacts | undefined {
+	const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+	const [pgid, tpgid] = [Number(fields[2]), Number(fields[5])];
+	return stat.includes(")") && Number.isInteger(pgid) && Number.isInteger(tpgid) ? { pgid, tpgid } : undefined;
+}
+
+/** `pgid` and `tpgid` from the output of `ps -o pgid=,tpgid= -p <pid>`. */
+export function parsePsGroups(output: string): GroupFacts | undefined {
+	const match = /^\s*(-?\d+)\s+(-?\d+)\s*$/.exec(output);
+	return match ? { pgid: Number(match[1]), tpgid: Number(match[2]) } : undefined;
+}
+
+/** The groups of `pid`, from /proc where there is one (Linux) and from `ps` elsewhere (macOS); undefined when neither tells (then `--web` is not refused for it). Runs once, at start-up. */
+export function readGroupFacts(pid: number): GroupFacts | undefined {
+	try {
+		const facts = parseProcStat(readFileSync(`/proc/${pid}/stat`, "utf8"));
+		if (facts) return facts;
+	} catch {
+		// No /proc.
+	}
+	try {
+		return parsePsGroups(execFileSync("ps", ["-o", "pgid=,tpgid=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 2_000 }));
+	} catch {
+		return undefined;
+	}
+}
+
+const processTerminal = (): Terminal => ({
+	stdinIsTTY: process.stdin.isTTY === true,
+	stdoutIsTTY: process.stdout.isTTY === true,
+	inBackground: () => isBackground(readGroupFacts(process.pid)),
+});
+
+/** R4-003: why `--web` cannot run in a background job. */
+const BACKGROUND_REFUSAL =
+	"--web must run in the foreground of its terminal: this process is in a background job (`&`, or sent there). Reading the terminal from a background job stops the process (SIGTTIN), and it would sit suspended with the loop half done and the store held, and the board's link would be gone with it. Run it without `&`, or bring it back with `fg`.";
 
 /** The terminal multiplexers a process can tell it runs in, by the variable each one sets (any non-empty value: zellij sets `ZELLIJ=0`). */
 const MULTIPLEXERS: ReadonlyArray<{ variable: string; name: string }> = [
@@ -508,6 +558,10 @@ export async function main(args: string[], env: Env = process.env, io: Io = { ou
 		const noTerminal = terminalRefusal(terminal);
 		if (noTerminal) {
 			io.err(noTerminal);
+			return 2;
+		}
+		if (terminal.inBackground?.()) {
+			io.err(BACKGROUND_REFUSAL);
 			return 2;
 		}
 		const multiplexer = multiplexerOf(env);

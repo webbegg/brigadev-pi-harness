@@ -14,13 +14,30 @@ import { defaultDeps, type TicketDeps } from "../src/tasks.ts";
 
 export const context = BACKGROUND_CONTEXT;
 
-/** Whether `pid` is a live process (a zombie awaiting its parent's wait is not). */
+/**
+ * Whether `pid` is a live process (a zombie awaiting its parent's wait is not). The signal-0 probe decides existence, so a slim image without `ps` still answers; only
+ * a pid that exists is looked at for the zombie state, from /proc where there is one (Linux), else from `ps` (macOS), and without either it counts as live.
+ * A pid that is not a positive integer (a marker that was never captured) is never live here, and the callers assert they captured one.
+ */
 export function live(pid: number): boolean {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EPERM") return false; // ESRCH: no such process
+	}
+	try {
+		// `pid (comm) S ...`: the state follows the last `)`, as the name may hold one.
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		return !/^[Zx]/i.test(stat.slice(stat.lastIndexOf(")") + 2));
+	} catch {
+		// No /proc (macOS) or the process went in between.
+	}
 	try {
 		const stat = execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
 		return stat !== "" && !stat.startsWith("Z");
-	} catch {
-		return false; // ps exits 1 when there is no such process
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT"; // no `ps` at all: it exists (signal 0 said so); ps exits 1 for a process that is gone
 	}
 }
 

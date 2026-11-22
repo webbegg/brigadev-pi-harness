@@ -61,6 +61,7 @@ test("the page switches to runner mode from the session snapshot (kind: runner):
 	assert.match(html, /"Pause"/, "the abort button reads Pause in runner mode");
 	assert.match(html, /brigadev-runner · /, "the title names the runner and the doc");
 	assert.match(html, /cancel: a\.cancellable && live && !runner/, "cancel buttons are hidden in runner mode");
+	assert.match(html, /p\.reason \? String\(p\.reason\)/, "a closed prompt's reason (the runner's `no longer current`) is shown in place of `dismissed`");
 	assert.match(html, /id="stop-hint"/);
 	assert.match(html, /id="title"/);
 });

@@ -35,7 +35,24 @@ import type { OpenDecision } from "./tasks.ts";
  * Text that leaves for the page: both redactors. lib/redact.ts knows flags, assignments, and URLs credentials; src/redact.ts also masks standard base64 (with `+` and `/`, an AWS
  * secret key), which it does not.
  */
-const redact = (text: string): string => redactRunner(redactLib(text));
+const redactBoth = (text: string): string => redactRunner(redactLib(text));
+
+/**
+ * R4-002: worker-controlled strings (a tool call's command or path, a decision's text) are bounded before the redactors see them. src/redact.ts has a pattern whose cost grows with
+ * the square of a long run of `[a-z0-9+.-]`, and the board reads the store on a timer on the one event loop the runner's loop, its lock, and the Harness share.
+ * The cut can split a secret, and half of one is below the redactors' thresholds (a 20-character start of a 64-character token is not masked): so the input is cut generously
+ * (`limit`), redacted, and the last `TAIL_MARGIN` characters of the result, which the cut can have touched, are dropped. What is left is redacted whole, and nothing of it is
+ * within the longest bounded pattern (256) of the cut. A string within the limit is redacted as it was.
+ */
+const RAW_LIMIT = 8_192;
+const TAIL_MARGIN = 512;
+function redactBounded(text: string, limit: number): string {
+	if (text.length <= limit) return redactBoth(text);
+	const out = redactBoth(text.slice(0, limit));
+	return `${out.slice(0, Math.max(0, out.length - TAIL_MARGIN))}…`;
+}
+
+const redact = (text: string): string => redactBounded(text, RAW_LIMIT);
 
 /** What answering a prompt does: the control it maps to, with the identity (`key`, and the merge's head `sha`) the prompt was shown with. */
 type Target = { kind: "decision"; ticketId: string; labels: string[]; key: string } | { kind: "merge"; key: string; sha?: string } | { kind: "resume"; scope: "loop" | "pr"; key: string };
@@ -63,6 +80,8 @@ export interface ViewInput {
 
 const MAX_OUTPUT = 4_000;
 const MAX_SUMMARY = 200;
+/** A summary shows 200 characters, so a tool argument is bounded far below `RAW_LIMIT` before it is redacted (the cost of the bound itself stays small). */
+const SUMMARY_RAW_LIMIT = 2_048;
 const cap = (text: string, max: number): string => (text.length <= max ? text : `${text.slice(0, max - 1)}…`);
 const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
 const short = (sha: string): string => sha.slice(0, 7);
@@ -74,7 +93,7 @@ export function summarize(args: unknown): string {
 	const fields = args as Record<string, unknown>;
 	for (const field of SUMMARY_FIELDS) {
 		const value = fields[field];
-		if (typeof value === "string" && value) return cap(oneLine(redact(value)), MAX_SUMMARY);
+		if (typeof value === "string" && value) return cap(oneLine(redactBounded(value, SUMMARY_RAW_LIMIT)), MAX_SUMMARY);
 	}
 	return "";
 }
@@ -283,7 +302,7 @@ export function viewOf(input: ViewInput): BoardView {
 }
 
 /** `value` with every string redacted: the one gate between the runner's state and the page. */
-function clean<T>(value: T): T {
+export function clean<T>(value: T): T {
 	if (typeof value === "string") return redact(value) as T;
 	if (Array.isArray(value)) return value.map(clean) as T;
 	if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, clean(item)])) as T;
