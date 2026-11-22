@@ -1,5 +1,6 @@
-// The runner's variant of the web page (T7, R4): the same static file, with the link and ended messages naming the runner instead of Pi. The messages are
-// injected server side as static text (a process id, never a secret); the Pi variant must stay exactly what it was.
+// The runner's variant of the web page (T7, R4): the same static file, with the link and ended messages naming the runner's terminal instead of Pi. The messages are
+// injected server side as static text (no process id, no signal, never a secret: a fresh link comes only from Enter on the runner's own terminal, H1); the Pi variant
+// must stay exactly what it was.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -27,14 +28,15 @@ test("the Pi variant is the page as it was: the default, and an explicit `pi`, a
 	for (const line of [PI_LINK, PI_ENDED, PI_SIGNIN]) assert.ok(asset.includes(line), `asset: ${line}`);
 });
 
-test("the runner variant names the runner's signal and terminal in the link, ended, and sign-in messages, and never Pi's command", () => {
-	const html = webPage(ASSETS_ROOT, { variant: "runner", pid: 4242 });
-	assert.equal(webPage({ variant: "runner", pid: 4242 }), html, "the options alone work too");
+test("the runner variant says to press Enter in the runner's terminal for a new link in the link, ended, and sign-in messages: no signal, no pid, never Pi's command", () => {
+	const html = webPage(ASSETS_ROOT, { variant: "runner" });
+	assert.equal(webPage({ variant: "runner" }), html, "the options alone work too");
 	for (const name of ["LINK_MESSAGE", "ENDED_MESSAGE", "SIGNIN_HINT"]) {
 		const message = messageOf(html, name);
-		assert.match(message, /run `kill -USR1 4242` or press Enter in the runner's terminal for a new link/, name);
-		assert.ok(!/brigadev:web|\bIn pi\b/.test(message), `${name} does not send the user to pi: ${message}`);
+		assert.match(message, /press Enter in the runner's terminal for a new link\.$/, name);
+		assert.ok(!/brigadev:web|\bIn pi\b|kill|USR1|signal|\d/.test(message), `${name} names no signal, pid or Pi command: ${message}`);
 	}
+	assert.ok(!html.includes("USR1"), "the page never suggests a signal");
 	assert.match(messageOf(html, "LINK_MESSAGE"), /^This link was already used or expired\./);
 	for (const line of [PI_LINK, PI_ENDED, PI_SIGNIN]) assert.ok(!html.includes(line), `replaced: ${line}`);
 	// Only the three message lines differ from the Pi page.
@@ -47,11 +49,10 @@ test("the runner variant names the runner's signal and terminal in the link, end
 	);
 });
 
-test("the pid is a number of this process's world, not text: anything else is refused, so nothing but a number reaches the page", () => {
-	for (const pid of [0, -1, 1.5, Number.NaN, "1; alert(1)" as unknown as number]) {
-		assert.throws(() => webPage(ASSETS_ROOT, { variant: "runner", pid }), /pid/, String(pid));
-	}
-	assert.throws(() => webPage(ASSETS_ROOT, { variant: "runner" }), /pid/, "the runner variant needs its pid");
+test("the runner variant takes no pid: the process id is not part of the page, whatever an old caller passes", () => {
+	const html = webPage(ASSETS_ROOT, { variant: "runner" });
+	assert.equal(webPage(ASSETS_ROOT, { variant: "runner", pid: 4242 } as never), html, "an ignored option, not text in the page");
+	assert.ok(!html.includes("4242"));
 });
 
 test("the page switches to runner mode from the session snapshot (kind: runner): no composer, Pause for Abort, no cancel, a runner title", () => {
@@ -65,7 +66,7 @@ test("the page switches to runner mode from the session snapshot (kind: runner):
 });
 
 test("the page holds no secret: the code is read from the address and the runner variant adds only static text", () => {
-	const html = webPage(ASSETS_ROOT, { variant: "runner", pid: 7 });
+	const html = webPage(ASSETS_ROOT, { variant: "runner" });
 	assert.ok(!/code=[A-Za-z0-9_-]{20,}/.test(html));
 	assert.ok(!html.includes("Authorization\": \"Bearer \" + \"") && !/Bearer [A-Za-z0-9_-]{20,}/.test(html));
 });

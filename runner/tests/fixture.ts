@@ -14,6 +14,26 @@ import { defaultDeps, type TicketDeps } from "../src/tasks.ts";
 
 export const context = BACKGROUND_CONTEXT;
 
+/** Whether `pid` is a live process (a zombie awaiting its parent's wait is not). */
+export function live(pid: number): boolean {
+	try {
+		const stat = execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+		return stat !== "" && !stat.startsWith("Z");
+	} catch {
+		return false; // ps exits 1 when there is no such process
+	}
+}
+
+/** Poll (bounded) until `pid` is gone; true when it is. */
+export async function goneWithin(pid: number, ms: number): Promise<boolean> {
+	const end = Date.now() + ms;
+	while (Date.now() < end) {
+		if (!live(pid)) return true;
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+	return !live(pid);
+}
+
 /**
  * A plain commit: the guard blocks `git -c` and `git config` (B1), so the identity comes from the environment (`isolateGitEnv` sets it), signing is off
  * through `GIT_CONFIG_GLOBAL=/dev/null`, and hooks are off through the contained environment of the worker's shell.

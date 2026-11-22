@@ -8,7 +8,6 @@ import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context"
 import type { Models } from "@earendil-works/pi-ai/models";
 import { createRegistry, defineExtension, Harness } from "@earendil-works/pi-durable";
 import type { HarnessSettings, ModelRef, Report, SetTimer, SignalResult, SignalToken, Storage, TaskId, Tx } from "@earendil-works/pi-durable";
-import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { canonicalPath } from "../../lib/paths.ts";
 import { readSettings } from "../../lib/runtime.ts";
@@ -16,8 +15,10 @@ import { createCheckTool } from "./check-tool.ts";
 import { createContainment } from "./contain.ts";
 import { createAskTool } from "./decision.ts";
 import { LoopStartedDifferently } from "./errors.ts";
+import { ReapingExecutionEnv } from "./reaping-env.ts";
 import { guardExtension } from "./guard.ts";
 import { PR_TASK, prPhaseLabel, type PrDeps, type PrState } from "./pr.ts";
+import { RunsCache } from "./runs-cache.ts";
 import { decisionKey, deliver } from "./signals.ts";
 import { createTasks, defaultDeps, LOOP_TASK, TICKET_TASK, type LoopInput, type LoopResult, type LoopState, type OpenDecision, type TicketDeps, type TicketInput, type TicketResult, type TicketState } from "./tasks.ts";
 import { doneTimeoutMs } from "./shell.ts";
@@ -165,6 +166,9 @@ const SETTLE_POLL_MS = 20;
 /** How many of a worker conversation's newest entries are read for its recent tool calls, and how many calls are kept. */
 const STEP_WINDOW_ENTRIES = 60;
 const STEPS_KEPT = 8;
+/** `ticketRuns` scans the store's ticket and PR tasks newest first: a first page of a few rows (a steady-state refresh reads that and stops at the mark), doubling up to a page. */
+const FIRST_SCAN_PAGE = 2;
+const MAX_SCAN_PAGE = 100;
 const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
 
 export async function openRunner(options: RunnerOptions): Promise<Runner> {
@@ -195,7 +199,8 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			models: options.models,
 			registry,
 			settings: options.settings,
-			env: (target) => new NodeExecutionEnv({ cwd: target.cwd ?? cwd, shellEnv: containment.env }),
+			// H4: a bash call's processes end with the call (their own group, no terminal; see src/reaping-env.ts).
+			env: (target) => new ReapingExecutionEnv({ cwd: target.cwd ?? cwd, shellEnv: containment.env }),
 			onReport: options.onReport,
 			...(options.now ? { now: options.now } : {}),
 			...(options.setTimer ? { setTimer: options.setTimer } : {}),
@@ -243,11 +248,8 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 		};
 	};
 
-	/** The tool calls of a ticket task's latest worker conversation, from the store: the newest entries only, oldest first. A finished task's are read once. */
-	const finishedSteps = new Map<number, TicketRun["steps"]>();
-	const stepsOf = async (taskId: TaskId, finished: boolean): Promise<TicketRun["steps"]> => {
-		const known = finishedSteps.get(taskId);
-		if (finished && known) return known;
+	/** The tool calls of a ticket task's latest worker conversation, from the store: the newest entries only, oldest first. `ticketRuns` reads a finished task's once. */
+	const stepsOf = async (taskId: TaskId): Promise<TicketRun["steps"]> => {
 		const steps: TicketRun["steps"] = [];
 		try {
 			const [conversation] = (await options.storage.scanConversations({ ownerTaskId: taskId, order: "descending" }, 1, undefined, context)).items;
@@ -264,9 +266,51 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 		} catch {
 			// Steps are a nicety of the board: a store that cannot answer shows a card without them.
 		}
-		const kept = steps.slice(-STEPS_KEPT);
-		if (finished) finishedSteps.set(taskId, kept);
-		return kept;
+		return steps.slice(-STEPS_KEPT);
+	};
+
+	type TaskRow = Awaited<ReturnType<Storage["scanTasks"]>>["items"][number];
+	const isFinished = (record: TaskRow): boolean => record.state.status === "terminal" || record.state.status === "completing";
+	/** R4-001: what `ticketRuns` remembers per loop (see src/runs-cache.ts). */
+	const runsCache = new RunsCache();
+
+	/** The `kind` tasks with an id above `mark`, oldest first. Scanned newest first, in pages that grow from a few rows, and stopped at the first row at or below the mark: the store's older history is not read. */
+	const newerThan = async (kind: string, mark: number): Promise<TaskRow[]> => {
+		const rows: TaskRow[] = [];
+		let limit = FIRST_SCAN_PAGE;
+		let cursor: Awaited<ReturnType<Storage["scanTasks"]>>["next"];
+		for (;;) {
+			const page = await options.storage.scanTasks({ kind, order: "descending" }, limit, cursor, context);
+			for (const record of page.items) {
+				if (Number(record.id) <= mark) return rows.reverse();
+				rows.push(record);
+			}
+			if (!page.next) return rows.reverse();
+			cursor = page.next;
+			limit = Math.min(limit * 2, MAX_SCAN_PAGE);
+		}
+	};
+
+	/** One ticket task as a run: live (its steps are read now) or finished (the caller keeps it). */
+	const runOf = async (record: TaskRow): Promise<TicketRun> => {
+		const input = record.input as TicketInput;
+		const base = { ticketId: input.ticketId, taskId: record.id as TaskId, maxAttempts: input.maxAttempts, ...(record.startedAt === undefined ? {} : { startedAt: record.startedAt }), ...(record.endedAt === undefined ? {} : { endedAt: record.endedAt }) };
+		if (record.state.status !== "terminal" && record.state.status !== "completing") {
+			const attempt = (record.state.checkpoint as TicketState | undefined)?.attempt ?? 1;
+			return { ...base, live: true, attempts: attempt, steps: await stepsOf(record.id as TaskId) };
+		}
+		const outcome = record.state.outcome as { status: string; result?: TicketResult; error?: { message: string; detail?: unknown } };
+		const steps = await stepsOf(record.id as TaskId);
+		if (outcome.status === "completed" && outcome.result) {
+			const result = outcome.result;
+			if ("commit" in result) return { ...base, live: false, end: "commit", attempts: result.attempts, commit: result.commit, steps };
+			return { ...base, live: false, end: "decision" in result ? "decision" : "integrity", attempts: result.attempts, steps };
+		}
+		if (outcome.status === "failed") {
+			const detail = outcome.error?.detail as { attempts?: number; outputTail?: string } | undefined;
+			return { ...base, live: false, end: "failed", attempts: detail?.attempts ?? input.maxAttempts, failure: outcome.error?.message, ...(detail?.outputTail ? { outputTail: detail.outputTail } : {}), steps };
+		}
+		return { ...base, live: false, end: "aborted", attempts: 0, steps };
 	};
 
 	const runner: Runner = {
@@ -363,47 +407,39 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 			return { ...base, ...carried, ...(pr ? { pr } : {}), state: record.state.status === "sleeping" ? "sleeping" : "running" };
 		},
 		async ticketRuns(taskId) {
-			type Page = Awaited<ReturnType<Storage["scanTasks"]>>;
-			type TaskRow = Page["items"][number];
-			const scan = async (kind: string, each: (record: TaskRow) => void) => {
-				let cursor: Page["next"];
-				do {
-					const page = await options.storage.scanTasks({ kind }, 100, cursor, context);
-					for (const record of page.items) each(record);
-					cursor = page.next;
-				} while (cursor);
-			};
+			const loop = runsCache.of(taskId);
+			// Tickets first, then PR loops: a PR loop is created before its fix tickets, so a ticket seen here has its PR loop among the ones read next.
+			const tickets = await newerThan(TICKET_TASK, loop.mark);
+			const prLoops = await newerThan(PR_TASK, loop.mark);
 			// A ticket is the loop's child; a PR loop's fix ticket is the PR loop's.
-			const owners = new Set<number>([taskId]);
-			await scan(PR_TASK, (record) => {
-				if (record.owner === taskId) owners.add(record.id);
-			});
-			const latest = new Map<string, TaskRow>();
-			await scan(TICKET_TASK, (record) => {
-				if (record.owner !== undefined && owners.has(record.owner)) latest.set((record.input as TicketInput).ticketId, record);
-			});
-			return Promise.all(
-				[...latest.values()].map(async (record): Promise<TicketRun> => {
-					const input = record.input as TicketInput;
-					const base = { ticketId: input.ticketId, taskId: record.id as TaskId, maxAttempts: input.maxAttempts, ...(record.startedAt === undefined ? {} : { startedAt: record.startedAt }), ...(record.endedAt === undefined ? {} : { endedAt: record.endedAt }) };
-					if (record.state.status !== "terminal" && record.state.status !== "completing") {
-						const attempt = (record.state.checkpoint as TicketState | undefined)?.attempt ?? 1;
-						return { ...base, live: true, attempts: attempt, steps: await stepsOf(record.id as TaskId, false) };
-					}
-					const outcome = record.state.outcome as { status: string; result?: TicketResult; error?: { message: string; detail?: unknown } };
-					const steps = await stepsOf(record.id as TaskId, true);
-					if (outcome.status === "completed" && outcome.result) {
-						const result = outcome.result;
-						if ("commit" in result) return { ...base, live: false, end: "commit", attempts: result.attempts, commit: result.commit, steps };
-						return { ...base, live: false, end: "decision" in result ? "decision" : "integrity", attempts: result.attempts, steps };
-					}
-					if (outcome.status === "failed") {
-						const detail = outcome.error?.detail as { attempts?: number; outputTail?: string } | undefined;
-						return { ...base, live: false, end: "failed", attempts: detail?.attempts ?? input.maxAttempts, failure: outcome.error?.message, ...(detail?.outputTail ? { outputTail: detail.outputTail } : {}), steps };
-					}
-					return { ...base, live: false, end: "aborted", attempts: 0, steps };
-				}),
-			);
+			let blocker: number | undefined;
+			const block = (id: number) => void (blocker = blocker === undefined ? id : Math.min(blocker, id));
+			for (const record of prLoops) {
+				if (record.owner !== taskId) continue;
+				loop.owners.add(Number(record.id));
+				if (!isFinished(record)) block(Number(record.id));
+			}
+			const latest = new Map<string, TicketRun>();
+			for (const run of [...loop.final.values()].sort((a, b) => Number(a.taskId) - Number(b.taskId))) latest.set(run.ticketId, run);
+			for (const record of tickets) {
+				if (record.owner === undefined || !loop.owners.has(Number(record.owner))) continue; // another loop's
+				const id = Number(record.id);
+				let run = loop.final.get(id);
+				if (!run) {
+					run = await runOf(record);
+					if (isFinished(record)) loop.final.set(id, run);
+				}
+				if (!isFinished(record)) block(id);
+				const known = latest.get(run.ticketId);
+				if (!known || Number(known.taskId) < id) latest.set(run.ticketId, run);
+			}
+			// Everything at or below the newest task seen is final, up to the oldest live task of this loop (anything of another loop's is final for this one: its owner never changes).
+			const newest = Math.max(loop.mark, ...tickets.map((record) => Number(record.id)), ...prLoops.map((record) => Number(record.id)));
+			loop.mark = blocker === undefined ? newest : Math.max(loop.mark, blocker - 1);
+			// A run that a later run of the same ticket replaced, and that is below the mark, is never needed again.
+			for (const [id, run] of loop.final) if (id <= loop.mark && Number(latest.get(run.ticketId)?.taskId) !== id) loop.final.delete(id);
+			runsCache.settle(loop);
+			return [...latest.values()];
 		},
 		deliver: (taskId, token, key, value) => deliver(harness, taskId, token, key, value, context),
 		close: async () => {

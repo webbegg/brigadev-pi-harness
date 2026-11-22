@@ -4,7 +4,11 @@
 //
 // Source of events: `runner.status()` (the loop and its PR loop), the doc's `## Tasks`, and `runner.ticketRuns()` (each ticket's latest worker run, with its recent tool
 // calls, from storage reads). It is read again when the task graph advances (debounced: the observer only schedules, it never awaits, as pi-durable requires) and on a
-// slow timer as a fallback, and only what changed is published. Everything that leaves goes through `redact` (lib/redact.ts): reasons, failure output, commands, worker text.
+// slow timer as a fallback, and only what changed is published. Everything that leaves goes through `mask` (lib/redact.ts and src/redact.ts, the stricter of the two
+// shapes each): reasons, failure output, commands, worker text, and what a refusal says.
+//
+// An answer acts only on what the page showed (R1-001): each open prompt keeps the identity it was published with (the signal key it names, and for the merge the head commit
+// its title shows), and the control it calls checks that identity against the state it reads itself and delivers with that key, so a state that moved on in between is refused.
 //
 // The board never sees or stores the one-time code or a session secret: those live in lib/web-server.ts. It never writes the store, the doc, or a PR comment.
 import { readFileSync } from "node:fs";
@@ -13,21 +17,28 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { TaskId } from "@earendil-works/pi-durable";
 import type { Action, AgentState, AgentStep, Phase, PromptState, SessionState, TodoItem } from "../../lib/bus.ts";
 import { readCurrentBranch } from "../../lib/commit-branch.ts";
-import { redact } from "../../lib/redact.ts";
+import { redact as redactLib } from "../../lib/redact.ts";
 import { parseTicketList, type Ticket } from "../../lib/ticket-list.ts";
 import { createWebLog, type WebLog } from "../../lib/web-log.ts";
 import { webPage } from "../../lib/web-page.ts";
 import { ActionRefused, startWebServer, type WebServer } from "../../lib/web-server.ts";
 import { answerDecision, mergeLoop, pauseLoop, resumeLoop, type ControlResult } from "./control.ts";
 import { nodeExec } from "./exec.ts";
+import { redact as redactRunner } from "./redact.ts";
 import type { LoopResult, LoopStatus, Runner, TicketRun } from "./runner.ts";
 import type { OpenDecision } from "./tasks.ts";
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The mapping: the loop's state as what the page shows
 
-/** What answering a prompt does: the control it maps to. */
-type Target = { kind: "decision"; ticketId: string; labels: string[] } | { kind: "merge" } | { kind: "resume"; scope: "loop" | "pr" };
+/**
+ * Text that leaves for the page: both redactors. lib/redact.ts knows flags, assignments, and URLs credentials; src/redact.ts also masks standard base64 (with `+` and `/`, an AWS
+ * secret key), which it does not.
+ */
+const redact = (text: string): string => redactRunner(redactLib(text));
+
+/** What answering a prompt does: the control it maps to, with the identity (`key`, and the merge's head `sha`) the prompt was shown with. */
+type Target = { kind: "decision"; ticketId: string; labels: string[]; key: string } | { kind: "merge"; key: string; sha?: string } | { kind: "resume"; scope: "loop" | "pr"; key: string };
 
 export interface BoardView {
 	session: SessionState;
@@ -233,7 +244,7 @@ export function viewOf(input: ViewInput): BoardView {
 				status: "open",
 				at: 0,
 			},
-			target: { kind: "decision", ticketId: decision.ticketId, labels: decision.options.map((option) => redact(option.label)) },
+			target: { kind: "decision", ticketId: decision.ticketId, labels: decision.options.map((option) => redact(option.label)), key: decision.key },
 		});
 	}
 	const prStatus = status?.pr;
@@ -248,13 +259,13 @@ export function viewOf(input: ViewInput): BoardView {
 				status: "open",
 				at: 0,
 			},
-			target: { kind: "merge" },
+			target: { kind: "merge", key: prStatus.mergeKey, ...(prStatus.sha ? { sha: prStatus.sha } : {}) },
 		});
 	}
 	if (status?.state === "paused" && status.resumeKey !== undefined) {
-		prompts.push({ state: { id: status.resumeKey, kind: "confirm", source: "runner", title: "Resume the loop?", body: status.reason ?? "", status: "open", at: 0 }, target: { kind: "resume", scope: "loop" } });
+		prompts.push({ state: { id: status.resumeKey, kind: "confirm", source: "runner", title: "Resume the loop?", body: status.reason ?? "", status: "open", at: 0 }, target: { kind: "resume", scope: "loop", key: status.resumeKey } });
 	} else if (prStatus?.resumeKey !== undefined) {
-		prompts.push({ state: { id: prStatus.resumeKey, kind: "confirm", source: "runner", title: "Resume the PR loop?", body: prStatus.reason ?? "", status: "open", at: 0 }, target: { kind: "resume", scope: "pr" } });
+		prompts.push({ state: { id: prStatus.resumeKey, kind: "confirm", source: "runner", title: "Resume the PR loop?", body: prStatus.reason ?? "", status: "open", at: 0 }, target: { kind: "resume", scope: "pr", key: prStatus.resumeKey } });
 	}
 
 	// Parked on a person: the loop sleeps on decisions or a pause, the PR loop waits for a merge approval, a stop, or a fix ticket's question.
@@ -316,8 +327,8 @@ export async function createBoard(options: BoardOptions): Promise<Board> {
 	const readBranch = options.readBranch ?? (() => readCurrentBranch(nodeExec, runner.cwd));
 
 	const published = new Map<string, string>();
-	/** Prompts last published open, by id; a prompt that leaves the view is closed from here. */
-	const open = new Map<string, { state: PromptState; sig: string }>();
+	/** Prompts last published open, by id, with the target they were published for (what an answer to them acts on); a prompt that leaves the view is closed from here. */
+	const open = new Map<string, { state: PromptState; sig: string; target: Target }>();
 	/** Prompts answered through this board, by identity (id and target): they close at once, before the loop has moved on. */
 	const answered = new Map<string, { value: boolean | string; at: number }>();
 	const firstSeen = new Map<string, number>();
@@ -391,7 +402,7 @@ export async function createBoard(options: BoardOptions): Promise<Board> {
 			const seenAt = firstSeen.get(sig) ?? at;
 			firstSeen.set(sig, seenAt);
 			const shown = { ...state, at: seenAt };
-			open.set(state.id, { state: shown, sig });
+			open.set(state.id, { state: shown, sig, target });
 			publish("brigadev_prompt", state.id, shown);
 		}
 		// What was open and is not now: the state moved on, whoever answered. An answer through this board is known; one through the CLI is not.
@@ -403,6 +414,8 @@ export async function createBoard(options: BoardOptions): Promise<Board> {
 		}
 	}
 
+	// R4-002: `running` is cleared by the same synchronous step that finds `again` unset, so a refresh() requested at any point either sets `again` before that check (the loop
+	// runs once more) or finds nothing running and starts its own: there is no moment in between at which a request is taken and forgotten.
 	let running: Promise<void> | undefined;
 	let again = false;
 	function refresh(): Promise<void> {
@@ -410,19 +423,23 @@ export async function createBoard(options: BoardOptions): Promise<Board> {
 			again = true;
 			return running;
 		}
-		running = (async () => {
-			do {
-				again = false;
-				try {
-					await refreshNow();
-				} catch {
-					// A UI is an observer: a failed read (the Harness is closing, the doc is mid-write) shows the last state until the next trigger.
-				}
-			} while (again && !stopped);
-		})().finally(() => {
-			running = undefined;
-		});
-		return running;
+		if (stopped) return Promise.resolve();
+		const run = (async () => {
+			try {
+				do {
+					again = false;
+					try {
+						await refreshNow();
+					} catch {
+						// A UI is an observer: a failed read (the Harness is closing, the doc is mid-write) shows the last state until the next trigger.
+					}
+				} while (again && !stopped);
+			} finally {
+				running = undefined;
+			}
+		})();
+		running = run;
+		return run;
 	}
 
 	let timer: NodeJS.Timeout | undefined;
@@ -440,8 +457,10 @@ export async function createBoard(options: BoardOptions): Promise<Board> {
 	poll.unref();
 	await refresh();
 
-	const refused = (result: ControlResult): never => {
-		throw new ActionRefused(result.text);
+	/** What the control said, for the page (masked), after a refresh so that the page shows what is current now. */
+	const refused = async (result: ControlResult): Promise<never> => {
+		await refresh();
+		throw new ActionRefused(redact(result.text));
 	};
 
 	async function onAction(action: Action): Promise<void> {
@@ -452,7 +471,7 @@ export async function createBoard(options: BoardOptions): Promise<Board> {
 				throw new ActionRefused("the runner does not cancel a ticket. Pause the loop instead: it pauses at its next pick, after the running ticket finishes.");
 			case "abort": {
 				const result = await pauseLoop(runner, docPath);
-				if (result.code !== 0) refused(result);
+				if (result.code !== 0) await refused(result);
 				await refresh();
 				return;
 			}
@@ -461,20 +480,21 @@ export async function createBoard(options: BoardOptions): Promise<Board> {
 				const view = await compute();
 				const prompt = view.prompts.find(({ state, target }) => state.id === action.id && !answered.has(sigOf(state.id, target)));
 				if (!prompt) throw new ActionRefused(EMPTY_PROMPT);
-				const { target } = prompt;
+				// What the page showed for this id (the key, and the merge's head), not what it is now: the control checks it against its own read and delivers with that key.
+				const target = open.get(action.id)?.target ?? prompt.target;
 				let result: ControlResult | undefined;
 				if (target.kind === "decision") {
 					if (typeof action.value !== "string") throw new ActionRefused("choose one of the options, or write an answer");
 					// A label the page shows is the option's number (as the CLI takes it); anything else is free text, which the CLI also takes.
 					const index = target.labels.indexOf(action.value);
-					result = await answerDecision(runner, docPath, target.ticketId, index >= 0 ? String(index + 1) : action.value.trim());
+					result = await answerDecision(runner, docPath, target.ticketId, index >= 0 ? String(index + 1) : action.value.trim(), { expect: { key: target.key } });
 				} else {
 					if (typeof action.value !== "boolean") throw new ActionRefused("this asks yes or no: approve or deny");
 					// Deny is no answer: the runner keeps waiting, and the prompt stays open.
 					if (!action.value) return;
-					result = target.kind === "merge" ? await mergeLoop(runner, docPath) : await resumeLoop(runner, docPath);
+					result = target.kind === "merge" ? await mergeLoop(runner, docPath, { key: target.key, ...(target.sha ? { sha: target.sha } : {}) }) : await resumeLoop(runner, docPath, { key: target.key });
 				}
-				if (result.code !== 0) refused(result);
+				if (result.code !== 0) await refused(result);
 				answered.set(sigOf(prompt.state.id, target), { value: action.value, at: now() });
 				// Scheduling is on in a `start`; this only makes sure a signal delivered to a sleeping loop is picked up now.
 				runner.harness.resume();
@@ -503,8 +523,6 @@ export async function createBoard(options: BoardOptions): Promise<Board> {
 export interface ServeOptions extends Partial<Omit<BoardOptions, "runner" | "docPath" | "log">> {
 	/** 0 (default) = ephemeral. */
 	port?: number;
-	/** The pid the page's new-link instruction names (default: this process). */
-	pid?: number;
 }
 
 export interface ServedBoard {
@@ -519,12 +537,12 @@ export interface ServedBoard {
  * mode. Starts nothing in the loop: call it before `runner.start` so the link exists before anything runs.
  */
 export async function serveBoard(runner: Runner, docPath: string, options: ServeOptions = {}): Promise<ServedBoard> {
-	const { port, pid, ...boardOptions } = options;
+	const { port, ...boardOptions } = options;
 	const log = createWebLog();
 	const board = await createBoard({ ...boardOptions, runner, docPath, log });
 	let server: WebServer;
 	try {
-		server = await startWebServer({ host: "127.0.0.1", port: port ?? 0, html: webPage(undefined, { variant: "runner", pid: pid ?? process.pid }), log, onAction: board.onAction });
+		server = await startWebServer({ host: "127.0.0.1", port: port ?? 0, html: webPage(undefined, { variant: "runner" }), log, onAction: board.onAction });
 	} catch (error) {
 		await board.stop();
 		throw error;
