@@ -374,7 +374,9 @@ async function loadRunnerModules() {
 /** `status`, `answer`, `pause`, `resume`, `merge`: no worker, no API key, no scheduling. */
 async function control(command: string, args: string[], env: Env, io: Io, cwd: string): Promise<number> {
 	const approve = args.includes("--approve");
-	const capped = takeCap(args.filter((arg) => arg !== "--approve"));
+	// `--cap` is a flag of `resume` only: an answer's words may contain it (as before the cap), and elsewhere it stays positional, a usage error.
+	const flagless = args.filter((arg) => arg !== "--approve");
+	const capped = command === "resume" ? takeCap(flagless) : { rest: flagless, cap: undefined, bad: false };
 	const positional = capped.rest;
 	const cap = capped.cap;
 	const [docArg, ticketId, ...words] = positional;

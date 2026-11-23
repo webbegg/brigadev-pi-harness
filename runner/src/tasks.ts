@@ -25,7 +25,7 @@ import { asExec, nodeExec } from "./exec.ts";
 import { redact } from "./redact.ts";
 import { branchOf, compareIntegrity, integrityReason, takeIntegrity, type Integrity } from "./integrity.ts";
 import { defaultContainedEnv } from "./contain.ts";
-import { capMessage, CostMeter, reached, track, type GuardState } from "./cost.ts";
+import { capMessage, CostMeter, DEFAULT_MAX_TURNS, maxTurnsOf, reached, track, type GuardState } from "./cost.ts";
 import { createPrTask, type PrOptions, type PrResult } from "./pr.ts";
 import { DEFAULT_DONE_TIMEOUT_MINUTES, runShell } from "./shell.ts";
 import { ANSWER, answerCommand, DECISION_DEADLINE_MS, decisionKey, PAUSE, pauseKey, RESUME, resumeKey } from "./signals.ts";
@@ -131,7 +131,7 @@ export type TicketTask = ReturnType<typeof createTicketTask>;
 /** The beforeKey of the snapshot taken before an attempt's worker conversation. */
 const integrityKey = (attempt: number) => `integrity.before.${attempt}`;
 
-function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly ToolRegistration[], shell: ShellContext, exec: ExecFn, meter: CostMeter) {
+function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly ToolRegistration[], shell: ShellContext, exec: ExecFn, meter: CostMeter, maxTurns = DEFAULT_MAX_TURNS) {
 	return defineTask<TicketInput, TicketState, TicketResult>({
 		name: TICKET_TASK,
 		version: 1,
@@ -166,7 +166,7 @@ function createTicketTask(deps: TicketDeps, worker: Worker, extraTools: readonly
 						return undefined;
 					}
 					const created = await tx.createConversation({ ownership: { kind: "task", taskId: task.id } });
-					await configure(tx, created.id, { model: input.model, cwd: input.cwd, tools: workerTools(worker, extraTools), instructions: workerInstructions(worker, brief) });
+					await configure(tx, created.id, { model: input.model, cwd: input.cwd, tools: workerTools(worker, extraTools), instructions: workerInstructions(worker, brief), maxTurns });
 					// The approval of a decision's command lives on the conversation the guard decides for: durable (it survives a reopen) and scoped
 					// to this ticket (only its conversations carry it). Only the first attempt's: the approval is for one run of the command.
 					if (attempt === 1 && input.decision?.approved && input.decision.command !== null) (await tx.doc(ApprovalDoc, created.id)).command = input.decision.command;
@@ -280,7 +280,8 @@ export type Carry = { owned: Owned; baseline: string; failed: string[]; decision
 type PickState = { phase: "pick"; first: boolean } & Carry;
 /** `since`: set when the ticket parked on an integrity change; the rerun measures "HEAD moved" from there. */
 type LaunchState = { phase: "launch"; ticketId: string; since?: string } & Carry;
-type RecordState = { phase: "record"; ticketId: string; childId: string; done: string } & Carry;
+/** `answered`: the decision the child was launched with (it left `answers` then), so a park that relaunches the ticket gives it back. */
+type RecordState = { phase: "record"; ticketId: string; childId: string; done: string; answered?: AnsweredDecision } & Carry;
 type Working = PickState | LaunchState | RecordState;
 /** With every ticket done and `pr` set: launch the PR loop, then wait for it. The PR loop is a child task; it parks and resumes on its own signals. */
 type PrLaunchState = { phase: "pr" } & Carry;
@@ -473,7 +474,7 @@ function createLoopTask(ticketTask: TicketTask, prTask: ReturnType<typeof create
 					const childId = await tx.createTask(ticketTask, input, { ownership: { kind: "task", taskId: task.id } });
 					return {
 						status: "waiting",
-						checkpoint: { phase: "record", ticketId: current.id, childId, done, owned: written.owned, baseline: written.baseline, failed: state.failed, decisions: state.decisions, rounds: state.rounds, answers, epoch: state.epoch },
+						checkpoint: { phase: "record", ticketId: current.id, childId, done, owned: written.owned, baseline: written.baseline, failed: state.failed, decisions: state.decisions, rounds: state.rounds, answers, epoch: state.epoch, ...(answered ? { answered } : {}) },
 						on: [childId],
 						policy: "allSettled",
 					};
@@ -516,7 +517,8 @@ function createLoopTask(ticketTask: TicketTask, prTask: ReturnType<typeof create
 					const change: Change = { id: state.ticketId, status: "in_progress", note: `needs you: ${reason}`, log: `${state.ticketId} needs you: ${reason}`, own: true };
 					const written = writeBack(task.input.docPath, state, change, date);
 					if ("conflict" in written) return pause(runtime, context, "conflict", `doc edited: ${written.conflict}`, state);
-					const { phase: _pick, first: _first, ...carry } = carryOf(written);
+					// The relaunch is the same ticket run on: it keeps the answer it was launched with.
+					const { phase: _pick, first: _first, ...carry } = carryOf(written, state.answered ? { answers: { ...state.answers, [state.ticketId]: state.answered } } : {});
 					const next: LaunchState = { ...carry, phase: "launch", ticketId: state.ticketId, ...(outcome.result.startHead ? { since: outcome.result.startHead } : {}) };
 					return pause(runtime, context, "cost", reason, next);
 				}
@@ -624,7 +626,7 @@ export interface Tasks {
 export function createTasks(deps: TicketDeps = defaultDeps, worker: Worker = loadWorker(), extraTools: readonly ToolRegistration[] = [], prOptions: PrOptions = {}, shell: ShellContext = {}): Tasks {
 	// The integrity snapshot asks the remote with the runner's real environment: the PR loop's git seam (a test's fake gh passes git through).
 	const meter = new CostMeter();
-	const ticket = createTicketTask(deps, worker, extraTools, shell, prOptions.deps ? asExec(prOptions.deps.exec) : nodeExec, meter);
+	const ticket = createTicketTask(deps, worker, extraTools, shell, prOptions.deps ? asExec(prOptions.deps.exec) : nodeExec, meter, maxTurnsOf(prOptions.settings));
 	const pr = createPrTask(ticket, { ...prOptions, meter });
 	return { loop: createLoopTask(ticket, pr, meter), ticket, pr, meter };
 }

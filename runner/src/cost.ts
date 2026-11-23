@@ -18,6 +18,15 @@ export { UsageDoc };
 
 /** The cap of a loop whose `start` gave none, in dollars. */
 export const DEFAULT_CAP = 5;
+/**
+ * Tool rounds one worker or verify run takes at most (pi-durable `maxTurns`; then the run ends `turn_limit`, a failed attempt). A hook cannot end a run, so this is
+ * what bounds a run whose tools the cap blocks but which keeps calling them. `runner.maxTurns` in brigadev.json, an integer 1 or more; anything else is the default.
+ */
+export const DEFAULT_MAX_TURNS = 60;
+export function maxTurnsOf(settings: unknown): number {
+	const value = (settings as { runner?: { maxTurns?: unknown } } | undefined)?.runner?.maxTurns;
+	return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : DEFAULT_MAX_TURNS;
+}
 /** Costs are sums of floats: "at the cap" tolerates their rounding. */
 const EPSILON = 1e-9;
 

@@ -4,7 +4,7 @@
 import { readFileSync } from "node:fs";
 import type { SignalResult } from "@earendil-works/pi-durable";
 import { parseTicketList } from "../../lib/ticket-list.ts";
-import { dollars, reached } from "./cost.ts";
+import { dollars, reached, validCap } from "./cost.ts";
 import type { Runner } from "./runner.ts";
 import { ANSWER, MERGE, mergeCommand, PAUSE, pauseKey, RESUME, signalExit, signalLine } from "./signals.ts";
 
@@ -116,6 +116,7 @@ export async function resumeLoop(runner: Runner, docPath: string, expect?: Expec
 	}
 	const key = parked ? parked.resumeKey! : status.resumeKey!;
 	if (expect && key !== expect.key) return stale(`the resume prompt ${expect.key} was replaced by ${key}`);
+	if (options.cap !== undefined && !validCap(options.cap)) return failure(`the cost cap must be a positive number of dollars; nothing was delivered`, 2);
 	const atCap = parked ? parked.costCap === true : status.kind === "cost";
 	const spent = status.cost?.spent ?? 0;
 	if (options.cap !== undefined && !atCap) return failure(`not a cost-cap park: --cap applies only when the loop stopped at its cost cap (${parked ? parked.reason : status.reason}); nothing was delivered`, 2);

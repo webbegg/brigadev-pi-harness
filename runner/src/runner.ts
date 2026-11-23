@@ -100,7 +100,7 @@ export interface TicketRun {
 	/** The task has not ended: the worker runs, or the ticket waits for its done check. */
 	live: boolean;
 	/** How the run ended; absent while live. */
-	end?: "commit" | "decision" | "integrity" | "failed" | "aborted";
+	end?: "commit" | "decision" | "integrity" | "cost" | "failed" | "aborted";
 	/** The attempt in progress while live; the attempts used when it ended. */
 	attempts: number;
 	maxAttempts: number;
@@ -335,7 +335,7 @@ export async function openRunner(options: RunnerOptions): Promise<Runner> {
 		if (outcome.status === "completed" && outcome.result) {
 			const result = outcome.result;
 			if ("commit" in result) return { ...base, live: false, end: "commit", attempts: result.attempts, commit: result.commit, steps };
-			return { ...base, live: false, end: "decision" in result ? "decision" : "integrity", attempts: result.attempts, steps };
+			return { ...base, live: false, end: "decision" in result ? "decision" : "capped" in result ? "cost" : "integrity", attempts: result.attempts, steps };
 		}
 		if (outcome.status === "failed") {
 			const detail = outcome.error?.detail as { attempts?: number; outputTail?: string } | undefined;

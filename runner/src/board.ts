@@ -67,7 +67,7 @@ const CAP_RAISES = [5, 10];
 /** A typed-in new cap: dollars, with an optional `$`. */
 const capAmount = (text: string): number | undefined => {
 	const match = /^\$?\s*(\d+\.?\d*|\.\d+)$/.exec(text.trim());
-	return match && Number(match[1]) > 0 ? Number(match[1]) : undefined;
+	return match && Number(match[1]) > 0 && Number.isFinite(Number(match[1])) ? Number(match[1]) : undefined;
 };
 
 /** The prompt of a stop at the cost cap: raise the cap by $5 or $10 over the spend, or type the new cap. */
@@ -129,7 +129,7 @@ function ticketCard(id: string, ticket: Ticket | undefined, run: TicketRun | und
 	else if (ticket?.status === "done") status = "done";
 	else if (ticket?.status === "in_progress") status = /^needs you\b/.test(note) ? "needs-you" : loopLive ? "running" : "blocked";
 	else if (ticket?.status === "blocked") status = run?.end === "failed" || run?.end === "aborted" ? "failed" : /^needs you: decision/.test(note) ? "needs-you" : "blocked";
-	else if (!ticket && run) status = run.live ? "running" : run.end === "commit" ? "done" : run.end === "decision" || run.end === "integrity" ? "needs-you" : "failed";
+	else if (!ticket && run) status = run.live ? "running" : run.end === "commit" ? "done" : run.end === "decision" || run.end === "integrity" || run.end === "cost" ? "needs-you" : "failed";
 	if (!status) return undefined; // pending, dropped, or unknown: it has not run
 
 	const title = ticket ? oneLine(ticket.title) || id : `${id} (PR loop fix)`;

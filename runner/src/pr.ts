@@ -27,7 +27,7 @@ import { appendLogLine, parseTicketList, writeFileAtomic } from "../../lib/ticke
 import { runContainedCheck } from "./check-run.ts";
 import { defaultContainedEnv } from "./contain.ts";
 import { approves, type AnsweredDecision } from "./decision.ts";
-import { capMessage, CostMeter, reached, track } from "./cost.ts";
+import { capMessage, CostMeter, maxTurnsOf, reached, track } from "./cost.ts";
 import { asExec as execFnOf, nodeExec } from "./exec.ts";
 import { compareIntegrity, integrityReason, takeIntegrity, type Integrity } from "./integrity.ts";
 import { redact } from "./redact.ts";
@@ -477,7 +477,7 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 					}
 					const created = await tx.createConversation({ ownership: { kind: "task", taskId: task.id } });
 					const tools = [...(CodingTools.tools ?? []).filter((tool) => tool.name === "read" || tool.name === "bash"), verdictTool] as ToolRegistration[];
-					await configure(tx, created.id, { model: task.input.model, cwd, tools, instructions: verifyInstructions(verifier, brief) });
+					await configure(tx, created.id, { model: task.input.model, cwd, tools, instructions: verifyInstructions(verifier, brief), maxTurns: maxTurnsOf(settings) });
 					(await tx.doc(RoleDoc, created.id)).role = VERIFY_ROLE;
 					if (spend && task.input.loop) await track(tx, task.input.loop, created.id, { cap: spend.cap, base: spend.spent });
 					conversationId = created.id;

@@ -11,13 +11,13 @@ import type { WebServer } from "../../lib/web-server.ts";
 import { parseTicketList } from "../../lib/ticket-list.ts";
 import { createBoard, serveBoard, type ServedBoard } from "../src/board.ts";
 import { main, startLoop, storePathFor } from "../src/cli.ts";
-import { resumeLoop, statusText } from "../src/control.ts";
-import { costBlock, DEFAULT_CAP, UsageDoc } from "../src/cost.ts";
+import { answerDecision, resumeLoop, statusText } from "../src/control.ts";
+import { costBlock, DEFAULT_CAP, DEFAULT_MAX_TURNS, maxTurnsOf, UsageDoc } from "../src/cost.ts";
 import { POLL_MS, type PrDeps } from "../src/pr.ts";
 import { createWebLog } from "../../lib/web-log.ts";
 import { pauseLoop } from "../src/control.ts";
 import { defaultDeps, type TicketDeps } from "../src/tasks.ts";
-import { bash, commitFile, context, docText, fakeClock, isolateEnv, makeWorker, makeWorkspace, openFixtureRunner, readDoc, type FixtureRunner, type Isolation, type Workspace } from "./fixture.ts";
+import { askUser, bash, commitFile, context, docText, fakeClock, isolateEnv, makeWorker, makeWorkspace, openFixtureRunner, readDoc, type FixtureRunner, type Isolation, type Workspace } from "./fixture.ts";
 import { addRemote, drivers, FakeGh, FAIL, PENDING, prDepsOf, until, verdict } from "./pr-fixture.ts";
 
 let env: Isolation;
@@ -199,6 +199,29 @@ describe("a conversation over the cap gets its tools blocked (b)", () => {
 	});
 });
 
+describe("a turn limit bounds a run that ignores the blocks", () => {
+	it("`runner.maxTurns` (default 60, an integer 1 or more) is read from the settings; anything else is the default", () => {
+		assert.equal(DEFAULT_MAX_TURNS, 60);
+		for (const settings of [undefined, {}, { runner: {} }, { runner: { maxTurns: 0 } }, { runner: { maxTurns: 2.5 } }, { runner: { maxTurns: "9" } }, { runner: { maxTurns: -1 } }]) assert.equal(maxTurnsOf(settings), 60, JSON.stringify(settings));
+		assert.equal(maxTurnsOf({ runner: { maxTurns: 3 } }), 3);
+	});
+
+	it("a worker run that keeps calling tools past the cap's block ends at the turn limit, and the ticket's next attempt is the next boundary", async () => {
+		env.settings({ check: { test: "true" }, runner: { maxTurns: 3 } });
+		writeFileSync(ws.docPath, docText([T1]));
+		const steps = Array.from({ length: 8 }, (_, index) => bash(`echo step-${index + 1}`));
+		const worker = makeWorker({ T1: steps }, { price: PRICE });
+		const r = await open(worker);
+		const id = await r.start(ws.docPath, { cap: 1 });
+		assert.match(String(((await r.settle(id)) as { paused?: string }).paused), /^cost cap reached/);
+		// The fixture sees a tool result in the next request: three requests (rounds) see the first two results, and the run ends turn_limit after round 3.
+		assert.equal(worker.results.filter((result) => result.ticketId === "T1").length, 2);
+		// Three responses at $0.50, not the nine ($4.50) of the unbounded run.
+		assert.equal((await r.status(id)).cost!.spent, 1.5);
+		assert.deepEqual(worker.prompts.map((p) => `${p.ticketId}#${p.run}`), ["T1#1"]);
+	});
+});
+
 describe("resume --cap (c)", () => {
 	async function parked() {
 		writeFileSync(ws.docPath, docText([T1, T2, T3]));
@@ -229,6 +252,46 @@ describe("resume --cap (c)", () => {
 		assert.deepEqual([resumed.code, resumed.result], [0, "delivered"], resumed.text);
 		assert.equal((await r.settle(id)).status, "completed");
 		assert.deepEqual(worker.prompts.map((p) => p.ticketId), ["T1", "T2", "T3"]);
+	});
+
+	it("a cap that is not a finite positive number (a typed-in amount that overflows to Infinity, NaN, 0) is refused (exit 2) and delivers nothing; the store stays readable", async () => {
+		const { r, id } = await parked();
+		for (const bad of [Number("9".repeat(400)), Number.NaN, 0, -3]) {
+			const refused = await resumeLoop(r, ws.docPath, undefined, { cap: bad });
+			assert.deepEqual([refused.code, refused.result], [2, undefined], `cap ${bad}`);
+			assert.match(refused.text, /positive number of dollars; nothing was delivered/);
+		}
+		const status = await r.status(id);
+		assert.deepEqual([status.state, status.cost], ["paused", { spent: 4, cap: 4 }]);
+	});
+
+	it("a ticket capped between attempts after its decision was answered runs again with that answer", async () => {
+		writeFileSync(ws.docPath, docText([T1]));
+		const worker = makeWorker({ T1: (run) => (run === 1 ? [askUser("Which store?", ["sqlite", "postgres"])] : run === 2 ? [bash("echo no commit yet")] : commitFile("t1.txt")) }, { price: PRICE });
+		const r = await open(worker);
+		const id = await r.start(ws.docPath, { cap: 50 });
+		assert.deepEqual((await r.settle(id)) as unknown, { status: "waiting", decisions: ["T1"] });
+		const asked = (await r.status(id)).cost!.spent;
+		// The failed attempt 2 (two responses, $1.00) reaches the cap, so the ticket parks before attempt 3.
+		await r.start(ws.docPath, { cap: asked + 1 });
+		assert.equal((await answerDecision(r, ws.docPath, "T1", "use postgres instead")).result, "delivered");
+		assert.match(String((await r.settle(id) as { paused?: string }).paused), /^cost cap reached/);
+		assert.deepEqual(worker.prompts.map((p) => `${p.ticketId}#${p.run}`), ["T1#1", "T1#2"]);
+		assert.match(worker.prompts[1].system, /answer: use postgres instead/i);
+
+		assert.equal((await resumeLoop(r, ws.docPath, undefined, { cap: asked + 10 })).code, 0);
+		assert.equal((await r.settle(id)).status, "completed");
+		assert.deepEqual(worker.prompts.map((p) => `${p.ticketId}#${p.run}`), ["T1#1", "T1#2", "T1#3"]);
+		assert.match(worker.prompts[2].system, /answer: use postgres instead/i, "the relaunch keeps the answer");
+	});
+
+	it("a capped ticket's run ends `cost`, not `integrity`", async () => {
+		writeFileSync(ws.docPath, docText([T1]));
+		const worker = makeWorker({ T1: (run) => (run === 1 ? [bash("echo no commit yet")] : commitFile("t1.txt")) }, { price: PRICE });
+		const r = await open(worker);
+		const id = await r.start(ws.docPath, { cap: 1 });
+		await r.settle(id);
+		assert.deepEqual((await r.ticketRuns(id)).map((run) => [run.ticketId, run.end]), [["T1", "cost"]]);
 	});
 
 	it("a cap at or below the spend is refused (exit 2) and delivers nothing; a cap above it continues and the loop finishes", async () => {
@@ -471,6 +534,8 @@ describe("status and the board show spend and cap (e)", () => {
 		const text = await act({ action: "answer", id: prompt.id, value: "plenty" });
 		assert.equal(text.status, 409);
 		assert.match(text.body.error, /amount in dollars/);
+		const huge = await act({ action: "answer", id: prompt.id, value: "9".repeat(400) });
+		assert.equal(huge.status, 409, "an amount that overflows to Infinity is no amount");
 		const yes = await act({ action: "answer", id: prompt.id, value: true });
 		assert.equal(yes.status, 409, "this is a choice, not a yes/no");
 		assert.equal((await r.status(id)).state, "paused", "nothing was delivered");
@@ -504,7 +569,14 @@ describe("--cap parsing (f)", () => {
 	it("`resume --cap` has the same rules, and --cap belongs to start and resume only", async () => {
 		for (const args of [["--cap", "0"], ["--cap", "-1"], ["--cap", "abc"], ["--cap"]]) assert.equal((await cli(["resume", doc(), ...args], dir)).code, 2, args.join(" "));
 		for (const command of ["status", "pause", "merge"]) assert.equal((await cli([command, doc(), "--cap", "5"], dir)).code, 2, command);
-		assert.equal((await cli(["answer", doc(), "T1", "1", "--cap", "5"], dir)).code, 2);
+	});
+
+	it("an answer's free text may contain `--cap`, as before the cap: it is the answer's words, not a flag (it goes on to its own checks)", async () => {
+		for (const words of [["use", "a", "--cap", "of", "3"], ["--cap"], ["--cap=abc"]]) {
+			const result = await cli(["answer", doc(), "T1", ...words], dir);
+			assert.equal(result.code, 1, words.join(" "));
+			assert.match(result.stderr, /no runner state for/);
+		}
 	});
 
 	it("a valid amount is accepted: the command goes on to its own checks (here: not a git repository), also as --cap=N", async () => {
