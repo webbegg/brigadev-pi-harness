@@ -27,6 +27,7 @@ import { appendLogLine, parseTicketList, writeFileAtomic } from "../../lib/ticke
 import { runContainedCheck } from "./check-run.ts";
 import { defaultContainedEnv } from "./contain.ts";
 import { approves, type AnsweredDecision } from "./decision.ts";
+import { capMessage, CostMeter, maxTurnsOf, reached, track } from "./cost.ts";
 import { asExec as execFnOf, nodeExec } from "./exec.ts";
 import { compareIntegrity, integrityReason, takeIntegrity, type Integrity } from "./integrity.ts";
 import { redact } from "./redact.ts";
@@ -97,12 +98,15 @@ export interface PrOptions {
 	verifier?: Verifier;
 	/** The terminating verdict tool the verify conversation gets (default: a fresh one; the Harness registry must hold the same tool name). */
 	verdictTool?: ToolRegistration;
+	/** Reads the loop's spend for the cost cap (default: a fresh one). */
+	meter?: CostMeter;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
 // State
 
-export type PrInput = { docPath: string; cwd: string; model: ModelRef };
+/** `loop`: the ticket loop task this PR loop belongs to, whose cost cap its verify and fix tickets count against (absent: no cap). */
+export type PrInput = { docPath: string; cwd: string; model: ModelRef; loop?: string };
 
 /** The terminal result: the PR is merged (by the runner, or already by someone). */
 export type PrResult = { status: "merged"; number: number; url: string; sha: string };
@@ -148,8 +152,8 @@ export type PrState =
 	| ({ phase: "poll" } & PrCarry)
 	| ({ phase: "nap" } & PrCarry)
 	| ({ phase: "merge"; key: string } & PrCarry)
-	| ({ phase: "stop"; reason: string; next: Plain } & PrCarry)
-	| ({ phase: "resume"; reason: string; key: string; next: Plain } & PrCarry);
+	| ({ phase: "stop"; reason: string; next: Plain; cost?: true } & PrCarry)
+	| ({ phase: "resume"; reason: string; key: string; next: Plain; cost?: true } & PrCarry);
 
 const CARRY_KEYS = ["branch", "sha", "pr", "budget", "fixSeq", "verifyRound", "mergeRound", "waits", "stops", "decision", "rounds", "answers", "warn"] as const;
 
@@ -382,6 +386,7 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 	const integrityExec = asExec(deps);
 	const verifier = options.verifier ?? loadVerifier();
 	const verdictTool = options.verdictTool ?? createVerdictTool();
+	const meter = options.meter ?? new CostMeter();
 
 	const go = (runtime: Rt, context: Context, next: PrState) => runtime.commit(() => ({ status: "running", checkpoint: next }), context);
 	const finish = (runtime: Rt, context: Context, result: PrResult) => runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result } }), context);
@@ -389,6 +394,14 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 	const dateOf = (runtime: Rt) => new Date(runtime.now()).toISOString().slice(0, 10);
 	/** Stop for a person: the `stop` phase comments, logs, and parks on `resume`; `resume` continues at `next` with a fresh fix budget. */
 	const stop = (runtime: Rt, context: Context, state: PrCarry, reason: string, next: Plain) => go(runtime, context, { phase: "stop", reason, next, ...carryOf(state) });
+	/** The loop's spend is at its cap: a stop that only `resume --cap` lifts (`cost` marks it for `status`, the comment, and the control). */
+	const capStop = (runtime: Rt, context: Context, state: PrCarry, reason: string, next: Plain) => go(runtime, context, { phase: "stop", reason, next, cost: true, ...carryOf(state) });
+	/** The loop's spend and cap, when this PR loop belongs to a loop with a ledger and its spend is at the cap. */
+	const capReached = async (runtime: Rt, context: Context, input: PrInput): Promise<string | undefined> => {
+		if (!input.loop) return undefined;
+		const spend = await meter.read(runtime, input.loop, context);
+		return reached(spend.spent, spend.cap) ? capMessage(spend.spent, spend.cap) : undefined;
+	};
 
 	const merged = async (runtime: Rt, context: Context, state: PrCarry, input: PrInput) => {
 		const pr = state.pr!;
@@ -442,9 +455,14 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 				// An unknown base means the committed changes were not seen: the safe reading is the high tier.
 				const tier = risk && !risk.baseUnknown ? risk.tier : "T2";
 				if (tier !== "T2") return go(runtime, context, at("push", state));
+				// The cost cap, before the verify conversation spends anything.
+				const capped = await capReached(runtime, context, task.input);
+				if (capped) return capStop(runtime, context, state, capped, at("verify", state));
 
 				const round = state.verifyRound + 1;
 				const base = (await live(readBranchFacts(asExec(deps), cwd))).defaultBranch ?? undefined;
+				// What the loop has spent so far: the conversation's own cap and base (its tools are blocked once the spend reaches the cap).
+				const spend = task.input.loop ? await meter.read(runtime, task.input.loop, context) : undefined;
 				// The worktree as it is before the run (a read-only run must leave it so), and what the verifier must not touch (src/integrity.ts).
 				await runtime.memo(`verify.before.${round}`, await live(worktreeFingerprint(cwd)), context);
 				await runtime.memo(`verify.integrity.${round}`, await live(takeIntegrity(cwd, integrityExec, { docPath })), context);
@@ -459,8 +477,9 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 					}
 					const created = await tx.createConversation({ ownership: { kind: "task", taskId: task.id } });
 					const tools = [...(CodingTools.tools ?? []).filter((tool) => tool.name === "read" || tool.name === "bash"), verdictTool] as ToolRegistration[];
-					await configure(tx, created.id, { model: task.input.model, cwd, tools, instructions: verifyInstructions(verifier, brief) });
+					await configure(tx, created.id, { model: task.input.model, cwd, tools, instructions: verifyInstructions(verifier, brief), maxTurns: maxTurnsOf(settings) });
 					(await tx.doc(RoleDoc, created.id)).role = VERIFY_ROLE;
+					if (spend && task.input.loop) await track(tx, task.input.loop, created.id, { cap: spend.cap, base: spend.spent });
 					conversationId = created.id;
 					return undefined;
 				}, context);
@@ -511,6 +530,9 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 				}
 				const suite = resolveCommand({ cwd, settings });
 				if ("error" in suite) return stop(runtime, context, state, `no test command to prove a fix with: ${trimmed(suite.error)}`, at(retryPhase(state.origin), state));
+				// The cost cap, before the fix ticket spends anything (and before the fix budget is charged: a stop at the cap uses none of it).
+				const capped = await capReached(runtime, context, task.input);
+				if (capped) return capStop(runtime, context, state, capped, at(retryPhase(state.origin), state));
 				const model = task.input.model;
 				const ticketId = state.ticketId ?? `FIX-${state.fixSeq + 1}`;
 				const carry = carryOf(state, fresh ? { budget: state.budget + 1, fixSeq: state.fixSeq + 1 } : {});
@@ -526,6 +548,7 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 					maxAttempts: 1,
 					model,
 					...(state.answered ? { decision: state.answered } : {}),
+					...(task.input.loop ? { loop: task.input.loop } : {}),
 				};
 				await runtime.commit(async (tx) => {
 					const childId = await tx.createTask(ticketTask, input, { ownership: { kind: "task", taskId: task.id } });
@@ -549,6 +572,12 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 				if (outcome.status === "completed" && "integrity" in outcome.result) {
 					const carry = without(carryOf(state), "decision");
 					return stop(runtime, context, carry, `${ticketId}: ${integrityReason("worker", outcome.result.integrity)}`, at("check", carry));
+				}
+
+				// The loop's spend was at its cap before the fix worker's attempt (a cap lowered meanwhile): stop like the fix phase does; `resume --cap` goes on.
+				if (outcome.status === "completed" && "capped" in outcome.result) {
+					const carry = without(carryOf(state), "decision");
+					return capStop(runtime, context, carry, capMessage(outcome.result.capped.spent, outcome.result.capped.cap), at(retryPhase(origin), carry));
 				}
 
 				// The fix worker asked a question: park on its key, like a ticket decision. It used no attempt.
@@ -744,12 +773,13 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 				let warn = state.warn;
 				if (state.pr && (await runtime.memo<boolean>(`commented.stop.${n}`, context)) === undefined) {
 					await runtime.memo(`commented.stop.${n}`, true, context);
-					warn = await postComment(live, runtime, task.input, state.pr.number, `Needs you: ${state.reason}\n\nWhen it is sorted out, run \`brigadev-runner resume ${docPath}\`: the runner continues where it stopped.`);
+					const resume = state.cost ? `brigadev-runner resume ${docPath} --cap <dollars>` : `brigadev-runner resume ${docPath}`;
+					warn = await postComment(live, runtime, task.input, state.pr.number, `Needs you: ${state.reason}\n\nWhen it is sorted out, run \`${resume}\`: the runner continues where it stopped.`);
 				}
 				logLine(docPath, dateOf(runtime), `PR loop needs you (${n}): ${state.reason}`);
 				const key = resumeKey(n);
 				await runtime.commit(
-					() => ({ status: "sleeping", signals: [RESUME.key(key)], checkpoint: { phase: "resume", reason: state.reason, key, next: { ...state.next, stops: n }, ...carryOf(state, { stops: n, warn }) } }),
+					() => ({ status: "sleeping", signals: [RESUME.key(key)], checkpoint: { phase: "resume", reason: state.reason, key, next: { ...state.next, stops: n }, ...(state.cost ? { cost: true as const } : {}), ...carryOf(state, { stops: n, warn }) } }),
 					context,
 				);
 			}),

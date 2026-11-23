@@ -1,11 +1,11 @@
 // brigadev-runner CLI.
-//   start <feature-doc> [--no-pr] [--web [--port N] [--web-in-multiplexer]]
+//   start <feature-doc> [--no-pr] [--cap <dollars>] [--web [--port N] [--web-in-multiplexer]]
 //                                   validate the doc, then run its ticket list durably, then the PR loop (push, PR, CI, fixes, merge approval);
-//                                   `--no-pr` stops after the tickets. Returns when the loop ends or parks on a person. With `--web` it serves the loop board
+//                                   `--no-pr` stops after the tickets. `--cap` sets the loop's cost cap (default $5, stored with the loop: see src/cost.ts). Returns when the loop ends or parks on a person. With `--web` it serves the loop board
 //                                   (the web UI) on 127.0.0.1 instead and stays up while the loop waits for a person, on a terminal only: see below
 //   status <feature-doc>            read-only: the loop's state, each ticket's status, open decisions with the exact answer command
 //   answer <feature-doc> <T#> <1..n|text> [--approve]   answer a parked ticket decision (--approve also approves its command)
-//   pause <feature-doc>             pause at the next pick;  resume <feature-doc>   lift a pause (or a PR loop stop)
+//   pause <feature-doc>             pause at the next pick;  resume <feature-doc> [--cap <dollars>]   lift a pause (or a PR loop stop); a stop at the cost cap needs --cap
 //   merge <feature-doc>             approve the merge of the PR the PR loop opened (it re-checks the PR before merging)
 // Exit codes: 0 loop done / signal delivered; 1 refused, failed, paused, stalled, parked, or a final signal answer (duplicate, closed, not_found);
 // 2 usage or an invalid answer.
@@ -32,6 +32,7 @@ import { canonicalPath } from "../../lib/paths.ts";
 import { repoDocsDir, repoName } from "../../lib/repo-docs.ts";
 import { serveBoard } from "./board.ts";
 import { hardenGitEnv } from "./contain.ts";
+import { dollars } from "./cost.ts";
 import { answerDecision, mergeLoop, pauseLoop, resumeLoop, statusText, type ControlResult } from "./control.ts";
 import { validateDoc } from "./doc.ts";
 import { nodeExec } from "./exec.ts";
@@ -46,14 +47,15 @@ if (process.platform !== "win32") process.on("SIGUSR1", () => {});
 
 export const DEFAULT_MODEL = "claude-sonnet-5-5";
 const USAGE = [
-	"usage: brigadev-runner start <feature-doc> [--no-pr] [--web [--port N] [--web-in-multiplexer]]",
+	"usage: brigadev-runner start <feature-doc> [--no-pr] [--cap <dollars>] [--web [--port N] [--web-in-multiplexer]]",
+	"         --cap <dollars> is the loop's cost cap (a positive number, default 5): at or over it the loop parks needs-you; continue with `resume <feature-doc> --cap <dollars>`",
 	"         --web serves the loop board on 127.0.0.1 (port: --port or BRIGADEV_WEB_PORT, default: any free port) and stays up while the loop waits for you;",
 	"         it needs stdin and stdout to be a terminal (the one-time link is printed there, a new one on Enter) and refuses inside tmux, screen or zellij",
 	"         unless --web-in-multiplexer, and in the foreground of that terminal (not with `&`)",
 	"       brigadev-runner status <feature-doc>",
 	"       brigadev-runner answer <feature-doc> <T#> <1..n|text> [--approve]",
 	"       brigadev-runner pause <feature-doc>",
-	"       brigadev-runner resume <feature-doc>",
+	"       brigadev-runner resume <feature-doc> [--cap <dollars>]",
 	"       brigadev-runner merge <feature-doc>",
 ].join("\n");
 
@@ -219,7 +221,7 @@ export const exitCodeOf = (outcome: Awaited<ReturnType<Runner["wait"]>>): number
  * `start --web`: the board first (so its link is printed before anything is scheduled), then the loop, and then wait for the loop to end, not for it to park: while it waits
  * for a person the board is the way to answer, and answering delivers through this process's Harness, so the loop wakes in it.
  */
-async function startWithBoard(runner: Runner, docPath: string, io: Io, pr: boolean, web: WebStart): Promise<number> {
+async function startWithBoard(runner: Runner, docPath: string, io: Io, pr: boolean, web: WebStart, cap?: number): Promise<number> {
 	let served: Awaited<ReturnType<typeof serveBoard>>;
 	try {
 		served = await serveBoard(runner, docPath, { port: web.port, debounceMs: web.debounceMs, pollMs: web.pollMs });
@@ -238,7 +240,7 @@ async function startWithBoard(runner: Runner, docPath: string, io: Io, pr: boole
 	try {
 		let id: Awaited<ReturnType<Runner["start"]>>;
 		try {
-			id = await runner.start(docPath, { pr });
+			id = await startWithCap(runner, docPath, io, { pr, cap });
 		} catch (error) {
 			if (!(error instanceof LoopStartedDifferently)) throw error;
 			io.err(`Refusing to start: ${error.message}`);
@@ -266,6 +268,18 @@ async function startWithBoard(runner: Runner, docPath: string, io: Io, pr: boole
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** `runner.start`, and with `--cap` a line on stdout saying what the loop's cap is now (and what it was, when this changed an existing loop's). */
+async function startWithCap(runner: Runner, docPath: string, io: Io, options: { pr: boolean; cap?: number }): Promise<Awaited<ReturnType<Runner["start"]>>> {
+	const existing = options.cap === undefined ? undefined : await runner.find(docPath);
+	const before = existing === undefined ? undefined : (await runner.status(existing)).cost;
+	const id = await runner.start(docPath, { pr: options.pr, ...(options.cap === undefined ? {} : { cap: options.cap }) });
+	if (options.cap !== undefined) {
+		const now = (await runner.status(id)).cost;
+		io.out(before && now && before.cap !== now.cap ? `cost cap changed: ${dollars(before.cap)} → ${dollars(now.cap)} (spent ${dollars(now.spent)})` : `cost cap: ${dollars(options.cap)}${before ? ` (unchanged; spent ${dollars(before.spent)})` : ""}`);
+	}
+	return id;
+}
 
 /** The process as `wireLinkRequests` uses it (tests pass a fake). It has no signals: a fresh link is never asked for by one. */
 export interface LinkHost {
@@ -322,11 +336,11 @@ export function watchInterrupt(host: SignalHost = process): { signal: AbortSigna
  * Run the loop for a doc until it ends or parks. Parked (asleep on a decision or a pause, nothing runnable): print where it waits and how to
  * answer, and return 1; the loop continues from storage the next time `start` runs. With `web`, serve the board and wait for the loop to end instead (see `startWithBoard`).
  */
-export async function startLoop(runner: Runner, docPath: string, io: Io, options: { pr?: boolean; web?: WebStart } = {}): Promise<number> {
-	if (options.web) return startWithBoard(runner, docPath, io, options.pr === true, options.web);
+export async function startLoop(runner: Runner, docPath: string, io: Io, options: { pr?: boolean; web?: WebStart; cap?: number } = {}): Promise<number> {
+	if (options.web) return startWithBoard(runner, docPath, io, options.pr === true, options.web, options.cap);
 	let id: Awaited<ReturnType<Runner["start"]>>;
 	try {
-		id = await runner.start(docPath, { pr: options.pr === true });
+		id = await startWithCap(runner, docPath, io, { pr: options.pr === true, cap: options.cap });
 	} catch (error) {
 		// B5: the loop exists with other options; nothing was started.
 		if (!(error instanceof LoopStartedDifferently)) throw error;
@@ -338,10 +352,10 @@ export async function startLoop(runner: Runner, docPath: string, io: Io, options
 	if (outcome.status === "waiting") {
 		const status = await runner.status(id);
 		for (const decision of [...status.decisions, ...(status.pr?.decisions ?? [])]) io.out(`${decision.ticketId} needs a decision: ${answerCommand(docPath, decision.ticketId)}`);
-		if (outcome.paused !== undefined) io.out(`paused: ${outcome.paused}. Resume with: brigadev-runner resume ${docPath}`);
+		if (outcome.paused !== undefined) io.out(`paused: ${outcome.paused}. Resume with: brigadev-runner resume ${docPath}${status.kind === "cost" ? " --cap <dollars>" : ""}`);
 		if (status.pr) io.out(`PR loop: ${status.pr.phase}${status.pr.url ? ` ${status.pr.url}` : ""}`);
 		if (status.pr?.mergeKey !== undefined) io.out(`Ready to merge. Approve with: ${mergeCommand(docPath)}`);
-		if (status.pr?.resumeKey !== undefined) io.out(`needs you: ${status.pr.reason}. Resume with: brigadev-runner resume ${docPath}`);
+		if (status.pr?.resumeKey !== undefined) io.out(`needs you: ${status.pr.reason}. Resume with: brigadev-runner resume ${docPath}${status.pr.costCap ? " --cap <dollars>" : ""}`);
 		io.out(`Parked, nothing is running. After answering, then run \`brigadev-runner start ${docPath}\` again: the loop continues from storage.`);
 		return 1;
 	}
@@ -360,10 +374,14 @@ async function loadRunnerModules() {
 /** `status`, `answer`, `pause`, `resume`, `merge`: no worker, no API key, no scheduling. */
 async function control(command: string, args: string[], env: Env, io: Io, cwd: string): Promise<number> {
 	const approve = args.includes("--approve");
-	const positional = args.filter((arg) => arg !== "--approve");
+	// `--cap` is a flag of `resume` only: an answer's words may contain it (as before the cap), and elsewhere it stays positional, a usage error.
+	const flagless = args.filter((arg) => arg !== "--approve");
+	const capped = command === "resume" ? takeCap(flagless) : { rest: flagless, cap: undefined, bad: false };
+	const positional = capped.rest;
+	const cap = capped.cap;
 	const [docArg, ticketId, ...words] = positional;
 	const choice = words.join(" ").trim();
-	if (!docArg || (command === "answer" ? !ticketId || !choice : positional.length > 1) || (approve && command !== "answer")) {
+	if (!docArg || (command === "answer" ? !ticketId || !choice : positional.length > 1) || (approve && command !== "answer") || capped.bad || (cap !== undefined && command !== "resume")) {
 		io.err(USAGE);
 		return 2;
 	}
@@ -400,7 +418,7 @@ async function control(command: string, args: string[], env: Env, io: Io, cwd: s
 		release = held;
 	}
 	try {
-		return await runControl(command, { cwd, env, io, storePath, docPath, ticketId, choice, approve });
+		return await runControl(command, { cwd, env, io, storePath, docPath, ticketId, choice, approve, cap });
 	} finally {
 		release?.();
 	}
@@ -408,7 +426,7 @@ async function control(command: string, args: string[], env: Env, io: Io, cwd: s
 
 async function runControl(
 	command: string,
-	{ cwd, env, io, storePath, docPath, ticketId, choice, approve }: { cwd: string; env: Env; io: Io; storePath: string; docPath: string; ticketId: string; choice: string; approve: boolean },
+	{ cwd, env, io, storePath, docPath, ticketId, choice, approve, cap }: { cwd: string; env: Env; io: Io; storePath: string; docPath: string; ticketId: string; choice: string; approve: boolean; cap?: number },
 ): Promise<number> {
 
 	const { createModels, openNodeSqliteStorage, openRunner } = await loadRunnerModules();
@@ -426,7 +444,7 @@ async function runControl(
 		else if (command === "answer") result = await answerDecision(runner, docPath, ticketId, choice, { approve });
 		else if (command === "pause") result = await pauseLoop(runner, docPath);
 		else if (command === "merge") result = await mergeLoop(runner, docPath);
-		else result = await resumeLoop(runner, docPath);
+		else result = await resumeLoop(runner, docPath, undefined, cap === undefined ? {} : { cap });
 		(result.code === 0 ? io.out : io.err)(result.text);
 		return result.code;
 	} finally {
@@ -434,17 +452,36 @@ async function runControl(
 	}
 }
 
+/** A dollar amount for `--cap`: a positive number written as digits with an optional fraction (no sign, exponent, or `Infinity`), else undefined. */
+const capOf = (text: string | undefined): number | undefined => (text !== undefined && /^(\d+\.?\d*|\.\d+)$/.test(text) && Number(text) > 0 && Number.isFinite(Number(text)) ? Number(text) : undefined);
+
+/** `--cap <dollars>` or `--cap=<dollars>` out of `args`; `bad` when the amount is missing or not a positive number. */
+function takeCap(args: string[]): { rest: string[]; cap?: number; bad: boolean } {
+	const rest: string[] = [];
+	let cap: number | undefined;
+	let bad = false;
+	for (let i = 0; i < args.length; i += 1) {
+		const arg = args[i];
+		if (arg === "--cap" || arg.startsWith("--cap=")) {
+			cap = capOf(arg === "--cap" ? args[++i] : arg.slice("--cap=".length));
+			if (cap === undefined) bad = true;
+		} else rest.push(arg);
+	}
+	return { rest, ...(cap === undefined ? {} : { cap }), bad };
+}
+
 /** A port number from 0 to 65535 written as digits, else undefined. */
 const portOf = (text: string): number | undefined => (/^\d{1,5}$/.test(text) && Number(text) <= 65535 ? Number(text) : undefined);
 
 /** `start`'s arguments: the doc and anything unknown stay positional (so an unknown flag is a usage error as before); `bad` is a `--port` without a valid number. */
-function parseStartArgs(rest: string[]): { positional: string[]; noPr: boolean; web: boolean; inMultiplexer: boolean; port?: number; bad: boolean } {
+function parseStartArgs(all: string[]): { positional: string[]; noPr: boolean; web: boolean; inMultiplexer: boolean; port?: number; cap?: number; bad: boolean } {
+	const { rest, cap, bad: badCap } = takeCap(all);
 	const positional: string[] = [];
 	let noPr = false;
 	let web = false;
 	let inMultiplexer = false;
 	let port: number | undefined;
-	let bad = false;
+	let bad = badCap;
 	for (let i = 0; i < rest.length; i += 1) {
 		const arg = rest[i];
 		if (arg === "--no-pr") noPr = true;
@@ -456,7 +493,7 @@ function parseStartArgs(rest: string[]): { positional: string[]; noPr: boolean; 
 			if (port === undefined) bad = true;
 		} else positional.push(arg);
 	}
-	return { positional, noPr, web, inMultiplexer, ...(port === undefined ? {} : { port }), bad };
+	return { positional, noPr, web, inMultiplexer, ...(port === undefined ? {} : { port }), ...(cap === undefined ? {} : { cap }), bad };
 }
 
 /** Whether the process's stdin and stdout are terminals, and whether it is in the background of its terminal (tests pass their own). */
@@ -626,7 +663,7 @@ export async function main(args: string[], env: Env = process.env, io: Io = { ou
 		const interrupt = parsed.web ? watchInterrupt() : undefined;
 		try {
 			const web: WebStart | undefined = parsed.web ? { port: webPort, signal: interrupt!.signal, wire: (newLink) => wireLinkRequests(newLink) } : undefined;
-			return await startLoop(runner, docPath, io, { pr: !noPr, ...(web ? { web } : {}) });
+			return await startLoop(runner, docPath, io, { pr: !noPr, ...(parsed.cap === undefined ? {} : { cap: parsed.cap }), ...(web ? { web } : {}) });
 		} finally {
 			interrupt?.dispose();
 			await runner.close();

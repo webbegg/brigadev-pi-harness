@@ -363,7 +363,7 @@ describe("CLI arguments and messages", () => {
 		for (const args of [["start", ws.docPath, "--port", "8123"], ["start", ws.docPath, "--web", "--port"], ["start", ws.docPath, "--web", "--port", "70000"], ["start", ws.docPath, "--web", "--port=abc"], ["start", ws.docPath, "--web", "--bogus"]]) {
 			const result = await cli(args);
 			assert.equal(result.code, 2, args.join(" "));
-			assert.match(result.stderr, /usage: brigadev-runner start <feature-doc> \[--no-pr\] \[--web \[--port N\] \[--web-in-multiplexer\]\]\n/, args.join(" "));
+			assert.match(result.stderr, /usage: brigadev-runner start <feature-doc> \[--no-pr\] \[--cap <dollars>\] \[--web \[--port N\] \[--web-in-multiplexer\]\]\n/, args.join(" "));
 		}
 		let stderr = "";
 		const bad = await main(["start", ws.docPath, "--web"], { ...env, BRIGADEV_WEB_PORT: "99999" }, { out: () => {}, err: (text) => (stderr += `${text}\n`) }, ws.repo, TERMINAL);

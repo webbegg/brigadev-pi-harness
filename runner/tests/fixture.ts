@@ -5,6 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
+import type { Provider } from "@earendil-works/pi-ai/models";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall, type FauxProviderHandle } from "@earendil-works/pi-ai/providers/faux";
 import { MemoryStorage } from "@earendil-works/pi-durable";
 import type { Report, Storage } from "@earendil-works/pi-durable";
@@ -237,6 +240,8 @@ export interface Result {
 
 export interface Worker {
 	faux: FauxProviderHandle;
+	/** Dollars every model response costs (the faux provider reports none): see `priced`. Unset: free. */
+	price?: number;
 	prompts: Prompt[];
 	results: Result[];
 	/** Runs inside the model call, before the scripted answer: lets a test edit the doc "while the worker runs". */
@@ -254,9 +259,9 @@ function text(content: unknown): string {
  * A string is one `bash` command; a list is a sequence of steps (a step runs even when the guard blocked the one before);
  * a function gets the 1-based number of this worker run for the ticket (a rerun after a decision, or a retry) and returns the steps.
  */
-export function makeWorker(scripts: Record<string, string | Step[] | ((run: number) => Step[])>): Worker {
+export function makeWorker(scripts: Record<string, string | Step[] | ((run: number) => Step[])>, options: { price?: number } = {}): Worker {
 	const faux = fauxProvider({ models: [{ id: "worker" }] });
-	const worker: Worker = { faux, prompts: [], results: [] };
+	const worker: Worker = { faux, prompts: [], results: [], ...(options.price === undefined ? {} : { price: options.price }) };
 	const runs = new Map<string, number>();
 	const stepsOf = (ticketId: string): Step[] => {
 		const script = scripts[ticketId];
@@ -292,9 +297,28 @@ export function makeWorker(scripts: Record<string, string | Step[] | ((run: numb
 	return worker;
 }
 
+/**
+ * The faux provider reports a cost of 0 (each real API computes it from the model's rates), so a cost test wraps it: every response that ends (`done` or `error`) carries
+ * `dollars` as `usage.cost.total`, whatever its tokens, so N responses are exactly N * dollars.
+ */
+export function priced(provider: Provider, dollars: number): Provider {
+	const price = (message: AssistantMessage): AssistantMessage => ({ ...message, usage: { ...message.usage, cost: { input: 0, output: dollars, cacheRead: 0, cacheWrite: 0, total: dollars } } });
+	const wrap = <F extends Provider["stream"] | Provider["streamSimple"]>(inner: F): F =>
+		(((model: never, context: never, options: never) => {
+			const source = (inner as (...args: unknown[]) => AsyncIterable<{ type: string; message?: AssistantMessage; error?: AssistantMessage }>)(model, context, options);
+			const out = createAssistantMessageEventStream();
+			void (async () => {
+				for await (const event of source) out.push((event.type === "done" ? { ...event, message: price(event.message!) } : event.type === "error" ? { ...event, error: price(event.error!) } : event) as never);
+				out.end();
+			})();
+			return out;
+		}) as unknown) as F;
+	return { ...provider, stream: wrap(provider.stream), streamSimple: wrap(provider.streamSimple) };
+}
+
 export function modelsFor(worker: Worker) {
 	const models = createModels();
-	models.setProvider(worker.faux.provider);
+	models.setProvider(worker.price === undefined ? worker.faux.provider : priced(worker.faux.provider, worker.price));
 	const model = worker.faux.getModel();
 	return { models, model: { provider: model.provider, modelId: model.id } };
 }

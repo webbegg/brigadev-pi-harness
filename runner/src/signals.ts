@@ -7,7 +7,7 @@
 // A key serves one wait and is never reused (pi-durable rejects a second sleep on it), so each key carries a counter the loop
 // keeps in its checkpoint.
 import { defineSignal } from "@earendil-works/pi-durable";
-import type { Harness, SignalResult, SignalToken, TaskId } from "@earendil-works/pi-durable";
+import type { Harness, SignalResult, SignalToken, TaskId, Tx } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord/context";
 import { bool, int, obj, opt, str } from "@earendil-works/pi-schema";
 
@@ -39,10 +39,15 @@ export const mergeCommand = (docPath: string): string => `brigadev-runner merge 
 
 /**
  * Deliver a signal to a task in one commit. Unlike `Harness.signal()` this does not start the scheduler, so a process that only
- * hands an answer over (`brigadev-runner answer`) runs no task. Results: see `SignalResult`.
+ * hands an answer over (`brigadev-runner answer`) runs no task. Results: see `SignalResult`. `alongside` writes more in the same commit, only when the signal was
+ * delivered (a `resume --cap` changes the cap together with its resume: both or neither).
  */
-export function deliver<T>(harness: Harness, taskId: TaskId, token: SignalToken<T>, key: string, value: T, context: Context): Promise<SignalResult> {
-	return harness.commit((tx) => tx.signal(taskId, token, key, value), context);
+export function deliver<T>(harness: Harness, taskId: TaskId, token: SignalToken<T>, key: string, value: T, context: Context, alongside?: (tx: Tx) => Promise<void>): Promise<SignalResult> {
+	return harness.commit(async (tx) => {
+		const result = await tx.signal(taskId, token, key, value);
+		if (result === "delivered" && alongside) await alongside(tx);
+		return result;
+	}, context);
 }
 
 /** Exit code of a delivery: delivered 0; duplicate, closed, and not_found are final answers (1); invalid is a usage error (2). */
