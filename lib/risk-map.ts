@@ -166,6 +166,8 @@ export interface BranchRisk extends Classification {
 	branch: string | null;
 	/** The merge-base the branch was compared with; absent when only the working tree counted. */
 	base?: string;
+	/** Paths the branch commits since `base` (`base...HEAD`, without the working tree); empty without a base. */
+	committed: string[];
 	/** True when HEAD has commits but no base branch resolved: committed changes were not seen, so the tier is unknown. */
 	baseUnknown?: true;
 }
@@ -201,7 +203,7 @@ export async function branchRisk(exec: ExecFn, cwd: string, map: RiskMap | ((rep
 	const paths = [...branchPaths.filter(Boolean), ...parsePorcelain(status ?? "")];
 	const resolved = typeof map === "function" ? map(basename(root)) : map;
 	const unknown = base === undefined && (await git("rev-parse", "--verify", "-q", "HEAD")) !== undefined;
-	return { ...classifyPaths(paths, resolved), root, base, branch, ...(unknown ? { baseUnknown: true as const } : {}) };
+	return { ...classifyPaths(paths, resolved), root, base, branch, committed: branchPaths.filter(Boolean), ...(unknown ? { baseUnknown: true as const } : {}) };
 }
 
 // --- The notice `check` appends ----------------------------------------------------

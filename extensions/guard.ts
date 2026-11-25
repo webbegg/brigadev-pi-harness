@@ -22,13 +22,13 @@ import { askConfirm } from "../lib/human-prompt.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, sensitiveWords, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
-import { decidePrGate, opensPrCreate, prCreateDirectory, prGateBlockMessage, prGateDialogText, riskMapFor, UNRESOLVED_DIRECTORY_REASON, type PrGateDecision } from "../lib/pr-gate.ts";
+import { decidePrGate, opensPrCreate, PR_FACTS_ERROR_REASON, prCreateDirectory, prGateBlockMessage, prGateDialogText, riskMapFor, UNRESOLVED_DIRECTORY_REASON, type PrGateDecision } from "../lib/pr-gate.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
 import { redact } from "../lib/redact.ts";
 import { branchRisk, type RiskCategory } from "../lib/risk-map.ts";
 import { agentDir, CHILD_ENV, childAllowedSurfaces, isChildSession, PACKAGE_ROOT, readSettings, writeSettings } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
-import { worktreeTreeResult } from "../lib/worktree-tree.ts";
+import { isDocPath, worktreeTreeResult } from "../lib/worktree-tree.ts";
 
 const MODE_ENTRY = "brigadev-mode";
 const STATUS_KEY = "brigadev-mode";
@@ -229,19 +229,25 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * PR risk gate for `gh pr create` (parent only, every permission mode, S9): the branch's tier against its evidence and review ledger.
-	 * Undefined when the command opens no PR. It is advice on top of the human PR decision, so anything that fails while
-	 * reading the facts (no git, a detached HEAD, an unreadable log) fails open instead of blocking the PR. A `gh pr create`
-	 * whose directory cannot be resolved is not a read error: the gate cannot look, so it asks.
+	 * PR gate for `gh pr create` (parent only, every permission mode, S9): a passing full-suite run on the committed HEAD, then
+	 * the branch's tier against its evidence and review ledger. Undefined when the command opens no PR, outside git, or on a
+	 * detached HEAD. It is the one gate in front of delivery, so a failure while reading the facts (an unreadable log, git
+	 * failing) asks instead of passing, and so does a `gh pr create` whose directory cannot be resolved.
 	 */
 	const prGate = async (command: string, commandCwd: string): Promise<{ decision: PrGateDecision; categories: RiskCategory[] } | undefined> => {
 		try {
 			const dir = prCreateDirectory(command, commandCwd);
 			if (!dir) return opensPrCreate(command) ? { decision: { action: "ask", reasons: [UNRESOLVED_DIRECTORY_REASON] }, categories: [] } : undefined;
-			const risk = await branchRisk(exec, dir, riskMapFor(readSettings()));
+			const settings = readSettings();
+			const risk = await branchRisk(exec, dir, riskMapFor(settings));
 			if (!risk?.branch) return undefined;
 			const docs = repoDocsDir(dir);
+			const head = await worktreeTreeResult(dir, { sourceTree: true, commit: "HEAD" });
+			const suite = resolveCommand({ cwd: risk.root, settings });
 			const decision = decidePrGate({
+				sourceChanged: risk.baseUnknown === true || risk.committed.some((path) => !isDocPath(path)),
+				head: head.kind === "tree" ? { tree: head.tree, sourceTree: head.sourceTree ?? head.tree, root: head.root } : { error: head.kind === "error" ? head.reason : "not a git work tree" },
+				suiteCommand: "command" in suite ? suite.command : undefined,
 				tier: risk.tier,
 				categories: risk.categories,
 				records: readEvidence(evidenceFile(docs, risk.branch)),
@@ -250,8 +256,8 @@ export default function (pi: ExtensionAPI) {
 				baseUnknown: risk.baseUnknown,
 			});
 			return { decision, categories: (Object.keys(risk.categories) as RiskCategory[]).filter((category) => category === "security" || category === "data" || category === "contract") };
-		} catch {
-			return undefined;
+		} catch (error) {
+			return { decision: { action: "ask", reasons: [`${PR_FACTS_ERROR_REASON} (${String((error as Error)?.message ?? error).split("\n")[0].slice(0, 200)})`] }, categories: [] };
 		}
 	};
 

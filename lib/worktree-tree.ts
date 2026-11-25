@@ -44,6 +44,8 @@ export interface WorktreeTreeOptions {
 	timeoutMs?: number;
 	/** Also compute the tree without doc paths (one more `ls-files`, and a second `write-tree` only when docs exist). */
 	sourceTree?: boolean;
+	/** Key this commit (`HEAD`) instead of the working tree: uncommitted edits do not count. Equal to the working-tree key of a clean checkout. */
+	commit?: string;
 }
 
 const NOT_A_WORK_TREE = /not a git repository|must be run in a work tree/i;
@@ -84,7 +86,10 @@ export async function worktreeTreeResult(cwd: string, options: WorktreeTreeOptio
 		const index = join(scratch, "index");
 		const quarantine = join(scratch, "objects");
 		mkdirSync(quarantine);
-		if (existsSync(realIndex)) {
+		if (options.commit !== undefined) {
+			// `--end-of-options`: the commit is never read as an option.
+			await git(["read-tree", "--end-of-options", `${options.commit}^{tree}`], top, { GIT_INDEX_FILE: index });
+		} else if (existsSync(realIndex)) {
 			copyFileSync(realIndex, index);
 			// Keep the index mtime: git re-hashes "racily clean" entries (files modified
 			// no earlier than the index was written). A fresh mtime would make a
@@ -97,7 +102,7 @@ export async function worktreeTreeResult(cwd: string, options: WorktreeTreeOptio
 			GIT_OBJECT_DIRECTORY: quarantine,
 			GIT_ALTERNATE_OBJECT_DIRECTORIES: [realObjects, process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES].filter(Boolean).join(delimiter),
 		};
-		await git(["add", "-A", "--", "."], top, env);
+		if (options.commit === undefined) await git(["add", "-A", "--", "."], top, env);
 		const tree = await git(["write-tree"], top, env);
 		if (!/^[0-9a-f]{40,64}$/.test(tree)) return { kind: "error", reason: "git write-tree printed no tree id" };
 		if (!options.sourceTree) return { kind: "tree", tree, root: top };
