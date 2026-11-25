@@ -291,6 +291,33 @@ describe("guard: PR risk gate", () => {
 			assert.equal(await s.bash(PR), undefined);
 		});
 
+		it("`gh pr new` (gh's alias) is gated like gh pr create, and asks for confirmation in normal mode", async () => {
+			const { cwd } = repo(["src/a.ts"]);
+			assert.match(String(await (await session(cwd, { mode: "yolo", ui: false })).bash("gh pr new --fill")), /no passing test recorded for the committed HEAD/);
+			const normal = await session(cwd, { answer: true });
+			assert.equal(await normal.bash("gh pr new --fill"), undefined);
+			assert.equal(normal.dialogs.length, 1);
+			assert.match(normal.dialogs[0].body, /no passing test recorded/);
+		});
+
+		it("a branch that only deletes or renames source still needs a test", async () => {
+			const { cwd } = repo(["src/a.ts"]);
+			git(cwd, "checkout", "-q", "main");
+			git(cwd, "merge", "-q", "--ff-only", "feat/x");
+			git(cwd, "checkout", "-q", "-b", "feat/y");
+			git(cwd, "mv", "src/a.ts", "src/b.ts");
+			git(cwd, "commit", "-qm", "rename");
+			const s = await session(cwd, { mode: "yolo", ui: false });
+			assert.match(String(await s.bash(PR)), /no passing test recorded for the committed HEAD/);
+		});
+
+		it("a git failure while reading the branch's paths asks instead of passing", async () => {
+			const { cwd } = repo(["src/a.ts"]);
+			git(cwd, "config", "diff.relative", "notabool"); // merge-base still works; diff and status fail
+			const s = await session(cwd, { mode: "yolo", ui: false });
+			assert.notEqual(await s.bash(PR), undefined);
+		});
+
 		it("a branch that commits only docs needs no test", async () => {
 			const { cwd } = repo(["docs/guide.md"]);
 			const s = await session(cwd, { mode: "yolo" });

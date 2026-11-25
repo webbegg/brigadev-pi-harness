@@ -503,7 +503,9 @@ function classifyGit(args: string[]): CommandMatch | undefined {
 }
 
 function classifyGh(args: string[]): CommandMatch | undefined {
-	const [group, action] = args;
+	const [group, written] = args;
+	// `gh pr new` and `gh issue new` are gh's own aliases of `create`.
+	const action = (group === "pr" || group === "issue") && written === "new" ? "create" : written;
 	if (group === "repo" && (action === "delete" || action === "archive")) {
 		return { kind: COMMAND_KIND.DESTRUCTIVE, reason: `gh repo ${action}` };
 	}

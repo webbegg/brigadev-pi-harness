@@ -168,6 +168,8 @@ export interface BranchRisk extends Classification {
 	base?: string;
 	/** Paths the branch commits since `base` (`base...HEAD`, without the working tree); empty without a base. */
 	committed: string[];
+	/** A base resolved but `git diff` failed: `committed` is not the branch's real list. */
+	committedUnknown?: true;
 	/** True when HEAD has commits but no base branch resolved: committed changes were not seen, so the tier is unknown. */
 	baseUnknown?: true;
 }
@@ -191,19 +193,21 @@ export async function branchRisk(exec: ExecFn, cwd: string, map: RiskMap | ((rep
 	};
 	const root = (await git("rev-parse", "--show-toplevel"))?.trim();
 	if (!root) return undefined;
-	const committed = async (): Promise<{ base?: string; paths: string[] }> => {
+	const committed = async (): Promise<{ base?: string; paths: string[]; unknown?: boolean }> => {
 		const configured = (await git("config", "init.defaultBranch"))?.trim();
 		for (const ref of ["origin/HEAD", "main", "master", ...(configured ? [configured] : []), "develop", "trunk"]) {
 			const base = (await git("merge-base", "HEAD", ref))?.trim();
-			if (base) return { base, paths: ((await git("diff", "--name-only", "--no-renames", "-z", `${base}...HEAD`)) ?? "").split("\0") };
+			if (!base) continue;
+			const diff = await git("diff", "--name-only", "--no-renames", "-z", `${base}...HEAD`);
+			return { base, paths: (diff ?? "").split("\0"), unknown: diff === undefined };
 		}
 		return { paths: [] };
 	};
-	const [{ base, paths: branchPaths }, status, branch] = await Promise.all([committed(), git("status", "--porcelain=v1", "-z", "--untracked-files=all"), readCurrentBranch(exec, cwd)]);
+	const [{ base, paths: branchPaths, unknown: diffFailed }, status, branch] = await Promise.all([committed(), git("status", "--porcelain=v1", "-z", "--untracked-files=all"), readCurrentBranch(exec, cwd)]);
 	const paths = [...branchPaths.filter(Boolean), ...parsePorcelain(status ?? "")];
 	const resolved = typeof map === "function" ? map(basename(root)) : map;
 	const unknown = base === undefined && (await git("rev-parse", "--verify", "-q", "HEAD")) !== undefined;
-	return { ...classifyPaths(paths, resolved), root, base, branch, committed: branchPaths.filter(Boolean), ...(unknown ? { baseUnknown: true as const } : {}) };
+	return { ...classifyPaths(paths, resolved), root, base, branch, committed: branchPaths.filter(Boolean), ...(diffFailed ? { committedUnknown: true as const } : {}), ...(unknown ? { baseUnknown: true as const } : {}) };
 }
 
 // --- The notice `check` appends ----------------------------------------------------

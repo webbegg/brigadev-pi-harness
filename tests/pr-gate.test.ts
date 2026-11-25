@@ -184,6 +184,20 @@ describe("decidePrGate: a passing test on the committed HEAD (the evidence check
 		assert.equal(withHead("T0", [run("2026-01-01T00:01:00Z", "pass", { tree: "H", command: "  npm test " })], suite).action, "allow", "whitespace around the command does not matter");
 	});
 
+	it("the latest run of the suite on HEAD's tree decides: a later failure revokes an earlier pass", () => {
+		const passThenFail = [run("2026-01-01T00:01:00Z", "pass", { tree: "H" }), run("2026-01-01T00:02:00Z", "fail", { tree: "H", exitCode: 1 })];
+		assert.deepEqual(withHead("T0", passThenFail).reasons, [`${NO_HEAD_TEST_REASON} (the last run failed: \`npm test\`, exit 1)`]);
+		assert.equal(withHead("T0", [...passThenFail, run("2026-01-01T00:03:00Z", "pass", { tree: "H" })]).action, "allow", "a pass after it counts again");
+		const suite = { suiteCommand: "npm test" };
+		const focusedFailAfter = [run("2026-01-01T00:01:00Z", "pass", { tree: "H" }), run("2026-01-01T00:02:00Z", "fail", { tree: "H", command: "npm test -- a.test.ts" })];
+		assert.equal(withHead("T0", focusedFailAfter, suite).action, "allow", "with a known suite only suite runs are compared");
+	});
+
+	it("the block message for a git error says retry once", () => {
+		const message = prGateBlockMessage(withHead("T0", [], { head: { error: "git failed" } }), []);
+		assert.doesNotMatch(message, /retry; then retry/);
+	});
+
 	it("a branch that commits only docs needs no test", () => {
 		assert.deepEqual(withHead("T0", [], { sourceChanged: false }), { action: "allow", reasons: [] });
 	});
@@ -208,6 +222,10 @@ describe("prCreateDirectory", () => {
 		assert.equal(prCreateDirectory("gh pr create --fill", "/r"), "/r");
 	});
 
+	it("knows `gh pr new`, gh's alias of `gh pr create`", () => {
+		assert.equal(prCreateDirectory("gh pr new --fill", "/r"), "/r");
+	});
+
 	it("follows a leading cd", () => {
 		assert.equal(prCreateDirectory("cd sub && gh pr create", "/r"), "/r/sub");
 	});
@@ -228,7 +246,7 @@ describe("prCreateDirectory", () => {
 
 describe("opensPrCreate (W4)", () => {
 	it("is true for every shape the classifier reads as gh pr create, resolvable or not", () => {
-		for (const command of ["gh pr create --fill", "cd sub && gh pr create", "(cd . && gh pr create --fill)", "cd x; gh pr create", 'cd "$PWD" && gh pr create', "bash -c 'gh pr create --fill'", "eval 'gh pr create'"]) assert.equal(opensPrCreate(command), true, command);
+		for (const command of ["gh pr create --fill", "gh pr new --fill", "cd sub && gh pr create", "(cd . && gh pr create --fill)", "cd x; gh pr create", 'cd "$PWD" && gh pr create', "bash -c 'gh pr create --fill'", "eval 'gh pr create'"]) assert.equal(opensPrCreate(command), true, command);
 	});
 	it("is false for the rest", () => {
 		for (const command of ["gh pr view", "echo gh pr create", "git push"]) assert.equal(opensPrCreate(command), false, command);

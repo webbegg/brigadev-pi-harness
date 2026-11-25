@@ -21,7 +21,7 @@ export interface PrGateInput {
 	ledgerExists: boolean;
 	/** No base branch resolved: committed changes were not classified, so a tier below T2 is not trustworthy. */
 	baseUnknown?: boolean;
-	/** The branch commits a source path (not only docs) since its base, or the base is unknown: HEAD needs a passing test. */
+	/** The branch commits a source path (not only docs) since its base, or that cannot be told (unknown base, git failing): HEAD needs a passing test. */
 	sourceChanged?: boolean;
 	/** HEAD's tree and its source tree (docs removed), matched against recorded test runs; `error` when git could not compute them. Absent: no test check. */
 	head?: { tree: string; sourceTree: string; root?: string } | { error: string };
@@ -52,10 +52,12 @@ function headTestReason(input: PrGateInput): string | undefined {
 			(r.tree === head.tree || r.srcTree === head.sourceTree),
 	);
 	const suite = input.suiteCommand?.trim();
-	const passes = runs.filter((r) => r.outcome === "pass");
-	if (passes.some((r) => !suite || r.command.trim() === suite)) return undefined;
-	if (passes.length > 0) return `${NO_HEAD_TEST_REASON} (only other test commands passed on it; the full suite is \`${suite}\`)`;
-	const last = runs.at(-1);
+	// The latest suite run on HEAD decides (a later failure revokes an earlier pass); with no known suite, the latest test run.
+	const suiteRuns = suite ? runs.filter((r) => r.command.trim() === suite) : runs;
+	const latest = [...suiteRuns].sort(byTime).at(-1);
+	if (latest?.outcome === "pass") return undefined;
+	if (!latest && runs.some((r) => r.outcome === "pass")) return `${NO_HEAD_TEST_REASON} (only other test commands passed on it; the full suite is \`${suite}\`)`;
+	const last = latest ?? runs.at(-1);
 	const detail = !last ? "no test ran on it" : last.outcome === "fail" ? `the last run failed: \`${last.command}\`, exit ${last.exitCode}` : `the last run has no trustworthy exit code: \`${last.command}\``;
 	return `${NO_HEAD_TEST_REASON} (${detail})`;
 }
@@ -125,7 +127,7 @@ export function prCreateDirectory(command: string, cwd: string): string | undefi
 	let found: string | undefined;
 	for (let i = 0; i < segments.length; i++) {
 		const { argv } = unwrap(segments[i].argv);
-		if (basename(argv[0] ?? "") !== "gh" || argv[1] !== "pr" || argv[2] !== "create") continue;
+		if (basename(argv[0] ?? "") !== "gh" || argv[1] !== "pr" || (argv[2] !== "create" && argv[2] !== "new")) continue;
 		if (dirs[i] === undefined || (found !== undefined && dirs[i] !== found)) return undefined;
 		found = dirs[i];
 	}
@@ -148,7 +150,7 @@ export function prGateBlockMessage(decision: PrGateDecision, categories: readonl
 	if (/no brigadev-verify run/.test(joined)) steps.push(`run one brigadev-verify for this branch with \`Risk: ${categories.length > 0 ? categories.join(",") : "<category>"}\` in the launch reason`);
 	if (joined.includes(UNKNOWN_BASE_REASON)) steps.push("make the default branch resolvable (fetch origin, or create `main`/`master`, or set `git config init.defaultBranch <name>`) so the branch's committed changes can be classified");
 	if (joined.includes(NO_HEAD_TEST_REASON)) steps.push("commit your changes, then run the tests with `check` on the clean working tree, the full suite with no `focus` or `command` (a run with uncommitted source edits does not vouch for HEAD)");
-	if (joined.includes(HEAD_TREE_ERROR_REASON) || joined.includes(PR_FACTS_ERROR_REASON)) steps.push("fix the git problem (a corrupt index, a stuck lock, an unreadable evidence log) and retry");
+	if (joined.includes(HEAD_TREE_ERROR_REASON) || joined.includes(PR_FACTS_ERROR_REASON)) steps.push("fix the git problem (a corrupt index, a stuck lock, an unreadable evidence log)");
 	if (joined.includes(UNRESOLVED_DIRECTORY_REASON)) steps.push("run `gh pr create` as its own plain command from the repository directory (or after a leading `cd <dir> &&`), not inside a subshell, `bash -c`, `eval`, or a variable path");
 	if (/repro test/.test(joined)) steps.push("add the repro test for each verify blocker and run it through check (RED, then GREEN)");
 	return `Blocked by brigadev guard: gh pr create was declined (${joined}). To clear it: ${steps.join("; ")}; then retry. Do not open the PR another way.`;

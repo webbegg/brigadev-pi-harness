@@ -8,7 +8,11 @@
 
 ### Changed
 
-- **Breaking: the evidence gate moved from `git commit` to `gh pr create`.** Commits are never gated on test evidence (in the session, subagents, and the runner's worker). Instead `gh pr create` on a branch that commits source asks (in every mode; in normal mode inside the PR confirmation) and blocks without a UI until a passing test run is recorded for the committed HEAD: a run on exactly HEAD's tree, or HEAD's tree without doc paths. When the project's test command is known (`check.test` or detected), only a run of that exact command counts, so a `check` with `focus` does not vouch for the PR. Uncommitted edits do not matter; docs-only branches need no run. The PR gate also asks instead of passing when it cannot read the facts (an unreadable evidence log, git failing). `worktreeTreeResult` takes `commit` to key a commit's tree, and `branchRisk` reports the `committed` paths.
+- **Breaking: the evidence gate moved from `git commit` to `gh pr create`.** Commits are never gated on test evidence (in the session, subagents, and the runner's worker). Instead `gh pr create` on a branch that commits source asks (in every mode; in normal mode inside the PR confirmation) and blocks without a UI until a passing test run is recorded for the committed HEAD: a run on exactly HEAD's tree, or HEAD's tree without doc paths. When the project's test command is known (`check.test` or detected), only a run of that exact command counts, so a `check` with `focus` does not vouch for the PR, and the latest suite run on HEAD decides (a later failure revokes an earlier pass). Uncommitted edits do not matter; docs-only branches need no run. The PR gate also asks instead of passing when it cannot read the facts (an unreadable evidence log, git failing, a `git diff` of the branch that fails). `worktreeTreeResult` takes `commit` to key a commit's tree, and `branchRisk` reports the `committed` paths.
+
+### Fixed
+
+- `gh pr new` and `gh issue new` (gh's aliases of `create`) are classified like `gh pr create` and `gh issue create`: they ask in normal mode and go through the PR gate, where before they ran unasked.
 
 ### Removed
 

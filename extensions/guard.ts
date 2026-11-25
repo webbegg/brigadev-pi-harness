@@ -205,7 +205,7 @@ export default function (pi: ExtensionAPI) {
 			const head = await worktreeTreeResult(dir, { sourceTree: true, commit: "HEAD" });
 			const suite = resolveCommand({ cwd: risk.root, settings });
 			const decision = decidePrGate({
-				sourceChanged: risk.baseUnknown === true || risk.committed.some((path) => !isDocPath(path)),
+				sourceChanged: risk.baseUnknown === true || risk.committedUnknown === true || risk.committed.some((path) => !isDocPath(path)),
 				head: head.kind === "tree" ? { tree: head.tree, sourceTree: head.sourceTree ?? head.tree, root: head.root } : { error: head.kind === "error" ? head.reason : "not a git work tree" },
 				suiteCommand: "command" in suite ? suite.command : undefined,
 				tier: risk.tier,
