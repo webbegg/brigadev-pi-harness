@@ -4,9 +4,11 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isDocPath } from "../lib/worktree-tree.ts";
-import { evaluateCommitGate } from "../lib/evidence.ts";
+import { isDocPath, worktreeTreeResult } from "../lib/worktree-tree.ts";
+import { evidenceFile, readEvidence } from "../lib/evidence.ts";
 import { runCheck } from "../lib/check.ts";
+import { decidePrGate } from "../lib/pr-gate.ts";
+import { repoDocsDir } from "../lib/repo-docs.ts";
 
 const exec = async (command: string, args: string[], options: { cwd?: string } = {}) => {
 	const r = spawnSync(command, args, { cwd: options.cwd, encoding: "utf8" });
@@ -29,12 +31,22 @@ function failingRepo(): string {
 	return dir;
 }
 
+/** Commits the working tree, then asks the PR gate whether a passing test is recorded for that HEAD. */
+async function prGateAfterCommit(dir: string) {
+	sh(dir, "git commit -qam x");
+	const head = await worktreeTreeResult(dir, { sourceTree: true, commit: "HEAD" });
+	assert.equal(head.kind, "tree");
+	if (head.kind !== "tree") throw new Error("no tree");
+	const records = readEvidence(evidenceFile(repoDocsDir(dir), "feat/x"));
+	return decidePrGate({ tier: "T0", categories: {}, records, branch: "feat/x", ledgerExists: true, sourceChanged: true, head: { tree: head.tree, sourceTree: head.sourceTree ?? head.tree, root: head.root } });
+}
+
 test("code files never count as docs, whatever their folder or name", () => {
 	for (const path of ["docs/helper.js", "docs/conf.py", "lib/CHANGELOG.ts", "src/LICENSE_check.py", "src/AUTHORSHIP.js", "NOTICEboard.go"]) assert.equal(isDocPath(path), false, path);
 	for (const path of ["README.md", "docs/guide.md", "CHANGELOG.md", "LICENSE", "LICENSE.txt", "NOTICE", "COPYING", "AUTHORS"]) assert.equal(isDocPath(path), true, path);
 });
 
-test("a broken docs/*.js that the tests import does not pass the gate after a passing run", async () => {
+test("a broken docs/*.js that the tests import does not pass the PR gate after a passing run", async () => {
 	process.env.BRIGADEV_HOME = mkdtempSync(join(tmpdir(), "ev-home-"));
 	const dir = failingRepo();
 	writeFileSync(join(dir, "src.js"), "export const v = 2;\n");
@@ -42,11 +54,10 @@ test("a broken docs/*.js that the tests import does not pass the gate after a pa
 	assert.equal(passed.details?.outcome, "pass");
 	writeFileSync(join(dir, "docs/helper.js"), "export const h = 2;\n");
 	assert.notEqual(sh(dir, "node --test t.test.js >/dev/null 2>&1").status, 0, "the tests now fail");
-	const gate = await evaluateCommitGate({ exec, command: "git commit -am x", cwd: dir, forcedTree: undefined });
-	assert.equal(gate?.decision.action, "block");
+	assert.equal((await prGateAfterCommit(dir)).action, "ask");
 });
 
-test("check with a command that runs no tests does not vouch for a commit", async () => {
+test("check with a command that runs no tests does not vouch for HEAD", async () => {
 	process.env.BRIGADEV_HOME = mkdtempSync(join(tmpdir(), "ev-home-"));
 	const dir = failingRepo();
 	writeFileSync(join(dir, "src.js"), "export const v = 2;\n");
@@ -54,9 +65,8 @@ test("check with a command that runs no tests does not vouch for a commit", asyn
 	for (const command of ["true", "exit 0", "echo ok"]) {
 		const result = await runCheck({ command }, { cwd: dir, exec, agent: "parent" });
 		assert.notEqual(result.details?.outcome, "pass", command);
-		const gate = await evaluateCommitGate({ exec, command: "git commit -am x", cwd: dir, forcedTree: undefined });
-		assert.equal(gate?.decision.action, "block", command);
 	}
+	assert.equal((await prGateAfterCommit(dir)).action, "ask");
 });
 
 test("a command that is the configured test command is recorded, and one that is not says it was not recorded", async () => {

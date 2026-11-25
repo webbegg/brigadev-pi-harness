@@ -60,9 +60,10 @@ const tested = (cwd: string, docs: string, extra: object = {}) =>
 
 async function session(cwd: string, options: { mode?: "yolo"; ui?: boolean; answer?: boolean } = {}) {
 	const handlers: Record<string, Function[]> = {};
+	const commands: string[] = [];
 	const pi: any = {
 		on: (e: string, h: Function) => (handlers[e] ??= []).push(h),
-		registerCommand: () => {},
+		registerCommand: (name: string) => commands.push(name),
 		registerShortcut: () => {},
 		appendEntry: () => {},
 		exec: (command: string, args: string[], options: { cwd?: string }) =>
@@ -79,6 +80,7 @@ async function session(cwd: string, options: { mode?: "yolo"; ui?: boolean; answ
 	for (const h of handlers.session_start ?? []) await h({}, ctx);
 	return {
 		dialogs,
+		commands,
 		async bash(command: string, toolName = "bash") {
 			for (const h of handlers.tool_call ?? []) {
 				const input = toolName === "bg_start" ? { command, cwd } : { command };
@@ -312,6 +314,15 @@ describe("guard: PR risk gate", () => {
 			mkdirSync(evidenceFile(docs, "feat/x"), { recursive: true }); // reading it as a file throws EISDIR
 			const s = await session(cwd, { mode: "yolo", ui: false });
 			assert.match(String(await s.bash(PR)), /PR gate could not read the branch facts/);
+		});
+
+		it("a git commit is never gated on evidence, and there is no force-commit command", async () => {
+			const { cwd } = repo(["src/a.ts"]);
+			writeFileSync(join(cwd, "src/a.ts"), "untested\n");
+			const s = await session(cwd, { mode: "yolo" });
+			assert.equal(await s.bash("git commit -am untested"), undefined);
+			assert.deepEqual(s.dialogs, []);
+			assert.equal(s.commands.includes("brigadev:force-commit"), false);
 		});
 
 		it("no UI: blocks, in yolo and normal", async () => {

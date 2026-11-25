@@ -2,7 +2,7 @@
  * The `check` tool's engine: pick the project's test command (configured,
  * else detected), run it with its real exit code, shape a small result for
  * the model, and record the run in the evidence log exactly as the bash
- * recorder does (extensions/evidence.ts), so the commit gate trusts it.
+ * recorder does (extensions/evidence.ts), so the PR gate trusts it.
  */
 
 import { spawn } from "node:child_process";
@@ -210,7 +210,7 @@ const UNTRUSTED_SHELL = /\|\||;|\n|`|\$\(|(?<![&>])&(?![&>\d-])/;
  * "pass" or "fail" from the real exit code when it is the test's: the command
  * runs under `set -o pipefail`, so a pipe keeps it; `;`, `||`, `&`, a newline,
  * or a substitution hands it to something else. A recognized runner also gets
- * the evidence gate's own checks (a `--help` or `--collect-only` run is not a
+ * the evidence recorder's own checks (a `--help` or `--collect-only` run is not a
  * test run).
  */
 export function evidenceOutcome(command: string, exitCode: number | undefined): CheckOutcome {
@@ -391,7 +391,7 @@ function defaultCommand(focus: string | undefined, env: CheckEnvironment): strin
 	return "command" in choice ? choice.command : undefined;
 }
 
-const NOT_RECORDED = "Not recorded as test evidence: this is not a recognized test runner or the configured/detected test command, so it does not count toward the commit gate. Run the tests (omit `command`, or use the project's test command).";
+const NOT_RECORDED = "Not recorded as test evidence: this is not a recognized test runner or the configured/detected test command, so it does not count as test evidence for the PR gate. Run the tests (omit `command`, or use the project's test command).";
 
 export async function runCheck(request: CheckRequest, env: CheckEnvironment): Promise<CheckResult> {
 	const choice = resolveCommand({ command: request.command, focus: request.focus, cwd: env.cwd, settings: env.settings });
@@ -412,7 +412,7 @@ export async function runCheck(request: CheckRequest, env: CheckEnvironment): Pr
 
 	let outcome: CheckOutcome = run.timedOut || run.aborted ? "unknown" : evidenceOutcome(command, run.exitCode);
 	let recorded = false;
-	// Only a test run vouches for a commit: a runner the evidence gate recognizes, or the configured/detected test command
+	// Only a test run vouches for a tree: a runner the evidence recorder recognizes, or the configured/detected test command
 	// (whatever its name). Any other command (`true`, `echo ok`) says nothing about the tests, so it leaves no record.
 	const vouches = checkKind(command) === "test" || command === defaultCommand(request.focus, env);
 	if (!vouches) outcome = "unknown";

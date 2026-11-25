@@ -41,10 +41,10 @@ The branch's changed paths (against its merge-base with the default branch — `
 
 | Tier | When | Before the PR |
 | --- | --- | --- |
-| T0 | only tests, fixtures, or plain docs | tests and the evidence gate; no review, disclosed in the PR Risk line |
+| T0 | only tests, fixtures, or plain docs | a passing full-suite run on HEAD (the PR gate); no review, disclosed in the PR Risk line |
 | T1 | other source or prompt files | one `review-4r` pass with the fitting lenses: R3, plus R1 for security/delivery paths and R4 for data/concurrency paths; R2 only for prompt/docs diffs or on request |
 | T2 | a data, security, or contract path | one `brigadev-verify` for the whole branch plus the fitting lenses, in one parallel call |
 
 Verify runs once per branch, not per unit, and each run is recorded in the evidence log. A second branch verify on the same source tree is refused, and on a changed tree it asks. Blocker fixes are proven with a repro test that `check` sees fail, then pass. A recheck is allowed only for security or data blockers: at most one, launched with `recheck <ids>` in the reason, on the `brigadev-verify-recheck` profile route when the profile has one. A correction batch fixes the blockers plus at most five defect WARNINGs in the same files; the rest go to Follow-ups.
 
-`gh pr create` asks, in every mode, when a T2 branch has no verify run or the latest verify's blockers have no fail-then-pass test run after it; in NORMAL mode this joins the usual PR confirmation. Without a UI it blocks. If the facts cannot be read (no git, detached HEAD), the gate does not run.
+`gh pr create` asks, in every mode, when a branch that commits source has no passing full-suite run on the committed HEAD ([evidence-gate.md](evidence-gate.md)), a T2 branch has no verify run, or the latest verify's blockers have no fail-then-pass test run after it; in NORMAL mode this joins the usual PR confirmation. Without a UI it blocks. If the facts cannot be read (an unreadable evidence log, git failing) it asks too; outside git or on a detached HEAD the gate does not run.

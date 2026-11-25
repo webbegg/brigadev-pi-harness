@@ -73,7 +73,7 @@ export function containedEnv(base: NodeJS.ProcessEnv, scratch: string): NodeJS.P
 export const defaultContainedEnv = (): NodeJS.ProcessEnv => containedEnv(process.env, join(tmpdir(), "brigadev-contain-default"));
 
 /**
- * For the runner process itself (called once, at the script's entry): its own git calls (the guard's branch facts, the commit gate's tree hash) read
+ * For the runner process itself (called once, at the script's entry): its own git calls (the guard's branch facts, the check tool's tree hash) read
  * the repository's config, which the agent may have edited. No fsmonitor or hook program of that config may run, with the runner's credentials in reach.
  */
 export function hardenGitEnv(env: NodeJS.ProcessEnv): void {

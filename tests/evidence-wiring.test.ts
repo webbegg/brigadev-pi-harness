@@ -5,7 +5,7 @@ import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import { commitGateWithForce, evidenceFile, forceRecord, gateDialog, readEvidence, runRecordFromResult, settleRunTree, type RunRecord } from "../lib/evidence.ts";
+import { evidenceFile, readEvidence, runRecordFromResult, settleRunTree, type RunRecord } from "../lib/evidence.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 
 // The extensions import the Pi package at runtime; tests run without it.
@@ -61,70 +61,6 @@ describe("runRecordFromResult", () => {
 		assert.equal(record?.branch, null);
 		assert.equal(record?.agent, "brigadev-verify");
 		assert.equal(record?.kind, "check");
-	});
-});
-
-describe("forceRecord", () => {
-	it("records how the user forced the commit", () => {
-		const record = forceRecord({ ts: base.ts, branch: "feat/x", tree: base.tree, via: "dialog", command: "git commit -m x" });
-		assert.deepEqual(record, { v: 1, type: "force", ts: base.ts, branch: "feat/x", tree: base.tree, via: "dialog", command: "git commit -m x" });
-	});
-
-	it("truncates a long command", () => {
-		assert.equal(forceRecord({ ts: base.ts, branch: null, via: "command", command: "x".repeat(900) }).command.length, 500);
-	});
-});
-
-describe("gateDialog", () => {
-	it("shows the reason, the command, and asks the user to force it", () => {
-		const dialog = gateDialog("Blocked by brigadev evidence gate: nothing ran.", "git commit -m 'x'");
-		assert.match(dialog.title, /evidence gate/i);
-		assert.match(dialog.body, /nothing ran/);
-		assert.match(dialog.body, /git commit -m 'x'/);
-		assert.match(dialog.body, /Commit anyway\?/);
-	});
-
-	it("does not repeat the instructions meant for the model", () => {
-		const dialog = gateDialog("Blocked by brigadev evidence gate: nothing ran. Run the tests in their own bash command, then commit again.", "git commit");
-		assert.doesNotMatch(dialog.body, /tell them to run/);
-	});
-});
-
-describe("commitGateWithForce", () => {
-	const tree = "b".repeat(40);
-	const input = { dirtyPaths: ["src/a.ts"], tree, elsewhere: false, records: [] as RunRecord[], forcedTree: undefined as string | undefined };
-
-	it("blocks without evidence and without a force", () => {
-		const result = commitGateWithForce(input);
-		assert.equal(result.decision.action, "block");
-		assert.equal(result.consumedForce, false);
-	});
-
-	it("lets a force for this tree through and consumes it", () => {
-		const result = commitGateWithForce({ ...input, forcedTree: tree });
-		assert.equal(result.decision.action, "allow");
-		assert.equal(result.consumedForce, true);
-	});
-
-	it("keeps a force bound to another tree unused", () => {
-		const result = commitGateWithForce({ ...input, forcedTree: "c".repeat(40) });
-		assert.equal(result.decision.action, "block");
-		assert.equal(result.consumedForce, false);
-	});
-
-	it("does not consume the force when the commit passes on its own", () => {
-		const run: RunRecord = { v: 1, type: "run", ts: base.ts, branch: null, tree, cwd: "/repo", agent: "parent", command: "npm test", kind: "test", exitCode: 0, outcome: "pass", tail: "" };
-		const result = commitGateWithForce({ ...input, records: [run], forcedTree: tree });
-		assert.equal(result.decision.action, "allow");
-		assert.equal(result.consumedForce, false);
-		const docs = commitGateWithForce({ ...input, dirtyPaths: ["README.md"], forcedTree: tree });
-		assert.equal(docs.consumedForce, false);
-	});
-
-	it("never lets a force override an elsewhere commit", () => {
-		const result = commitGateWithForce({ ...input, elsewhere: true, forcedTree: tree });
-		assert.equal(result.decision.action, "block");
-		assert.equal(result.consumedForce, false);
 	});
 });
 
@@ -198,15 +134,7 @@ describe("runRecordFromResult keyed by source tree and root (S8b, S8c)", () => {
 	});
 });
 
-describe("gateDialog wording", () => {
-	it("says forcing is logged, not that the answer is", () => {
-		const dialog = gateDialog("Blocked by brigadev evidence gate: nothing ran.", "git commit");
-		assert.doesNotMatch(dialog.body, /answer is logged/i);
-		assert.match(dialog.body, /Forcing is logged/);
-	});
-});
-
-describe("the user's force is spent only when the commit goes ahead (A3)", () => {
+describe("guard wiring: the evidence log is written only by the recorder", () => {
 	const saved = { ...process.env };
 	const scratch: string[] = [];
 	after(() => {
@@ -257,7 +185,6 @@ describe("the user's force is spent only when the commit goes ahead (A3)", () =>
 		let id = 0;
 		return {
 			notes,
-			force: () => commands["brigadev:force-commit"].handler("", ctx),
 			async call(command: string) {
 				for (const handler of handlers.tool_call ?? []) {
 					const result = await handler({ toolName: "bash", toolCallId: String(++id), input: { command } }, ctx);
@@ -267,51 +194,6 @@ describe("the user's force is spent only when the commit goes ahead (A3)", () =>
 			},
 		};
 	}
-
-	it("keeps /brigadev:force-commit when a later rule declines the commit, then spends and logs it once", async () => {
-		const { repo, git, evidence } = makeRepo("main");
-		const s = await session(repo, { hasUI: false, confirm: () => false });
-		await s.force();
-		assert.match(String(await s.call("git commit -am x")), /User declined/); // protected branch asks; no UI means no
-		assert.deepEqual(evidence("main").filter((r) => r.type === "force"), [], "nothing logged for a declined commit");
-
-		git("checkout", "-q", "-b", "feat/y");
-		assert.equal(await s.call("git commit -am x"), undefined, "the force is still there");
-		assert.deepEqual(evidence("feat-y").filter((r) => r.type === "force").map((r) => r.via), ["command"]);
-		assert.match(String(await s.call("git commit -am x")), /evidence gate/, "spent after one commit");
-	});
-
-	it("does not log the dialog's force when a later rule declines the commit", async () => {
-		const { repo, git, evidence } = makeRepo("main");
-		const s = await session(repo, { hasUI: true, confirm: (title) => /evidence gate/.test(title) });
-		assert.match(String(await s.call("git commit -am x")), /User declined/);
-		assert.deepEqual(evidence("main").filter((r) => r.type === "force"), []);
-
-		git("checkout", "-q", "-b", "feat/y");
-		assert.equal(await s.call("git commit -am x"), undefined);
-		assert.deepEqual(evidence("feat-y").filter((r) => r.type === "force").map((r) => r.via), ["dialog"]);
-	});
-
-	it("fails closed when the working tree cannot be computed; only the dialog can force it", async () => {
-		const { repo, git, evidence } = makeRepo("feat/q");
-		writeFileSync(join(repo, ".git", "index"), "not an index"); // rev-parse still works, hashing the tree does not
-		const headless = await session(repo, { hasUI: false, confirm: () => false });
-		const reason = String(await headless.call("git commit -am x"));
-		assert.match(reason, /evidence gate/);
-		assert.match(reason, /could not be computed/);
-
-		await headless.force();
-		assert.match(headless.notes.join("\n"), /dialog|fix git/i, "the command says what to do instead");
-		assert.match(String(await headless.call("git commit -am x")), /evidence gate/, "the command grants nothing on an error");
-		assert.deepEqual(evidence("feat-q"), []);
-
-		const asked: string[] = [];
-		const interactive = await session(repo, { hasUI: true, confirm: (title) => (asked.push(title), true) });
-		assert.equal(await interactive.call("git commit -am x"), undefined, "the user can force it in the dialog");
-		assert.match(asked[0], /evidence gate/, "the gate asks first, then the normal commit rule");
-		assert.deepEqual(evidence("feat-q").filter((r) => r.type === "force").map((r) => r.via), ["dialog"]);
-		void git;
-	});
 
 	it("blocks a bash command that writes the evidence log and lets one read it (A1)", async () => {
 		const { repo } = makeRepo("feat/z");

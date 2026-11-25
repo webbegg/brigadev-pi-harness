@@ -3,23 +3,18 @@
  * with its exit code and output tail in `<repo docs>/evidence/<branch>.jsonl`,
  * keyed to the worktree content tree it ran on (lib/worktree-tree.ts).
  *
- * The commit gate reads it: a commit with source changes needs a passing
- * test recorded for the current tree, so any source edit after the last passing
- * run blocks the commit until the tests run again (a docs-only edit does not:
- * each run also carries the tree of its non-doc paths). The gate judges the
- * repository the commit runs in (`git -C <dir>`, `cd <dir> &&`). Only the user
- * can force it.
+ * The PR gate (lib/pr-gate.ts) reads it: `gh pr create` on a branch that
+ * commits source needs a passing full-suite run recorded for the committed
+ * HEAD's tree, or its tree without doc paths (each run carries both). Commits
+ * are never gated on it. `force` records are from the removed commit gate;
+ * older logs still hold them.
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { basename as executableName, blankHeredocs, classifyCommand, commitDirectory, segmentDirectories, tokenize, unwrap, type Segment } from "./command-classifier.ts";
-import { readCurrentBranch } from "./commit-branch.ts";
+import { basename as executableName, blankHeredocs, segmentDirectories, tokenize, unwrap, type Segment } from "./command-classifier.ts";
 import { canonicalPath, isInside } from "./paths.ts";
-import { repoDocsDir } from "./repo-docs.ts";
-import { type ExecFn, takeSnapshot } from "./worktree-snapshot.ts";
-import { isDocPath, worktreeTreeResult } from "./worktree-tree.ts";
 
 const MAX_COMMAND_CHARS = 500;
 const TAIL_LINES = 20;
@@ -70,6 +65,7 @@ export interface RunRecord {
 	note?: string;
 }
 
+/** A commit the user forced past the removed commit gate; only older logs hold these (the PR body still discloses them). */
 export interface ForceRecord {
 	v: 1;
 	type: "force";
@@ -85,8 +81,8 @@ export type VerifyScope = "branch" | "recheck";
 export type VerifyOutcome = "clean" | "blockers" | "unverified" | "failed";
 
 /**
- * A finished brigadev-verify (S6). It records that a verifier ran, never that tests passed: the commit gate reads
- * only `run` records, so a verify record cannot satisfy it. The verify budget (lib/delegation.ts) reads these.
+ * A finished brigadev-verify (S6). It records that a verifier ran, never that tests passed: the PR gate's test check
+ * reads only `run` records, so a verify record cannot satisfy it. The verify budget (lib/delegation.ts) reads these.
  */
 export interface VerifyRecord {
 	v: 1;
@@ -477,64 +473,6 @@ export function readEvidence(file: string): EvidenceRecord[] {
 	return records;
 }
 
-/** Prose (`*.md`, `*.rst`, ...) and the LICENSE/NOTICE/CHANGELOG/COPYING/AUTHORS files never need a test run; everything else, code under `docs/` included, is source. */
-export function isSourcePath(path: string): boolean {
-	return !isDocPath(path);
-}
-
-export type GateDecision = { action: "allow"; why: string } | { action: "block"; reason: string };
-
-export interface GateInput {
-	/** Paths `git status` reports as changed, project-relative. */
-	dirtyPaths: readonly string[];
-	/** Current worktree content tree; undefined when there is no git work tree, or when `treeError` says it could not be computed. */
-	tree: string | undefined;
-	/** The current tree without doc paths; a run recorded for the same source tree vouches even when the full tree differs. */
-	sourceTree?: string;
-	/** Top level of the repository the commit runs in; runs recorded for another repository do not count. */
-	root?: string;
-	/** Why the tree could not be computed (timeout, git failure). Set means the gate fails closed; absent with no tree means no git. */
-	treeError?: string;
-	/** The commit's directory or branch cannot be resolved (a branch switch, `GIT_DIR`, a non-literal `cd` or `-C`). */
-	elsewhere: boolean;
-	records: readonly EvidenceRecord[];
-	/** Tree a user force (/brigadev:force-commit) was granted for. */
-	forcedTree: string | undefined;
-}
-
-const UNBLOCK =
-	"Run the tests in their own bash command, with the runner as the command itself (`npm test`, `node --test`, ...; optionally in an `&&` chain) so its exit code is the test's: no `;`, `||`, `&`, `!`, comment, subshell, or later `|` unless a leading `set -o pipefail;` is set, and no `cd` out of the repository. Then commit again. If the user wants to commit anyway, only they can force it: the guard asks them when a UI is present; otherwise tell them to run /brigadev:force-commit.";
-
-const TREE_ERROR_UNBLOCK =
-	"Retry the commit; if it keeps failing, fix the git problem (a very large untracked file, a corrupt index, a stuck lock) or ignore the file. If the user wants to commit anyway, only they can force it: the guard asks them when a UI is present; /brigadev:force-commit cannot help while the working tree cannot be computed.";
-
-export function decideCommitGate(input: GateInput): GateDecision {
-	if (input.elsewhere) {
-		return { action: "block", reason: `Blocked by brigadev evidence gate: this commit runs in another directory or on another branch that cannot be resolved (a branch switch, GIT_DIR, --git-dir, --work-tree, a \`;\` or \`||\` after a \`cd\`, or a path with a variable), so the recorded test runs cannot vouch for it. Commit with \`git -C <dir> commit\` or \`cd <dir> && git commit\` using a literal path, on the current branch. ${UNBLOCK}` };
-	}
-	if (input.treeError !== undefined) {
-		return { action: "block", reason: `Blocked by brigadev evidence gate: the working tree could not be computed (${input.treeError}), so no recorded test run can be matched to this commit. ${TREE_ERROR_UNBLOCK}` };
-	}
-	if (input.tree === undefined) return { action: "allow", why: "no git tree to check" };
-	if (!input.dirtyPaths.some(isSourcePath)) return { action: "allow", why: "docs-only changes" };
-	if (input.forcedTree !== undefined && input.forcedTree === input.tree) return { action: "allow", why: "forced by the user" };
-	const runs = input.records.filter(
-		(r): r is RunRecord =>
-			r.type === "run" &&
-			r.kind === "test" &&
-			(r.root === undefined || input.root === undefined || r.root === input.root) &&
-			(r.tree === input.tree || (input.sourceTree !== undefined && r.srcTree === input.sourceTree)),
-	);
-	if (runs.some((r) => r.outcome === "pass")) return { action: "allow", why: "passing test on this tree" };
-	const last = runs.at(-1);
-	const detail = !last
-		? "no passing test is recorded for the current working tree (source files changed since the last passing run, or the tests never ran)"
-		: last.outcome === "fail"
-			? `the last test run on this tree failed (\`${last.command}\`, exit ${last.exitCode})`
-			: `the last test run on this tree has no trustworthy exit code (\`${last.command}\`)`;
-	return { action: "block", reason: `Blocked by brigadev evidence gate: ${detail}. ${UNBLOCK}` };
-}
-
 /** Fields of a tool_result event the recorder reads; anything else about the event is ignored. */
 export interface ToolResultLike {
 	toolName?: unknown;
@@ -573,85 +511,4 @@ export function runRecordFromResult(event: ToolResultLike | undefined, context: 
 	} catch {
 		return undefined;
 	}
-}
-
-export function forceRecord(input: { ts: string; branch: string | null; tree?: string; via: ForceRecord["via"]; command: string }): ForceRecord {
-	return { v: 1, type: "force", ts: input.ts, branch: input.branch, tree: input.tree, via: input.via, command: input.command.slice(0, MAX_COMMAND_CHARS) };
-}
-
-/** What the user sees when the gate blocks: the reason without the instructions meant for the model. */
-export function gateDialog(reason: string, command: string): { title: string; body: string } {
-	const detail = reason
-		.replace(/^Blocked by brigadev evidence gate:\s*/, "")
-		.replace(/\s*(Run the tests in their own|Commit with `git -C|Retry the commit).*$/s, "")
-		.trim();
-	return {
-		title: "brigadev: evidence gate blocked this commit",
-		body: `${command.length > 300 ? `${command.slice(0, 300)}…` : command}\n\n${detail}\n\nCommit anyway? Forcing is logged as evidence.`,
-	};
-}
-
-/**
- * The gate decision with the user's one-shot force applied only when the
- * commit would be blocked without it; `consumedForce` tells the caller to
- * spend the grant and log it.
- */
-export function commitGateWithForce(input: GateInput): { decision: GateDecision; consumedForce: boolean } {
-	const plain = decideCommitGate({ ...input, forcedTree: undefined });
-	if (plain.action === "allow" || input.forcedTree === undefined) return { decision: plain, consumedForce: false };
-	const forced = decideCommitGate(input);
-	return { decision: forced, consumedForce: forced.action === "allow" };
-}
-
-export interface CommitGateRequest {
-	exec: ExecFn;
-	/** The bash command; one without a `git commit` has nothing to gate. */
-	command: string;
-	/** Directory the command starts in: the session's, or a background process's `cwd`. */
-	cwd: string;
-	/** Tree a user force (/brigadev:force-commit) was granted for. */
-	forcedTree: string | undefined;
-}
-
-export interface CommitGateEvaluation {
-	decision: GateDecision;
-	/** The force decided the outcome: the caller spends and logs it once the commit is allowed to run. */
-	consumedForce: boolean;
-	/** Evidence log of the repository and branch the commit runs on (where a force is logged). */
-	file: string;
-	branch: string | null;
-	/** Worktree tree of that repository; undefined without git or when it could not be computed. */
-	tree: string | undefined;
-}
-
-/**
- * The commit gate for one bash command, judged against the repository the
- * commit runs in: `git -C <dir>` and a leading `cd <dir> &&` pick it, so a
- * session in a parent folder of nested repositories commits as it should; any
- * other move (a branch switch, `GIT_DIR`, a non-literal path) is "elsewhere" and
- * blocks. Tree, branch, and evidence log are all those of that repository.
- * Undefined when the command commits nothing.
- */
-export async function evaluateCommitGate(request: CommitGateRequest): Promise<CommitGateEvaluation | undefined> {
-	const { exec, command, cwd, forcedTree } = request;
-	if (!classifyCommand(command).some((match) => match.commit)) return undefined;
-	const target = commitDirectory(command, cwd);
-	const dir = target ?? cwd;
-	const result = await worktreeTreeResult(dir, { sourceTree: true });
-	const keyed = result.kind === "tree" ? result : undefined;
-	const snapshot = keyed ? await takeSnapshot(exec, keyed.root) : undefined;
-	const branch = await readCurrentBranch(exec, dir);
-	const file = evidenceFile(repoDocsDir(dir), branch);
-	const { decision, consumedForce } = commitGateWithForce({
-		// Unknown dirty paths count as source: a gate that cannot see the change must not pass it.
-		dirtyPaths: snapshot ? [...snapshot.keys()] : ["(unknown)"],
-		tree: keyed?.tree,
-		sourceTree: keyed?.sourceTree,
-		root: keyed?.root,
-		treeError: result.kind === "error" ? result.reason : undefined,
-		elsewhere: target === undefined,
-		records: readEvidence(file),
-		forcedTree,
-	});
-	return { decision, consumedForce, file, branch, tree: keyed?.tree };
 }

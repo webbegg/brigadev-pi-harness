@@ -675,7 +675,7 @@ export async function main(args: string[], env: Env = process.env, io: Io = { ou
 
 const entry = process.argv[1];
 if (entry && import.meta.url === pathToFileURL(realpathSync(entry)).href) {
-	// The runner's own git calls (the guard's branch facts, the commit gate's tree hash, the PR loop's push) read a repository config the agent may have edited:
+	// The runner's own git calls (the guard's branch facts, the check tool's tree hash, the PR loop's push) read a repository config the agent may have edited:
 	// no fsmonitor or hook program of it may run with the runner's credentials in reach.
 	hardenGitEnv(process.env);
 	main(process.argv.slice(2)).then(

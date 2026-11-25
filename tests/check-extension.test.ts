@@ -1,11 +1,12 @@
-// S13: the `check` tool runs a real test command through the fake pi, returns the compact summary, and records evidence the commit gate trusts.
+// S13: the `check` tool runs a real test command through the fake pi, returns the compact summary, and records evidence the PR gate trusts.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { decideCommitGate, evidenceFile, readEvidence, type RunRecord } from "../lib/evidence.ts";
+import { evidenceFile, readEvidence, type RunRecord } from "../lib/evidence.ts";
+import { decidePrGate } from "../lib/pr-gate.ts";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { createFakeCtx, createFakePi, type FakePi } from "./helpers/fake-pi.ts";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
@@ -21,6 +22,8 @@ const FAILING = `import { test } from "node:test";\nimport assert from "node:ass
 const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: repo, encoding: "utf8" });
 const run = (params: Record<string, unknown>, options: { cwd?: string; signal?: AbortSignal } = {}) => pi.tool("check").execute("call-1", params, options.signal, undefined, createFakeCtx({ cwd: options.cwd ?? repo }));
 const text = (result: any): string => result.content.map((part: any) => part.text).join("\n");
+const prGateFor = (record: RunRecord, list: RunRecord[]) =>
+	decidePrGate({ tier: "T0", categories: {}, records: list, branch: "main", ledgerExists: true, sourceChanged: true, head: { tree: record.tree ?? "", sourceTree: record.srcTree ?? "", root: repo } });
 const records = (): RunRecord[] => readEvidence(evidenceFile(repoDocsDir(repo), "main")).filter((r): r is RunRecord => r.type === "run");
 
 before(async () => {
@@ -87,9 +90,8 @@ describe("check tool", () => {
 		assert.match(record.tree ?? "", /^[0-9a-f]{40,}$/);
 		assert.ok(record.srcTree);
 
-		// The commit gate trusts it for the tree the run was keyed to.
-		const decision = decideCommitGate({ dirtyPaths: ["pass.test.js"], tree: record.tree, sourceTree: record.srcTree, root: repo, elsewhere: false, records: records(), forcedTree: undefined });
-		assert.equal(decision.action, "allow");
+		// The PR gate trusts it for a HEAD with the tree the run was keyed to.
+		assert.equal(prGateFor(record, records()).action, "allow");
 	});
 
 	it("saves the full output to a file named in the result", async () => {
@@ -113,8 +115,7 @@ describe("check tool", () => {
 		assert.equal(added[0].outcome, "fail");
 		assert.equal(added[0].exitCode, 1);
 		assert.equal(added[0].kind, "test");
-		const decision = decideCommitGate({ dirtyPaths: ["fail.test.js"], tree: added[0].tree, sourceTree: added[0].srcTree, root: repo, elsewhere: false, records: [added[0]], forcedTree: undefined });
-		assert.equal(decision.action, "block");
+		assert.equal(prGateFor(added[0], [added[0]]).action, "ask");
 	});
 
 	it("records the real exit code of the configured test command even when no runner pattern recognizes it", async () => {

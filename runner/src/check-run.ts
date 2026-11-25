@@ -15,7 +15,7 @@ const DEFAULT_TIMEOUT_SECONDS = 600;
 const MAX_TIMEOUT_SECONDS = 3600;
 const MAX_OUTPUT_CHARS = 256 * 1024;
 const CLOSE_GRACE_MS = 500;
-const NOT_RECORDED = "Not recorded as test evidence: this is not a recognized test runner or the configured/detected test command, so it does not count toward the commit gate. Run the tests (omit `command`, or use the project's test command).";
+const NOT_RECORDED = "Not recorded as test evidence: this is not a recognized test runner or the configured/detected test command, so it does not count as test evidence for the PR gate. Run the tests (omit `command`, or use the project's test command).";
 
 export interface ContainedCheckEnvironment extends CheckEnvironment {
 	/** The environment of the test process (the contained one). */

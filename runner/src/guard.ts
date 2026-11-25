@@ -6,11 +6,11 @@
 // How the runner's worker differs from the extension's child (all deliberate; see runner/README.md):
 // - It must commit, so bash is decided like the *parent* (`isChild: false`: commits on a feature branch pass, mode from brigadev.json),
 //   while file tools are decided like a *child* (`isChild: true`: nothing outside the worktree, secrets blocked, never asked).
-// - A commit passes the evidence commit gate (extension: parent only); the worker cannot force it.
+// - Commits are not gated on test evidence (neither are the extension's): the PR loop's final check runs the full suite before any push.
 // - The branch rule holds in every mode (extension: normal mode only).
 // - There is no human to answer a "confirm" during a run (Q6): it is denied as `needs you: <reason>`. The route to approval is a decision: the
 //   worker calls `ask_user_choice` with `command` set, the ticket parks, and an approving answer lifts the denial of that exact command string
-//   once in the ticket's rerun (src/decision.ts `commandApproved`). Nothing else is lifted: never-allowed commands, delivery, the commit gate,
+//   once in the ticket's rerun (src/decision.ts `commandApproved`). Nothing else is lifted: never-allowed commands, delivery,
 //   the branch rule, and file rules stay as they are.
 // - Push, merge, publish, and gh pr/release/api writes are always blocked: the runner owns PR delivery.
 // - B1/B3: the credentials are contained by the environment (src/contain.ts) and checked after the fact (src/integrity.ts); this file's string rules and
@@ -23,7 +23,6 @@ import { extractWriteTargets } from "../../lib/bash-writes.ts";
 import { basename, blankHeredocs, classifyCommand, COMMAND_KIND, SHELLS, tokenize, unwrap } from "../../lib/command-classifier.ts";
 import { checkRefusal, resolveCommand } from "../../lib/check.ts";
 import { onFeatureBranch, readBranchFacts, type BranchFacts } from "../../lib/commit-branch.ts";
-import { evaluateCommitGate } from "../../lib/evidence.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, isProtectedPath, sensitiveWords, shellCallOf } from "../../lib/guard-rules.ts";
 import { canonicalPath, expandHome, isInside } from "../../lib/paths.ts";
 import { isPermissionMode, isSensitivePath, PERMISSION_MODE, type PermissionMode } from "../../lib/permission-policy.ts";
@@ -143,7 +142,7 @@ export function deliveryReason(command: string): string | undefined {
 const COMMIT_COMPANIONS = new Set(["add", "commit", "status", "diff", "log", "show", "rev-parse"]);
 
 export const COMMIT_ALONE_BLOCK =
-	"Blocked by brigadev runner: a commit runs in its own bash call (only `git add`, `git status`, `git diff`, and `git commit` may share it, with no output redirection). The evidence gate reads the working tree before the command runs, so a write in the same call would be committed untested. Make the change, run `check`, then commit.";
+	"Blocked by brigadev runner: a commit runs in its own bash call (only `git add`, `git status`, `git diff`, and `git commit` may share it, with no output redirection). A write in the same call would land in the commit unseen and untested. Make the change, run `check`, then commit.";
 
 /** Every segment of a command, with the scripts of `bash -c '…'` and `eval` expanded in place of their shell segment. */
 function flatSegments(command: string, depth = 0): Array<{ argv: string[]; redirects: number } | { opaque: string }> {
@@ -264,7 +263,7 @@ export function createGuard(options: GuardOptions) {
 	};
 
 	/**
-	 * Every rule that applies to a shell command string: evidence log, delivery, the branch rule, the permission policy, the commit gate.
+	 * Every rule that applies to a shell command string: evidence log, delivery, the branch rule, the permission policy.
 	 * `approved` says whether the user approved exactly this command for this call: it lifts only the permission policy's confirmation.
 	 */
 	const decideShell = async (command: string, approved?: (command: string) => Promise<boolean>): Promise<string | undefined> => {
@@ -297,9 +296,6 @@ export function createGuard(options: GuardOptions) {
 		const decision = await decideBashCommand({ command, mode: mode(), isChild: false, cwd: root, readFacts: (dir) => (dir === root ? branchFacts() : readBranchFacts(exec, dir)) });
 		if (decision.action === "block") return decision.reason;
 		if (decision.action === "confirm" && !(approved && (await approved(command)))) return needsYou(decision.reason, true);
-
-		const gate = await evaluateCommitGate({ exec, command, cwd: root, forcedTree: undefined });
-		if (gate?.decision.action === "block") return gate.decision.reason;
 		return undefined;
 	};
 

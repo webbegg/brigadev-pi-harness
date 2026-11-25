@@ -1,6 +1,6 @@
 # brigadev-harness
 
-An opinionated [Pi](https://pi.dev) package for a disciplined development loop: one accountable orchestrator in the parent session, a few focused subagents with per-agent model routing, an evidence gate in front of every commit, and a safety guard. It adds no UI beyond a status bar, a todo list, and two read-only viewers (changes, agents).
+An opinionated [Pi](https://pi.dev) package for a disciplined development loop: one accountable orchestrator in the parent session, a few focused subagents with per-agent model routing, an evidence gate in front of every pull request, and a safety guard. It adds no UI beyond a status bar, a todo list, and two read-only viewers (changes, agents).
 
 ## Install
 
@@ -24,7 +24,7 @@ Check it loaded: `/brigadev:status`. Run `/brigadev:doctor` if something looks o
 | 1. Ask | Questions and reviews stay read-only until you ask for a change; real design forks get one question with a recommended option. | `assets/orchestrator.md`, `ask_user_choice` |
 | 2. Explore | One batch of `read`, `grep`, `find`, `ls` in the parent; a `brigadev-explore` subagent only when that does not settle it. | built-in tools, `subagent` |
 | 3. Test first | RED, minimal change, GREEN; bugs follow a diagnosis routine. | `assets/diagnosis.md`, `brigadev-worker` for parallel writers |
-| 4. Check | The focused test, then the suite, through one tool that returns a compact result and records evidence. | `check` tool, evidence gate |
+| 4. Check | The focused test, then the suite, through one tool that returns a compact result and records evidence. | `check` tool, evidence log |
 | 5. Verify | A path-based risk tier (shown by `check`) decides the checks: T2 (data, security, contract) branches get one independent `brigadev-verify` before the PR; blocker fixes are proven by a repro test RED→GREEN. | `subagent`, `Risk: <category>` line |
 | 6. Commit / PR | Each finished unit is committed on a `type/description` branch; push, PR, and merge go through the guard. `brigadev-review` runs only on request or once before the PR, with the tier's lenses ([review tiers](docs/configuration.md#review-tiers)). | `brigadev-branch-pr`, `brigadev-review` |
 
@@ -34,7 +34,7 @@ Large multi-session work gets one feature document in the repo docs folder (`/tr
 
 - **Modes:** `NORMAL` (default) and `YOLO`, switched with `/brigadev:mode`. The mode is announced as a context message, never written into the system prompt, so switching keeps the prompt cache.
 - **Always asks, in both modes:** destructive commands (`rm -rf dir`, `git reset --hard`, force push), publish (`npm publish`, `gh pr merge`), privileged (`sudo`, `curl | sh`), dependency installs, writes outside the project, secret files, and protected paths (`.git/hooks`, shell rc files, `~/.pi`). Catastrophic commands (`rm -rf ~`, `mkfs`) are blocked. NORMAL also asks before `git push` and PR creation; YOLO runs them. Without a UI, "ask" means block.
-- **Evidence gate:** a commit with source changes is blocked until a passing test run is recorded for the current working tree. Any later source edit invalidates it; docs-only edits do not. Piped test runs get `pipefail`, and commits through `git -C <dir>` or `cd <dir> &&` are checked against that repository. Only you can force a commit, with `/brigadev:force-commit` or the guard dialog.
+- **Evidence gate (at the PR):** commits are never gated. `gh pr create` on a branch that commits source asks (and blocks without a UI) until a passing full-suite run is recorded for the committed HEAD; docs-only edits after the run do not invalidate it. The same gate asks for a `brigadev-verify` run on T2 branches and a RED→GREEN test after verify blockers, and it asks instead of passing when it cannot read the facts. Only you can open the PR past it, in the dialog.
 - **Subagents** never wait on a person: the guard denies what would need confirmation, and writers are held to their allowed edit surfaces.
 
 Details: [docs/safety.md](docs/safety.md), [docs/evidence-gate.md](docs/evidence-gate.md).
@@ -78,7 +78,7 @@ Per field, a launch resolves: session profile, default profile, agent frontmatte
 | `/brigadev:ps` | Background processes started with `bg_start` |
 | `/brigadev:web [start\|open\|stop\|status]` | Local web UI for this session: a board of the loop (subagents, checks, commits, your decisions, prompts waiting on you), detail panels, and a composer (send, steer, abort). `open` prints a new one-time link |
 | `/brigadev:pr` | The current branch's pull request (needs `gh`) |
-| `/brigadev:force-commit`, `/brigadev:yolo-dir` | One-shot commit override; folders where writes run without asking |
+| `/brigadev:yolo-dir` | Folders where writes run without asking |
 | `/track`, `/review` | Force feature-document tracking; 4R review of a frozen change |
 
 Also: `/brigadev:agents`, `/brigadev:harness on|off`, `/brigadev:ui footer on|off`; `ctrl+shift+t` and `ctrl+shift+a` collapse the todo and agents cards.
@@ -142,7 +142,7 @@ Pure logic lives in `lib/` and is covered by `tests/`; extensions in `extensions
 
 ## Known limits
 
-- The guard recognizes executable command forms; it is not a sandbox. Aliases, scripts, and obfuscated commands can slip past the classifier and the evidence gate.
+- The guard recognizes executable command forms; it is not a sandbox. Aliases, scripts, and obfuscated commands can slip past the classifier and the PR gate.
 - Edit surfaces for `bash` are best effort (literal paths only); a writer's changes outside its surfaces are reported after the call, not reverted.
 - A read-only child can still write through `bash`.
 - Subagent runs live in the running Pi process: a finished run cannot be resumed, only read from its saved folder (kept 14 days, at most 200).

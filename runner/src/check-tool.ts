@@ -1,6 +1,6 @@
 // S5: the worker's `check` tool, over lib/check.ts exactly as extensions/check.ts uses it: the same parameters, the same command
 // resolution (brigadev.json `check.test`, else detection), the same refusal, the same compact result, and the run is appended
-// to the same evidence file (<docs>/evidence/<branch>.jsonl) so the commit gate (and the Pi extension) trust it. Agent: runner-worker.
+// to the same evidence file (<docs>/evidence/<branch>.jsonl) so the Pi extension's PR gate trusts it. Agent: runner-worker.
 import { defineTool } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord/json";
 import { num, obj, opt, str } from "@earendil-works/pi-schema";
@@ -35,7 +35,7 @@ export function createCheckTool(options: CheckToolOptions) {
 	return defineTool({
 		name: "check",
 		description:
-			"Run the project's tests and get a compact result: pass/fail counts and the failing tail; the full output goes to a file. Records the run as evidence for the commit gate. Use it instead of bash for tests, and never pipe it.",
+			"Run the project's tests and get a compact result: pass/fail counts and the failing tail; the full output goes to a file. Records the run as evidence. Use it instead of bash for tests, and never pipe it.",
 		parameters: Parameters,
 		async execute(args, api, context) {
 			const cwd = (await api.agent(context)).cwd ?? options.cwd;

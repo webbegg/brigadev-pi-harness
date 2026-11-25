@@ -1,13 +1,19 @@
-# Evidence gate
+# Evidence and the PR gate
 
 Every check command (tests, lint, typecheck, build) run through `bash` or the `check` tool, by you or by any subagent, is recorded with its command, exit code, time, directory, agent, and output tail in `~/.brigadev/<repo>/evidence/<branch>.jsonl`: an append-only log keyed to the content of the working tree it ran on. Outside git nothing is recorded. The log holds commands and output tails in plaintext (mode 0600), so treat it as sensitive.
 
+Commits are never gated on it: commit as often as you like. The log is checked once, where the change leaves your machine: `gh pr create`.
+
 ## The rule
 
-A `git commit` with source changes anywhere in the repository is blocked unless a passing `test` run is recorded for the current working tree. Any source edit after the last passing run changes the tree and blocks the commit until the tests run again; committing without new edits does not. Only the `test` kind counts (`npm test`, `node --test`, `pytest`, `go test`, ...), not lint or build. The gate applies in every permission mode, including yolo, and fails closed: if the working tree cannot be computed (git takes longer than 10 seconds, or fails), the commit is blocked with that reason.
+Before `gh pr create`, a branch that commits source since its base needs a passing `test` run recorded for the **committed HEAD**: a run whose working tree was exactly HEAD's tree, or HEAD's tree without doc paths (doc edits after the run are fine). In practice: commit, then run `check` on the clean working tree, then open the PR.
 
-- **Docs-only changes** pass without a test run, and doc edits after a passing run do not invalidate it. Docs are `*.md`, `*.markdown`, `*.rst`, `*.adoc`, files under the top-level `docs/`, and `LICENSE`/`NOTICE`/`CHANGELOG`/`COPYING`/`AUTHORS`. `.txt` and `.mdx` count as source.
-- **Nested repositories:** a commit through `git -C <dir>` or `cd <dir> && git commit` (literal path) is checked against that repository, and a test run is recorded against the repository of its cwd. A commit whose directory or branch cannot be resolved (branch switch, `GIT_DIR`, `--git-dir`, `--work-tree`, a `;` or `||` after `cd`, a path with a variable) is blocked.
+- **Full suite only.** When the project's test command is known (`check.test` in `brigadev.json`, or detected: a `package.json` test script, pytest, Cargo, Go), only a run of exactly that command counts. A `check` with `focus` or another `command` is recorded but does not vouch for HEAD. With no known test command, any recognized test run counts.
+- **Uncommitted edits do not matter.** HEAD is what the PR opens, so a run with uncommitted source edits keys a different tree and does not count, and edits you have not committed do not block the PR.
+- **Docs-only branches** need no test run. Docs are `*.md`, `*.markdown`, `*.rst`, `*.adoc`, and `LICENSE`/`NOTICE`/`CHANGELOG`/`COPYING`/`AUTHORS`. `.txt` and `.mdx` count as source. An unknown base branch counts as source changed.
+- **It asks instead of passing** when it cannot look: HEAD's tree cannot be computed, the evidence log cannot be read, or the directory of `gh pr create` cannot be resolved.
+
+The same gate also asks for a `brigadev-verify` run on a T2 branch and for a RED→GREEN repro test after verify blockers (see [configuration.md](configuration.md)). In normal mode its reasons ride the PR confirmation, in one dialog; in yolo it asks on its own, only when there is a reason; without a UI it blocks. Only you can open the PR past it, in that dialog. Subagents never reach it: they cannot open PRs.
 
 ## The exit-code rule
 
@@ -17,10 +23,10 @@ When a recognized test command is piped (`npm test | tail -20`), the guard runs 
 
 A run is keyed to the tree only if the tree was the same before and after it. An edit made while the tests ran is not vouched for: that run is recorded as unknown with a `note`. A package-manager test run (`npm`, `pnpm`, `yarn`, `bun`) counts only as plain `npm test` (optionally `-s`, arguments after `--`) without `npm_config_*` variables.
 
-## Forcing
-
-Only you can force it. With a UI the guard shows why the commit is blocked and asks whether to commit anyway. Without one, run `/brigadev:force-commit` first: it applies once, only to the working tree as it is now (editing a file cancels it) and is logged in the evidence file. It cannot help while the tree cannot be computed. There is no flag or environment variable that forces the gate, and subagents never reach it.
+Nested repositories: a test run is recorded against the repository of its cwd (`cd nested && npm test` lands in `nested`'s log), and `gh pr create` after a literal `cd <dir> &&` is judged against that repository.
 
 ## Limits
 
-It recognizes commits the way the command classifier does, so aliases, plumbing such as `git commit-tree`, wrappers, and scripts are not gated. To keep a model from forging a pass, `write`/`edit` into the evidence folder and bash commands naming it together with a write are blocked; a deliberately obfuscated command is not prevented.
+It is quality control, not a security boundary. It recognizes `gh pr create` the way the command classifier does, so a PR opened another way (`gh api`, the web UI, a script) is not gated. To keep a model from forging a pass, `write`/`edit` into the evidence folder and bash commands naming it together with a write are blocked; a deliberately obfuscated command is not prevented.
+
+Older logs may hold `type: "force"` records from the removed commit gate (`/brigadev:force-commit`); `brigadev-branch-pr` still discloses them in the PR body.

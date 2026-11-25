@@ -16,7 +16,7 @@ import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { BUS, publish, type GuardDecision, type ModeState } from "../lib/bus.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
-import { appendEvidence, branchSlug, evaluateCommitGate, evidenceFile, forceRecord, gateDialog, readEvidence, type ForceRecord } from "../lib/evidence.ts";
+import { branchSlug, evidenceFile, readEvidence } from "../lib/evidence.ts";
 import { checkRefusal, resolveCommand } from "../lib/check.ts";
 import { askConfirm } from "../lib/human-prompt.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, sensitiveWords, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
@@ -55,8 +55,6 @@ export default function (pi: ExtensionAPI) {
 	let mode: PermissionMode = PERMISSION_MODE.NORMAL;
 	// Per-session grants for directories outside the project root.
 	const outsideGrants = new Set<string>();
-	// Worktree tree the user granted a one-shot commit force for (/brigadev:force-commit). Only that command sets it.
-	let forcedTree: string | undefined;
 
 	const projectRoot = (ctx: ExtensionContext) => canonicalPath(process.env[CHILD_ENV.PROJECT_ROOT] ?? ctx.cwd);
 
@@ -144,44 +142,6 @@ export default function (pi: ExtensionAPI) {
 	const repoRoot = async (dir: string): Promise<string> => {
 		const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: dir, timeout: 15_000 }).catch(() => undefined);
 		return top?.code === 0 && top.stdout.trim() ? canonicalPath(top.stdout.trim()) : dir;
-	};
-
-	/**
-	 * Evidence gate for `git commit` (parent only, every permission mode): blocks a commit with source
-	 * changes unless a passing test is recorded for the current tree. Only the user can force it.
-	 * Returns a block reason, or a `settle` to call once the remaining rules let the commit run: the
-	 * user's force (one-shot or dialog) is spent and logged then, not when a later rule declines.
-	 */
-	const evidenceGate = async (command: string, ctx: ExtensionContext, commandCwd: string): Promise<{ reason?: string; settle: () => void }> => {
-		const nothing = { settle: () => {} };
-		// Judged against the repository the commit runs in (`git -C`, a leading `cd`, a nested repo); none when it commits nothing.
-		const evaluation = await evaluateCommitGate({ exec, command, cwd: commandCwd, forcedTree });
-		if (!evaluation) return nothing;
-		const { decision, consumedForce, file, branch, tree } = evaluation;
-		const log = (via: ForceRecord["via"]) => {
-			try {
-				appendEvidence(file, forceRecord({ ts: new Date().toISOString(), branch, tree, via, command }));
-			} catch {
-				// The force is the user's decision; a failed log write does not undo it.
-			}
-		};
-
-		if (decision.action === "allow") {
-			return consumedForce
-				? {
-						settle: () => {
-							forcedTree = undefined;
-							log("command");
-						},
-					}
-				: nothing;
-		}
-
-		if (!isChild && ctx.hasUI) {
-			const dialog = gateDialog(decision.reason, command);
-			if (await confirm(ctx, dialog.title, dialog.body)) return { settle: () => log("dialog") };
-		}
-		return { reason: decision.reason, settle: () => {} };
 	};
 
 	/**
@@ -325,12 +285,10 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// A commit whose directory is in another repository than the session's is "elsewhere" for the branch rule and the gate alike.
+			// A commit whose directory is in another repository than the session's is "elsewhere" for the branch rule.
 			const startsElsewhere = shell.cwd !== undefined && classifyCommand(command).some((match) => match.commit) && (await repoRoot(commandCwd)) !== (await repoRoot(projectRoot(ctx)));
 			const decision = await decideBashCommand({ command, mode, isChild, cwd: commandCwd, elsewhere: startsElsewhere, readFacts: (cwd) => readBranchFacts(exec, cwd) });
 			if (decision.action === "block") return { block: true, reason: decision.reason };
-			const gated = isChild ? undefined : await evidenceGate(command, ctx, commandCwd);
-			if (gated?.reason) return { block: true, reason: gated.reason };
 			// The PR gate shares the PR confirmation in normal mode (one dialog, the reasons and the note appended); in yolo it asks on its own, only for reasons.
 			const pr = isChild ? undefined : await prGate(command, commandCwd);
 			const prBlock = pr?.decision.action === "ask" ? { block: true as const, reason: prGateBlockMessage(pr.decision, pr.categories) } : undefined;
@@ -342,9 +300,6 @@ export default function (pi: ExtensionAPI) {
 				const ok = await confirm(ctx, "brigadev: PR risk gate", `${commandPreview(command)}\n\n${prGateDialogText(pr.decision)}\n\nOpen the PR anyway?`);
 				if (!ok) return prBlock;
 			}
-			// Every rule allowed the commit: only now is the user's force spent and logged.
-			gated?.settle();
-
 			// The command will run: remember the tree so tool_result can see what it changed.
 			if (surfaces) {
 				const snapshot = await takeSnapshot(exec, projectRoot(ctx));
@@ -417,19 +372,6 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const message = runYoloDirCommand(args, { read: readSettings, write: writeSettings }, { ...secureGuard(), tempRoots: tempDirs() });
 			ctx.ui.notify(message, message.startsWith("brigadev: refused") ? "error" : "info");
-		},
-	});
-
-	pi.registerCommand("brigadev:force-commit", {
-		description: "Let the next git commit on the current working tree pass the evidence gate (one-shot; edits cancel it)",
-		handler: async (_args, ctx) => {
-			const result = await worktreeTreeResult(projectRoot(ctx));
-			if (result.kind === "no-git") return ctx.ui.notify("brigadev: not a git working tree, so the evidence gate does not apply", "error");
-			if (result.kind === "error") {
-				return ctx.ui.notify(`brigadev: the working tree could not be computed (${result.reason}), so a force cannot be bound to it. Use the dialog the guard shows when the commit is blocked, or fix git and try again.`, "error");
-			}
-			forcedTree = result.tree;
-			ctx.ui.notify("brigadev: the next commit of the current working tree skips the evidence gate. Editing any file first cancels this.", "info");
 		},
 	});
 
