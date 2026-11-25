@@ -357,10 +357,12 @@ function isScratchPath(target: string): boolean {
 /**
  * Shell features that can change a variable, or what `mktemp` runs, without a plain `NAME=` in the text: evaluated or
  * sourced code, functions and aliases, builtins that write a named variable (`printf -v`, `read`, `mapfile`, `select`),
- * declarations and namerefs, `IFS` (word splitting) and `PATH`. With any of them the variable rules do not apply.
+ * declarations and namerefs, `IFS` (word splitting) and `PATH`, arithmetic (a value read as an expression can assign a
+ * name the text never spells: `$'\x64=1'` then `$((a))`), and line continuations (bash joins `d\<newline>d` into `dd`
+ * before it reads names). With any of them the variable rules do not apply.
  */
 const SHELL_INDIRECTION =
-	/\b(?:eval|source|alias|function|declare|typeset|local|readonly|unset|export\s+-|printf|read|readarray|mapfile|select|wait|getopts|trap|enable|builtin|hash|set)\b|[A-Za-z0-9_]\s*\(\s*\)|(?:^|[;&|(){}\n]\s*)\.\s|\bIFS\b|\bPATH\+?=|\bBASH_ENV\b/;
+	/\\\r?\n|\$'|\(\(|\[\[|\blet\b|\b(?:eval|source|alias|function|declare|typeset|local|readonly|unset|export\s+-|printf|read|readarray|mapfile|select|wait|getopts|trap|enable|builtin|hash|set)\b|[A-Za-z0-9_]\s*\(\s*\)|(?:^|[;&|(){}\n]\s*)\.\s|\bIFS\b|\bPATH\+?=|\bBASH_ENV\b/;
 
 /** Shell variables a script inherits or the shell itself sets: never trusted as a mktemp variable. */
 const SHELL_VARIABLES = new Set(["PWD", "OLDPWD", "HOME", "IFS", "PATH", "CDPATH", "SHELL", "TMPDIR", "RANDOM", "SECONDS", "LINENO", "REPLY", "OPTARG", "OPTIND", "PPID", "UID", "EUID", "HOSTNAME"]);
@@ -376,8 +378,9 @@ const nameOccurs = (text: string, name: string) => new RegExp(`(?<![A-Za-z0-9_-]
  * first statement (`d=$(mktemp -d) && …`, `;`, or a newline after it), when every other mention of it is a quoted read
  * (`"$d"`, `"${d}"`, `"$d/…`): no reassignment, no unquoted or `${d:=…}` expansion, no feature in SHELL_INDIRECTION.
  */
-function mktempVariables(command: string): Set<string> {
+function mktempVariables(text: string): Set<string> {
 	const names = new Set<string>();
+	const command = withoutStrictMode(text);
 	const first = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=("?)(?:\$\(\s*mktemp((?:\s+[^\s)`'"$]+)*)\s*\)|`\s*mktemp((?:\s+[^\s)`'"$]+)*)\s*`)\2[ \t]*(?:&&|;|\n)/.exec(command);
 	if (!first || SHELL_INDIRECTION.test(command)) return names;
 	const [assignment, name, , dollar, backtick] = first;
@@ -387,6 +390,12 @@ function mktempVariables(command: string): Set<string> {
 	if (nameOccurs(command.slice(assignment.length).replace(reads, ""), name)) return names;
 	names.add(name);
 	return names;
+}
+
+/** The command after a leading `set -euo pipefail` (only `-e`, `-u`, `-x`, `-o pipefail`), which changes no variable. */
+function withoutStrictMode(command: string): string {
+	const strict = /^\s*set(?:\s+(?:-[eux]+|-[eux]*o\s+pipefail|\+[eux]+))+[ \t]*(?:;|&&|\n)/.exec(command);
+	return strict ? command.slice(strict[0].length) : command;
 }
 
 /** `mktemp` options that keep the file or folder in the temp dir: `-d`, `-q`, and `-t <prefix>` (combinable, `-dt x`); anything else may not. */
@@ -414,7 +423,8 @@ function scratchContext(command: string): ScratchContext {
 	const inherited = process.env.TMPDIR?.replace(/\/+$/, "");
 	// Unquoted reads are allowed, so the value itself must not split or glob.
 	const plain = inherited !== undefined && /^\/[^\s*?[\]{}$`\\'"]+$/.test(inherited);
-	const changes = nameOccurs(command.replace(/\$(?:TMPDIR|\{TMPDIR\})\//g, ""), "TMPDIR") || SHELL_INDIRECTION.test(command);
+	const body = withoutStrictMode(command);
+	const changes = nameOccurs(body.replace(/\$(?:TMPDIR|\{TMPDIR\})\//g, ""), "TMPDIR") || SHELL_INDIRECTION.test(body);
 	return { mktemp: mktempVariables(command), tmpdir: plain && !changes ? inherited : undefined };
 }
 

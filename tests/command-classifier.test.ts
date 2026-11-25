@@ -59,6 +59,8 @@ describe("classifyCommand", () => {
 				'd=`mktemp -d` && rm -rf "$d"',
 				'd=$(mktemp -d) && cp -R src "$d/" && ls "$d/src" "${d}/x" && rm -rf "$d"',
 				'd=$(mktemp -d)\ncd "$d"\nrm -rf "$d"',
+				'set -euo pipefail; d=$(mktemp -d); cd "$d" && rm -rf "$d"',
+				'set -e\nd=$(mktemp -d)\nrm -rf "$d"',
 				'd=$(mktemp -dt brig) && rm -rf "${d}"',
 				'f=$(mktemp) && echo x > "$f" && rm -f "$f"',
 				'export D=$(mktemp -d -q) && rm -rf "$D"',
@@ -115,6 +117,13 @@ describe("classifyCommand", () => {
 				'd=$(mktemp -d) && rm -rf "${d:=/etc}"',
 				'd=$(mktemp -dt ..) && rm -rf "$d"',
 				'HOME=$(mktemp -d) && rm -rf "$HOME"',
+				'dd=$(mktemp -d) && d\\\nd=/etc && rm -rf "$dd"',
+				'd=$(mktemp -d) && a=$\'\\x64=1\' && : $((a)) && rm -rf "$d"',
+				'd=$(mktemp -d) && let a && rm -rf "$d"',
+				'd=$(mktemp -d) && [[ 1 -eq a ]] && rm -rf "$d"',
+				'd=$(mktemp -d) && ((a)) && rm -rf "$d"',
+				'set -a; d=$(mktemp -d); rm -rf "$d"',
+				'set -euo pipefail; set -k; d=$(mktemp -d); rm -rf "$d"',
 			]) {
 				assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
 			}
@@ -131,6 +140,8 @@ describe("classifyCommand", () => {
 					'env TMPDIR=/ rm -rf $TMPDIR/x',
 					'IFS=/; rm -rf $TMPDIR/x',
 					'rm -rf "${TMPDIR:=/}/x"',
+					'TMPDI\\\nR=$HOME; rm -rf $TMPDIR/project',
+					'a=$\'TMPDIR=1\'; : $((a)); rm -rf "$TMPDIR/1"',
 				]) {
 					assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
 				}
