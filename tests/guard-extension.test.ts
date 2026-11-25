@@ -315,6 +315,12 @@ describe("guard: PR risk gate", () => {
 		it("`gh pr new` (gh's alias) is gated like gh pr create, and asks for confirmation in normal mode", async () => {
 			const { cwd } = repo(["src/a.ts"]);
 			assert.match(String(await (await session(cwd, { mode: "yolo", ui: false })).bash("gh pr new --fill")), /no passing test recorded for the committed HEAD/);
+			for (const command of ["gh pr --repo o/r create --fill", "gh pr -R o/r create --fill"]) {
+				const flagged = await session(cwd, { mode: "yolo", answer: true });
+				assert.equal(await flagged.bash(command), undefined, command);
+				assert.equal(flagged.dialogs.length, 1, command);
+				assert.match(flagged.dialogs[0].body, /no passing test recorded/, command);
+			}
 			const normal = await session(cwd, { answer: true });
 			assert.equal(await normal.bash("gh pr new --fill"), undefined);
 			assert.equal(normal.dialogs.length, 1);

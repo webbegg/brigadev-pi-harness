@@ -8,7 +8,8 @@
 
 ### Changed
 
-- **Every `git push` and `gh pr create` (or `gh pr new`) asks the user, in every permission mode.** YOLO no longer gives standing permission for them; it still runs commits, issue writes, and PR comments without asking. Without a UI they are blocked. The PR gate's reasons ride the same dialog.
+- **Every `git push` and `gh pr create` (or `gh pr new`) asks the user, in every permission mode.** So do `git subtree push`, `gh repo create --push`, and a PR opened through `gh api` (a POST to `repos/<o>/<r>/pulls`, or the `createPullRequest` mutation). YOLO no longer gives standing permission for them; it still runs commits, issue writes, and PR comments without asking. Without a UI they are blocked. The PR gate's reasons ride the same dialog.
+- `gh pr --repo <o/r> create` (and `-R`, before the action) is read as a PR creation: it ran without asking and skipped the PR gate.
 - **Breaking: the evidence gate moved from `git commit` to `gh pr create`.** Commits are never gated on test evidence (in the session, subagents, and the runner's worker). Instead `gh pr create` on a branch that commits source asks (in every mode; in normal mode inside the PR confirmation) and blocks without a UI until a passing test run is recorded for the committed HEAD: a run on exactly HEAD's tree, or HEAD's tree without doc paths. When the project's test command is known (`check.test` or detected), only a run of that exact command counts, so a `check` with `focus` does not vouch for the PR, and the latest suite run on HEAD decides (a later failure revokes an earlier pass). Uncommitted edits do not matter; docs-only branches need no run. The PR gate also asks instead of passing when it cannot read the facts (an unreadable evidence log, git failing, a `git diff` of the branch that fails). `worktreeTreeResult` takes `commit` to key a commit's tree, and `branchRisk` reports the `committed` paths.
 
 ### Fixed

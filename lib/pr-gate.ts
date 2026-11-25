@@ -5,7 +5,7 @@
 // inputs (the guard reads the facts); a T1 branch without a review ledger only earns a note.
 // The guard asks instead of passing when it cannot read the facts: this is the gate in front of delivery.
 
-import { basename, blankHeredocs, classifyCommand, segmentDirectories, tokenize, unwrap } from "./command-classifier.ts";
+import { basename, blankHeredocs, classifyCommand, ghGroupAction, segmentDirectories, tokenize, unwrap } from "./command-classifier.ts";
 import type { EvidenceRecord, RunRecord, VerifyRecord } from "./evidence.ts";
 import type { RiskCategory, Tier } from "./risk-map.ts";
 
@@ -127,7 +127,8 @@ export function prCreateDirectory(command: string, cwd: string): string | undefi
 	let found: string | undefined;
 	for (let i = 0; i < segments.length; i++) {
 		const { argv } = unwrap(segments[i].argv);
-		if (basename(argv[0] ?? "") !== "gh" || argv[1] !== "pr" || (argv[2] !== "create" && argv[2] !== "new")) continue;
+		const { group, action } = ghGroupAction(argv.slice(1));
+		if (basename(argv[0] ?? "") !== "gh" || group !== "pr" || action !== "create") continue;
 		if (dirs[i] === undefined || (found !== undefined && dirs[i] !== found)) return undefined;
 		found = dirs[i];
 	}

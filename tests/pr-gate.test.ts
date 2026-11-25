@@ -226,6 +226,13 @@ describe("prCreateDirectory", () => {
 		assert.equal(prCreateDirectory("gh pr new --fill", "/r"), "/r");
 	});
 
+	it("knows gh's --repo flag before the action", () => {
+		for (const command of ["gh pr --repo o/r create --fill", "gh pr -R o/r new", "gh pr --repo=o/r create", "gh pr -Ro/r create"]) {
+			assert.equal(prCreateDirectory(command, "/r"), "/r", command);
+			assert.equal(opensPrCreate(command), true, command);
+		}
+	});
+
 	it("follows a leading cd", () => {
 		assert.equal(prCreateDirectory("cd sub && gh pr create", "/r"), "/r/sub");
 	});

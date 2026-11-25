@@ -391,7 +391,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (isPermissionMode(first)) {
 				setMode(first, ctx);
-				return ctx.ui.notify(first === PERMISSION_MODE.YOLO ? "🚀 YOLO on: commits, pushes, and PRs run without asking; destructive commands still ask." : "brigadev: normal mode", "info");
+				return ctx.ui.notify(first === PERMISSION_MODE.YOLO ? "🚀 YOLO on: commits and issue writes run without asking; pushes, PR creation, and destructive commands still ask." : "brigadev: normal mode", "info");
 			}
 			if (first && first !== "status") return ctx.ui.notify("Usage: /brigadev:mode normal | yolo | default <normal|yolo> | status", "error");
 			if (!first && ctx.hasUI) {
