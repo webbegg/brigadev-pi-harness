@@ -2,6 +2,7 @@
 // best-effort guard, not a sandbox: it does not expand variables, load
 // scripts, or follow aliases. Unknown shapes are allowed, never guessed.
 
+import { existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { canonicalPath } from "./paths.ts";
@@ -324,12 +325,85 @@ function hasAny(args: string[], ...flags: string[]): boolean {
  * Rejects the temp dir itself, "." / ".." / empty segments, and anything the
  * shell could expand (globs, variables, substitutions, tilde).
  */
-function isScratchPath(target: string, root: string = tmpdir().replace(/\/+$/, "")): boolean {
-	if (!root.startsWith("/") || root.split("/").some((seg) => seg === "." || seg === "..")) return false;
+/**
+ * The temp folders a delete may target without asking: `os.tmpdir()`, `/tmp`, and `/private/tmp`, as written and
+ * canonical (macOS `/tmp` is `/private/tmp`). Never the root folder, the home folder, or a folder that holds it (a
+ * `TMPDIR` set to the home folder must not make every delete in it silent).
+ */
+function scratchRoots(): { written: string[]; canonical: string[] } {
+	const home = canonicalPath(homedir());
+	const safe = (root: string) => root.startsWith("/") && root !== "/" && !root.split("/").some((seg) => seg === "." || seg === "..") && home !== root && !home.startsWith(`${root}/`);
+	const written = [tmpdir(), "/tmp", "/private/tmp"].map((root) => root.replace(/\/+$/, "")).filter((root) => safe(root) && existsSync(root));
+	return { written: [...new Set(written)], canonical: [...new Set(written.map((root) => canonicalPath(root)))].filter(safe) };
+}
+
+/**
+ * A literal path strictly inside a temp root, as written and after symlinks resolve (a link under /tmp to a folder
+ * elsewhere is not scratch). No glob, expansion, `.`/`..`, or empty segment; never a temp root itself.
+ */
+function isScratchPath(target: string): boolean {
 	if (/[*?[\]{}()$`~\\!<>@+^#]/.test(target)) return false;
-	if (!target.startsWith(`${root}/`)) return false;
-	const segments = target.slice(root.length + 1).replace(/\/$/, "").split("/");
-	return segments.every((seg) => seg !== "" && seg !== "." && seg !== "..");
+	const { written, canonical } = scratchRoots();
+	const inside = (path: string, root: string) => {
+		if (!path.startsWith(`${root}/`)) return false;
+		const segments = path.slice(root.length + 1).replace(/\/$/, "").split("/");
+		return segments.every((seg) => seg !== "" && seg !== "." && seg !== "..");
+	};
+	if (!written.some((root) => inside(target, root))) return false;
+	const resolved = canonicalPath(target.replace(/\/+$/, ""));
+	return canonical.some((root) => inside(resolved, root));
+}
+
+/** Names a default `mktemp` (in the temp dir: no template, no `-p`/`--tmpdir=<dir>`) assigns exactly once in the command, never reassigned or read into. */
+function mktempVariables(command: string): Set<string> {
+	const names = new Set<string>();
+	const assignment = /(?:^|[\s;&|(])(?:(?:export|local|declare|readonly)\s+)?([A-Za-z_][A-Za-z0-9_]*)=(["']?)(?:\$\(\s*mktemp((?:\s+[^\s)`]+)*)\s*\)|`\s*mktemp((?:\s+[^\s)`]+)*)\s*`)\2(?=$|[\s;&|)])/g;
+	for (const found of command.matchAll(assignment)) {
+		const [, name, , dollar, backtick] = found;
+		if (defaultMktemp((dollar ?? backtick ?? "").trim().split(/\s+/).filter(Boolean))) names.add(name);
+	}
+	for (const name of [...names]) {
+		const assigned = command.match(new RegExp(`(?:^|[\\s;&|(])${name}=`, "g"))?.length ?? 0;
+		const rebound = new RegExp(`\\b(?:for\\s+${name}\\b|read\\b[^;&|]*\\b${name}\\b|getopts\\b[^;&|]*\\b${name}\\b)`).test(command);
+		if (assigned !== 1 || rebound) names.delete(name);
+	}
+	return names;
+}
+
+/** `mktemp` options that keep the file or folder in the temp dir: `-d`, `-q`, and `-t <prefix>` (combinable, `-dt x`); anything else may not. */
+function defaultMktemp(words: string[]): boolean {
+	for (let i = 0; i < words.length; i++) {
+		const word = words[i];
+		if (word === "--directory" || word === "--quiet" || word === "--tmpdir") continue;
+		if (!/^-[dqt]+$/.test(word)) return false;
+		if (word.includes("t")) {
+			const prefix = words[++i];
+			if (prefix === undefined || prefix.startsWith("-") || prefix.includes("/")) return false;
+		}
+	}
+	return true;
+}
+
+/** What a delete may target without asking, given the command around it: a temp path, `$TMPDIR/<path>`, or a bare mktemp variable. */
+interface ScratchContext {
+	mktemp: ReadonlySet<string>;
+	/** `$TMPDIR` as the shell will expand it: the guard's own, unless the command sets it. */
+	tmpdir?: string;
+}
+
+function scratchContext(command: string): ScratchContext {
+	const inherited = process.env.TMPDIR?.replace(/\/+$/, "");
+	const setsTmpdir = /(?:^|[\s;&|(])TMPDIR=|\b(?:read|for|unset|getopts)\b[^;&|]*\bTMPDIR\b/.test(command);
+	return { mktemp: mktempVariables(command), tmpdir: inherited && !setsTmpdir ? inherited : undefined };
+}
+
+function isScratchTarget(target: string, context: ScratchContext): boolean {
+	// A bare mktemp variable only: with a path after it, an empty value (mktemp failed) would aim at `/<path>`.
+	const variable = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$/.exec(target);
+	if (variable) return context.mktemp.has(variable[1] ?? variable[2]);
+	const fromTmpdir = /^\$(?:\{TMPDIR\}|TMPDIR)\/(.+)$/.exec(target);
+	if (fromTmpdir) return context.tmpdir !== undefined && isScratchPath(`${context.tmpdir}/${fromTmpdir[1]}`);
+	return isScratchPath(target);
 }
 
 // Options that take a separate value, per manager, so the value is not
@@ -369,7 +443,7 @@ function classifyPip(label: string, args: string[]): CommandMatch | undefined {
 	return args[0] === "install" || args[0] === "uninstall" ? dependencyMatch(`${label} ${args[0]}`) : undefined;
 }
 
-function classifyRm(args: string[], viaXargs: boolean): CommandMatch | undefined {
+function classifyRm(args: string[], viaXargs: boolean, scratch: ScratchContext): CommandMatch | undefined {
 	const recursive = hasShortFlag(args, "r") || hasShortFlag(args, "R") || hasAny(args, "--recursive");
 	const force = hasShortFlag(args, "f") || hasAny(args, "--force");
 	if (!recursive && !force) return undefined;
@@ -380,7 +454,7 @@ function classifyRm(args: string[], viaXargs: boolean): CommandMatch | undefined
 		return { kind: COMMAND_KIND.DESTRUCTIVE, reason: `rm on a root, home, or wildcard target (${targets.join(" ")})`, hardDeny: true };
 	}
 	// xargs appends targets from stdin, so the visible ones are not the full list.
-	if (recursive && !viaXargs && targets.length > 0 && targets.every((t) => isScratchPath(t))) return undefined;
+	if (!viaXargs && targets.length > 0 && targets.every((t) => isScratchTarget(t, scratch))) return undefined;
 	return { kind: COMMAND_KIND.DESTRUCTIVE, reason: `rm ${recursive ? "recursive" : "forced"} removal` };
 }
 
@@ -559,7 +633,7 @@ const SQL_PATTERNS: Array<[RegExp, string]> = [
 	[/\bFLUSH(ALL|DB)\b/i, "Redis flush"],
 ];
 
-function classifySegment(rawArgv: string[], before: string): CommandMatch[] {
+function classifySegment(rawArgv: string[], before: string, scratch: ScratchContext): CommandMatch[] {
 	const { argv, privileged } = unwrap(rawArgv);
 	const matches: CommandMatch[] = [];
 	if (privileged) matches.push({ kind: COMMAND_KIND.PRIVILEGED, reason: "elevated privileges (sudo)" });
@@ -586,7 +660,7 @@ function classifySegment(rawArgv: string[], before: string): CommandMatch[] {
 	let match: CommandMatch | undefined;
 	switch (name) {
 		case "rm":
-			match = classifyRm(args, rawArgv.some((a) => basename(a) === "xargs"));
+			match = classifyRm(args, rawArgv.some((a) => basename(a) === "xargs"), scratch);
 			break;
 		case "git":
 			match = classifyGit(args);
@@ -690,8 +764,10 @@ function classifySegment(rawArgv: string[], before: string): CommandMatch[] {
 export function classifyCommand(command: string): CommandMatch[] {
 	const matches: CommandMatch[] = [];
 	let moved = false;
-	for (const segment of tokenize(blankHeredocs(command))) {
-		const found = classifySegment(segment.argv, segment.before);
+	const text = blankHeredocs(command);
+	const scratch = scratchContext(text);
+	for (const segment of tokenize(text)) {
+		const found = classifySegment(segment.argv, segment.before, scratch);
 		if (moved) for (const match of found) if (match.commit) match.elsewhere = true;
 		matches.push(...found);
 		moved ||= changesCommitTarget(segment.argv);

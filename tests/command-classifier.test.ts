@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { blankHeredocs, classifyCommand, COMMAND_KIND, commitDirectory, segmentDirectories, tokenize } from "../lib/command-classifier.ts";
 
@@ -18,6 +20,85 @@ describe("classifyCommand", () => {
 		assert.deepEqual(kinds("rm -f a.txt"), [COMMAND_KIND.DESTRUCTIVE]);
 		assert.deepEqual(kinds("find . -name '*.log' -delete"), [COMMAND_KIND.DESTRUCTIVE]);
 		assert.deepEqual(kinds("find dist -exec rm {} \\;"), [COMMAND_KIND.DESTRUCTIVE]);
+	});
+
+	describe("rm inside the temp dirs runs without asking (/tmp, /private/tmp, $TMPDIR, os.tmpdir(), a mktemp variable)", () => {
+		const tmp = tmpdir().replace(/\/+$/, "");
+		const withTmpdir = (value: string | undefined, run: () => void) => {
+			const saved = process.env.TMPDIR;
+			if (value === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = value;
+			try {
+				run();
+			} finally {
+				if (saved === undefined) delete process.env.TMPDIR;
+				else process.env.TMPDIR = saved;
+			}
+		};
+
+		it("allows rm -r and rm -f of literal paths under /tmp and os.tmpdir() (and /private/tmp on macOS)", () => {
+			const commands = ["rm -rf /tmp/brigadev-x", "rm -r /tmp/a/b", "rm -f /tmp/a.log", "rm -rf /tmp/a /tmp/b", `rm -f ${tmp}/a`, `rm -rf ${tmp}/x`];
+			if (process.platform === "darwin") commands.push("rm -rf /private/tmp/x", "rm -f /private/tmp/x.log");
+			for (const command of commands) assert.deepEqual(kinds(command), [], command);
+		});
+
+		it("allows $TMPDIR paths when TMPDIR is set and the command does not set it", () => {
+			withTmpdir(tmp, () => {
+				for (const command of ['rm -rf "$TMPDIR/x"', "rm -rf ${TMPDIR}/x", "rm -f $TMPDIR/a.log"]) assert.deepEqual(kinds(command), [], command);
+				for (const command of ['export TMPDIR=/etc && rm -rf "$TMPDIR/x"', "TMPDIR=/etc; rm -rf $TMPDIR/x", 'rm -rf "$TMPDIR"', 'rm -rf "$TMPDIR/"']) {
+					assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+				}
+			});
+			withTmpdir(undefined, () => assert.deepEqual(kinds("rm -rf $TMPDIR/x"), [COMMAND_KIND.DESTRUCTIVE], "unset TMPDIR makes it /x"));
+		});
+
+		it("allows removing a variable the same command set from a default mktemp", () => {
+			for (const command of [
+				'd=$(mktemp -d) && cp -R src "$d" && rm -rf "$d"',
+				'tmp="$(mktemp -d -t brig)"; npm test; rm -rf "$tmp"',
+				"d=`mktemp -d` && rm -rf $d",
+				'd=$(mktemp -dt brig) && rm -rf "${d}"',
+				'f=$(mktemp) && echo x > "$f" && rm -f "$f"',
+				'export D=$(mktemp -d -q) && rm -rf "$D"',
+			]) {
+				assert.deepEqual(kinds(command), [], command);
+			}
+		});
+
+		it("still asks for a mktemp variable that may not be in temp, may change, or has a path after it", () => {
+			for (const command of [
+				'rm -rf "$d"',
+				'd=$(mktemp -d foo.XXXX) && rm -rf "$d"',
+				'd=$(mktemp -d -p /home/me) && rm -rf "$d"',
+				'd=$(mktemp -d --tmpdir=/home/me) && rm -rf "$d"',
+				'd=$(mktemp -d) && d=/etc && rm -rf "$d"',
+				'd=$(mktemp -d); for d in /etc; do rm -rf "$d"; done',
+				'd=$(mktemp -d); read d; rm -rf "$d"',
+				'd=$(mktemp -d) && rm -rf "$d/sub"',
+				'd=$(mktemp -d) && rm -rf "$d"/*',
+				'd=$(mktemp -d) && rm -rf "$e"',
+			]) {
+				assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+			}
+		});
+
+		it("still asks for /tmp itself, escapes, globs, look-alikes, and mixed targets", () => {
+			for (const command of ["rm -rf /tmp", "rm -rf /tmp/", "rm -f /tmp", "rm -rf /tmp/../etc", "rm -rf /tmp/*", "rm -rf /tmpx/a", "rm -rf /tmp/a build", "rm -rf /tmp/a ~/x", "echo /tmp/a | xargs rm -rf /tmp/b"]) {
+				assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+			}
+		});
+
+		it("still asks when a path under temp resolves outside it through a symlink", () => {
+			const dir = mkdtempSync(join(tmpdir(), "brigadev-rm-link-"));
+			try {
+				symlinkSync(process.cwd(), join(dir, "lnk"));
+				assert.deepEqual(kinds(`rm -rf ${dir}/lnk/sub`), [COMMAND_KIND.DESTRUCTIVE]);
+				assert.deepEqual(kinds(`rm -rf ${dir}/lnk/`), [COMMAND_KIND.DESTRUCTIVE]);
+				assert.deepEqual(kinds(`rm -rf ${dir}/real`), [], "a plain path in the same folder still runs");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
 	});
 
 	it("allows recursive rm strictly inside the system temp dir", () => {
@@ -46,7 +127,6 @@ describe("classifyCommand", () => {
 			`rm -rf ${tmp}/a /home/me/project`,
 			`rm -rf tmp/a`,
 			`rm -rf ~/${tmp}/a`,
-			`rm -f ${tmp}/a`,
 			`rm -rf`,
 			`echo x | xargs rm -rf ${tmp}/a`,
 			`rm -rf ${tmp}/a -- -foo`,
