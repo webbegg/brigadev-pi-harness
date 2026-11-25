@@ -1,7 +1,7 @@
 /**
  * brigadev evidence recorder: appends every finished check command (tests,
  * lint, typecheck, build) to `<repo docs>/evidence/<branch>.jsonl`, keyed to
- * the worktree content tree it ran on. The guard's commit gate reads it.
+ * the worktree content tree it ran on. The guard's PR gate reads it.
  *
  * Loaded in the parent (package.json) and in every subagent (-e). Recording
  * never throws and never changes the tool result. Outside git nothing is

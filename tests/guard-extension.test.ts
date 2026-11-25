@@ -53,12 +53,17 @@ function repo(changed: string[], branch = "feat/x"): { cwd: string; docs: string
 }
 
 const record = (extra: object): EvidenceRecord => ({ v: 1, ts: new Date().toISOString(), branch: "feat/x", ...extra }) as EvidenceRecord;
+const headTree = (cwd: string) => execFileSync("git", ["rev-parse", "HEAD^{tree}"], { cwd, encoding: "utf8" }).trim();
+/** A passing test run recorded on the committed HEAD, as `check` records one on a clean tree. */
+const tested = (cwd: string, docs: string, extra: object = {}) =>
+	appendEvidence(evidenceFile(docs, "feat/x"), record({ type: "run", kind: "test", outcome: "pass", tree: headTree(cwd), root: cwd, cwd, agent: "parent", command: "npm test", tail: "", ...extra }));
 
 async function session(cwd: string, options: { mode?: "yolo"; ui?: boolean; answer?: boolean } = {}) {
 	const handlers: Record<string, Function[]> = {};
+	const commands: string[] = [];
 	const pi: any = {
 		on: (e: string, h: Function) => (handlers[e] ??= []).push(h),
-		registerCommand: () => {},
+		registerCommand: (name: string) => commands.push(name),
 		registerShortcut: () => {},
 		appendEntry: () => {},
 		exec: (command: string, args: string[], options: { cwd?: string }) =>
@@ -75,6 +80,7 @@ async function session(cwd: string, options: { mode?: "yolo"; ui?: boolean; answ
 	for (const h of handlers.session_start ?? []) await h({}, ctx);
 	return {
 		dialogs,
+		commands,
 		async bash(command: string, toolName = "bash") {
 			for (const h of handlers.tool_call ?? []) {
 				const input = toolName === "bg_start" ? { command, cwd } : { command };
@@ -87,6 +93,12 @@ async function session(cwd: string, options: { mode?: "yolo"; ui?: boolean; answ
 }
 
 const PR = "gh pr create --fill";
+/** The user approved the one PR dialog, and it held no gate reason (a T1 note may ride it): only the always-on approval of a PR creation. */
+const onlyApproval = (s: { dialogs: Array<{ title: string; body: string }> }) => {
+	assert.equal(s.dialogs.length, 1, JSON.stringify(s.dialogs));
+	assert.match(s.dialogs[0].title, /gh pr create/);
+	assert.doesNotMatch(s.dialogs[0].body, /^- /m);
+};
 
 describe("guard: PR risk gate", () => {
 	it("yolo: a T2 branch without a verify asks, and a decline blocks with what to do", async () => {
@@ -136,19 +148,32 @@ describe("guard: PR risk gate", () => {
 		}
 	});
 
-	it("T0 in yolo runs with no dialog", async () => {
-		const { cwd } = repo(["tests/a.test.ts"]);
-		const s = await session(cwd, { mode: "yolo" });
+	it("T0 in yolo: only the PR approval, with no gate reason", async () => {
+		const { cwd, docs } = repo(["tests/a.test.ts"]);
+		tested(cwd, docs);
+		const s = await session(cwd, { mode: "yolo", answer: true });
 		assert.equal(await s.bash(PR), undefined);
-		assert.deepEqual(s.dialogs, []);
+		onlyApproval(s);
+	});
+
+	it("a PR creation and a push always ask the user, in yolo too; without a UI they are blocked", async () => {
+		const { cwd, docs } = repo(["tests/a.test.ts"]);
+		tested(cwd, docs);
+		for (const command of [PR, "git push -u origin feat/x"]) {
+			const declined = await session(cwd, { mode: "yolo" });
+			assert.match(String(await declined.bash(command)), /User declined/, command);
+			assert.equal(declined.dialogs.length, 1, command);
+			assert.match(String(await (await session(cwd, { mode: "yolo", ui: false })).bash(command)), /User declined/, command);
+		}
 	});
 
 	it("yolo: a T2 branch with a clean verify runs with no dialog", async () => {
 		const { cwd, docs } = repo(["lib/guard-rules.ts"]);
 		appendEvidence(evidenceFile(docs, "feat/x"), record({ type: "verify", scope: "branch", categories: ["security"], blockers: [], outcome: "clean" }));
-		const s = await session(cwd, { mode: "yolo" });
+		tested(cwd, docs);
+		const s = await session(cwd, { mode: "yolo", answer: true });
 		assert.equal(await s.bash(PR), undefined);
-		assert.deepEqual(s.dialogs, []);
+		onlyApproval(s);
 	});
 
 	it("yolo: verify blockers without a repro test ask; with fail→pass after the verify they pass", async () => {
@@ -161,17 +186,19 @@ describe("guard: PR risk gate", () => {
 		assert.match(asked.dialogs[0].body, /verify blockers B1 have no repro test RED→GREEN after the verify/);
 		const run = (n: number, outcome: string) => record({ type: "run", ts: t(n), kind: "test", outcome, cwd, agent: "parent", command: "npm test", tail: "" });
 		appendEvidence(file, run(1, "fail"));
-		appendEvidence(file, run(2, "pass"));
-		const resolved = await session(cwd, { mode: "yolo" });
+		appendEvidence(file, { ...run(2, "pass"), tree: headTree(cwd) } as EvidenceRecord);
+		const resolved = await session(cwd, { mode: "yolo", answer: true });
 		assert.equal(await resolved.bash(PR), undefined);
-		assert.deepEqual(resolved.dialogs, []);
+		onlyApproval(resolved);
 	});
 
-	it("T1 without a ledger: no dialog of its own in yolo; the note rides the normal dialog", async () => {
-		const { cwd } = repo(["src/a.ts"]);
-		const yolo = await session(cwd, { mode: "yolo" });
+	it("T1 without a ledger: the note rides the one PR dialog, in yolo and normal", async () => {
+		const { cwd, docs } = repo(["src/a.ts"]);
+		tested(cwd, docs);
+		const yolo = await session(cwd, { mode: "yolo", answer: true });
 		assert.equal(await yolo.bash(PR), undefined);
-		assert.deepEqual(yolo.dialogs, []);
+		assert.equal(yolo.dialogs.length, 1);
+		assert.match(yolo.dialogs[0].body, /no review ledger for this branch/);
 		const normal = await session(cwd, { answer: true });
 		assert.equal(await normal.bash(PR), undefined);
 		assert.equal(normal.dialogs.length, 1);
@@ -187,10 +214,12 @@ describe("guard: PR risk gate", () => {
 
 	it("a command that opens no PR is never gated", async () => {
 		const { cwd } = repo(["lib/guard-rules.ts"]);
-		const s = await session(cwd, { mode: "yolo" });
+		const s = await session(cwd, { mode: "yolo", answer: true });
 		assert.equal(await s.bash("gh pr view"), undefined);
-		assert.equal(await s.bash("git push -u origin feat/x"), undefined);
 		assert.deepEqual(s.dialogs, []);
+		assert.equal(await s.bash("git push -u origin feat/x"), undefined);
+		assert.equal(s.dialogs.length, 1, "a push asks, but carries no PR gate reason");
+		assert.doesNotMatch(s.dialogs[0].body, /PR risk gate/);
 	});
 
 	it("W4: a gh pr create whose directory cannot be resolved asks in every mode, and blocks without a UI", async () => {
@@ -251,11 +280,120 @@ describe("guard: PR risk gate", () => {
 		assert.match(s.dialogs[0].body, /T2 branch \(security: lib\/guard-rules\.ts\)/);
 	});
 
-	it("fails open outside a git repository", async () => {
+	describe("a passing test on the committed HEAD (the evidence check, moved here from git commit)", () => {
+		it("yolo: a branch that commits source without one asks, naming it; a decline blocks with what to do", async () => {
+			const { cwd } = repo(["src/a.ts"]);
+			const s = await session(cwd, { mode: "yolo" });
+			const reason = String(await s.bash(PR));
+			assert.equal(s.dialogs.length, 1);
+			assert.match(s.dialogs[0].body, /no passing test recorded for the committed HEAD \(no test ran on it\)/);
+			assert.match(reason, /run the tests with `check` on the clean working tree/);
+		});
+
+		it("a pass recorded on HEAD's tree lets it run; a pass on an earlier tree does not", async () => {
+			const { cwd, docs } = repo(["src/a.ts"]);
+			tested(cwd, docs);
+			writeFileSync(join(cwd, "src/a.ts"), "edited after the run\n");
+			git(cwd, "commit", "-qam", "later");
+			const stale = await session(cwd, { mode: "yolo" });
+			assert.match(String(await stale.bash(PR)), /no passing test recorded for the committed HEAD/);
+			tested(cwd, docs);
+			const fresh = await session(cwd, { mode: "yolo", answer: true });
+			assert.equal(await fresh.bash(PR), undefined);
+			onlyApproval(fresh);
+		});
+
+		it("uncommitted edits do not matter: HEAD is what the PR opens", async () => {
+			const { cwd, docs } = repo(["src/a.ts"]);
+			tested(cwd, docs);
+			writeFileSync(join(cwd, "src/a.ts"), "uncommitted\n");
+			const s = await session(cwd, { mode: "yolo", answer: true });
+			assert.equal(await s.bash(PR), undefined);
+			onlyApproval(s);
+		});
+
+		it("`gh pr new` (gh's alias) is gated like gh pr create, and asks for confirmation in normal mode", async () => {
+			const { cwd } = repo(["src/a.ts"]);
+			assert.match(String(await (await session(cwd, { mode: "yolo", ui: false })).bash("gh pr new --fill")), /no passing test recorded for the committed HEAD/);
+			for (const command of ["gh pr --repo o/r create --fill", "gh pr -R o/r create --fill"]) {
+				const flagged = await session(cwd, { mode: "yolo", answer: true });
+				assert.equal(await flagged.bash(command), undefined, command);
+				assert.equal(flagged.dialogs.length, 1, command);
+				assert.match(flagged.dialogs[0].body, /no passing test recorded/, command);
+			}
+			const normal = await session(cwd, { answer: true });
+			assert.equal(await normal.bash("gh pr new --fill"), undefined);
+			assert.equal(normal.dialogs.length, 1);
+			assert.match(normal.dialogs[0].body, /no passing test recorded/);
+		});
+
+		it("a branch that only deletes or renames source still needs a test", async () => {
+			const { cwd } = repo(["src/a.ts"]);
+			git(cwd, "checkout", "-q", "main");
+			git(cwd, "merge", "-q", "--ff-only", "feat/x");
+			git(cwd, "checkout", "-q", "-b", "feat/y");
+			git(cwd, "mv", "src/a.ts", "src/b.ts");
+			git(cwd, "commit", "-qm", "rename");
+			const s = await session(cwd, { mode: "yolo", ui: false });
+			assert.match(String(await s.bash(PR)), /no passing test recorded for the committed HEAD/);
+		});
+
+		it("a git failure while reading the branch's paths asks instead of passing", async () => {
+			const { cwd } = repo(["src/a.ts"]);
+			git(cwd, "config", "diff.relative", "notabool"); // merge-base still works; diff and status fail
+			const s = await session(cwd, { mode: "yolo", ui: false });
+			assert.notEqual(await s.bash(PR), undefined);
+		});
+
+		it("a branch that commits only docs needs no test", async () => {
+			const { cwd } = repo(["docs/guide.md"]);
+			const s = await session(cwd, { mode: "yolo", answer: true });
+			assert.equal(await s.bash(PR), undefined);
+			onlyApproval(s);
+		});
+
+		it("with a detected suite, a focused run does not vouch for HEAD; the full suite does", async () => {
+			const { cwd, docs } = repo(["src/a.ts", "package.json"]);
+			writeFileSync(join(cwd, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+			git(cwd, "commit", "-qam", "suite");
+			tested(cwd, docs, { command: "npm test -- tests/a.test.ts" });
+			const focused = await session(cwd, { mode: "yolo" });
+			assert.match(String(await focused.bash(PR)), /only other test commands passed on it; the full suite is `npm test`/);
+			tested(cwd, docs);
+			assert.equal(await (await session(cwd, { mode: "yolo", answer: true })).bash(PR), undefined);
+		});
+
+		it("an unreadable evidence log asks instead of passing", async () => {
+			const { cwd, docs } = repo(["src/a.ts"]);
+			mkdirSync(evidenceFile(docs, "feat/x"), { recursive: true }); // reading it as a file throws EISDIR
+			const s = await session(cwd, { mode: "yolo", ui: false });
+			assert.match(String(await s.bash(PR)), /PR gate could not read the branch facts/);
+		});
+
+		it("a git commit is never gated on evidence, and there is no force-commit command", async () => {
+			const { cwd } = repo(["src/a.ts"]);
+			writeFileSync(join(cwd, "src/a.ts"), "untested\n");
+			const s = await session(cwd, { mode: "yolo" });
+			assert.equal(await s.bash("git commit -am untested"), undefined);
+			assert.deepEqual(s.dialogs, []);
+			assert.equal(s.commands.includes("brigadev:force-commit"), false);
+		});
+
+		it("no UI: blocks, in yolo and normal", async () => {
+			const { cwd } = repo(["src/a.ts"]);
+			for (const mode of ["yolo", undefined] as const) {
+				const s = await session(cwd, { mode, ui: false });
+				assert.match(String(await s.bash(PR)), /no passing test recorded for the committed HEAD/);
+			}
+		});
+
+	});
+
+	it("outside a git repository the gate adds nothing: only the PR approval", async () => {
 		const plain = join(dir, "plain");
 		mkdirSync(plain, { recursive: true });
-		const s = await session(plain, { mode: "yolo" });
+		const s = await session(plain, { mode: "yolo", answer: true });
 		assert.equal(await s.bash(PR), undefined);
-		assert.deepEqual(s.dialogs, []);
+		onlyApproval(s);
 	});
 });

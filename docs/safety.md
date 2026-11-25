@@ -9,7 +9,8 @@
 | Command kind | normal | yolo | subagent |
 | --- | --- | --- | --- |
 | ordinary (`npm test`, `git status`) | run | run | run |
-| delivery (`git push`, `gh pr create`) | ask | run | block |
+| `git push`, `gh pr create` (and `gh pr new`): always your approval | ask | ask | block |
+| other delivery (`gh issue create`, `gh pr comment`) | ask | run | block |
 | `git commit` on a feature branch | run | run | block |
 | `git commit` on the default branch, on a detached HEAD, or when the default branch is unknown | ask | run | block |
 | destructive (`rm -rf dir`, `git reset --hard`, `git push --force`, `DROP TABLE`; ref rewrites such as `git update-ref`) | ask | ask | block |

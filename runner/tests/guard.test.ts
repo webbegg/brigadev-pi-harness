@@ -187,37 +187,9 @@ describe("worker guard: commits (A1, A2)", () => {
 		assert.match((await guard().decide(bash("cd .. && git commit -m x"))) ?? "", NEEDS_YOU);
 	});
 
-	it("the evidence commit gate blocks a commit with an untested source change, and allows it once a passing run is on that tree", async () => {
+	it("a commit with an untested source change is allowed: the PR loop's final check is the evidence gate, not the commit", async () => {
 		writeFileSync(join(ws.repo, "a.ts"), "export const a = 1;\n");
-		const blocked = await guard().decide(bash("git add -A && git commit -m x"));
-		assert.match(blocked ?? "", /Blocked by brigadev evidence gate: no passing test is recorded/);
-		// A docs-only change needs no test run (the gate's own rule, so the runner and the extension agree).
-		git(ws.repo, "add", "-A");
-		git(ws.repo, "commit", "-q", "-m", "src");
-		writeFileSync(join(ws.repo, "NOTES.md"), "notes\n");
-		assert.equal(await guard().decide(bash("git add -A && git commit -m notes")), undefined);
-	});
-
-	it("the gate reads the same evidence file as the extension: <docs>/evidence/<branch>.jsonl of the repo", async () => {
-		const { appendEvidence, buildRunRecord } = await import("../../lib/evidence.ts");
-		const { worktreeTreeResult } = await import("../../lib/worktree-tree.ts");
-		writeFileSync(join(ws.repo, "a.ts"), "export const a = 1;\n");
-		const result = await worktreeTreeResult(ws.repo, { sourceTree: true });
-		assert.equal(result.kind, "tree");
-		if (result.kind !== "tree") return;
-		const record = buildRunRecord({ ts: new Date().toISOString(), branch: FEATURE_BRANCH, tree: result.tree, srcTree: result.sourceTree, cwd: ws.repo, topLevel: result.root, agent: "parent", command: "npm test", exitCode: 0, output: "" });
-		record.kind = "test";
-		record.outcome = "pass";
-		appendEvidence(evidenceFile(repoDocsDir(ws.repo), FEATURE_BRANCH), record);
 		assert.equal(await guard().decide(bash("git add -A && git commit -m x")), undefined);
-	});
-
-	it("a force record in the log does not let the worker through (only a passing run on the tree does)", async () => {
-		writeFileSync(join(ws.repo, "a.ts"), "export const a = 1;\n");
-		const file = evidenceFile(repoDocsDir(ws.repo), FEATURE_BRANCH);
-		mkdirSync(join(file, ".."), { recursive: true });
-		appendFileSync(file, `${JSON.stringify({ v: 1, type: "force", ts: new Date().toISOString(), branch: FEATURE_BRANCH, via: "command", command: "git commit" })}\n`);
-		assert.match((await guard().decide(bash("git add -A && git commit -m x"))) ?? "", /evidence gate/);
 	});
 });
 

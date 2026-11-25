@@ -6,6 +6,20 @@
 
 - `brigadev-runner` has a dollar cost cap per loop: `start <doc> --cap <dollars>` (default $5, a positive number; stored with the loop, so a reopen keeps it, and a later `start` without `--cap` keeps it). The spend is the sum of the costs `pi.usage` records for every conversation the loop owns (ticket attempts, verify, fix tickets; failed attempts count; usage a provider does not report is not counted). It is checked before each ticket attempt, verify and fix ticket: at or over the cap the loop parks needs-you (`cost cap reached: $5.12 of $5.00 spent`; `status`, the PR comment and the board's Needs you column show it), and inside a running conversation the guard blocks every further tool call. Every worker and verify run also takes at most `runner.maxTurns` tool rounds (brigadev.json, default 60), so a run that keeps calling blocked tools ends there: the overshoot is at most the run in progress. Loops started before this version have no ledger, so their earlier spend is not counted. `brigadev-runner resume <doc> --cap <dollars>` (or the board's cost-cap prompt) continues with a cap above the spend; a cap at or below the spend is refused, and so is a plain `resume` there unless `start --cap` already raised the cap above the spend. `status` prints `spend $X of $Y`, and the board shows it with each ticket's own spend.
 
+### Changed
+
+- **Every `git push` and `gh pr create` (or `gh pr new`) asks the user, in every permission mode.** So do `git subtree push`, `gh repo create --push`, and a PR opened through `gh api` (a POST to `repos/<o>/<r>/pulls`, or the `createPullRequest` mutation). YOLO no longer gives standing permission for them; it still runs commits, issue writes, and PR comments without asking. Without a UI they are blocked. The PR gate's reasons ride the same dialog.
+- `gh pr --repo <o/r> create` (and `-R`, before the action) is read as a PR creation: it ran without asking and skipped the PR gate.
+- **Breaking: the evidence gate moved from `git commit` to `gh pr create`.** Commits are never gated on test evidence (in the session, subagents, and the runner's worker). Instead `gh pr create` on a branch that commits source asks (in every mode; in normal mode inside the PR confirmation) and blocks without a UI until a passing test run is recorded for the committed HEAD: a run on exactly HEAD's tree, or HEAD's tree without doc paths. When the project's test command is known (`check.test` or detected), only a run of that exact command counts, so a `check` with `focus` does not vouch for the PR, and the latest suite run on HEAD decides (a later failure revokes an earlier pass). Uncommitted edits do not matter; docs-only branches need no run. The PR gate also asks instead of passing when it cannot read the facts (an unreadable evidence log, git failing, a `git diff` of the branch that fails). `worktreeTreeResult` takes `commit` to key a commit's tree, and `branchRisk` reports the `committed` paths.
+
+### Fixed
+
+- `gh pr new` and `gh issue new` (gh's aliases of `create`) are classified like `gh pr create` and `gh issue create`: they ask in normal mode and go through the PR gate, where before they ran unasked.
+
+### Removed
+
+- `/brigadev:force-commit` and the commit gate's dialog. Older evidence logs keep their `force` records, and `brigadev-branch-pr` still discloses them. The runner's worker no longer needs a passing `check` on the exact tree to commit; the PR loop's final check runs the full suite before any push.
+
 ## [0.24.0] - 2026-11-22
 
 The durable runner's own loop board (`start --web`), hardened against the worker it supervises, and a fix that keeps SIGUSR1 from opening Node's inspector in Pi or the runner (in 0.23.0 a child process could get an unauthenticated debugger in its parent: upgrade).

@@ -401,7 +401,7 @@ describe("bg_start is guarded exactly like bash", () => {
 	let dir: string;
 	let repo: string;
 	let home: string;
-	// Sessions for the commit-gate tests: `clean` and `dirty` are repositories with a nested repository (ignored, with an untested change),
+	// Sessions for the commit tests: `clean` and `dirty` are repositories with a nested repository (ignored, with an untested change),
 	// a symlink into it, and (dirty only) an untested source change of their own; `outside` is another repository with an untested change.
 	let clean: string;
 	let dirty: string;
@@ -422,7 +422,7 @@ describe("bg_start is guarded exactly like bash", () => {
 		mkdirSync(join(path, "src"), { recursive: true });
 		writeFileSync(join(path, ".gitignore"), "nested/\nlnk\n");
 		writeFileSync(join(path, "src", "a.ts"), "1\n");
-		makeRepo(path, "feat/x", "src.ts"); // the session's repository is clean: the gate alone would allow a commit of it
+		makeRepo(path, "feat/x", "src.ts"); // the session's repository is clean
 		makeRepo(join(path, "nested"), "feat/n", "n.ts");
 		appendFileSync(join(path, "nested", "n.ts"), "2\n"); // untested source change in another repository
 		symlinkSync("nested", join(path, "lnk"));
@@ -443,7 +443,7 @@ describe("bg_start is guarded exactly like bash", () => {
 		writeFileSync(join(repo, "src.ts"), "export const a = 1;\n");
 		git("add", "-A");
 		git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init");
-		appendFileSync(join(repo, "src.ts"), "export const b = 2;\n"); // a source change with no recorded test: the commit gate applies
+		appendFileSync(join(repo, "src.ts"), "export const b = 2;\n"); // a source change with no recorded test: commits are not gated on it
 		clean = join(dir, "clean");
 		dirty = join(dir, "dirty");
 		outside = join(dir, "outrepo");
@@ -530,7 +530,7 @@ describe("bg_start is guarded exactly like bash", () => {
 		["a delivery command", () => "git push origin feat/x", /User declined/],
 		["a dependency command", () => "npm install left-pad", /User declined/],
 		["a privileged command", () => "sudo true", /User declined/],
-		["a commit the evidence gate stops", () => "git commit -am change", /evidence gate/],
+		["a commit (no resolvable default branch, so it asks)", () => "git commit -am change", /User declined: git commit/],
 		["a write to the evidence log", () => `echo '{"v":1}' >> ${evidenceLog()}`, /evidence log/],
 	];
 
@@ -553,9 +553,10 @@ describe("bg_start is guarded exactly like bash", () => {
 		assert.deepEqual(result.asked, []);
 	});
 
-	it("asks in normal mode and not for ordinary delivery in yolo, as bash does", async () => {
+	it("asks for a push in both modes and not for ordinary delivery in yolo, as bash does", async () => {
 		assert.deepEqual((await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true })).asked, ["brigadev: git push"]);
-		assert.deepEqual(await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true, yolo: true }), { reason: undefined, asked: [] });
+		assert.deepEqual((await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true, yolo: true })).asked, ["brigadev: git push"], "a push always asks");
+		assert.deepEqual(await outcome("bg_start", { command: "gh issue create --fill" }, { hasUI: true, answer: true, yolo: true }), { reason: undefined, asked: [] });
 		assert.deepEqual((await outcome("bg_start", { command: "rm -rf build" }, { hasUI: true, answer: true, yolo: true })).asked.length, 1, "destructive still asks in yolo");
 	});
 
@@ -579,7 +580,7 @@ describe("bg_start is guarded exactly like bash", () => {
 		assert.equal((await outcome("bg_start", { command: "cat evidence/feat-x.jsonl", cwd: docs }, { hasUI: false })).reason, undefined);
 	});
 
-	it("the commit gate reads the repository at the working directory the process runs in", async () => {
+	it("a commit from a subdirectory working directory is decided like the same commit through bash", async () => {
 		const viaBash = await outcome("bash", { command: "git commit -am change" }, { hasUI: false });
 		const viaSub = await outcome("bg_start", { command: "git commit -am change", cwd: "sub" }, { hasUI: false });
 		assert.deepEqual(viaSub, viaBash);
@@ -640,63 +641,49 @@ describe("bg_start is guarded exactly like bash", () => {
 		});
 	});
 
-	describe("a commit through the working directory is judged by the repository it runs in", () => {
+	describe("a commit through the working directory is decided by the repository it runs in", () => {
 		const COMMIT = "git commit -am x";
-		const GATE_QUESTION = "brigadev: evidence gate blocked this commit";
-		// The bash side is the same call for every `sub`: evaluate it once.
-		const once = <T>(make: () => Promise<T>) => {
-			let cached: Promise<T> | undefined;
-			return () => (cached ??= make());
-		};
-		const cleanViaBash = once(() => outcome("bash", { command: COMMIT }, { hasUI: false }, clean));
-		const dirtyViaBash = once(() => outcome("bash", { command: COMMIT }, { hasUI: false }, dirty));
-
-		// A bg_start `cwd` is decided like `cd <cwd> && <command>`: a nested repository (or a symlink into one) is another repository whose
-		// runs the gate judges, while a subdirectory of the session's own repository is not "elsewhere".
-		it("yolo without a UI: a commit in a nested repository is blocked as bash blocks `cd nested && git commit`", async () => {
+		// A bg_start `cwd` is decided like `cd <cwd> && <command>`: a nested repository (or a symlink into one) is another repository, so the
+		// feature-branch waiver does not apply and normal mode asks, while a subdirectory of the session's own repository is not "elsewhere".
+		it("normal without a UI: a commit in a nested repository is declined as bash declines `cd nested && git commit`", async () => {
 			const [viaBash, viaBg] = await Promise.all([
-				outcome("bash", { command: `cd nested && ${COMMIT}` }, { hasUI: false, yolo: true }, clean),
-				outcome("bg_start", { command: COMMIT, cwd: "nested" }, { hasUI: false, yolo: true }, clean),
+				outcome("bash", { command: `cd nested && ${COMMIT}` }, { hasUI: false }, clean),
+				outcome("bg_start", { command: COMMIT, cwd: "nested" }, { hasUI: false }, clean),
 			]);
-			assert.match(String(viaBash.reason), /evidence gate/);
-			assert.match(String(viaBg.reason), /evidence gate/);
+			assert.match(String(viaBash.reason), /User declined/);
+			assert.deepEqual(viaBg, viaBash);
 		});
 
-		it("with a UI the user sees the evidence-gate question for a bg_start commit elsewhere, as for bash", async () => {
+		it("with a UI the user is asked about a bg_start commit elsewhere, as for bash", async () => {
 			const [viaBash, viaBg] = await Promise.all([
-				outcome("bash", { command: `cd nested && ${COMMIT}` }, { hasUI: true, answer: true, yolo: true }, clean),
-				outcome("bg_start", { command: COMMIT, cwd: "nested" }, { hasUI: true, answer: true, yolo: true }, clean),
+				outcome("bash", { command: `cd nested && ${COMMIT}` }, { hasUI: true, answer: true }, clean),
+				outcome("bg_start", { command: COMMIT, cwd: "nested" }, { hasUI: true, answer: true }, clean),
 			]);
-			assert.ok(viaBash.asked.includes(GATE_QUESTION));
-			assert.ok(viaBg.asked.includes(GATE_QUESTION), JSON.stringify(viaBg));
+			assert.equal(viaBash.asked.length, 1);
+			assert.deepEqual(viaBg, viaBash);
 		});
 
-		it("an outside repository the user granted as a working directory still goes through the gate", async () => {
-			const viaBg = await outcome("bg_start", { command: COMMIT, cwd: outside }, { hasUI: true, answer: true, yolo: true }, clean);
-			assert.ok(viaBg.asked.includes(GATE_QUESTION), JSON.stringify(viaBg));
+		it("an outside repository the user granted as a working directory is still asked about", async () => {
+			const viaBg = await outcome("bg_start", { command: COMMIT, cwd: outside }, { hasUI: true, answer: true }, clean);
+			assert.ok(viaBg.asked.some((title) => /commit/.test(title)), JSON.stringify(viaBg));
 		});
 
 		for (const sub of ["src", ".", "src/"]) {
-			it(`a clean session repository: bg_start cwd "${sub}" commits like a plain git commit (not "another directory")`, async () => {
-				assert.equal((await cleanViaBash()).reason, undefined);
-				assert.equal((await outcome("bg_start", { command: COMMIT, cwd: sub }, { hasUI: false }, clean)).reason, undefined);
-			});
-
-			it(`an untested change: bg_start cwd "${sub}" gets the same gate reason as a plain git commit`, async () => {
-				const viaBash = (await dirtyViaBash()).reason;
-				const viaBg = (await outcome("bg_start", { command: COMMIT, cwd: sub }, { hasUI: false }, dirty)).reason;
-				assert.match(String(viaBash), /no passing test is recorded/);
-				assert.equal(viaBg, viaBash);
+			it(`bg_start cwd "${sub}" commits like a plain git commit (not "another directory"), with or without untested changes`, async () => {
+				for (const cwd of [clean, dirty]) {
+					assert.equal((await outcome("bash", { command: COMMIT }, { hasUI: false }, cwd)).reason, undefined);
+					assert.equal((await outcome("bg_start", { command: COMMIT, cwd: sub }, { hasUI: false }, cwd)).reason, undefined);
+				}
 			});
 		}
 
-		it("a symlink cwd into a nested repository is judged by that repository's runs (its own untested change), as `cd lnk && git commit` is", async () => {
+		it("a symlink cwd into a nested repository is decided as `cd lnk && git commit` is", async () => {
 			for (const yolo of [false, true]) {
 				const [viaBash, viaBg] = await Promise.all([
 					outcome("bash", { command: `cd lnk && ${COMMIT}` }, { hasUI: false, yolo }, clean),
 					outcome("bg_start", { command: COMMIT, cwd: "lnk" }, { hasUI: false, yolo }, clean),
 				]);
-				assert.match(String(viaBash.reason), /no passing test is recorded/);
+				if (!yolo) assert.match(String(viaBash.reason), /User declined/);
 				assert.equal(viaBg.reason, viaBash.reason);
 			}
 		});

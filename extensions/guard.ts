@@ -16,19 +16,19 @@ import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { BUS, publish, type GuardDecision, type ModeState } from "../lib/bus.ts";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
-import { appendEvidence, branchSlug, evaluateCommitGate, evidenceFile, forceRecord, gateDialog, readEvidence, type ForceRecord } from "../lib/evidence.ts";
+import { branchSlug, evidenceFile, readEvidence } from "../lib/evidence.ts";
 import { checkRefusal, resolveCommand } from "../lib/check.ts";
 import { askConfirm } from "../lib/human-prompt.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, sensitiveWords, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
 import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
-import { decidePrGate, opensPrCreate, prCreateDirectory, prGateBlockMessage, prGateDialogText, riskMapFor, UNRESOLVED_DIRECTORY_REASON, type PrGateDecision } from "../lib/pr-gate.ts";
+import { decidePrGate, opensPrCreate, PR_FACTS_ERROR_REASON, prCreateDirectory, prGateBlockMessage, prGateDialogText, riskMapFor, UNRESOLVED_DIRECTORY_REASON, type PrGateDecision } from "../lib/pr-gate.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
 import { redact } from "../lib/redact.ts";
 import { branchRisk, type RiskCategory } from "../lib/risk-map.ts";
 import { agentDir, CHILD_ENV, childAllowedSurfaces, isChildSession, PACKAGE_ROOT, readSettings, writeSettings } from "../lib/runtime.ts";
 import { diffSnapshots, outsideSurfaces, takeSnapshot, type ExecFn, type Snapshot } from "../lib/worktree-snapshot.ts";
-import { worktreeTreeResult } from "../lib/worktree-tree.ts";
+import { isDocPath, worktreeTreeResult } from "../lib/worktree-tree.ts";
 
 const MODE_ENTRY = "brigadev-mode";
 const STATUS_KEY = "brigadev-mode";
@@ -55,8 +55,6 @@ export default function (pi: ExtensionAPI) {
 	let mode: PermissionMode = PERMISSION_MODE.NORMAL;
 	// Per-session grants for directories outside the project root.
 	const outsideGrants = new Set<string>();
-	// Worktree tree the user granted a one-shot commit force for (/brigadev:force-commit). Only that command sets it.
-	let forcedTree: string | undefined;
 
 	const projectRoot = (ctx: ExtensionContext) => canonicalPath(process.env[CHILD_ENV.PROJECT_ROOT] ?? ctx.cwd);
 
@@ -147,44 +145,6 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * Evidence gate for `git commit` (parent only, every permission mode): blocks a commit with source
-	 * changes unless a passing test is recorded for the current tree. Only the user can force it.
-	 * Returns a block reason, or a `settle` to call once the remaining rules let the commit run: the
-	 * user's force (one-shot or dialog) is spent and logged then, not when a later rule declines.
-	 */
-	const evidenceGate = async (command: string, ctx: ExtensionContext, commandCwd: string): Promise<{ reason?: string; settle: () => void }> => {
-		const nothing = { settle: () => {} };
-		// Judged against the repository the commit runs in (`git -C`, a leading `cd`, a nested repo); none when it commits nothing.
-		const evaluation = await evaluateCommitGate({ exec, command, cwd: commandCwd, forcedTree });
-		if (!evaluation) return nothing;
-		const { decision, consumedForce, file, branch, tree } = evaluation;
-		const log = (via: ForceRecord["via"]) => {
-			try {
-				appendEvidence(file, forceRecord({ ts: new Date().toISOString(), branch, tree, via, command }));
-			} catch {
-				// The force is the user's decision; a failed log write does not undo it.
-			}
-		};
-
-		if (decision.action === "allow") {
-			return consumedForce
-				? {
-						settle: () => {
-							forcedTree = undefined;
-							log("command");
-						},
-					}
-				: nothing;
-		}
-
-		if (!isChild && ctx.hasUI) {
-			const dialog = gateDialog(decision.reason, command);
-			if (await confirm(ctx, dialog.title, dialog.body)) return { settle: () => log("dialog") };
-		}
-		return { reason: decision.reason, settle: () => {} };
-	};
-
-	/**
 	 * One file-access decision for a path a tool call touches (read, write, edit, the `path` of grep/find/ls, or the working directory a background
 	 * process starts in): sensitive-path question, outside-project grant. Returns a block, or undefined to let it run.
 	 * `isDirectory`: the path is a working directory, so a sensitive folder (`.ssh`) counts as sensitive and an outside
@@ -229,19 +189,25 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * PR risk gate for `gh pr create` (parent only, every permission mode, S9): the branch's tier against its evidence and review ledger.
-	 * Undefined when the command opens no PR. It is advice on top of the human PR decision, so anything that fails while
-	 * reading the facts (no git, a detached HEAD, an unreadable log) fails open instead of blocking the PR. A `gh pr create`
-	 * whose directory cannot be resolved is not a read error: the gate cannot look, so it asks.
+	 * PR gate for `gh pr create` (parent only, every permission mode, S9): a passing full-suite run on the committed HEAD, then
+	 * the branch's tier against its evidence and review ledger. Undefined when the command opens no PR, outside git, or on a
+	 * detached HEAD. It is the one gate in front of delivery, so a failure while reading the facts (an unreadable log, git
+	 * failing) asks instead of passing, and so does a `gh pr create` whose directory cannot be resolved.
 	 */
 	const prGate = async (command: string, commandCwd: string): Promise<{ decision: PrGateDecision; categories: RiskCategory[] } | undefined> => {
 		try {
 			const dir = prCreateDirectory(command, commandCwd);
 			if (!dir) return opensPrCreate(command) ? { decision: { action: "ask", reasons: [UNRESOLVED_DIRECTORY_REASON] }, categories: [] } : undefined;
-			const risk = await branchRisk(exec, dir, riskMapFor(readSettings()));
+			const settings = readSettings();
+			const risk = await branchRisk(exec, dir, riskMapFor(settings));
 			if (!risk?.branch) return undefined;
 			const docs = repoDocsDir(dir);
+			const head = await worktreeTreeResult(dir, { sourceTree: true, commit: "HEAD" });
+			const suite = resolveCommand({ cwd: risk.root, settings });
 			const decision = decidePrGate({
+				sourceChanged: risk.baseUnknown === true || risk.committedUnknown === true || risk.committed.some((path) => !isDocPath(path)),
+				head: head.kind === "tree" ? { tree: head.tree, sourceTree: head.sourceTree ?? head.tree, root: head.root } : { error: head.kind === "error" ? head.reason : "not a git work tree" },
+				suiteCommand: "command" in suite ? suite.command : undefined,
 				tier: risk.tier,
 				categories: risk.categories,
 				records: readEvidence(evidenceFile(docs, risk.branch)),
@@ -250,8 +216,8 @@ export default function (pi: ExtensionAPI) {
 				baseUnknown: risk.baseUnknown,
 			});
 			return { decision, categories: (Object.keys(risk.categories) as RiskCategory[]).filter((category) => category === "security" || category === "data" || category === "contract") };
-		} catch {
-			return undefined;
+		} catch (error) {
+			return { decision: { action: "ask", reasons: [`${PR_FACTS_ERROR_REASON} (${String((error as Error)?.message ?? error).split("\n")[0].slice(0, 200)})`] }, categories: [] };
 		}
 	};
 
@@ -319,13 +285,11 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// A commit whose directory is in another repository than the session's is "elsewhere" for the branch rule and the gate alike.
+			// A commit whose directory is in another repository than the session's is "elsewhere" for the branch rule.
 			const startsElsewhere = shell.cwd !== undefined && classifyCommand(command).some((match) => match.commit) && (await repoRoot(commandCwd)) !== (await repoRoot(projectRoot(ctx)));
 			const decision = await decideBashCommand({ command, mode, isChild, cwd: commandCwd, elsewhere: startsElsewhere, readFacts: (cwd) => readBranchFacts(exec, cwd) });
 			if (decision.action === "block") return { block: true, reason: decision.reason };
-			const gated = isChild ? undefined : await evidenceGate(command, ctx, commandCwd);
-			if (gated?.reason) return { block: true, reason: gated.reason };
-			// The PR gate shares the PR confirmation in normal mode (one dialog, the reasons and the note appended); in yolo it asks on its own, only for reasons.
+			// The PR gate shares the PR confirmation (every mode: a PR creation always asks; one dialog, the reasons and the note appended). It asks on its own only if the policy let a PR command run unasked.
 			const pr = isChild ? undefined : await prGate(command, commandCwd);
 			const prBlock = pr?.decision.action === "ask" ? { block: true as const, reason: prGateBlockMessage(pr.decision, pr.categories) } : undefined;
 			if (decision.action === "confirm") {
@@ -336,9 +300,6 @@ export default function (pi: ExtensionAPI) {
 				const ok = await confirm(ctx, "brigadev: PR risk gate", `${commandPreview(command)}\n\n${prGateDialogText(pr.decision)}\n\nOpen the PR anyway?`);
 				if (!ok) return prBlock;
 			}
-			// Every rule allowed the commit: only now is the user's force spent and logged.
-			gated?.settle();
-
 			// The command will run: remember the tree so tool_result can see what it changed.
 			if (surfaces) {
 				const snapshot = await takeSnapshot(exec, projectRoot(ctx));
@@ -414,19 +375,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("brigadev:force-commit", {
-		description: "Let the next git commit on the current working tree pass the evidence gate (one-shot; edits cancel it)",
-		handler: async (_args, ctx) => {
-			const result = await worktreeTreeResult(projectRoot(ctx));
-			if (result.kind === "no-git") return ctx.ui.notify("brigadev: not a git working tree, so the evidence gate does not apply", "error");
-			if (result.kind === "error") {
-				return ctx.ui.notify(`brigadev: the working tree could not be computed (${result.reason}), so a force cannot be bound to it. Use the dialog the guard shows when the commit is blocked, or fix git and try again.`, "error");
-			}
-			forcedTree = result.tree;
-			ctx.ui.notify("brigadev: the next commit of the current working tree skips the evidence gate. Editing any file first cancels this.", "info");
-		},
-	});
-
 	pi.registerCommand("brigadev:mode", {
 		description: "Permission mode: normal | yolo | default <normal|yolo> | status",
 		getArgumentCompletions: (prefix) => {
@@ -443,7 +391,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (isPermissionMode(first)) {
 				setMode(first, ctx);
-				return ctx.ui.notify(first === PERMISSION_MODE.YOLO ? "🚀 YOLO on: commits, pushes, and PRs run without asking; destructive commands still ask." : "brigadev: normal mode", "info");
+				return ctx.ui.notify(first === PERMISSION_MODE.YOLO ? "🚀 YOLO on: commits and issue writes run without asking; pushes, PR creation, and destructive commands still ask." : "brigadev: normal mode", "info");
 			}
 			if (first && first !== "status") return ctx.ui.notify("Usage: /brigadev:mode normal | yolo | default <normal|yolo> | status", "error");
 			if (!first && ctx.hasUI) {

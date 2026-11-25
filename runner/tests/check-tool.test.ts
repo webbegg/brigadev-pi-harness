@@ -1,4 +1,4 @@
-// A3, A4 (S5): the worker's `check` tool records evidence the commit gate trusts, and the gate decides the worker's commits
+// A3, A4 (S5): the worker's `check` tool records evidence (the PR loop's final check is the gate; commits are never gated on it),
 // end-to-end through the loop (faux model, fixture repo, evidence/docs dirs in a temp BRIGADEV_HOME so ~/.brigadev is never written).
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -104,7 +104,7 @@ describe("check tool (A3)", () => {
 	});
 });
 
-describe("commit gate end-to-end (A2, A4)", () => {
+describe("worker commits and evidence end-to-end (A2, A4)", () => {
 	const A_TS = "export const a = 1;\n";
 	const COMMIT = `git add -A && ${GIT_COMMIT} -m "add a.ts"`;
 	const TICKET = "- T1 [S1] inline: add a deps: none done: `test -f a.ts` — pending";
@@ -118,14 +118,11 @@ describe("commit gate end-to-end (A2, A4)", () => {
 		return { worker, outcome };
 	}
 
-	it("(a) a worker that commits without running `check` is blocked, the ticket retries and then fails", async () => {
+	it("(a) a worker that commits without running `check` is not blocked: the commit lands, nothing is recorded", async () => {
 		const { worker, outcome } = await run({ T1: [writeFile("a.ts", A_TS), bash(COMMIT)] });
-		assert.deepEqual(outcome, { status: "completed", result: { status: "stalled", waiting: ["T1"] } });
-		assert.equal(worker.prompts.length, 2, "two attempts");
-		const gate = worker.results.filter((r) => r.isError && /Blocked by brigadev evidence gate: no passing test is recorded/.test(r.text));
-		assert.equal(gate.length, 2, "the gate's reason reached the worker in each attempt");
-		assert.equal(git(ws.repo, "rev-list", "--count", "HEAD"), "1", "no commit was made");
-		assert.match(ticketLine(readDoc(ws), "T1"), /— blocked needs you: no commit/);
+		assert.deepEqual(outcome, { status: "completed", result: { status: "done", tickets: [{ id: "T1", status: "done" }] } });
+		assert.equal(worker.results.some((r) => r.isError), false);
+		assert.equal(git(ws.repo, "rev-list", "--count", "HEAD"), "2");
 		assert.equal(existsSync(evidencePath()), false, "nothing was recorded: the worker never ran check");
 	});
 
@@ -142,22 +139,6 @@ describe("commit gate end-to-end (A2, A4)", () => {
 		assert.ok(JSON.parse(readFileSync(evidencePath(), "utf8").split("\n")[0]).tree, "the run is bound to the working tree");
 	});
 
-	it("a worker that edits after `check` is blocked: the passing run no longer matches the tree", async () => {
-		const { worker } = await run({ T1: [writeFile("a.ts", A_TS), check(), writeFile("a.ts", `${A_TS}export const b = 2;\n`), bash(COMMIT)] });
-		assert.ok(worker.results.some((r) => r.isError && /evidence gate/.test(r.text)), "blocked by the gate");
-		assert.equal(git(ws.repo, "rev-list", "--count", "HEAD"), "1");
-	});
-
-	it("a failing `check` does not unlock the commit", async () => {
-		env.settings({ check: { test: "false" } });
-		writeFileSync(ws.docPath, docText([TICKET]));
-		const worker = makeWorker({ T1: [writeFile("a.ts", A_TS), check(), bash(COMMIT)] });
-		runner = await openFixtureRunner(ws, worker);
-		await runner.wait(await runner.start(ws.docPath, { maxAttempts: 1 }));
-		assert.match(worker.results[1].text, /^FAIL exit=1/);
-		assert.match(worker.results[2].text, /the last test run on this tree failed/);
-		assert.equal(git(ws.repo, "rev-list", "--count", "HEAD"), "1");
-	});
 
 	it("the worker cannot write the evidence log to forge a pass", async () => {
 		const forge = `echo '{"v":1,"type":"run","kind":"test","outcome":"pass"}' >> ${evidencePath()}`;

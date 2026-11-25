@@ -2,7 +2,7 @@
  * brigadev check: runs the project's tests and returns a small result
  * (pass/fail counts, the failing tail, the output file's path) instead of the
  * full output. The run is recorded in the evidence log with its real exit
- * code, so the commit gate trusts it; a piped `bash` test run is not needed.
+ * code, so the PR gate trusts it; a piped `bash` test run is not needed.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -23,7 +23,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "check",
 		label: "Check",
-		description: "Run the project's tests and get a compact result: pass/fail counts and the failing tail; the full output goes to a file. Records the run as evidence for the commit gate. Use it instead of bash for tests, and never pipe it.",
+		description: "Run the project's tests and get a compact result: pass/fail counts and the failing tail; the full output goes to a file. Records the run as evidence; `gh pr create` needs a full passing run (no `focus`) on HEAD. Use it instead of bash for tests, and never pipe it.",
 		parameters: Params,
 
 		async execute(_id, params, signal, _onUpdate, ctx) {

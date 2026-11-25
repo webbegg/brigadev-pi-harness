@@ -23,6 +23,8 @@ export interface CommandMatch {
 	hardDeny?: boolean;
 	/** A `git commit` (set on that match only; kind and reason are unchanged). */
 	commit?: boolean;
+	/** Delivery the user approves every time, whatever the mode (`git push`, `gh pr create`): yolo does not waive it. */
+	alwaysConfirm?: boolean;
 	/**
 	 * Set with `commit` when it may not run in the session's directory or on
 	 * its current branch: a preceding `cd`, branch switch, or `-C`/`--git-dir`/
@@ -493,8 +495,10 @@ function classifyGit(args: string[]): CommandMatch | undefined {
 			const forced = hasAny(rest, "--force", "-f", "--force-with-lease", "--mirror", "--delete", "-d", "--prune");
 			const forcedRefspec = rest.some((a) => !a.startsWith("-") && (a.startsWith("+") || a.startsWith(":")));
 			if (forced || forcedRefspec) return destructive("push rewrites or deletes remote refs");
-			return { kind: COMMAND_KIND.DELIVERY, reason: "git push" };
+			return { kind: COMMAND_KIND.DELIVERY, reason: "git push", alwaysConfirm: true };
 		}
+		case "subtree":
+			return rest[0] === "push" ? { kind: COMMAND_KIND.DELIVERY, reason: "git subtree push", alwaysConfirm: true } : undefined;
 		case "commit":
 			return { kind: COMMAND_KIND.DELIVERY, reason: hasAny(rest, "--amend") ? "git commit --amend" : "git commit", commit: true };
 		default:
@@ -502,26 +506,47 @@ function classifyGit(args: string[]): CommandMatch | undefined {
 	}
 }
 
+/**
+ * The group and action of a gh command (`gh <group> [--repo <o/r>] <action>`). `--repo`/`-R` is a persistent flag gh
+ * also accepts between the group and the action; `gh pr new` and `gh issue new` are gh's own aliases of `create`.
+ */
+export function ghGroupAction(args: readonly string[]): { group: string | undefined; action: string | undefined } {
+	const [group, ...rest] = args;
+	let i = 0;
+	while (i < rest.length) {
+		if (rest[i] === "-R" || rest[i] === "--repo") i += 2;
+		else if (/^(?:-R.+|--repo=.*)$/.test(rest[i])) i += 1;
+		else break;
+	}
+	const written = rest[i];
+	return { group, action: (group === "pr" || group === "issue") && written === "new" ? "create" : written };
+}
+
 function classifyGh(args: string[]): CommandMatch | undefined {
-	const [group, action] = args;
+	const { group, action = "" } = ghGroupAction(args);
 	if (group === "repo" && (action === "delete" || action === "archive")) {
 		return { kind: COMMAND_KIND.DESTRUCTIVE, reason: `gh repo ${action}` };
+	}
+	if (group === "repo" && action === "create" && args.includes("--push")) {
+		return { kind: COMMAND_KIND.DELIVERY, reason: "gh repo create --push", alwaysConfirm: true };
 	}
 	if ((group === "pr" && action === "merge") || (group === "release" && ["create", "delete", "upload", "edit"].includes(action))) {
 		return { kind: COMMAND_KIND.PUBLISH, reason: `gh ${group} ${action}` };
 	}
 	if ((group === "pr" || group === "issue") && ["create", "comment", "review", "edit", "close", "reopen"].includes(action)) {
-		return { kind: COMMAND_KIND.DELIVERY, reason: `gh ${group} ${action}` };
+		return { kind: COMMAND_KIND.DELIVERY, reason: `gh ${group} ${action}`, ...(group === "pr" && action === "create" ? { alwaysConfirm: true } : {}) };
 	}
 	if (group === "api") {
 		const all = args.slice(1);
 		const methodIndex = all.findIndex((a) => a === "-X" || a === "--method");
 		const method = methodIndex >= 0 ? all[methodIndex + 1]?.toUpperCase() : all.find((a) => a.startsWith("--method="))?.split("=")[1]?.toUpperCase();
 		if (method === "DELETE") return { kind: COMMAND_KIND.DESTRUCTIVE, reason: "gh api DELETE" };
+		const writes = (method !== undefined && method !== "GET") || all.some((a) => a === "-f" || a === "-F" || a === "--field" || a === "--raw-field" || a === "--input");
+		// A POST to a repo's pulls endpoint, or the GraphQL createPullRequest mutation, opens a PR like `gh pr create`.
+		const opensPr = all.some((a) => /^\/?repos\/[^/\s]+\/[^/\s]+\/pulls\/?$/.test(a)) || all.some((a) => /\bcreatePullRequest\b/.test(a));
+		if (writes && opensPr && method !== "PATCH" && method !== "PUT") return { kind: COMMAND_KIND.DELIVERY, reason: "gh api opens a PR", alwaysConfirm: true };
 		if (method && method !== "GET") return { kind: COMMAND_KIND.DELIVERY, reason: `gh api ${method}` };
-		if (all.some((a) => a === "-f" || a === "-F" || a === "--field" || a === "--raw-field")) {
-			return { kind: COMMAND_KIND.DELIVERY, reason: "gh api with fields (POST)" };
-		}
+		if (writes) return { kind: COMMAND_KIND.DELIVERY, reason: "gh api with fields (POST)" };
 	}
 	return undefined;
 }

@@ -67,3 +67,51 @@ describe("worktreeTreeResult sourceTree and root (S8b, S8c)", () => {
 		assert.equal(plain.kind === "tree" ? plain.sourceTree : "x", undefined);
 	});
 });
+
+describe("worktreeTreeResult of a commit (the PR evidence check keys HEAD like a test run keys the working tree)", () => {
+	const commitAll = (repo: string) => {
+		git(repo, "add", "-A");
+		git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x");
+	};
+	const headOf = async (repo: string) => {
+		const result = await worktreeTreeResult(repo, { sourceTree: true, commit: "HEAD" });
+		return result.kind === "tree" ? result : assert.fail(`no tree: ${JSON.stringify(result)}`);
+	};
+
+	it("equals the working-tree key of a clean checkout, source tree included", async () => {
+		const repo = repoWith({ "a.ts": "1", "README.md": "# r\n" });
+		commitAll(repo);
+		const work = await treeOf(repo);
+		const head = await headOf(repo);
+		assert.equal(head.tree, work.tree);
+		assert.equal(head.sourceTree, work.sourceTree);
+		assert.notEqual(head.sourceTree, head.tree, "docs are stripped from the source tree");
+		assert.equal(head.root, repo);
+		assert.equal(head.tree, git(repo, "rev-parse", "HEAD^{tree}"));
+	});
+
+	it("ignores uncommitted edits, which a working-tree key sees", async () => {
+		const repo = repoWith({ "a.ts": "1" });
+		commitAll(repo);
+		const before = await headOf(repo);
+		writeFileSync(join(repo, "a.ts"), "2");
+		writeFileSync(join(repo, "b.ts"), "new");
+		assert.deepEqual(await headOf(repo), before);
+		assert.notEqual((await treeOf(repo)).tree, before.tree);
+	});
+
+	it("writes nothing to the real object store or index", async () => {
+		const repo = repoWith({ "a.ts": "1", "N.md": "n" });
+		commitAll(repo);
+		const objects = git(repo, "count-objects", "-v");
+		const status = git(repo, "status", "--porcelain");
+		await headOf(repo);
+		assert.equal(git(repo, "count-objects", "-v"), objects);
+		assert.equal(git(repo, "status", "--porcelain"), status);
+	});
+
+	it("is an error for a commit that does not exist (an unborn branch)", async () => {
+		const repo = repoWith({ "a.ts": "1" });
+		assert.equal((await worktreeTreeResult(repo, { sourceTree: true, commit: "HEAD" })).kind, "error");
+	});
+});

@@ -13,7 +13,7 @@ Deciding what goes into each commit, creating or preparing a pull request, or sp
 ## Target and authorization
 
 - Establish one unambiguous target: `git remote get-url origin` → host and `owner/repo`. Never assume the default branch is `main`; read it from the remote.
-- Push and PR creation are separate human decisions. Preparing a candidate locally is not permission to deliver it. The runtime guard asks before `git push` and `gh pr create` in normal mode.
+- Push and PR creation are separate human decisions. Preparing a candidate locally is not permission to deliver it. The runtime guard asks before every `git push` and `gh pr create`, in every mode.
 - Read the target's contribution policy first: `CONTRIBUTING.md`, `.github/PULL_REQUEST_TEMPLATE.md`, required labels, and required CI.
 
 ## Workflow
@@ -78,7 +78,8 @@ Add `Closes #N` or `Refs #N` only when the user named an issue. Record only comm
 The log is `<repo docs>/evidence/<branch with / as ->.jsonl`, in the repo docs folder named in the orchestrator prompt. Read it with `read` or `grep`; it is JSON lines, and the guard blocks writing it, so never edit it.
 
 - `type:"run"` records: `command`, `kind` (`test` or `check`), `exitCode`, `outcome` (`pass`, `fail`, or `unknown`), `ts`, `tree`, `srcTree` (the tree without doc paths), `root` (the repository the run belongs to; a nested repository's own, not the session's), `agent`, and `tail` (the end of the output).
-- `type:"force"` records: the user forced a commit past the evidence gate. State this in the body under Forced commits, with its time; never leave it out.
+- `type:"force"` records (older logs only; the commit gate is gone): the user forced a commit past it. State this in the body under Forced commits, with its time; never leave it out.
+- Before `gh pr create`, the guard needs a passing full-suite `check` (no `focus`) on the committed HEAD: commit everything, run `check`, then open the PR.
 - Before: the earliest `fail` run for the bug or the RED test, quoting its `command` and what `tail` shows. Without one (no bug, or nothing was recorded), write `none recorded` instead of inventing it.
 - After: the latest `pass` run, quoting `command` and `outcome`. Prefer a `test` run whose `tree` is the final one. A run is also valid for the final tree when its `srcTree` equals the final tree's source tree (only docs changed after it); if a source edit came after it, say so.
 - Quote commands as the model ran them, without the `set -o pipefail; ` the harness puts in front of a piped test run (it is not part of the command), and outcomes as logged. Treat `unknown` as not verified. Never claim a check that is not in the log; a check you ran outside the log may be listed as run without a log record.

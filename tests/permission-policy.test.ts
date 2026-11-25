@@ -12,10 +12,40 @@ describe("decideCommand", () => {
 		assert.equal(decide("npm test", PERMISSION_MODE.NORMAL, true), "allow");
 	});
 
-	it("asks before delivery in normal mode only", () => {
+	it("asks before delivery in normal mode; yolo waives commits and issue writes", () => {
 		assert.equal(decide("git commit -m x"), "confirm");
 		assert.equal(decide("git commit -m x", PERMISSION_MODE.YOLO), "allow");
-		assert.equal(decide("gh pr create --fill", PERMISSION_MODE.YOLO), "allow");
+		assert.equal(decide("gh issue create --fill", PERMISSION_MODE.YOLO), "allow");
+	});
+
+	it("a push and a PR creation always ask the user, in yolo too, and chained after a waived commit", () => {
+		for (const command of ["git push", "git push -u origin feat/x", "gh pr create --fill", "gh pr new --fill", "git commit -m x && git push"]) {
+			assert.equal(decide(command, PERMISSION_MODE.NORMAL), "confirm", command);
+			assert.equal(decide(command, PERMISSION_MODE.YOLO), "confirm", command);
+		}
+		assert.match(MODE_PROMPT.yolo, /push.*PR creation.*always ask/i);
+	});
+
+	it("every other form that opens a PR or pushes asks too: gh's --repo before the action, the API, subtree, repo create --push", () => {
+		for (const command of [
+			"gh pr --repo o/r create --fill",
+			"gh pr -R o/r create --fill",
+			"gh pr --repo=o/r new --fill",
+			"gh pr -Ro/r create",
+			"gh api repos/o/r/pulls -f title=x -f head=a -f base=main",
+			"gh api -X POST /repos/o/r/pulls --input pr.json",
+			"gh api graphql -f query='mutation { createPullRequest(input: {}) { pullRequest { url } } }'",
+			"git subtree push --prefix dist origin gh-pages",
+			"gh repo create x --source . --push",
+		]) {
+			assert.equal(decide(command, PERMISSION_MODE.NORMAL), "confirm", command);
+			assert.equal(decide(command, PERMISSION_MODE.YOLO), "confirm", command);
+		}
+		for (const command of ["gh pr --repo o/r view 3", "gh api repos/o/r/pulls", "gh repo create x --source ."]) {
+			assert.notEqual(decide(command, PERMISSION_MODE.YOLO), "confirm", command);
+		}
+		assert.equal(decide("gh issue -R o/r create -t x", PERMISSION_MODE.YOLO), "allow", "issue writes stay unasked in yolo");
+		assert.equal(decide("gh issue -R o/r create -t x", PERMISSION_MODE.NORMAL), "confirm");
 	});
 
 	it("keeps destructive, publish, and privileged confirmations in yolo", () => {
