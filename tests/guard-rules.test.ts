@@ -553,9 +553,10 @@ describe("bg_start is guarded exactly like bash", () => {
 		assert.deepEqual(result.asked, []);
 	});
 
-	it("asks in normal mode and not for ordinary delivery in yolo, as bash does", async () => {
+	it("asks for a push in both modes and not for ordinary delivery in yolo, as bash does", async () => {
 		assert.deepEqual((await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true })).asked, ["brigadev: git push"]);
-		assert.deepEqual(await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true, yolo: true }), { reason: undefined, asked: [] });
+		assert.deepEqual((await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true, yolo: true })).asked, ["brigadev: git push"], "a push always asks");
+		assert.deepEqual(await outcome("bg_start", { command: "gh issue create --fill" }, { hasUI: true, answer: true, yolo: true }), { reason: undefined, asked: [] });
 		assert.deepEqual((await outcome("bg_start", { command: "rm -rf build" }, { hasUI: true, answer: true, yolo: true })).asked.length, 1, "destructive still asks in yolo");
 	});
 

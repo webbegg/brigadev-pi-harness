@@ -10,7 +10,7 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
 /** One line per mode, sent to the model as a context message when a session starts and when the mode changes (never in the system prompt). */
 export const MODE_PROMPT: Record<PermissionMode, string> = {
 	normal: "Permission mode NORMAL: the guard asks the user before commits on the default branch, pushes, PR/issue writes, and destructive, publish, privileged, or dependency commands. Run the command; don't ask in chat first.",
-	yolo: "Permission mode YOLO: commits, non-force pushes, and PR/issue creation run without asking; destructive, publish, privileged, and dependency (install) commands still ask.",
+	yolo: "Permission mode YOLO: commits and issue writes run without asking; pushes and PR creation always ask; destructive, publish, privileged, and dependency (install) commands still ask.",
 };
 
 export type Decision = { action: "allow" } | { action: "confirm"; reason: string } | { action: "block"; reason: string };
@@ -23,9 +23,10 @@ export type Decision = { action: "allow" } | { action: "confirm"; reason: string
  *   publish, privileged, or dependency commands: delivery is parent-owned.
  * - NORMAL asks before every risky kind (commits on feature branches are
  *   waived by `decideWithBranchRule` in commit-branch.ts).
- * - YOLO gives standing permission for ordinary delivery (commits,
- *   non-force pushes, PR/issue creation) but still asks for destructive,
- *   publish, privileged, and dependency commands.
+ * - YOLO gives standing permission for ordinary delivery (commits, issue
+ *   writes, PR comments) but still asks for destructive, publish, privileged,
+ *   and dependency commands, and for every push and PR creation
+ *   (`alwaysConfirm`): those leave the machine only with the user's yes.
  */
 export function decideCommand(matches: CommandMatch[], mode: PermissionMode, isChild: boolean): Decision {
 	if (matches.length === 0) return { action: "allow" };
@@ -36,7 +37,7 @@ export function decideCommand(matches: CommandMatch[], mode: PermissionMode, isC
 	if (isChild) {
 		return { action: "block", reason: `Blocked by brigadev guard: subagents may not run this (${reasons}). Report it to the parent instead.` };
 	}
-	const needsConfirmation = matches.filter((m) => mode === PERMISSION_MODE.NORMAL || m.kind !== COMMAND_KIND.DELIVERY);
+	const needsConfirmation = matches.filter((m) => mode === PERMISSION_MODE.NORMAL || m.kind !== COMMAND_KIND.DELIVERY || m.alwaysConfirm);
 	if (needsConfirmation.length === 0) return { action: "allow" };
 	return { action: "confirm", reason: [...new Set(needsConfirmation.map((m) => m.reason))].join("; ") };
 }

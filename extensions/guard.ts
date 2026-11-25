@@ -289,7 +289,7 @@ export default function (pi: ExtensionAPI) {
 			const startsElsewhere = shell.cwd !== undefined && classifyCommand(command).some((match) => match.commit) && (await repoRoot(commandCwd)) !== (await repoRoot(projectRoot(ctx)));
 			const decision = await decideBashCommand({ command, mode, isChild, cwd: commandCwd, elsewhere: startsElsewhere, readFacts: (cwd) => readBranchFacts(exec, cwd) });
 			if (decision.action === "block") return { block: true, reason: decision.reason };
-			// The PR gate shares the PR confirmation in normal mode (one dialog, the reasons and the note appended); in yolo it asks on its own, only for reasons.
+			// The PR gate shares the PR confirmation (every mode: a PR creation always asks; one dialog, the reasons and the note appended). It asks on its own only if the policy let a PR command run unasked.
 			const pr = isChild ? undefined : await prGate(command, commandCwd);
 			const prBlock = pr?.decision.action === "ask" ? { block: true as const, reason: prGateBlockMessage(pr.decision, pr.categories) } : undefined;
 			if (decision.action === "confirm") {

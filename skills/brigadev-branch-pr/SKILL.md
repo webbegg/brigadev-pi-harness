@@ -13,7 +13,7 @@ Deciding what goes into each commit, creating or preparing a pull request, or sp
 ## Target and authorization
 
 - Establish one unambiguous target: `git remote get-url origin` → host and `owner/repo`. Never assume the default branch is `main`; read it from the remote.
-- Push and PR creation are separate human decisions. Preparing a candidate locally is not permission to deliver it. The runtime guard asks before `git push` and `gh pr create` in normal mode.
+- Push and PR creation are separate human decisions. Preparing a candidate locally is not permission to deliver it. The runtime guard asks before every `git push` and `gh pr create`, in every mode.
 - Read the target's contribution policy first: `CONTRIBUTING.md`, `.github/PULL_REQUEST_TEMPLATE.md`, required labels, and required CI.
 
 ## Workflow

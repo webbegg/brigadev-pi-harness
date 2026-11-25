@@ -12,10 +12,18 @@ describe("decideCommand", () => {
 		assert.equal(decide("npm test", PERMISSION_MODE.NORMAL, true), "allow");
 	});
 
-	it("asks before delivery in normal mode only", () => {
+	it("asks before delivery in normal mode; yolo waives commits and issue writes", () => {
 		assert.equal(decide("git commit -m x"), "confirm");
 		assert.equal(decide("git commit -m x", PERMISSION_MODE.YOLO), "allow");
-		assert.equal(decide("gh pr create --fill", PERMISSION_MODE.YOLO), "allow");
+		assert.equal(decide("gh issue create --fill", PERMISSION_MODE.YOLO), "allow");
+	});
+
+	it("a push and a PR creation always ask the user, in yolo too, and chained after a waived commit", () => {
+		for (const command of ["git push", "git push -u origin feat/x", "gh pr create --fill", "gh pr new --fill", "git commit -m x && git push"]) {
+			assert.equal(decide(command, PERMISSION_MODE.NORMAL), "confirm", command);
+			assert.equal(decide(command, PERMISSION_MODE.YOLO), "confirm", command);
+		}
+		assert.match(MODE_PROMPT.yolo, /push.*PR creation.*always ask/i);
 	});
 
 	it("keeps destructive, publish, and privileged confirmations in yolo", () => {

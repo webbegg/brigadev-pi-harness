@@ -220,8 +220,8 @@ describe("classifyCommand commit details", () => {
 	});
 
 	it("leaves other matches without the new fields", () => {
-		assert.deepEqual(classifyCommand("git push"), [{ kind: "delivery", reason: "git push" }]);
-		assert.deepEqual(classifyCommand("cd x && git push"), [{ kind: "delivery", reason: "git push" }]);
+		assert.deepEqual(classifyCommand("git push"), [{ kind: "delivery", reason: "git push", alwaysConfirm: true }]);
+		assert.deepEqual(classifyCommand("cd x && git push"), [{ kind: "delivery", reason: "git push", alwaysConfirm: true }]);
 	});
 });
 

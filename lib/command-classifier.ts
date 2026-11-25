@@ -23,6 +23,8 @@ export interface CommandMatch {
 	hardDeny?: boolean;
 	/** A `git commit` (set on that match only; kind and reason are unchanged). */
 	commit?: boolean;
+	/** Delivery the user approves every time, whatever the mode (`git push`, `gh pr create`): yolo does not waive it. */
+	alwaysConfirm?: boolean;
 	/**
 	 * Set with `commit` when it may not run in the session's directory or on
 	 * its current branch: a preceding `cd`, branch switch, or `-C`/`--git-dir`/
@@ -493,7 +495,7 @@ function classifyGit(args: string[]): CommandMatch | undefined {
 			const forced = hasAny(rest, "--force", "-f", "--force-with-lease", "--mirror", "--delete", "-d", "--prune");
 			const forcedRefspec = rest.some((a) => !a.startsWith("-") && (a.startsWith("+") || a.startsWith(":")));
 			if (forced || forcedRefspec) return destructive("push rewrites or deletes remote refs");
-			return { kind: COMMAND_KIND.DELIVERY, reason: "git push" };
+			return { kind: COMMAND_KIND.DELIVERY, reason: "git push", alwaysConfirm: true };
 		}
 		case "commit":
 			return { kind: COMMAND_KIND.DELIVERY, reason: hasAny(rest, "--amend") ? "git commit --amend" : "git commit", commit: true };
@@ -513,7 +515,7 @@ function classifyGh(args: string[]): CommandMatch | undefined {
 		return { kind: COMMAND_KIND.PUBLISH, reason: `gh ${group} ${action}` };
 	}
 	if ((group === "pr" || group === "issue") && ["create", "comment", "review", "edit", "close", "reopen"].includes(action)) {
-		return { kind: COMMAND_KIND.DELIVERY, reason: `gh ${group} ${action}` };
+		return { kind: COMMAND_KIND.DELIVERY, reason: `gh ${group} ${action}`, ...(group === "pr" && action === "create" ? { alwaysConfirm: true } : {}) };
 	}
 	if (group === "api") {
 		const all = args.slice(1);
