@@ -354,19 +354,38 @@ function isScratchPath(target: string): boolean {
 	return canonical.some((root) => inside(resolved, root));
 }
 
-/** Names a default `mktemp` (in the temp dir: no template, no `-p`/`--tmpdir=<dir>`) assigns exactly once in the command, never reassigned or read into. */
+/**
+ * Shell features that can change a variable, or what `mktemp` runs, without a plain `NAME=` in the text: evaluated or
+ * sourced code, functions and aliases, builtins that write a named variable (`printf -v`, `read`, `mapfile`, `select`),
+ * declarations and namerefs, `IFS` (word splitting) and `PATH`. With any of them the variable rules do not apply.
+ */
+const SHELL_INDIRECTION =
+	/\b(?:eval|source|alias|function|declare|typeset|local|readonly|unset|export\s+-|printf|read|readarray|mapfile|select|wait|getopts|trap|enable|builtin|hash|set)\b|[A-Za-z0-9_]\s*\(\s*\)|(?:^|[;&|(){}\n]\s*)\.\s|\bIFS\b|\bPATH\+?=|\bBASH_ENV\b/;
+
+/** Shell variables a script inherits or the shell itself sets: never trusted as a mktemp variable. */
+const SHELL_VARIABLES = new Set(["PWD", "OLDPWD", "HOME", "IFS", "PATH", "CDPATH", "SHELL", "TMPDIR", "RANDOM", "SECONDS", "LINENO", "REPLY", "OPTARG", "OPTIND", "PPID", "UID", "EUID", "HOSTNAME"]);
+
+/**
+ * An identifier occurrence, not part of a longer name or an option (`cd` and `-d` are not `d`). The builtins that take a
+ * variable name glued to an option (`printf -vd`, `read -ad`, `wait -pd`) are in SHELL_INDIRECTION.
+ */
+const nameOccurs = (text: string, name: string) => new RegExp(`(?<![A-Za-z0-9_-])${name}(?![A-Za-z0-9_])`).test(text);
+
+/**
+ * The variable a default `mktemp` (in the temp dir: no template, no `-p`/`--tmpdir=<dir>`) assigns as the command's
+ * first statement (`d=$(mktemp -d) && …`, `;`, or a newline after it), when every other mention of it is a quoted read
+ * (`"$d"`, `"${d}"`, `"$d/…`): no reassignment, no unquoted or `${d:=…}` expansion, no feature in SHELL_INDIRECTION.
+ */
 function mktempVariables(command: string): Set<string> {
 	const names = new Set<string>();
-	const assignment = /(?:^|[\s;&|(])(?:(?:export|local|declare|readonly)\s+)?([A-Za-z_][A-Za-z0-9_]*)=(["']?)(?:\$\(\s*mktemp((?:\s+[^\s)`]+)*)\s*\)|`\s*mktemp((?:\s+[^\s)`]+)*)\s*`)\2(?=$|[\s;&|)])/g;
-	for (const found of command.matchAll(assignment)) {
-		const [, name, , dollar, backtick] = found;
-		if (defaultMktemp((dollar ?? backtick ?? "").trim().split(/\s+/).filter(Boolean))) names.add(name);
-	}
-	for (const name of [...names]) {
-		const assigned = command.match(new RegExp(`(?:^|[\\s;&|(])${name}=`, "g"))?.length ?? 0;
-		const rebound = new RegExp(`\\b(?:for\\s+${name}\\b|read\\b[^;&|]*\\b${name}\\b|getopts\\b[^;&|]*\\b${name}\\b)`).test(command);
-		if (assigned !== 1 || rebound) names.delete(name);
-	}
+	const first = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=("?)(?:\$\(\s*mktemp((?:\s+[^\s)`'"$]+)*)\s*\)|`\s*mktemp((?:\s+[^\s)`'"$]+)*)\s*`)\2[ \t]*(?:&&|;|\n)/.exec(command);
+	if (!first || SHELL_INDIRECTION.test(command)) return names;
+	const [assignment, name, , dollar, backtick] = first;
+	if (name in process.env || SHELL_VARIABLES.has(name) || name.startsWith("BASH")) return names;
+	if (!defaultMktemp((dollar ?? backtick ?? "").trim().split(/\s+/).filter(Boolean))) return names;
+	const reads = new RegExp(`"\\$(?:${name}|\\{${name}\\})(?=["/])`, "g");
+	if (nameOccurs(command.slice(assignment.length).replace(reads, ""), name)) return names;
+	names.add(name);
 	return names;
 }
 
@@ -378,7 +397,7 @@ function defaultMktemp(words: string[]): boolean {
 		if (!/^-[dqt]+$/.test(word)) return false;
 		if (word.includes("t")) {
 			const prefix = words[++i];
-			if (prefix === undefined || prefix.startsWith("-") || prefix.includes("/")) return false;
+			if (prefix === undefined || prefix.startsWith("-") || prefix.includes("/") || prefix.includes("..")) return false;
 		}
 	}
 	return true;
@@ -387,14 +406,16 @@ function defaultMktemp(words: string[]): boolean {
 /** What a delete may target without asking, given the command around it: a temp path, `$TMPDIR/<path>`, or a bare mktemp variable. */
 interface ScratchContext {
 	mktemp: ReadonlySet<string>;
-	/** `$TMPDIR` as the shell will expand it: the guard's own, unless the command sets it. */
+	/** `$TMPDIR` as the shell will expand it: the guard's own, when every mention of it in the command is a `$TMPDIR/…` read. */
 	tmpdir?: string;
 }
 
 function scratchContext(command: string): ScratchContext {
 	const inherited = process.env.TMPDIR?.replace(/\/+$/, "");
-	const setsTmpdir = /(?:^|[\s;&|(])TMPDIR=|\b(?:read|for|unset|getopts)\b[^;&|]*\bTMPDIR\b/.test(command);
-	return { mktemp: mktempVariables(command), tmpdir: inherited && !setsTmpdir ? inherited : undefined };
+	// Unquoted reads are allowed, so the value itself must not split or glob.
+	const plain = inherited !== undefined && /^\/[^\s*?[\]{}$`\\'"]+$/.test(inherited);
+	const changes = nameOccurs(command.replace(/\$(?:TMPDIR|\{TMPDIR\})\//g, ""), "TMPDIR") || SHELL_INDIRECTION.test(command);
+	return { mktemp: mktempVariables(command), tmpdir: plain && !changes ? inherited : undefined };
 }
 
 function isScratchTarget(target: string, context: ScratchContext): boolean {

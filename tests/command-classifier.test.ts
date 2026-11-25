@@ -56,7 +56,9 @@ describe("classifyCommand", () => {
 			for (const command of [
 				'd=$(mktemp -d) && cp -R src "$d" && rm -rf "$d"',
 				'tmp="$(mktemp -d -t brig)"; npm test; rm -rf "$tmp"',
-				"d=`mktemp -d` && rm -rf $d",
+				'd=`mktemp -d` && rm -rf "$d"',
+				'd=$(mktemp -d) && cp -R src "$d/" && ls "$d/src" "${d}/x" && rm -rf "$d"',
+				'd=$(mktemp -d)\ncd "$d"\nrm -rf "$d"',
 				'd=$(mktemp -dt brig) && rm -rf "${d}"',
 				'f=$(mktemp) && echo x > "$f" && rm -f "$f"',
 				'export D=$(mktemp -d -q) && rm -rf "$D"',
@@ -80,6 +82,59 @@ describe("classifyCommand", () => {
 			]) {
 				assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
 			}
+		});
+
+		it("still asks when the mktemp variable could hold anything else (adversarial review)", () => {
+			for (const command of [
+				'PWD=$(mktemp -d) rm -rf "$PWD"',
+				'(PWD=$(mktemp -d)); rm -rf "$PWD"',
+				'(d=$(mktemp -d)); rm -rf "$d"',
+				'false && d=$(mktemp -d); rm -rf "$d"',
+				'# d=$(mktemp -d)\nrm -rf "$d"',
+				'echo "d=$(mktemp -d)"; rm -rf "$d"',
+				'f() { d=$(mktemp -d); }; rm -rf "$d"',
+				'mktemp() { echo "$HOME"; }; d=$(mktemp -d); rm -rf "$d"',
+				'd=$(mktemp -d); mktemp() { :; }; rm -rf "$d"',
+				'd=$(mktemp -d) || d=/; rm -rf "$d"',
+				'd=$(mktemp -d) rm -rf "$d"',
+				'd=$(mktemp -d); d+=/../../../..; rm -rf "$d"',
+				'd=$(mktemp -d); d[0]=/etc; rm -rf "$d"',
+				'd=$(mktemp -d); printf -v d %s "$HOME"; rm -rf "$d"',
+				'd=$(mktemp -d); printf -vd %s "$HOME"; rm -rf "$d"',
+				'd=$(mktemp -d); read -ad < x; rm -rf "$d"',
+				'd=$(mktemp -d); readarray -t d <<< "$HOME"; rm -rf "$d"',
+				'd=$(mktemp -d); mapfile -t d < x; rm -rf "$d"',
+				'd=$(mktemp -d); eval "d=$HOME"; rm -rf "$d"',
+				'd=$(mktemp -d); declare "d=$HOME"; rm -rf "$d"',
+				'd=$(mktemp -d); x=d; declare -n r=$x; r=/etc; rm -rf "$d"',
+				'd=$(mktemp -d); select d in /etc; do break; done; rm -rf "$d"',
+				'd=$(mktemp -d); source ./env.sh; rm -rf "$d"',
+				'd=$(mktemp -d); . ./env.sh; rm -rf "$d"',
+				'd=$(mktemp -d); IFS=/; rm -rf $d',
+				'd=$(mktemp -d) && rm -rf $d',
+				'd=$(mktemp -d) && rm -rf "${d:=/etc}"',
+				'd=$(mktemp -dt ..) && rm -rf "$d"',
+				'HOME=$(mktemp -d) && rm -rf "$HOME"',
+			]) {
+				assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+			}
+		});
+
+		it("still asks for $TMPDIR when the command could change it (adversarial review)", () => {
+			withTmpdir(tmp, () => {
+				for (const command of [
+					'TMPDIR+=/../../../..; rm -rf "$TMPDIR/Users"',
+					'eval "TMPDIR=$HOME"; rm -rf "$TMPDIR/project"',
+					'printf -v TMPDIR %s "$HOME"; rm -rf "$TMPDIR/project"',
+					'source ./env.sh; rm -rf "$TMPDIR/project"',
+					'. ./env.sh && rm -rf "$TMPDIR/project"',
+					'env TMPDIR=/ rm -rf $TMPDIR/x',
+					'IFS=/; rm -rf $TMPDIR/x',
+					'rm -rf "${TMPDIR:=/}/x"',
+				]) {
+					assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+				}
+			});
 		});
 
 		it("still asks for /tmp itself, escapes, globs, look-alikes, and mixed targets", () => {
