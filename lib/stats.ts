@@ -6,6 +6,8 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { formatCost, formatTokens } from "./cost.ts";
 import type { EvidenceRecord } from "./evidence.ts";
+import { OUTCOMES, type Outcome } from "./retro.ts";
+import { runStatus } from "./run-status.ts";
 
 /** A turn whose context (input + cacheRead + cacheWrite) is above this is "large". */
 export const LARGE_CONTEXT = 200_000;
@@ -53,6 +55,15 @@ export interface Stats {
 	blocks: number;
 	/** Undefined when no session was selected. */
 	evidence: { pass: number; fail: number; unknown: number; forces: number } | undefined;
+	/** The `Outcome:` of every closing message, overall and per workflow the request started from (sorted by name). */
+	outcomes: { counts: Record<Outcome, number>; byWorkflow: Array<{ workflow: string; counts: Record<Outcome, number> }> };
+	/** Subagent runs that failed or ended without a result, per agent (most first). */
+	failedRuns: Array<[string, number]>;
+}
+
+export interface StatsOptions {
+	/** Workflow request line ("Bug fix request") to the workflow's name (`readWorkflowNames`). */
+	workflows?: ReadonlyMap<string, string>;
 }
 
 export function parseJsonl(text: string): unknown[] {
@@ -172,6 +183,73 @@ export function classifyTurn(calls: ToolCall[]): Phase {
 	return PHASE_PRIORITY.find((p) => phases.has(p)) ?? "other";
 }
 
+// --- outcomes ---
+
+/** The close line `Outcome: <word>`, plain or in markdown (`**Outcome:** blocked`); the vocabulary in parentheses does not match. */
+const OUTCOME_LINE = /\boutcome:[*_`\s]*(success|flawed|blocked|manual)\b/gi;
+/** The first line of a request composed by the workflow menu (lib/workflow-run.ts, the workflow body's first line). */
+const WORKFLOW_REQUEST = /^(.+? request), started from the workflow menu\./;
+
+/** The last outcome a message states, or undefined. */
+export function lastOutcome(text: string): Outcome | undefined {
+	let last: Outcome | undefined;
+	for (const match of text.matchAll(OUTCOME_LINE)) last = match[1].toLowerCase() as Outcome;
+	return last;
+}
+
+/** Request line ("Bug fix request") to workflow name ("Bug fix") from workflow files' contents; a later file wins. */
+export function workflowNames(contents: readonly string[]): Map<string, string> {
+	const names = new Map<string, string>();
+	for (const content of contents) {
+		const parts = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(content);
+		const name = parts && /^name:\s*(.+?)\s*$/m.exec(parts[1])?.[1].replace(/^(["'])(.*)\1$/, "$2");
+		const marker = parts && WORKFLOW_REQUEST.exec(parts[2].trimStart())?.[1];
+		if (name && marker) names.set(marker, name);
+	}
+	return names;
+}
+
+/** `workflowNames` of every `*.md` in the folders, in order (package, user, repo: overrides last). */
+export function readWorkflowNames(dirs: readonly string[]): Map<string, string> {
+	const contents: string[] = [];
+	for (const dir of dirs) {
+		if (!existsSync(dir)) continue;
+		for (const name of readdirSync(dir).sort()) {
+			if (!name.endsWith(".md")) continue;
+			try {
+				contents.push(readFileSync(join(dir, name), "utf8"));
+			} catch {
+				// One unreadable file does not hide the rest.
+			}
+		}
+	}
+	return workflowNames(contents);
+}
+
+/** The workflow a user message was started from, by name when its file is known, else from its request line. */
+function requestWorkflow(text: string, names: ReadonlyMap<string, string>): string | undefined {
+	const marker = WORKFLOW_REQUEST.exec(text.trimStart())?.[1];
+	return marker && (names.get(marker) ?? marker.replace(/ request$/, ""));
+}
+
+const emptyOutcomes = (): Record<Outcome, number> => Object.fromEntries(OUTCOMES.map((o) => [o, 0])) as Record<Outcome, number>;
+
+/** Agents of the subagent runs in one `subagent` tool result that failed, or finished with neither a structured result nor final text. */
+function failedRunAgents(details: unknown): string[] {
+	const results = record(details)?.results;
+	if (!Array.isArray(results)) return [];
+	return results.flatMap((item) => {
+		const r = record(item);
+		if (!r || typeof r.agent !== "string" || typeof r.exitCode !== "number") return [];
+		const status = runStatus(r as Parameters<typeof runStatus>[0]);
+		if (status === "failed") return [r.agent];
+		// Without the messages there is no telling whether it answered.
+		if (status !== "done" || r.structured !== undefined || !Array.isArray(r.messages)) return [];
+		const answered = r.messages.some((m) => record(m)?.role === "assistant" && textOf(record(m)?.content).trim() !== "");
+		return answered ? [] : [r.agent];
+	});
+}
+
 // --- stats ---
 
 interface Turn {
@@ -220,7 +298,7 @@ function toTurn(entry: Record<string, unknown>, message: Record<string, unknown>
 
 const emptyPhases = (): Record<Phase, PhaseTotal> => Object.fromEntries(PHASES.map((p) => [p, { turns: 0, cost: 0 }])) as Record<Phase, PhaseTotal>;
 
-export function computeStats(sessions: SessionLog[], evidence: EvidenceRecord[]): Stats {
+export function computeStats(sessions: SessionLog[], evidence: EvidenceRecord[], options: StatsOptions = {}): Stats {
 	const stats: Stats = {
 		sessions: sessions.length,
 		sessionRows: [],
@@ -240,7 +318,12 @@ export function computeStats(sessions: SessionLog[], evidence: EvidenceRecord[])
 		tools: [],
 		blocks: 0,
 		evidence: undefined,
+		outcomes: { counts: emptyOutcomes(), byWorkflow: [] },
+		failedRuns: [],
 	};
+	const workflowNamesMap = options.workflows ?? new Map<string, string>();
+	const byWorkflow = new Map<string, Record<Outcome, number>>();
+	const failedRuns = new Map<string, number>();
 	const contexts: number[] = [];
 	const toolCounts = new Map<string, number>();
 	let largeCost = 0;
@@ -249,6 +332,8 @@ export function computeStats(sessions: SessionLog[], evidence: EvidenceRecord[])
 
 	for (const session of sessions) {
 		let previous: Turn | undefined;
+		// The workflow of the latest request started from the menu; outcomes after it count for it.
+		let workflow: string | undefined;
 		const row = { id: session.id, start: "", turns: 0, cost: 0 };
 		for (const raw of session.entries) {
 			const entry = record(raw);
@@ -262,9 +347,12 @@ export function computeStats(sessions: SessionLog[], evidence: EvidenceRecord[])
 			}
 			const message = entry.type === "message" ? record(entry.message) : undefined;
 			if (!message) continue;
-			if (message.role === "user") stats.userMessages++;
-			else if (message.role === "toolResult") {
+			if (message.role === "user") {
+				stats.userMessages++;
+				workflow = requestWorkflow(textOf(message.content), workflowNamesMap) ?? workflow;
+			} else if (message.role === "toolResult") {
 				if (textOf(message.content).includes(GATE_BLOCK)) stats.blocks++;
+				if (message.toolName === "subagent") for (const agent of failedRunAgents(message.details)) failedRuns.set(agent, (failedRuns.get(agent) ?? 0) + 1);
 			} else if (message.role === "assistant") {
 				const turn = toTurn(entry, message);
 				if (!turn) continue;
@@ -290,6 +378,16 @@ export function computeStats(sessions: SessionLog[], evidence: EvidenceRecord[])
 				stats.phases[phase].turns++;
 				stats.phases[phase].cost += turn.cost;
 				for (const call of turn.calls) toolCounts.set(call.name, (toolCounts.get(call.name) ?? 0) + 1);
+				// A message without tool calls closes the turn: the parent's final text, where the close line sits.
+				const outcome = turn.calls.length === 0 ? lastOutcome(textOf(message.content)) : undefined;
+				if (outcome) {
+					stats.outcomes.counts[outcome]++;
+					if (workflow !== undefined) {
+						const counts = byWorkflow.get(workflow) ?? emptyOutcomes();
+						counts[outcome]++;
+						byWorkflow.set(workflow, counts);
+					}
+				}
 				previous = turn;
 			}
 		}
@@ -303,6 +401,8 @@ export function computeStats(sessions: SessionLog[], evidence: EvidenceRecord[])
 	}
 	stats.costShareOver200k = stats.cost > 0 ? largeCost / stats.cost : 0;
 	stats.tools = [...toolCounts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, TOP_TOOLS);
+	stats.outcomes.byWorkflow = [...byWorkflow].sort((a, b) => a[0].localeCompare(b[0])).map(([name, counts]) => ({ workflow: name, counts }));
+	stats.failedRuns = [...failedRuns].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 	if (sessions.length > 0) stats.evidence = summarizeEvidence(evidence, first, last + EVIDENCE_TAIL_MS);
 	return stats;
 }
@@ -352,6 +452,18 @@ export function renderStats(stats: Stats, scope: string): string[] {
 		const e = stats.evidence;
 		lines.push("evidence");
 		lines.push(`  runs: ${e.pass} pass · ${e.fail} fail · ${e.unknown} unknown · forces ${e.forces} · blocks ${stats.blocks}`);
+	}
+	const closed = OUTCOMES.reduce((sum, o) => sum + stats.outcomes.counts[o], 0);
+	if (closed > 0) {
+		lines.push("outcomes");
+		lines.push(`  ${closed} closed · ${OUTCOMES.map((o) => `${o} ${stats.outcomes.counts[o]} (${pct(stats.outcomes.counts[o] / closed)})`).join(" · ")}`);
+		for (const { workflow, counts } of stats.outcomes.byWorkflow) {
+			lines.push(`  ${workflow}: ${OUTCOMES.filter((o) => counts[o] > 0).map((o) => `${o} ${counts[o]}`).join(" · ")}`);
+		}
+	}
+	if (stats.failedRuns.length > 0) {
+		lines.push("subagent runs failed or without a result");
+		lines.push(`  ${stats.failedRuns.map(([agent, count]) => `${agent} ×${count}`).join(" · ")}`);
 	}
 	if (stats.sessionRows.length > 1) {
 		lines.push(`sessions (top ${Math.min(TOP_SESSIONS, stats.sessionRows.length)} by cost)`);
