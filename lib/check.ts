@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyCommand, COMMAND_KIND } from "./command-classifier.ts";
 import { readCurrentBranch } from "./commit-branch.ts";
-import { appendEvidence, buildRunRecord, checkDirectory, checkKind, checkOutcome, type CheckOutcome, evidenceFile, settleRunTree } from "./evidence.ts";
+import { appendEvidence, buildRunRecord, type CheckContext, checkDirectory, checkKind, checkOutcome, type CheckOutcome, evidenceFile, settleRunTree } from "./evidence.ts";
 import { repoDocsDir } from "./repo-docs.ts";
 import { riskNotice } from "./risk-map.ts";
 import type { ExecFn } from "./worktree-snapshot.ts";
@@ -211,11 +211,12 @@ const UNTRUSTED_SHELL = /\|\||;|\n|`|\$\(|(?<![&>])&(?![&>\d-])/;
  * runs under `set -o pipefail`, so a pipe keeps it; `;`, `||`, `&`, a newline,
  * or a substitution hands it to something else. A recognized runner also gets
  * the evidence recorder's own checks (a `--help` or `--collect-only` run is not a
- * test run).
+ * test run). `context` (the session cwd and the run's repository top level) lets a
+ * leading `cd` into that repository keep the exit code, as the bash recorder does.
  */
-export function evidenceOutcome(command: string, exitCode: number | undefined): CheckOutcome {
+export function evidenceOutcome(command: string, exitCode: number | undefined, context: CheckContext = {}): CheckOutcome {
 	if (exitCode === undefined) return "unknown";
-	if (checkKind(command) !== undefined) return checkOutcome(`set -o pipefail; ${command}`, exitCode);
+	if (checkKind(command) !== undefined) return checkOutcome(`set -o pipefail; ${command}`, exitCode, context);
 	if (UNTRUSTED_SHELL.test(command)) return "unknown";
 	return exitCode === 0 ? "pass" : "fail";
 }
@@ -410,7 +411,7 @@ export async function runCheck(request: CheckRequest, env: CheckEnvironment): Pr
 	const outputFile = createOutputFile();
 	const run = await runCommand({ command, cwd: env.cwd, timeoutMs: timeoutMs(request.timeoutSeconds), signal: env.signal, outputFile });
 
-	let outcome: CheckOutcome = run.timedOut || run.aborted ? "unknown" : evidenceOutcome(command, run.exitCode);
+	let outcome: CheckOutcome = run.timedOut || run.aborted ? "unknown" : evidenceOutcome(command, run.exitCode, { cwd: env.cwd, topLevel: before?.root });
 	let recorded = false;
 	// Only a test run vouches for a tree: a runner the evidence recorder recognizes, or the configured/detected test command
 	// (whatever its name). Any other command (`true`, `echo ok`) says nothing about the tests, so it leaves no record.

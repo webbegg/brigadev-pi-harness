@@ -202,6 +202,14 @@ describe("evidenceOutcome", () => {
 		assert.equal(evidenceOutcome("echo $(npm test)", 0), "unknown");
 	});
 
+	it("is the real exit code after a leading cd that stays inside the run's repository (a worktree under the session)", () => {
+		const context = { cwd: "/r", topLevel: "/r/.worktrees/x" };
+		assert.equal(evidenceOutcome("cd .worktrees/x && npm test", 1, context), "fail");
+		assert.equal(evidenceOutcome("cd .worktrees/x && npm test", 0, context), "pass");
+		assert.equal(evidenceOutcome("cd /elsewhere && npm test", 0, context), "unknown", "a cd out of the repository");
+		assert.equal(evidenceOutcome("cd .worktrees/x && npm test", 0), "unknown", "without the context the cd cannot be judged");
+	});
+
 	it("is unknown for a run that lists tests or prints help instead of running them", () => {
 		assert.equal(evidenceOutcome("npm test -- --help", 0), "unknown");
 		assert.equal(evidenceOutcome("pytest --collect-only", 0), "unknown");
