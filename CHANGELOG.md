@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- `t3/`: brigadev-t3, an optional add-on for T3 Code (load it with `-e <path>/t3` in Pi's launch arguments in T3 Code's settings). It adds status chips for the loop phase, todo progress, and the last check, and a prompt section that settles where brigadev's and T3's rules overlap (subagents, PR tools, CI waits). It reads only the `brigadev:*` bus and does nothing outside T3 Code; `tests/t3-contract.test.ts` checks the channels it reads.
+- `ask_user_choice` asks with Pi's standard select and input dialogs in an RPC client with a UI (T3 Code, any `pi --mode rpc` front end) instead of telling the model to ask in chat.
+
+### Fixed
+
+- MCP tools that open a PR, merge, or push (T3 Code's `pull_request_create` / `pull_request_merge`, GitHub MCP's `create_pull_request`, `merge_pull_request`, `push_files`, …) ran with no guard decision. They now follow the policy of the gh/git commands they stand for, and opening a PR runs the PR gate. Names Pi cut to 64 characters are read as the strictest tool they could be.
+- Subagents no longer inherit environment variables named for an MCP server (`T3_MCP_URL`, `T3_MCP_BEARER_TOKEN`, …).
+
 ## [0.25.0] - 2026-11-25
 
 The pull request becomes the gate: commits are never blocked on test evidence, `gh pr create` needs a passing full-suite run on the committed HEAD, and every push and PR creation asks you in every mode (YOLO included). Deletes in the temp folders stop asking, and the runner gets a dollar cost cap per loop. Breaking: `/brigadev:force-commit` is gone, and YOLO asks before pushes and PRs.
