@@ -102,6 +102,12 @@ describe("formatRiskLine", () => {
 		assert.match(line, /^risk T2 security\(a\/auth\/one\.ts, a\/auth\/two\.ts \+2\) data\(db\/migrations\/1\.sql\) → before PR: brigadev-verify \+ R1,R3,R4, ≤2 revise rounds$/);
 		assert.ok(formatRiskLine(classify("x".repeat(200) + "/guard.ts", "y".repeat(200) + "/storage.ts")).length <= 140);
 	});
+	it("every category at once, with long paths, stays within 140 and keeps the rounds", () => {
+		const long = (name: string) => `${"d".repeat(60)}/${name}`;
+		const line = formatRiskLine(classify(long("guard.ts"), long("storage.ts"), long("api.schema.json"), long("queue.ts"), "package.json"), 5);
+		assert.ok(line.length <= 140, `${line.length}: ${line}`);
+		assert.match(line, /, ≤5 revise rounds$/);
+	});
 	it("T1 and T0", () => {
 		assert.equal(formatRiskLine(classify("src/render.ts")), "risk T1 → before PR: review R3, ≤2 revise rounds");
 		assert.equal(formatRiskLine(classify("package.json")), "risk T1 delivery(package.json) → before PR: review R1,R3, ≤2 revise rounds");

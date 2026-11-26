@@ -67,7 +67,11 @@ function branchPrProblems(text: string): string[] {
 	const review = step.indexOf("`brigadev-review`");
 	if (review < 0) return ["step 5 does not invoke brigadev-review"];
 	const problems: string[] = [];
-	const ask = SCOPE_QUESTION.exec(step.slice(0, review));
+	// The review is not done until the revise rounds start: a scope question anywhere before them is still a gate in front of it.
+	const rounds = step.indexOf("revise rounds", review);
+	const head = step.slice(0, rounds > review ? rounds : step.length);
+	// "without asking the scope" states the policy; any other match is a question.
+	const ask = [...head.matchAll(new RegExp(SCOPE_QUESTION.source, "gi"))].find((m) => !/\b(?:without|never|not|no)\s+$/i.test(head.slice(Math.max(0, m.index - 12), m.index)));
 	if (ask) problems.push(`step 5 asks the scope before reviewing: "${ask[0]}"`);
 	if (!/\bT0\b[^.]*\bno review\b/.test(step)) problems.push("step 5 does not say T0 gets no review");
 	if (!/\bT1\b[^.]*\bautomatic/i.test(step)) problems.push("step 5 does not make the T1 review automatic");
@@ -241,6 +245,11 @@ describe("review policy checks catch a regression (mutated copies of the asset t
 
 		it("a scope question with ask_user_choice comes back before the review", () => {
 			const mutated = mutate(text, "T1: run `brigadev-review`", "T1: ask the scope with one `ask_user_choice` (full, fitting, skip), then run `brigadev-review`");
+			assert.match(branchPrProblems(mutated).join("\n"), /asks the scope/);
+		});
+
+		it("a scope question between the review sentence and the revise rounds is still caught", () => {
+			const mutated = mutate(text, "Skip it only when the user said so", "Before it runs, ask the scope with one `ask_user_choice`. Skip it only when the user said so");
 			assert.match(branchPrProblems(mutated).join("\n"), /asks the scope/);
 		});
 
