@@ -55,6 +55,21 @@ describe("ticket list: parse", () => {
 		assert.deepEqual(tickets.map((t) => [t.done, t.doneIsCommand]), [["npm test", true], ["the board shows cards", false], [undefined, false]]);
 	});
 
+	it("flags an expected-fail (reproduce) done: command, `! <cmd>`, and keeps done as written", () => {
+		const { tickets } = parseTicketList(
+			"## Tasks\n- T1 [S1] inline: reproduce deps: none done: `! node --test tests/crash.test.ts` — pending\n- T2 [S1] inline: fix deps: T1 done: `node --test tests/crash.test.ts` — pending\n- T3 [S1] c done: `!true` — pending\n- T4 [S1] d done: ! not a command — pending\n",
+		);
+		assert.deepEqual(
+			tickets.map((t) => [t.done, t.doneIsCommand, t.expectFail]),
+			[
+				["! node --test tests/crash.test.ts", true, true],
+				["node --test tests/crash.test.ts", true, false],
+				["!true", true, false],
+				["! not a command", false, false],
+			],
+		);
+	});
+
 	it("keeps today's lines without deps or done (both absent, nothing invented)", () => {
 		const { tickets } = parseTicketList("## Tasks\n- T1 [S1] inline — pending\n- T2 [S1,S2] inline: docs — done f52f882\n");
 		assert.deepEqual(tickets.map((t) => [t.id, t.deps, t.done, t.status, t.note]), [["T1", [], undefined, "pending", ""], ["T2", [], undefined, "done", "f52f882"]]);

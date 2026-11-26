@@ -2,6 +2,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parseAgent, type FrontmatterParser } from "../../lib/agents.ts";
+import { expectFailInner } from "../../lib/ticket-list.ts";
 import type { AnsweredDecision } from "./decision.ts";
 
 export const WORKER_AGENT_PATH = fileURLToPath(new URL("../../assets/agents/brigadev-worker.md", import.meta.url));
@@ -59,6 +60,15 @@ export function decisionSection(decision: AnsweredDecision): string[] {
 	return lines;
 }
 
+/** A reproduce ticket's job (`done: `! <cmd>``): the RED half of a bug fix. A later ticket that depends on it makes <cmd> pass. */
+function reproduceSection(inner: string): string[] {
+	return [
+		"## Reproduce only",
+		`This ticket reproduces a bug. Your job is a test that fails because of the bug, committed: \`${inner}\` must fail (so the done command \`! ${inner}\` exits 0) for the bug's reason, not for a typo, a missing file, or a broken import.`,
+		"Do not fix the bug: a later ticket that depends on this one fixes it and makes the test pass. Commit only the test (and what it needs to run).",
+	];
+}
+
 /** System instructions: the worker prompt, what differs when the runner drives it, and the ticket. */
 export function workerInstructions(worker: Worker, brief: TicketBrief): string {
 	const lines = [
@@ -80,6 +90,8 @@ export function workerInstructions(worker: Worker, brief: TicketBrief): string {
 		`- feature document: ${brief.docPath}`,
 		`- attempt: ${brief.attempt} of ${brief.maxAttempts}`,
 	];
+	const inner = expectFailInner(brief.done);
+	if (inner !== undefined) lines.push("", ...reproduceSection(inner));
 	if (brief.spec) lines.push("", "## Spec", brief.spec);
 	if (brief.decision) lines.push("", ...decisionSection(brief.decision));
 	if (brief.failure) lines.push("", "## Previous attempt failed", brief.failure);
@@ -88,5 +100,7 @@ export function workerInstructions(worker: Worker, brief: TicketBrief): string {
 
 /** The input that starts the worker's run. */
 export function workerInput(brief: TicketBrief): string {
-	return `Implement ticket ${brief.ticketId}${brief.title ? `: ${brief.title}` : ""}. It is finished when \`${brief.done}\` exits 0 and your work is committed.`;
+	const inner = expectFailInner(brief.done);
+	const finished = inner !== undefined ? `\`${inner}\` fails because of the bug and your failing test is committed; do not fix the bug` : `\`${brief.done}\` exits 0 and your work is committed`;
+	return `Implement ticket ${brief.ticketId}${brief.title ? `: ${brief.title}` : ""}. It is finished when ${finished}.`;
 }

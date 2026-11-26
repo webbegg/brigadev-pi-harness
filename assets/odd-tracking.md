@@ -8,7 +8,7 @@ Create `tasks/<feature-name>.md` in the repo docs folder (never inside the proje
 
 1. **Header** (2–3 lines): objective, branch, delivery strategy, test runner.
 2. `## Specs`: numbered `S1..Sn` requirements, constraints, and acceptance criteria with their checks. Quote the user's exact strings, error messages, commands, and examples verbatim, in the user's language. Never add requirements the user did not ask for; mark assumptions as assumptions.
-3. `## Tasks`: one line per task: stable ID, linked `S#`, route (inline or delegated + reason), `deps:` (task IDs it needs, or `none`), `done:` (the check that proves it, a command in backticks or an observable outcome), then ` — ` and the status (`pending`, `in_progress`, `done`, `blocked`, `dropped`) with its commit or RED/GREEN evidence.
+3. `## Tasks`: one line per task: stable ID, linked `S#`, route (inline or delegated + reason), `deps:` (task IDs it needs, or `none`), `done:` (the check that proves it, a command in backticks or an observable outcome), then ` — ` and the status (`pending`, `in_progress`, `done`, `blocked`, `dropped`) with its commit or RED/GREEN evidence. A bug's RED can be its own task: a reproduce task with `done: `! <cmd>`` (passes while `<cmd>` fails: a committed failing test, no fix), then a fix task with `deps:` on it and `done: `<cmd>``.
 4. `## Log`: `L1` is the user's original request verbatim; later corrections verbatim with their date; then analysis, rationale, verification evidence, next step. Brief.
 
 ```markdown
@@ -21,6 +21,8 @@ Objective: <one line>. Branch: `<branch>`. Delivery: <strategy>. Tests: `<runner
 ## Tasks
 - T1 [S1] inline: <title> deps: none done: `<test command>` — pending
 - T2 [S2] inline: <title> deps: T1 done: <observable outcome> — pending
+- T3 [S3] inline: reproduce <bug> deps: none done: `! <test command>` — pending
+- T4 [S3] inline: fix <bug> deps: T3 done: `<test command>` — pending
 
 ## Log
 - L1 (<date>): "<original request, verbatim>"

@@ -3,6 +3,7 @@
 //
 // Ticket line: `- T3 [S1,S2] <route>: <title> deps: T1, T2 done: `<check>` — <status> <note>`.
 // `deps:` and `done:` are optional when parsing (older documents have neither); a run requires `done:` on unfinished tickets.
+// A reproduce ticket checks `done: `! <cmd>`` (bash negation: it passes while <cmd> fails); its fix ticket depends on it with `done: `<cmd>``.
 import { randomBytes } from "node:crypto";
 import { renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -21,6 +22,8 @@ export interface Ticket {
 	done?: string;
 	/** True when the `done:` value was wrapped in backticks, so a runner that only runs commands can execute it. */
 	doneIsCommand: boolean;
+	/** True when the done command is `! <cmd>`: the ticket reproduces a bug, so it is finished when <cmd> fails. */
+	expectFail: boolean;
 	status?: TicketStatus;
 	/** Text after the status word: commit, evidence, or why it is blocked. */
 	note: string;
@@ -59,6 +62,12 @@ function unquote(value: string): string {
 	return trimmed.length > 1 && trimmed.startsWith("`") && trimmed.endsWith("`") ? trimmed.slice(1, -1) : trimmed;
 }
 
+/** The command an expected-fail done command (`! <cmd>`) negates, trimmed; undefined for any other command. */
+export function expectFailInner(done: string): string | undefined {
+	const match = /^!\s+(\S[\s\S]*)$/.exec(done.trim());
+	return match ? match[1].trim() : undefined;
+}
+
 function splitStatus(rest: string): { body: string; status?: TicketStatus; note: string } {
 	// A leading space lets a title-less line (`- T10 [S12] — done x`) match the ` — ` separator too.
 	const match = STATUS_TAIL.exec(` ${rest}`);
@@ -87,7 +96,8 @@ function parseLine(raw: string): Ticket | undefined {
 		deps = field === "none" ? [] : field.split(/[,\s]+/).filter(Boolean);
 		head = head.slice(0, depsAt);
 	}
-	return { id: match[1], specs: expandSpecs(match[2]), title: head.trim(), deps, done, doneIsCommand, status, note, raw };
+	const expectFail = doneIsCommand && done !== undefined && expectFailInner(done) !== undefined;
+	return { id: match[1], specs: expandSpecs(match[2]), title: head.trim(), deps, done, doneIsCommand, expectFail, status, note, raw };
 }
 
 export function parseTicketList(markdown: string): TicketList {
