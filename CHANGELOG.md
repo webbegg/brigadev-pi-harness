@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **The review before the PR is automatic for T1/T2, with bounded revise rounds.** `brigadev-branch-pr` no longer asks the review scope: a T1 branch gets `brigadev-review` with its fitting lenses, a T2 branch `brigadev-verify` plus the fitting lenses in one parallel call, and T0 gets none (disclosed in the PR's Risk line). Then come at most `review.maxRounds` revise rounds (new key in brigadev.json, an integer 0–5, default 2; anything else falls back to 2 and `/brigadev:doctor` lists it): each fixes the introduced or worsened blockers plus at most 5 defect WARNINGs in the same files, proves each fix with a repro test seen RED→GREEN via `check`, and re-reviews only the lenses whose findings were fixed. Leftovers become one **Needs your decision** before the PR; advisories never start a round, and nothing is reviewed per commit. The user can still skip the review, and a requested review runs at any time. The `check` risk line names the limit: `risk T1 → before PR: review R3, ≤2 revise rounds` (`no revise rounds` with 0).
+
 ## [0.25.0] - 2026-11-25
 
 The pull request becomes the gate: commits are never blocked on test evidence, `gh pr create` needs a passing full-suite run on the committed HEAD, and every push and PR creation asks you in every mode (YOLO included). Deletes in the temp folders stop asking, and the runner gets a dollar cost cap per loop. Breaking: `/brigadev:force-commit` is gone, and YOLO asks before pushes and PRs.

@@ -11,6 +11,7 @@ All keys are optional; `PI_CODING_AGENT_DIR` relocates the agent folder.
   "bridgePricing": true,
   "ui": { "footer": true, "compactTools": true },
   "check": { "test": "npm test" },
+  "review": { "maxRounds": 2 },
   "context": { "enabled": true, "compactAt": 160000, "idleCompactMinutes": 60, "idleCompactMin": 100000 },
   "risk": { "paths": { "data": ["db/**"] }, "repos": { "my-repo": { "security": ["src/policy/**"] } } }
 }
@@ -21,6 +22,7 @@ All keys are optional; `PI_CODING_AGENT_DIR` relocates the agent folder.
 - `bridgePricing`: price zero-cost `claude-bridge` turns at the API list price.
 - `ui.footer` (`/brigadev:ui footer on|off`) and `ui.compactTools` (one-line rows for built-in tools; read at startup, `/reload` applies it).
 - `check.test`: the test command the `check` tool runs; when absent it is detected (`npm test`, `pytest`, `cargo test`, `go test`). The tool also takes `command`, `focus` (appended, for example one test file) and `timeoutSeconds` (default 600).
+- `review.maxRounds`: the revise rounds after the review before the PR (see Review tiers), an integer from 0 to 5, default 2. The `check` risk line names it (`≤2 revise rounds`, or `no revise rounds` for 0). Anything else falls back to 2, and `/brigadev:doctor` lists it.
 - `context`: automatic compaction through Pi's `ctx.compact`. At a turn boundary it compacts when context reaches `compactAt` tokens (`0` turns that rule off); before a request that arrives after `idleCompactMinutes` idle minutes (`0` turns it off) it compacts if context holds at least `idleCompactMin` tokens, then continues. `enabled: false` disables both. It adds no text to the model's context; `/brigadev:doctor` shows the settings and the last compaction.
 - `risk`: extra globs for the risk map (see Review tiers), per category (`data`, `security`, `contract`, `concurrency`, `delivery`) for every repository (`paths`) or one repository by its top-level folder name (`repos`). Additive only: entries raise a tier, never lower it; invalid entries are ignored and `/brigadev:doctor` lists them.
 
@@ -37,14 +39,16 @@ An authorized change on the default branch starts a `type/description` branch, a
 
 ## Review tiers
 
-The branch's changed paths (against its merge-base with the default branch — `origin/HEAD`, `main`, `master`, `init.defaultBranch`, `develop`, or `trunk`, whichever resolves first — plus uncommitted changes; when none resolves, `check` prints no line and the PR gate asks) set a tier through a path-based risk map (`lib/risk-map.ts` defaults plus `risk` above). `check` prints it as one line when it changes, for example `risk T2 security(lib/guard-rules.ts) → before PR: brigadev-verify + R1,R3`.
+The branch's changed paths (against its merge-base with the default branch — `origin/HEAD`, `main`, `master`, `init.defaultBranch`, `develop`, or `trunk`, whichever resolves first — plus uncommitted changes; when none resolves, `check` prints no line and the PR gate asks) set a tier through a path-based risk map (`lib/risk-map.ts` defaults plus `risk` above). `check` prints it as one line when it changes, for example `risk T2 security(lib/guard-rules.ts) → before PR: brigadev-verify + R1,R3, ≤2 revise rounds`.
 
 | Tier | When | Before the PR |
 | --- | --- | --- |
 | T0 | only tests, fixtures, or plain docs | a passing full-suite run on HEAD (the PR gate); no review, disclosed in the PR Risk line |
-| T1 | other source or prompt files | one `review-4r` pass with the fitting lenses: R3, plus R1 for security/delivery paths and R4 for data/concurrency paths; R2 only for prompt/docs diffs or on request |
-| T2 | a data, security, or contract path | one `brigadev-verify` for the whole branch plus the fitting lenses, in one parallel call |
+| T1 | other source or prompt files | an automatic `review-4r` pass (no scope question) with the fitting lenses: R3, plus R1 for security/delivery paths and R4 for data/concurrency paths; R2 only for prompt/docs diffs or on request |
+| T2 | a data, security, or contract path | automatic: one `brigadev-verify` for the whole branch plus the fitting lenses, in one parallel call |
 
-Verify runs once per branch, not per unit, and each run is recorded in the evidence log. A second branch verify on the same source tree is refused, and on a changed tree it asks. Blocker fixes are proven with a repro test that `check` sees fail, then pass. A recheck is allowed only for security or data blockers: at most one, launched with `recheck <ids>` in the reason, on the `brigadev-verify-recheck` profile route when the profile has one. A correction batch fixes the blockers plus at most five defect WARNINGs in the same files; the rest go to Follow-ups.
+After a T1 or T2 review come at most `review.maxRounds` revise rounds (default 2). Each round fixes the introduced or worsened blockers plus at most five defect WARNINGs in the same files, proves each fix with a repro test that `check` sees fail, then pass, and re-reviews only the lenses whose findings were fixed. It stops when clean or out of rounds; what is left becomes one **Needs your decision** before the PR. Advisories never start a round, and nothing is reviewed per commit. You can skip the review by saying so (the PR's Risk line says it was skipped), and a review you ask for runs at any time.
+
+Verify runs once per branch, not per unit, and each run is recorded in the evidence log. A second branch verify on the same source tree is refused, and on a changed tree it asks. Blocker fixes are proven with a repro test that `check` sees fail, then pass. A recheck is allowed only for security or data blockers: at most one, launched with `recheck <ids>` in the reason, on the `brigadev-verify-recheck` profile route when the profile has one. Each revise round is one correction batch: the blockers plus at most five defect WARNINGs in the same files; the rest go to Follow-ups.
 
 `gh pr create` asks, in every mode, when a branch that commits source has no passing full-suite run on the committed HEAD ([evidence-gate.md](evidence-gate.md)), a T2 branch has no verify run, or the latest verify's blockers have no fail-then-pass test run after it; this joins the PR confirmation, which every PR creation gets in every mode. Without a UI it blocks. If the facts cannot be read (an unreadable evidence log, git failing) it asks too; outside git or on a detached HEAD the gate does not run.
