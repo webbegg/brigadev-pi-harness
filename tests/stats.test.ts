@@ -232,6 +232,10 @@ describe("outcomes (factory S12)", () => {
 		assert.equal(lastOutcome("outcome: MANUAL"), "manual");
 		assert.equal(lastOutcome("`Outcome:` (success|flawed|blocked|manual)"), undefined);
 		assert.equal(lastOutcome("Outcome: shipped"), undefined);
+		assert.equal(lastOutcome("Close with Outcome: success|flawed|blocked|manual."), undefined, "the vocabulary unparenthesised");
+		assert.equal(lastOutcome("I think the outcome: manual review was needed"), undefined, "mid-sentence prose");
+		assert.equal(lastOutcome("Outcome:\nsuccess criteria"), undefined, "across a line break");
+		assert.equal(lastOutcome("Next: PR\n> Outcome: success"), "success", "a quoted close line");
 	});
 
 	it("counts the outcomes of closing messages, overall and per workflow", () => {

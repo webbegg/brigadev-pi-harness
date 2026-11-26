@@ -42,7 +42,8 @@ function surfacesOf(taskText: string): string[] | undefined {
 }
 
 /** The text under `## Task` of the composed message, the fallback when result.json lacks the task. */
-const taskSection = (taskText: string): string => /^## Task\n([\s\S]*?)(?=\n## |$)/m.exec(taskText)?.[1].trim() ?? taskText.trim();
+/** The `## Task` section of a run's task.md, every line of it (up to the next `## ` heading or the end), else the whole text. */
+export const taskSection = (taskText: string): string => /^## Task\n([\s\S]*?)(?=\n## |(?![\s\S]))/m.exec(taskText)?.[1].trim() ?? taskText.trim();
 
 /** Reads `<docs>/runs/<runId>/` (task.md and result.json). */
 export function readRun(docsDir: string, runId: string): { ok: true; run: RetroRun } | { ok: false; error: string } {

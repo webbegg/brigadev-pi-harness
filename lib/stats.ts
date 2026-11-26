@@ -185,8 +185,11 @@ export function classifyTurn(calls: ToolCall[]): Phase {
 
 // --- outcomes ---
 
-/** The close line `Outcome: <word>`, plain or in markdown (`**Outcome:** blocked`); the vocabulary in parentheses does not match. */
-const OUTCOME_LINE = /\boutcome:[*_`\s]*(success|flawed|blocked|manual)\b/gi;
+/**
+ * The close line `Outcome: <word>` at the start of a line, plain, bulleted, quoted, or in markdown (`**Outcome:** blocked`).
+ * The vocabulary (`success|flawed|…`, in parentheses or not), mid-sentence prose, and a word on the next line do not match.
+ */
+const OUTCOME_LINE = /^[ \t>*_`-]*outcome:[*_` \t]*(success|flawed|blocked|manual)\b(?!\|)/gim;
 /** The first line of a request composed by the workflow menu (lib/workflow-run.ts, the workflow body's first line). */
 const WORKFLOW_REQUEST = /^(.+? request), started from the workflow menu\./;
 

@@ -8,15 +8,15 @@ import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { discoverAgents } from "../lib/agents.ts";
+import { type AgentDefinition, discoverAgents } from "../lib/agents.ts";
 import { installParentExitGuard, liveChildren, runChild } from "../lib/child-run.ts";
 import { formatCost } from "../lib/cost.ts";
-import { admitLaunch, buildChildTask } from "../lib/delegation.ts";
+import { admitLaunch, buildChildTask, type LaunchRequest } from "../lib/delegation.ts";
 import { evaluate, loadCases, parseEvalArgs, parseFlatFrontmatter, type EvalCase } from "../lib/evals.ts";
 import { resolveAgentRoute } from "../lib/model-routing.ts";
 import { failed } from "../lib/run-status.ts";
 import { PACKAGE_AGENTS_DIR } from "../lib/runtime.ts";
-import { loadOutputSchema } from "../lib/structured-output.ts";
+import { type JsonSchema, loadOutputSchema } from "../lib/structured-output.ts";
 
 const USAGE = "Usage: npm run eval -- [agent] [--model provider/id]";
 
@@ -45,10 +45,22 @@ async function runCase(c: EvalCase, model: string | undefined): Promise<{ pass: 
 	if ("error" in loaded) return { pass: false, lines: [loaded.error], cost: 0 };
 
 	const root = mkdtempSync(join(tmpdir(), `brigadev-eval-${c.agent}-`));
+	// A failing case keeps its folder for inspection; anything that throws before a verdict removes it.
+	let keep = false;
+	try {
+		const outcome = await runInRoot(c, root, agent, request, loaded.schema, model);
+		keep = !outcome.pass;
+		return outcome;
+	} finally {
+		if (!keep) rmSync(root, { recursive: true, force: true });
+	}
+}
+
+async function runInRoot(c: EvalCase, root: string, agent: AgentDefinition, request: LaunchRequest, schema: JsonSchema, model: string | undefined): Promise<{ pass: boolean; lines: string[]; cost: number }> {
 	const work = prepareWorkdir(root, c.fixture);
 	const route = resolveAgentRoute({ agent: model ? { ...agent, model } : agent, parent: {} });
 	const result = await runChild(
-		{ cwd: work, agent, request, taskText: buildChildTask(request, agent, []).text, route, routeLabel: route.modelSource === "none" ? "pi default" : route.modelSource, schema: loaded.schema, price: () => undefined, onUpdate: () => {} },
+		{ cwd: work, agent, request, taskText: buildChildTask(request, agent, []).text, route, routeLabel: route.modelSource === "none" ? "pi default" : route.modelSource, schema, price: () => undefined, onUpdate: () => {} },
 		// The child's evidence log and the run folder go under the temp root, never into ~/.brigadev.
 		{ piInvocation: (args) => ({ command: process.env.BRIGADEV_PI ?? "pi", args }), env: { ...process.env, BRIGADEV_HOME: join(root, "home") }, docsDir: () => root },
 	);
@@ -57,7 +69,6 @@ async function runCase(c: EvalCase, model: string | undefined): Promise<{ pass: 
 	if (failed(result)) return { pass: false, lines: [header, `run failed: ${result.errorMessage || result.stopReason || `exit ${result.exitCode}`}`, `kept ${root}`], cost };
 	const checks = evaluate(c.expect, result.structured, work);
 	const pass = checks.every((check) => check.pass);
-	if (pass) rmSync(root, { recursive: true, force: true });
 	return { pass, lines: [header, ...checks.map((check) => `${check.pass ? "ok  " : "FAIL"} ${check.reason}`), ...(pass ? [] : [`kept ${root}`])], cost };
 }
 

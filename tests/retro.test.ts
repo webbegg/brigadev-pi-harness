@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 import retroExtension from "../extensions/retro.ts";
 import { parseCase } from "../lib/evals.ts";
-import { blockedLine, draftEvalCase, readRun, runIdProblem } from "../lib/retro.ts";
+import { blockedLine, draftEvalCase, readRun, runIdProblem, taskSection } from "../lib/retro.ts";
 import { createFakeCtx, createFakePi } from "./helpers/fake-pi.ts";
 
 const FIXTURE = join(import.meta.dirname, "fixtures", "retro");
@@ -16,6 +16,14 @@ describe("runIdProblem", () => {
 	it("accepts a plain folder name and refuses paths", () => {
 		assert.equal(runIdProblem(REPRODUCE), undefined);
 		for (const bad of ["", "a/b", "..", "../x", "a..b", "/abs", ".hidden", "a\\b"]) assert.ok(runIdProblem(bad), bad);
+	});
+});
+
+describe("taskSection", () => {
+	it("keeps a multi-line task whole, up to the next section or the end", () => {
+		assert.equal(taskSection("## Task\nline one\nline two\n\n## Allowed edit surfaces\n- a\n"), "line one\nline two");
+		assert.equal(taskSection("## Task\nline one\nline two\n"), "line one\nline two");
+		assert.equal(taskSection("no sections\nat all"), "no sections\nat all");
 	});
 });
 
