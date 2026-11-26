@@ -89,6 +89,13 @@ async function session(cwd: string, options: { mode?: "yolo"; ui?: boolean; answ
 			}
 			return undefined;
 		},
+		async tool(toolName: string, input: object = {}) {
+			for (const h of handlers.tool_call ?? []) {
+				const r = await h({ toolName, toolCallId: String(++counter), input }, ctx);
+				if (r?.block) return String(r.reason);
+			}
+			return undefined;
+		},
 	};
 }
 
@@ -387,6 +394,66 @@ describe("guard: PR risk gate", () => {
 			}
 		});
 
+	});
+
+	describe("MCP tools that open a PR (T3 Code's pull_request_create, GitHub's create_pull_request)", () => {
+		const CREATE = "mcp__t3-code__pull_request_create";
+
+		it("yolo: a T2 branch without a verify asks with the gate's reasons; a decline blocks with what to do", async () => {
+			const { cwd } = repo(["lib/guard-rules.ts"]);
+			const s = await session(cwd, { mode: "yolo" });
+			const reason = String(await s.tool(CREATE, { title: "t", body: "b" }));
+			assert.equal(s.dialogs.length, 1);
+			assert.match(s.dialogs[0].title, /pull_request_create/);
+			assert.match(s.dialogs[0].body, /T2 branch \(security: lib\/guard-rules\.ts\) has no brigadev-verify run/);
+			assert.match(reason, /brigadev-verify/);
+			assert.match(reason, /pull_request_create/);
+		});
+
+		it("a tested T0 branch still asks every time (it pushes), in yolo too; the user's yes lets it run", async () => {
+			const { cwd, docs } = repo(["tests/a.test.ts"]);
+			tested(cwd, docs);
+			for (const name of [CREATE, "mcp__t3_code__pull_request_create", "mcp__github__create_pull_request"]) {
+				const s = await session(cwd, { mode: "yolo", answer: true });
+				assert.equal(await s.tool(name), undefined, name);
+				assert.equal(s.dialogs.length, 1, name);
+				assert.doesNotMatch(s.dialogs[0].body, /^- /m, name);
+			}
+		});
+
+		it("untested source: the gate names the missing run", async () => {
+			const { cwd } = repo(["src/a.ts"]);
+			const s = await session(cwd, { mode: "yolo" });
+			assert.match(String(await s.tool(CREATE)), /no passing test recorded for the committed HEAD/);
+		});
+
+		it("no UI: blocked, in yolo and normal", async () => {
+			const { cwd, docs } = repo(["tests/a.test.ts"]);
+			tested(cwd, docs);
+			for (const mode of ["yolo", undefined] as const) {
+				const s = await session(cwd, { mode, ui: false });
+				assert.notEqual(await s.tool(CREATE), undefined, String(mode));
+			}
+		});
+
+		it("a merge asks in yolo; a decline blocks", async () => {
+			const { cwd } = repo(["tests/a.test.ts"]);
+			const s = await session(cwd, { mode: "yolo" });
+			assert.match(String(await s.tool("mcp__t3-code__pull_request_merge", { expectedHeadSha: "abc" })), /declined/i);
+			assert.equal(s.dialogs.length, 1);
+			assert.match(s.dialogs[0].body, /expectedHeadSha/);
+		});
+
+		it("a PR comment runs in yolo and asks in normal; reads never ask", async () => {
+			const { cwd } = repo(["tests/a.test.ts"]);
+			const yolo = await session(cwd, { mode: "yolo" });
+			assert.equal(await yolo.tool("mcp__t3-code__pull_request_respond", { body: "x" }), undefined);
+			assert.equal(await yolo.tool("mcp__t3-code__pull_request_read"), undefined);
+			assert.deepEqual(yolo.dialogs, []);
+			const normal = await session(cwd);
+			assert.match(String(await normal.tool("mcp__t3-code__pull_request_respond", { body: "x" })), /declined/i);
+			assert.equal(normal.dialogs.length, 1);
+		});
 	});
 
 	it("outside a git repository the gate adds nothing: only the PR approval", async () => {

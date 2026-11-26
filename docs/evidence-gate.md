@@ -28,6 +28,6 @@ Nested repositories: a test run is recorded against the repository of its cwd (`
 
 ## Limits
 
-It is quality control, not a security boundary. It recognizes `gh pr create` (and gh's alias `gh pr new`) the way the command classifier does, so a PR opened another way (`gh api`, the web UI, a script) is not gated. To keep a model from forging a pass, `write`/`edit` into the evidence folder and bash commands naming it together with a write are blocked; a deliberately obfuscated command is not prevented.
+It is quality control, not a security boundary. It recognizes `gh pr create` (and gh's alias `gh pr new`) the way the command classifier does, and MCP tools that open a PR by name (`pull_request_create`, `create_pull_request`; judged against the session's directory), so a PR opened another way (`gh api`, the web UI, a script) is not gated. To keep a model from forging a pass, `write`/`edit` into the evidence folder and bash commands naming it together with a write are blocked; a deliberately obfuscated command is not prevented.
 
 Older logs may hold `type: "force"` records from the removed commit gate (`/brigadev:force-commit`); `brigadev-branch-pr` still discloses them in the PR body.
