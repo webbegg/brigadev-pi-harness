@@ -1,0 +1,35 @@
+{
+  "runId": "20261126T101500Z-brigadev-reproduce-a1b2c3",
+  "agent": "brigadev-reproduce",
+  "task": "Bug report. Where: src/slugify.js. Expected \"hello-world\", actual \"hello---world\".",
+  "reason": "Bug lane: reproduce first",
+  "model": "anthropic/claude-sonnet-5-5",
+  "exitCode": 0,
+  "stopReason": "stop",
+  "startedAt": 1795688100000,
+  "endedAt": 1795688160000,
+  "usage": {
+    "input": 10,
+    "output": 20,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "cost": 0.01,
+    "contextTokens": 0,
+    "turns": 3
+  },
+  "output": "...",
+  "structured": {
+    "reproduced": false,
+    "command": "",
+    "output": "",
+    "testPath": "",
+    "tried": [
+      {
+        "attempt": "node --test tests/slug.test.js",
+        "result": "passed"
+      }
+    ],
+    "unblock": "the production locale settings"
+  },
+  "finalText": ""
+}

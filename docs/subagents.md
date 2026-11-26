@@ -17,6 +17,36 @@ A stall watchdog stops a child that produces no events for 4 minutes (30 minutes
 
 While agents run, a card above the editor shows model, thinking, tokens, cost, and elapsed time (`ctrl+shift+a` collapses it). `alt+a` or `/brigadev:runs` opens the read-only viewer with every run and its thread.
 
+## Evals
+
+Each agent with an `output` schema can carry eval cases in the repository: `evals/<agent>/<case>/case.json`.
+
+```json
+{
+	"task": "Bug report. Where: src/slugify.js. ...",
+	"reason": "optional; defaults to Eval case <agent>/<case>",
+	"fixture": "fixture",
+	"allowedEditSurfaces": ["tests/**"],
+	"expect": [
+		{ "path": "$.reproduced", "equals": true },
+		{ "path": "$.findings[*].severity", "matches": "^(BLOCKER|CRITICAL)$" },
+		{ "path": "$.specs", "minItems": 1 },
+		{ "path": "$.backcompat", "exists": true },
+		{ "file": "$.testPath", "contains": "slugify" }
+	]
+}
+```
+
+- `fixture` is a directory under the case. It is copied to a temp dir, committed as the base of a fresh git repo, and becomes the agent's cwd; without one the agent starts in an empty repo.
+- A `path` assertion reads the agent's structured result: `$`, then `.name`, `[n]`, or `[*]`. It passes when any selected value satisfies its one check: `equals` (deep equality), `matches` (a regex on a string), `minItems` (an array at least that long), or `exists: true`.
+- A `file` assertion checks the temp dir after the run: `exists: true` or `contains: "text"`. The file is a relative path, or a `$` path whose value is one (`$.testPath`).
+
+`npm run eval -- [agent] [--model provider/id]` runs every case (or one agent's) in sequence. Each case launches the package agent the way the `subagent` tool launches a child (`lib/child-run.ts`: the same `pi --mode json` command, prompt, tools, admission, guard, and structured output), with `BRIGADEV_HOME` and the run folder inside the temp dir. It prints `PASS`/`FAIL <agent>/<case>` with each assertion's reason, keeps the temp dir of a failing case, prints a summary with the cost, and exits non-zero on a failure or an invalid case. Without `--model` the agent's frontmatter model applies, else Pi's default; profiles are not read. Evals call a model, so they are not part of `npm test`; `tests/evals.test.ts` checks the matcher and that the shipped cases are valid. `BRIGADEV_PI` overrides the `pi` command.
+
+`/brigadev:retro <runId>` closes one saved run (`<docs>/runs/<runId>/`) with its outcome: `success`, `flawed` (the agent produced the wrong thing), `blocked` (the environment lacked something), or `manual` (a deliberate human step). For `flawed` it drafts `evals/<agent>/<runId>/case.json` at the checkout's top level, with the run's task, reason, and edit surfaces and an `expect` skeleton from the result's shape (a boolean pinned to its value, an array needing an item, any other field required to exist), and writes it only after a confirm that shows the path and content; add a fixture and edit the skeleton into the right result. For `blocked` it drafts `Outcome: blocked (...). What was missing: ...` into the editor, from the agent's `unblock` or the run's error. Without a UI it prints the draft and writes nothing.
+
+Shipped cases: `review-4r` (an inverted owner check must get a BLOCKER or CRITICAL finding), `brigadev-reproduce` (a slug bug must be reproduced by a test under `tests/`), `brigadev-analyze` (a missing CSV export must fail its probe and get specs). `brigadev-verify` has none yet: a verify run needs a change, a spec, and several probes, too heavy for a sample.
+
 ## Agent overrides
 
 Override any package agent by name in `~/.pi/agent/agents/<name>.md` or, for trusted projects, `.pi/agents/<name>.md`; `/brigadev:agents` lists the effective set. Frontmatter: `name`, `description`, `tools`, `model`, `thinking`, `writer: true`, `admission: risk`, `output: <file>.schema.json` (a JSON Schema next to the agent file).

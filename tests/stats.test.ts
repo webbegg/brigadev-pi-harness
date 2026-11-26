@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import statsExtension from "../extensions/stats.ts";
-import { classifyBash, classifyTurn, computeStats, parseJsonl, percentile, readEvidenceDir, renderStats, sessionFiles, type SessionLog } from "../lib/stats.ts";
+import { classifyBash, classifyTurn, computeStats, lastOutcome, parseJsonl, percentile, readEvidenceDir, readWorkflowNames, renderStats, sessionFiles, workflowNames, type SessionLog } from "../lib/stats.ts";
+import { PACKAGE_WORKFLOWS_DIR } from "../lib/runtime.ts";
 import { createFakeCtx, createFakePi } from "./helpers/fake-pi.ts";
 
 const FIXTURES = join(import.meta.dirname, "fixtures", "stats");
@@ -183,6 +184,89 @@ describe("computeStats edge cases", () => {
 		assert.equal(stats.cacheHitRate, undefined);
 		assert.equal(stats.evidence, undefined);
 		assert.ok(renderStats(stats, "nothing").join("\n").includes("No sessions"));
+	});
+});
+
+describe("outcomes (factory S12)", () => {
+	let seq = 0;
+	const usage = { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } };
+	const at = () => new Date(Date.UTC(2026, 10, 20, 10, 0, seq++)).toISOString();
+	const user = (text: string) => ({ type: "message", timestamp: at(), message: { role: "user", content: [{ type: "text", text }] } });
+	const say = (text: string) => ({ type: "message", timestamp: at(), message: { role: "assistant", content: [{ type: "text", text }], usage } });
+	const call = (text: string) => ({ type: "message", timestamp: at(), message: { role: "assistant", content: [{ type: "text", text }, { type: "toolCall", id: `c${seq}`, name: "read", arguments: { path: "a" } }], usage } });
+	const subagentResult = (results: unknown[]) => ({ type: "message", timestamp: at(), message: { role: "toolResult", toolCallId: "s1", toolName: "subagent", content: [{ type: "text", text: "..." }], details: { mode: "parallel", results }, isError: false } });
+	const finalMessage = (text: string) => [{ role: "assistant", content: [{ type: "text", text }] }];
+
+	const workflowSession: SessionLog = {
+		id: "w",
+		entries: [
+			user("Bug fix request, started from the workflow menu. Reproduce the problem first.\n\nWhere: src/a.ts"),
+			call("Outcome: flawed"), // a turn that calls a tool does not close it
+			say("Done: fixed\nOutcome: flawed\nTests: 3 pass\nOutcome: success\nNext: PR"),
+			user("and the other bug?"),
+			say("Done: nothing\nRisk: none\n**Outcome:** blocked\nNext: a staging login"),
+		],
+	};
+	const plainSession: SessionLog = {
+		id: "p",
+		entries: [
+			user("Feature request, started from the workflow menu. Explore first, then implement."),
+			say("Outcome: manual"),
+			user("explain the close line"),
+			say("It ends with `Outcome:` (success|flawed|blocked|manual: shipped, wrong result, ...)."),
+			subagentResult([
+				{ agent: "brigadev-verify", exitCode: 1, stopReason: "error", messages: [] },
+				{ agent: "review-4r", exitCode: 0, stopReason: "stop", messages: finalMessage("") },
+				{ agent: "review-4r", exitCode: 0, stopReason: "stop", messages: finalMessage(""), structured: { findings: [] } },
+				{ agent: "brigadev-explore", exitCode: 0, stopReason: "stop", messages: finalMessage("found it") },
+				{ agent: "brigadev-worker", exitCode: 0, stopReason: "aborted", cancelled: true, messages: [] },
+			]),
+		],
+	};
+	const names = new Map([["Bug fix request", "Bug fix"]]);
+	const stats = computeStats([workflowSession, plainSession], [], { workflows: names });
+
+	it("takes the last Outcome line of a closing message, plain or bold, and ignores the vocabulary itself", () => {
+		assert.equal(lastOutcome("Outcome: flawed\nOutcome: success"), "success");
+		assert.equal(lastOutcome("- **Outcome:** blocked (no staging login)"), "blocked");
+		assert.equal(lastOutcome("outcome: MANUAL"), "manual");
+		assert.equal(lastOutcome("`Outcome:` (success|flawed|blocked|manual)"), undefined);
+		assert.equal(lastOutcome("Outcome: shipped"), undefined);
+		assert.equal(lastOutcome("Close with Outcome: success|flawed|blocked|manual."), undefined, "the vocabulary unparenthesised");
+		assert.equal(lastOutcome("I think the outcome: manual review was needed"), undefined, "mid-sentence prose");
+		assert.equal(lastOutcome("Outcome:\nsuccess criteria"), undefined, "across a line break");
+		assert.equal(lastOutcome("Next: PR\n> Outcome: success"), "success", "a quoted close line");
+	});
+
+	it("counts the outcomes of closing messages, overall and per workflow", () => {
+		assert.deepEqual(stats.outcomes.counts, { success: 1, flawed: 0, blocked: 1, manual: 1 });
+		assert.deepEqual(stats.outcomes.byWorkflow, [
+			{ workflow: "Bug fix", counts: { success: 1, flawed: 0, blocked: 1, manual: 0 } },
+			{ workflow: "Feature", counts: { success: 0, flawed: 0, blocked: 0, manual: 1 } },
+		]);
+	});
+
+	it("counts subagent runs that failed or ended without a result, per agent; cancelled runs are not failures", () => {
+		assert.deepEqual(stats.failedRuns, [
+			["brigadev-verify", 1],
+			["review-4r", 1],
+		]);
+	});
+
+	it("renders the outcome shares, the workflows, and the failed runs", () => {
+		const text = renderStats(stats, "all").join("\n");
+		assert.match(text, /outcomes\n  3 closed · success 1 \(33%\) · flawed 0 \(0%\) · blocked 1 \(33%\) · manual 1 \(33%\)/);
+		assert.match(text, /  Bug fix: success 1 · blocked 1\n  Feature: manual 1/);
+		assert.match(text, /subagent runs failed or without a result\n  brigadev-verify ×1 · review-4r ×1/);
+		assert.doesNotMatch(renderStats(computeStats([readLog("a")], []), "a").join("\n"), /outcomes|subagent runs failed/);
+	});
+
+	it("maps a workflow's request line to its name from the workflow files", () => {
+		const file = '---\nname: "Bug fix"\ndescription: "x"\nquestions:\n  - id: where\n---\nBug fix request, started from the workflow menu. Reproduce first.\n\n{{where}}\n';
+		assert.deepEqual(workflowNames([file, "no frontmatter"]), new Map([["Bug fix request", "Bug fix"]]));
+		const shipped = readWorkflowNames([PACKAGE_WORKFLOWS_DIR, join(FIXTURES, "missing")]);
+		assert.equal(shipped.get("PR feedback request"), "My PRs: feedback");
+		assert.equal(shipped.get("Team PR review request"), "Review a team PR");
 	});
 });
 
