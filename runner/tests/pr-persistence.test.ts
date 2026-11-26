@@ -3,6 +3,7 @@
 // storage with the same clock and the same fake GitHub. Phases: final-check, push, open (between `gh pr create` and the checkpoint), wait-ci, fix, wait-merge (also
 // right after `gh pr merge`, and an approval that expired meanwhile), on JSONL and SQLite. Also A5: `duplicate` and `closed` results of the `merge` command.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -222,6 +223,37 @@ for (const [name, open] of backends) {
 			assert.equal((await mergeLoop(second, ws.docPath)).result, "delivered");
 			assert.equal(await outcomeStatus(second, first), "merged");
 			assert.equal(gh.merges().length, 1);
+		});
+
+		it("S17: killed right after the runner merged the moved base into the branch: the merge is not made again, and the suite, push, CI, and a new approval follow", async () => {
+			const first = await startFirst();
+			await at.atMerge(first);
+			// Someone else's commit lands on main of the remote.
+			const other = mkdtempSync(join(tmpdir(), "brigadev-runner-main-"));
+			try {
+				execFileSync("git", ["clone", "-q", "-b", "main", gh.remote, other]);
+				writeFileSync(join(other, "main.js"), "main\n");
+				git(other, "add", "-A");
+				git(other, "commit", "-q", "-m", "main moves");
+				git(other, "push", "-q", "origin", "main");
+			} finally {
+				rmSync(other, { recursive: true, force: true });
+			}
+			const hit = hangOnce(gh, "after", (command, args) => command === "git" && args[0] === "merge");
+			assert.equal((await mergeLoop(current, ws.docPath)).result, "delivered");
+			await hit;
+			await kill();
+
+			const second = await reopen();
+			assert.equal(await second.start(ws.docPath, { pr: true }), first);
+			assert.equal((await at.atMerge(first)).mergeKey, "merge-2");
+			assert.equal((await mergeLoop(second, ws.docPath)).result, "delivered");
+			assert.equal(await outcomeStatus(second, first), "merged");
+			assert.equal(gh.gitCalls.filter((args) => args[0] === "merge").length, 1, "the base was merged once");
+			assert.equal(git(ws.repo, "rev-list", "--merges", "--count", "HEAD"), "1");
+			assert.equal(gh.pushes().length, 2, "the ticket's commit, then the merge commit");
+			assert.equal(gh.merges().length, 1);
+			assert.deepEqual(second.reports, []);
 		});
 
 		it("killed right after `gh pr merge` ran: the reopened loop sees the PR merged and does not merge again", async () => {

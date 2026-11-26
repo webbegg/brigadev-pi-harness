@@ -2,6 +2,7 @@
 //
 //   start → check (the full suite, evidence as the runner) → verify (T2 only: a read-only conversation) → push → open → wait-ci ⇄ poll
 //         → ready (one comment) → merge (parked on `brigadev.merge`) → done (merged)
+//   the base moved since the final check and the pushed commit does not contain it → sync (merge the base in) → check → … → ready (a new approval)
 //   a failure (suite, verify blockers, CI) → fix (a `brigadev.ticket` child with a synthetic ticket FIX-n) → verify | push
 //   any stop (3 fix attempts used, a refusal, an expiry) → stop (one PR comment, one Log line) → resume (parked on `brigadev.resume`) → the phase that stopped
 //
@@ -118,6 +119,8 @@ export type PrCarry = {
 	branch: string;
 	/** The commit the branch was last pushed at (CI results for another head are ignored). */
 	sha: string;
+	/** The base branch's commit (`origin/<default branch>`, fetched) when the final check ran: the merge gate compares it with the base at merge time. */
+	base?: string;
 	pr?: { number: number; url: string };
 	/** Fix attempts used since the start or the last `resume`. */
 	budget: number;
@@ -152,10 +155,11 @@ export type PrState =
 	| ({ phase: "poll" } & PrCarry)
 	| ({ phase: "nap" } & PrCarry)
 	| ({ phase: "merge"; key: string } & PrCarry)
+	| ({ phase: "sync"; target: string } & PrCarry)
 	| ({ phase: "stop"; reason: string; next: Plain; cost?: true } & PrCarry)
 	| ({ phase: "resume"; reason: string; key: string; next: Plain; cost?: true } & PrCarry);
 
-const CARRY_KEYS = ["branch", "sha", "pr", "budget", "fixSeq", "verifyRound", "mergeRound", "waits", "stops", "decision", "rounds", "answers", "warn"] as const;
+const CARRY_KEYS = ["branch", "sha", "base", "pr", "budget", "fixSeq", "verifyRound", "mergeRound", "waits", "stops", "decision", "rounds", "answers", "warn"] as const;
 
 /** The carried fields of a state (and nothing else), with a patch applied. */
 function carryOf(state: PrCarry, patch: Partial<PrCarry> = {}): PrCarry {
@@ -194,6 +198,8 @@ export function prPhaseLabel(state: PrState, carry: Pick<PrCarry, "fixSeq"> = st
 		case "ready":
 		case "merge":
 			return "wait-merge";
+		case "sync":
+			return "sync";
 		case "stop":
 		case "resume":
 			return "needs-you";
@@ -276,6 +282,28 @@ async function commitsAhead(deps: PrDeps, cwd: string, base: string): Promise<nu
 	const count = await gitOut(deps, cwd, "rev-list", "--count", `${remote ? `origin/${base}` : base}..HEAD`);
 	return count === undefined ? 0 : Number(count) || 0;
 }
+
+/**
+ * The base branch as the remote has it now: `git fetch` of the default branch into `refs/remotes/origin/<branch>`, then its commit. Read before the final check
+ * and again before the merge, so a base that moved in between is seen.
+ */
+async function readBase(deps: PrDeps, cwd: string): Promise<{ branch: string; sha: string } | { error: string }> {
+	const branch = (await readBranchFacts(asExec(deps), cwd)).defaultBranch;
+	if (!branch) return { error: "cannot determine the default branch (see `git remote set-head origin <branch>`)" };
+	const fetched = await deps.exec("git", ["fetch", "-q", "--no-tags", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { cwd, timeout: GIT_TIMEOUT });
+	if (fetched.code !== 0) return { error: `git fetch origin ${branch} failed: ${trimmed(fetched.stderr || fetched.stdout)}` };
+	const sha = await gitOut(deps, cwd, "rev-parse", "--verify", "-q", `refs/remotes/origin/${branch}^{commit}`);
+	return sha ? { branch, sha } : { error: `cannot read origin/${branch}` };
+}
+
+/** Whether `ancestor` is in `commit`'s history; undefined when git cannot say. */
+async function contains(deps: PrDeps, cwd: string, commit: string, ancestor: string): Promise<boolean | undefined> {
+	const result = await deps.exec("git", ["merge-base", "--is-ancestor", ancestor, commit], { cwd, timeout: GIT_TIMEOUT });
+	return result.code === 0 ? true : result.code === 1 ? false : undefined;
+}
+
+/** No program from the repository's config (the agent's to edit) runs for the runner's own merge: no hooks, no fsmonitor. */
+const NO_HOOKS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
 
 interface Live {
 	head: string;
@@ -440,7 +468,9 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 
 			// 1. final-check: the full suite, recorded as evidence by the runner. A failure is fixed.
 			check: phase<Plain>(async (task, runtime, context, live) => {
-				const state = task.state.checkpoint;
+				// The base this check runs against, so the merge gate can tell it moved. Best effort: unread, the gate goes by whether the pushed commit contains the base.
+				const read = await live(readBase(deps, task.input.cwd));
+				const state = "sha" in read ? carryOf(task.state.checkpoint, { base: read.sha }) : task.state.checkpoint;
 				const suite = await live(deps.suite(task.input.cwd, runtime.signal, suiteRun));
 				if (suite.error) return stop(runtime, context, state, `the final check could not run: ${trimmed(suite.error)}`, at("check", state));
 				if (suite.exitCode === 0) return go(runtime, context, at("verify", state));
@@ -754,6 +784,18 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 					logLine(docPath, dateOf(runtime), `PR #${pr.number} not merged: ${why}; waiting for CI again`);
 					return go(runtime, context, at("wait-ci", state));
 				}
+				// S17: the base moved after the final check, and the pushed commit does not contain it: what would be merged was never tested. Merge the base in first;
+				// the suite, the push, CI, and a new approval follow. A base that moved to a commit the branch already has changes nothing.
+				const base = await live(readBase(deps, cwd));
+				if ("error" in base) return stop(runtime, context, state, `cannot read the base branch before the merge: ${base.error}`, at("ready", state));
+				if (base.sha !== state.base) {
+					const has = await live(contains(deps, cwd, state.sha, base.sha));
+					if (has === undefined) return stop(runtime, context, state, `git cannot tell whether ${short(state.sha)} contains origin/${base.branch}`, at("ready", state));
+					if (!has) {
+						logLine(docPath, dateOf(runtime), `base moved ${state.base ? short(state.base) : "unknown"}..${short(base.sha)}; syncing before merge`);
+						return go(runtime, context, { phase: "sync", target: base.sha, ...carryOf(state) });
+					}
+				}
 				// --match-head-commit: GitHub refuses the merge if the head moved after the re-read above.
 				const result = await live(deps.exec("gh", ["pr", "merge", String(pr.number), "--merge", "--match-head-commit", state.sha], { cwd, timeout: GH_TIMEOUT }));
 				if (result.code !== 0) {
@@ -763,6 +805,26 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 					return stop(runtime, context, state, `gh pr merge failed: ${trimmed(result.stderr || result.stdout)}`, at("ready", state));
 				}
 				await merged(runtime, context, state, task.input);
+			}),
+
+			// S17: merge the moved base (the exact commit the merge gate read) into the branch, then the final check again. Safe to rerun: a merge that already landed
+			// (the target is in HEAD's history) is not repeated, and one a crash left half done (MERGE_HEAD) is aborted and made again. A conflict is aborted, so the
+			// worktree is clean, and stops for a person; `resume` starts again at the final check.
+			sync: phase<Extract<PrState, { phase: "sync" }>>(async (task, runtime, context, live) => {
+				const state = task.state.checkpoint;
+				const { cwd } = task.input;
+				const carry = carryOf(state);
+				const abort = () => live(deps.exec("git", [...NO_HOOKS, "merge", "--abort"], { cwd, timeout: GIT_TIMEOUT }));
+				if (await live(gitOut(deps, cwd, "rev-parse", "-q", "--verify", "MERGE_HEAD"))) await abort();
+				const head = await live(gitOut(deps, cwd, "rev-parse", "HEAD"));
+				if (head && (await live(contains(deps, cwd, head, state.target)))) return go(runtime, context, at("check", carry));
+				const merged = await live(deps.exec("git", [...NO_HOOKS, "merge", "--no-edit", state.target], { cwd, timeout: GIT_TIMEOUT }));
+				if (merged.code === 0) return go(runtime, context, at("check", carry));
+				const conflicts = (await live(gitOut(deps, cwd, "diff", "--name-only", "--diff-filter=U"))) ?? "";
+				if (await live(gitOut(deps, cwd, "rev-parse", "-q", "--verify", "MERGE_HEAD"))) await abort();
+				const files = conflicts.split("\n").filter(Boolean);
+				const reason = files.length > 0 ? `base moved and the merge conflicts: ${files.join(", ")}` : `base moved and git merge failed: ${trimmed(merged.stderr || merged.stdout)}`;
+				await stop(runtime, context, carry, reason, at("check", carry));
 			}),
 
 			// needs-you: one PR comment (when a PR exists), one Log line, then park on `resume`. Both are once per stop.

@@ -373,6 +373,99 @@ describe("the merge gate (A5)", () => {
 		}
 	}
 
+	/** Someone else merges into the base: a commit on `main` of the remote, writing `file`. Returns its sha. */
+	function pushMain(file: string, content = "main\n"): string {
+		const other = mkdtempSync(join(tmpdir(), "brigadev-runner-main-"));
+		try {
+			execFileSync("git", ["clone", "-q", "-b", "main", gh.remote, other]);
+			writeFileSync(join(other, file), content);
+			git(other, "add", "-A");
+			git(other, "commit", "-q", "-m", `main: ${file}`);
+			git(other, "push", "-q", "origin", "main");
+			return git(other, "rev-parse", "HEAD");
+		} finally {
+			rmSync(other, { recursive: true, force: true });
+		}
+	}
+	/** The PR loop's suite, counted. */
+	function countedSuite(): { deps: PrDeps; runs: () => number } {
+		let runs = 0;
+		const real = prDepsOf(gh);
+		return { deps: { ...real, suite: (cwd, signal, run) => (runs++, real.suite(cwd, signal, run)) }, runs: () => runs };
+	}
+	const gitMerges = () => gh.gitCalls.filter((args) => args[0] === "merge" && !args.includes("--abort"));
+
+	it("S17: the base did not move since the final check: it is fetched, and the PR merges as before, with no sync", async () => {
+		const { id } = await begin({});
+		await atMerge(id);
+		assert.equal((await mergeLoop(runner!, ws.docPath)).result, "delivered");
+		assert.equal((await outcomeOf(id)).result.status, "merged");
+		assert.equal(gh.merges().length, 1);
+		assert.ok(gh.gitCalls.some((args) => args[0] === "fetch" && args.includes("origin")), "the base is fetched");
+		assert.equal(gitMerges().length, 0);
+		assert.ok(!logLines().some((line) => /base moved/.test(line)));
+	});
+
+	it("S17: the base moved but the pushed commit already contains it: merges with no sync", async () => {
+		const { id } = await begin({});
+		await atMerge(id);
+		// main fast-forwards to the branch's own commit (as if its content landed through another PR): the branch already has it.
+		git(ws.repo, "push", "-q", "origin", "HEAD:main");
+		assert.equal((await mergeLoop(runner!, ws.docPath)).result, "delivered");
+		assert.equal((await outcomeOf(id)).result.status, "merged");
+		assert.equal(gh.merges().length, 1);
+		assert.equal(gitMerges().length, 0);
+		assert.equal(gh.pushes().length, 1);
+	});
+
+	it("S17: the base moved after the final check: merge it in, run the suite again, push, wait for CI, ask a new approval, then merge", async () => {
+		const suite = countedSuite();
+		const { id } = await begin({}, "app.js", suite.deps);
+		await atMerge(id);
+		const old = git(ws.repo, "rev-parse", "origin/main");
+		const firstSha = gh.remoteSha(FEATURE_BRANCH)!;
+		assert.equal(suite.runs(), 1);
+		const moved = pushMain("main.js");
+
+		assert.equal((await mergeLoop(runner!, ws.docPath)).result, "delivered");
+		const again = await atMerge(id);
+		assert.equal(again.mergeKey, "merge-2", "a new approval, a new key");
+		assert.equal(gh.merges().length, 0, "nothing merged on the old approval");
+		assert.ok(logLines().some((line) => line.endsWith(`: base moved ${old.slice(0, 7)}..${moved.slice(0, 7)}; syncing before merge`)), readDoc(ws));
+		assert.deepEqual(gitMerges(), [["merge", "--no-edit", moved]], "one merge of the base, in the worktree");
+		assert.equal(suite.runs(), 2, "the full suite ran again");
+		const head = git(ws.repo, "rev-parse", "HEAD");
+		assert.notEqual(head, firstSha);
+		assert.equal(git(ws.repo, "rev-parse", "HEAD^1"), firstSha, "a merge commit on top of what was pushed: never a rewrite");
+		assert.equal(git(ws.repo, "rev-parse", "HEAD^2"), moved);
+		assert.equal(gh.pushes().length, 2);
+		assert.equal(gh.remoteSha(FEATURE_BRANCH), head);
+		assert.equal(gh.comments.length, 2, "a second merge-ready comment");
+		assert.equal(git(ws.repo, "status", "--porcelain"), "");
+
+		assert.equal((await mergeLoop(runner!, ws.docPath)).result, "delivered");
+		assert.equal((await outcomeOf(id)).result.status, "merged");
+		assert.deepEqual(gh.merges(), [["pr", "merge", "1", "--merge", "--match-head-commit", head]]);
+		assert.equal(gitMerges().length, 1, "the base did not move again: no second sync");
+	});
+
+	it("S17: the base moved and merging it conflicts: needs you with the files, the merge aborted, the worktree clean", async () => {
+		const { id } = await begin({});
+		await atMerge(id);
+		const head = git(ws.repo, "rev-parse", "HEAD");
+		pushMain("app.js", "conflicting line from main\n");
+
+		assert.equal((await mergeLoop(runner!, ws.docPath)).result, "delivered");
+		const stopped = await atStop(id);
+		assert.equal(stopped.reason, "base moved and the merge conflicts: app.js");
+		assert.equal(gh.merges().length, 0);
+		assert.equal(git(ws.repo, "rev-parse", "HEAD"), head, "no merge commit");
+		assert.equal(git(ws.repo, "status", "--porcelain"), "", "the merge was aborted");
+		assert.throws(() => git(ws.repo, "rev-parse", "-q", "--verify", "MERGE_HEAD"));
+		assert.match(gh.comments.at(-1)!.body, /^Needs you: base moved and the merge conflicts: app\.js/);
+		assert.ok(logLines().some((line) => /PR loop needs you \(1\): base moved and the merge conflicts: app\.js/.test(line)));
+	});
+
 	it("an approval that does not come in 24 h stops with `merge approval expired`; resume asks again with a new key", async () => {
 		const { id } = await begin({});
 		await atMerge(id);
