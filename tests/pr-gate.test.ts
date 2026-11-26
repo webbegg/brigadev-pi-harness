@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { EvidenceRecord, RunRecord, VerifyRecord } from "../lib/evidence.ts";
-import { decidePrGate, NO_HEAD_TEST_REASON, opensPrCreate, prCreateDirectory, prGateBlockMessage, type PrGateInput, UNRESOLVED_DIRECTORY_REASON } from "../lib/pr-gate.ts";
+import { decidePrGate, NO_HEAD_TEST_REASON, NO_REPRO_REASON, opensPrCreate, prCreateDirectory, prGateBlockMessage, type PrGateInput, UNRESOLVED_DIRECTORY_REASON } from "../lib/pr-gate.ts";
 
 const BRANCH = "feat/x";
 const T2 = { security: ["lib/guard-rules.ts"] };
@@ -214,6 +214,69 @@ describe("decidePrGate: a passing test on the committed HEAD (the evidence check
 		const message = prGateBlockMessage(withHead("T0", []), []);
 		assert.match(message, /commit .*then run the tests with `check` on the clean working tree/);
 		assert.match(prGateBlockMessage(withHead("T0", [], { head: { error: "git failed" } }), []), /fix the git problem/);
+	});
+});
+
+// Factory lanes S7: a fix branch shows the bug was reproduced, a failing test run followed by a passing one.
+describe("fix branch reproduction", () => {
+	const FIX = "fix/null-session";
+	const fixRun = (ts: string, outcome: RunRecord["outcome"], extra: Partial<RunRecord> = {}) => run(ts, outcome, { branch: FIX, ...extra });
+	const fix = (records: EvidenceRecord[], options: { tier?: "T0" | "T1" | "T2"; branch?: string | null; sourceChanged?: boolean } = {}) =>
+		decidePrGate({ tier: options.tier ?? "T1", categories: options.tier === "T2" ? T2 : {}, records, branch: "branch" in options ? (options.branch ?? null) : FIX, ledgerExists: true, sourceChanged: options.sourceChanged ?? true });
+
+	it("asks when nothing failed first", () => {
+		assert.deepEqual(fix([]), { action: "ask", reasons: [NO_REPRO_REASON] });
+		assert.deepEqual(fix([fixRun("2026-01-01T00:01:00Z", "pass")]).reasons, [NO_REPRO_REASON], "a pass alone");
+		assert.deepEqual(fix([fixRun("2026-01-01T00:01:00Z", "fail")]).reasons, [NO_REPRO_REASON], "a fail alone");
+		assert.deepEqual(fix([fixRun("2026-01-01T00:01:00Z", "pass"), fixRun("2026-01-01T00:02:00Z", "fail")]).reasons, [NO_REPRO_REASON], "a pass then a fail");
+	});
+
+	it("allows a failing test run followed by a passing one on the branch", () => {
+		assert.deepEqual(fix([fixRun("2026-01-01T00:01:00Z", "fail"), fixRun("2026-01-01T00:02:00Z", "pass")]), { action: "allow", reasons: [] });
+		assert.deepEqual(fix([fixRun("2026-01-01T00:02:00Z", "pass"), fixRun("2026-01-01T00:01:00Z", "fail")]), { action: "allow", reasons: [] }, "ordered by time, not by position");
+	});
+
+	it("counts only test runs of this branch: a failing lint, an unknown outcome, or another branch's failure is no reproduction", () => {
+		assert.equal(fix([fixRun("2026-01-01T00:01:00Z", "fail", { kind: "check", command: "npm run lint" }), fixRun("2026-01-01T00:02:00Z", "pass")]).action, "ask");
+		assert.equal(fix([fixRun("2026-01-01T00:01:00Z", "unknown"), fixRun("2026-01-01T00:02:00Z", "pass")]).action, "ask");
+		assert.equal(fix([fixRun("2026-01-01T00:01:00Z", "fail", { branch: "feat/x" }), fixRun("2026-01-01T00:02:00Z", "pass")]).action, "ask");
+	});
+
+	it("applies at every tier, next to the other reasons", () => {
+		assert.deepEqual(fix([], { tier: "T0" }).reasons, [NO_REPRO_REASON]);
+		assert.deepEqual(fix([], { tier: "T2" }).reasons, [NO_REPRO_REASON, "T2 branch (security: lib/guard-rules.ts) has no brigadev-verify run"]);
+	});
+
+	it("sits next to the HEAD test check: each reason stands on its own", () => {
+		const withHead = (records: EvidenceRecord[]) =>
+			decidePrGate({ tier: "T1", categories: {}, records, branch: FIX, ledgerExists: true, sourceChanged: true, head: { tree: "H", sourceTree: "H" } });
+		assert.deepEqual(withHead([]).reasons, [`${NO_HEAD_TEST_REASON} (no test ran on it)`, NO_REPRO_REASON], "neither");
+		assert.deepEqual(withHead([fixRun("2026-01-01T00:01:00Z", "fail", { tree: "A" }), fixRun("2026-01-01T00:02:00Z", "pass", { tree: "B" })]).reasons, [`${NO_HEAD_TEST_REASON} (no test ran on it)`], "reproduced, HEAD untested");
+		assert.deepEqual(withHead([fixRun("2026-01-01T00:01:00Z", "pass", { tree: "H" })]).reasons, [NO_REPRO_REASON], "HEAD tested, never failed");
+		assert.equal(withHead([fixRun("2026-01-01T00:01:00Z", "fail", { tree: "A" }), fixRun("2026-01-01T00:02:00Z", "pass", { tree: "H" })]).action, "allow");
+	});
+
+	it("at the same instant the log order decides; an unknown base still checks the fix", () => {
+		assert.equal(fix([fixRun("2026-01-01T00:01:00Z", "fail"), fixRun("2026-01-01T00:01:00Z", "pass")]).action, "allow", "the log is append-only: a pass recorded after the fail counts");
+		assert.equal(fix([fixRun("2026-01-01T00:01:00Z", "pass"), fixRun("2026-01-01T00:01:00Z", "fail")]).action, "ask", "a pass recorded before the fail does not");
+		const unknown = decidePrGate({ tier: "T0", categories: {}, records: [], branch: FIX, ledgerExists: true, sourceChanged: true, baseUnknown: true });
+		assert.ok(unknown.reasons.includes(NO_REPRO_REASON));
+	});
+
+	it("a detached HEAD (no branch) is not a fix branch; neither is a bare `fix/`-less name", () => {
+		assert.deepEqual(fix([], { branch: null }), { action: "allow", reasons: [] });
+		assert.deepEqual(fix([], { branch: "fix" }), { action: "allow", reasons: [] });
+	});
+
+	it("leaves other branch types and docs-only fix branches alone", () => {
+		for (const branch of ["feat/x", "chore/fix-typo", "hotfix/y", "refactor/fix"]) assert.deepEqual(fix([], { branch }), { action: "allow", reasons: [] }, branch);
+		assert.deepEqual(fix([], { sourceChanged: false }), { action: "allow", reasons: [] });
+	});
+
+	it("the block message says how to show the reproduction", () => {
+		const message = prGateBlockMessage(fix([]), []);
+		assert.match(message, /failing test.*RED.*GREEN/);
+		assert.match(message, /not a bug fix.*rename the branch/);
 	});
 });
 

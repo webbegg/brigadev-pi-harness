@@ -7,7 +7,9 @@ Parent session only. Load before launching a writer or verifier, or when one ret
 | `brigadev-explore` | Read-only mapping, ≤ ~2k token handoff with `path:line` | read, grep, find, ls | exploration |
 | `brigadev-worker` | Bounded writer, no commits | read, grep, find, ls, edit, write, bash | parallel writers or context handoff, with `allowedEditSurfaces` |
 | `brigadev-verify` | Independent spec-derived verification | read, grep, find, ls, bash | `Risk: <category> (why)` |
-| `review-4r` | One-pass 4R review (via `brigadev-review`) | read, grep, find, ls | review request |
+| `review-4r` | One-pass 4R review (via `brigadev-review`), with side-effect, performance, and backward-compatibility ratings | read, grep, find, ls | review request |
+| `brigadev-reproduce` | Bug lane: one failing test that shows the symptom, or what was tried; never fixes | read, grep, find, ls, edit, write, bash | context handoff, with `allowedEditSurfaces` limited to test paths |
+| `brigadev-analyze` | Feature lane: a probe that fails on the current code, numbered specs, docs scope, backward compatibility | read, grep, find, ls, bash, codemode | exploration |
 
 `/brigadev:agents` shows the effective list, including user and trusted project overrides.
 

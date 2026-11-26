@@ -1,7 +1,8 @@
 // The PR risk gate (S9): before `gh pr create`, a branch that commits source needs a passing test
 // recorded for the committed HEAD (the evidence check; commits themselves are never gated), a T2
 // branch needs a brigadev-verify run, and verify
-// blockers need a repro test that went RED then GREEN after the verify. Pure functions of plain
+// blockers need a repro test that went RED then GREEN after the verify, and a `fix/` branch needs the bug reproduced: a
+// failing test run followed by a passing one (factory lanes S7). Pure functions of plain
 // inputs (the guard reads the facts); a T1 branch without a review ledger only earns a note.
 // The guard asks instead of passing when it cannot read the facts: this is the gate in front of delivery.
 
@@ -38,6 +39,17 @@ export const UNRESOLVED_DIRECTORY_REASON = "PR risk gate could not resolve the d
 export const NO_HEAD_TEST_REASON = "no passing test recorded for the committed HEAD";
 export const HEAD_TREE_ERROR_REASON = "test evidence unknown: HEAD's tree could not be computed";
 export const PR_FACTS_ERROR_REASON = "PR gate could not read the branch facts";
+export const NO_REPRO_REASON = "fix branch shows no reproduction: no failing test run followed by a passing one on this branch";
+
+/** A bug-fix branch by name: `fix/<slug>`, the prefix brigadev-branch-pr gives a fix. */
+const isFixBranch = (branch: string | null): boolean => branch?.startsWith("fix/") === true;
+
+/** Why a fix branch lacks a reproduction (a test run that failed, then one that passed), or undefined when it has one or is not a fix. */
+function reproReason(input: PrGateInput): string | undefined {
+	if (!isFixBranch(input.branch) || !input.sourceChanged) return undefined;
+	const runs = input.records.filter((r): r is RunRecord => r.type === "run" && r.branch === input.branch);
+	return redThenGreen(runs, "") ? undefined : NO_REPRO_REASON;
+}
 
 /** Why HEAD lacks a passing test, or undefined when one is recorded (or there is nothing to check). */
 function headTestReason(input: PrGateInput): string | undefined {
@@ -76,9 +88,9 @@ function redThenGreen(runs: readonly RunRecord[], after: string): boolean {
 
 export function decidePrGate(input: PrGateInput): PrGateDecision {
 	const { tier, branch } = input;
-	const untested = headTestReason(input);
-	if (tier === "T0" && !input.baseUnknown) return untested ? { action: "ask", reasons: [untested] } : { action: "allow", reasons: [] };
-	const reasons: string[] = untested ? [untested] : [];
+	const early = [headTestReason(input), reproReason(input)].filter((reason): reason is string => reason !== undefined);
+	if (tier === "T0" && !input.baseUnknown) return early.length > 0 ? { action: "ask", reasons: early } : { action: "allow", reasons: [] };
+	const reasons: string[] = early;
 	if (input.baseUnknown && tier !== "T2") reasons.push(UNKNOWN_BASE_REASON);
 	const verifies = input.records.filter((r): r is VerifyRecord => r.type === "verify" && r.branch === branch && r.outcome !== "failed");
 	// The latest by time; among equal times the one recorded last (the log is append-only).
@@ -153,6 +165,7 @@ export function prGateBlockMessage(decision: PrGateDecision, categories: readonl
 	if (joined.includes(NO_HEAD_TEST_REASON)) steps.push("commit your changes, then run the tests with `check` on the clean working tree, the full suite with no `focus` or `command` (a run with uncommitted source edits does not vouch for HEAD)");
 	if (joined.includes(HEAD_TREE_ERROR_REASON) || joined.includes(PR_FACTS_ERROR_REASON)) steps.push("fix the git problem (a corrupt index, a stuck lock, an unreadable evidence log)");
 	if (joined.includes(UNRESOLVED_DIRECTORY_REASON)) steps.push("run `gh pr create` as its own plain command from the repository directory (or after a leading `cd <dir> &&`), not inside a subshell, `bash -c`, `eval`, or a variable path");
+	if (joined.includes(NO_REPRO_REASON)) steps.push("reproduce the bug with a failing test run through `check` (RED), fix it, and run it again (GREEN); if the branch is not a bug fix, rename the branch (`chore/`, `refactor/`, `feat/`)");
 	if (/repro test/.test(joined)) steps.push("add the repro test for each verify blocker and run it through check (RED, then GREEN)");
 	return `Blocked by brigadev guard: gh pr create was declined (${joined}). To clear it: ${steps.join("; ")}; then retry. Do not open the PR another way.`;
 }

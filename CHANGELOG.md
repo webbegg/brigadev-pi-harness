@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- Stage agents for the bug and feature lanes: `brigadev-reproduce` (a writer limited to test paths: one test that fails because of the bug, or what was tried; never fixes) and `brigadev-analyze` (read-only: a probe that fails on the current code in a scratch copy, numbered specs, docs scope, backward compatibility). Both return schema-checked results.
+- `review-4r` returns a `risk` rating (side effects, performance, backward compatibility: none, low, medium, or high, each with its reason) for the PR body's Review section. The field is optional in the schema, so older custom reviewers stay valid.
+
+### Changed
+
+- **The PR gate asks for a reproduction on `fix/` branches.** `gh pr create` on a `fix/` branch that commits source asks (in every mode; blocks without a UI) unless the branch's evidence log shows a failing test run followed by a passing one. A failing lint, an `unknown` outcome, or another branch's run does not count. Docs-only fix branches and other branch types are unaffected.
+
+### Fixed
+
+- `check` with a leading `cd` into the run's repository (`cd .worktrees/x && npm test` from the main checkout) recorded the run as `unknown`; it now records `pass` or `fail` like the bash recorder, so a worktree's RED and GREEN count for its PR gate.
+
 ## [0.25.0] - 2026-11-25
 
 The pull request becomes the gate: commits are never blocked on test evidence, `gh pr create` needs a passing full-suite run on the committed HEAD, and every push and PR creation asks you in every mode (YOLO included). Deletes in the temp folders stop asking, and the runner gets a dollar cost cap per loop. Breaking: `/brigadev:force-commit` is gone, and YOLO asks before pushes and PRs.

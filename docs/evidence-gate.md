@@ -14,6 +14,8 @@ Before `gh pr create`, a branch that commits source since its base needs a passi
 - **Docs-only branches** need no test run. Docs are `*.md`, `*.markdown`, `*.rst`, `*.adoc`, and `LICENSE`/`NOTICE`/`CHANGELOG`/`COPYING`/`AUTHORS`. `.txt` and `.mdx` count as source. An unknown base branch, or a `git diff` that fails, counts as source changed; deletions and renames of source count as source.
 - **It asks instead of passing** when it cannot look: HEAD's tree cannot be computed, the evidence log cannot be read, or the directory of `gh pr create` cannot be resolved.
 
+On a `fix/` branch that commits source, the gate also asks for the bug's reproduction: a failing `test` run on the branch followed by a passing one (a failing lint or an `unknown` outcome does not count). A branch that fixes no bug should not be named `fix/`.
+
 The same gate also asks for a `brigadev-verify` run on a T2 branch and for a RED→GREEN repro test after verify blockers (see [configuration.md](configuration.md)). A PR creation always asks for your approval, in every mode, and the gate's reasons ride that one dialog; without a UI it blocks. Only you can open the PR past it, in that dialog. Subagents never reach it: they cannot open PRs.
 
 ## The exit-code rule
