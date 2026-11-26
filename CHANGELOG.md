@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-11-26
+
+brigadev runs well inside T3 Code: an optional `brigadev-t3` add-on shows status chips and settles where the two sets of rules overlap, and `ask_user_choice` opens real dialogs in RPC clients. MCP tools that open a PR, merge, or push now go through the guard like their gh/git commands, and subagents no longer inherit MCP server credentials.
+
 ### Added
 
 - `t3/`: brigadev-t3, an optional add-on for T3 Code (load it with `-e <path>/t3` in Pi's launch arguments in T3 Code's settings). It adds status chips for the loop phase, todo progress, and the last check, and a prompt section that settles where brigadev's and T3's rules overlap (subagents, PR tools, CI waits). It reads only the `brigadev:*` bus and does nothing outside T3 Code; `tests/t3-contract.test.ts` checks the channels it reads.
