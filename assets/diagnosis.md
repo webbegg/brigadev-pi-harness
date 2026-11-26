@@ -12,7 +12,12 @@ Before any hypothesis, run one command that fails because of this bug, and show 
 - It must assert the user's exact symptom, not "runs without error", and be fast, deterministic, and runnable unattended. For a flaky bug, loop it until the failure rate is debuggable.
 - A recognised test or check command is recorded in the evidence log automatically, and the PR body quotes the failing run as the RED. Run it as the command itself; a pipe is fine, but `||` or `;` after it records the run as unknown.
 - A CI failure: with `codemode`, fetch the log (`gh run view <id> --log-failed`) inside one script and return only the failing steps and errors, not the whole log.
-- No loop possible: stop, list what you tried, and ask for access, a redacted artifact, or permission for temporary instrumentation. Do not guess.
+- No loop possible: do not guess; end the step with `Not reproduced:` below.
+
+Close this step with one block, before any source edit:
+
+- `Reproduced:` the command, an excerpt of its failing output that shows the symptom, and the test path (`no test yet` when the command is a script; the failing test still comes before the fix, step 5).
+- `Not reproduced:` what was tried, each with its result, and what would unblock it (access, a redacted artifact, or permission for temporary instrumentation). Then stop.
 
 ## 2. Minimise
 

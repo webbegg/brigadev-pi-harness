@@ -35,7 +35,7 @@ Ticket request, started from the workflow menu. The ticket below (key, kind, tex
 
 Normalize the key first: take the first match of `[A-Za-z][A-Za-z0-9]+-[0-9]+` in the ticket key answer (so a pasted ticket URL or a lowercase key works), uppercase it, and use that as <KEY> everywhere below. If there is no match, ask once for the key and stop.
 
-"Bug" means follow the bug-fix flow: a failing test that reproduces it comes first, whatever the size, then fix the root cause following the diagnosis loop in `diagnosis.md` in the assets root named in the orchestrator prompt. "Story or task" means the normal feature flow.
+"Bug" means follow the bug-fix flow: a failing test that reproduces it comes first, whatever the size, then fix the root cause following the diagnosis loop in `diagnosis.md` in the assets root named in the orchestrator prompt; its `Reproduced:` block comes before any source edit. "Story or task" means the normal feature flow: every size except a "Quick change" starts with an `Analysis:` block before the first source write: a probe that fails on the current code (the command and its output, proving the feature is absent), numbered specs with their checks, the docs scope, and backward compatibility (what existing callers, flags, or formats notice).
 
 "Quick change" means work inline, test first, in one work unit and its commit, with no feature document; if it needs more than that, stop and say so instead of growing it. "Plan first" means track it per `odd-tracking.md` with the whole request above (key, kind, ticket text, and link) as L1 verbatim, then show the plan and stop for the user's approval before the first source write. "Let the agent decide" means apply the usual tracking rule: only multi-session work gets a feature document.
 

@@ -35,6 +35,6 @@ Bug fix request, started from the workflow menu. Reproduce the problem first, ad
 - Actual (errors or logs): {{actual}}
 - Ticket or link: {{ticket}}
 
-Follow the diagnosis loop in `diagnosis.md` in the assets root named in the orchestrator prompt.
+Follow the diagnosis loop in `diagnosis.md` in the assets root named in the orchestrator prompt. Its `Reproduced:` block (the failing command, its output, the test path) comes before any source edit.
 
-If the problem cannot be reproduced from the details above, report what was tried instead of guessing at a fix.
+If the problem cannot be reproduced from the details above, end with its `Not reproduced:` block (what was tried) instead of guessing at a fix.

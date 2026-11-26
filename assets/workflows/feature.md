@@ -22,12 +22,14 @@ questions:
     options: ["Let the agent decide", "Quick change", "Plan first"]
     default: "Let the agent decide"
 ---
-Feature request, started from the workflow menu. Explore first, then implement.
+Feature request, started from the workflow menu. Explore first, then analyze, then implement.
 
 - What to build: {{what}}
 - Area or files: {{area}}
 - Acceptance criteria: {{criteria}}
 - Ticket or link: {{ticket}}
 - Size: {{size}}
+
+Every size except a "Quick change" starts with an `Analysis:` block before the first source write: a probe that fails on the current code (the command and its output, proving the feature is absent), numbered specs with their checks, the docs scope, and backward compatibility (what existing callers, flags, or formats notice).
 
 "Quick change" means work inline, test first, in one work unit and its commit, with no feature document; if it needs more than that, stop and say so instead of growing it. "Plan first" means track it per `odd-tracking.md` with this request quoted verbatim as L1, then show the plan and stop for the user's approval before the first source write. "Let the agent decide" means apply the usual tracking rule: only multi-session work gets a feature document.

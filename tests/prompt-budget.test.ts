@@ -15,7 +15,8 @@ import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
 const root = join(import.meta.dirname, "..");
 const bytes = (s: string) => Buffer.byteLength(s, "utf8");
 
-const ORCHESTRATOR_MAX_BYTES = 2_600;
+// Raised from 2,600 for the close's `Outcome:` (success|flawed|blocked|manual), the run-outcome signal of software-factory-lanes S6.
+const ORCHESTRATOR_MAX_BYTES = 2_700;
 // Measured 623 bytes; appended after the orchestrator prompt while codemode is active.
 const CODEMODE_MAX_BYTES = 700;
 const SKILL_DESCRIPTION_MAX_CHARS = 120;
@@ -95,7 +96,7 @@ describe("prompt budget", () => {
 	it("asks for no narration between tool calls and a fixed closing shape", () => {
 		const prompt = readFileSync(join(root, "assets", "orchestrator.md"), "utf8");
 		assert.match(prompt, /no narration between tool calls/);
-		assert.match(prompt, /`Done:`.*`Tests:`.*`Risk:`.*`Next:`/);
+		assert.match(prompt, /`Done:`.*`Tests:`.*`Risk:`.*`Outcome:`.*`Next:`/);
 	});
 
 	it(`keeps the brigadev tool definitions under ${TOOL_DEFINITIONS_MAX_CHARS} chars in total`, async () => {
