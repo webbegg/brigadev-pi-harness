@@ -250,11 +250,11 @@ describe("runCheck risk notice (S5)", () => {
 		assert.equal(quiet.text.split("\n").length, first.text.split("\n").length - 1, "the result is otherwise identical in shape");
 
 		write("src/render.ts");
-		assert.equal((await run()).text.split("\n").at(-1), "risk T1 → before PR: review R3");
+		assert.equal((await run()).text.split("\n").at(-1), "risk T1 → before PR: review R3, ≤2 revise rounds");
 		write("src/render2.ts");
 		assert.doesNotMatch((await run()).text, /^risk /m);
 		write("src/guard.ts");
-		assert.match((await run()).text.split("\n").at(-1) ?? "", /^risk T2 security\(src\/guard\.ts\) → before PR: brigadev-verify \+ R1,R3$/);
+		assert.match((await run()).text.split("\n").at(-1) ?? "", /^risk T2 security\(src\/guard\.ts\) → before PR: brigadev-verify \+ R1,R3, ≤2 revise rounds$/);
 		assert.equal(first.details?.recorded, quiet.details?.recorded);
 	});
 

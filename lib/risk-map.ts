@@ -131,14 +131,32 @@ export function classifyPaths(paths: readonly string[], map: RiskMap): Classific
 
 // --- The line the model sees ---------------------------------------------------
 
-const MAX_LINE = 120;
+const MAX_LINE = 140;
 const MAX_PATH = 48;
 const SHOWN_PATHS = 2;
 
 const shortPath = (path: string): string => (path.length > MAX_PATH ? `…${path.slice(-(MAX_PATH - 1))}` : path);
 
-/** `risk T2 security(lib/guard-rules.ts) → before PR: brigadev-verify + R1,R3`; T1 `risk T1 → before PR: review R3`; T0 `risk T0 → tests only`. */
-export function formatRiskLine(c: Classification): string {
+/** Revise rounds after the review before the PR when `review.maxRounds` is absent or invalid. */
+export const DEFAULT_REVIEW_ROUNDS = 2;
+const MAX_REVIEW_ROUNDS = 5;
+
+/** `review.maxRounds` from brigadev.json: an integer 0 to 5; anything else is the default, listed in `invalid`. */
+export function reviewRounds(settings: unknown): { rounds: number; invalid: string[] } {
+	const review = (settings as { review?: unknown } | undefined)?.review;
+	if (review === undefined) return { rounds: DEFAULT_REVIEW_ROUNDS, invalid: [] };
+	if (!isRecord(review)) return { rounds: DEFAULT_REVIEW_ROUNDS, invalid: ["review: not an object"] };
+	const value = review.maxRounds;
+	if (value === undefined) return { rounds: DEFAULT_REVIEW_ROUNDS, invalid: [] };
+	if (typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= MAX_REVIEW_ROUNDS) return { rounds: value, invalid: [] };
+	return { rounds: DEFAULT_REVIEW_ROUNDS, invalid: [`review.maxRounds: not an integer from 0 to ${MAX_REVIEW_ROUNDS}`] };
+}
+
+/**
+ * `risk T2 security(lib/guard-rules.ts) → before PR: brigadev-verify + R1,R3, ≤2 revise rounds`; T1 `risk T1 → before PR: review R3, ≤2 revise rounds`
+ * (`no revise rounds` with 0); T0 `risk T0 → tests only`.
+ */
+export function formatRiskLine(c: Classification, rounds = DEFAULT_REVIEW_ROUNDS): string {
 	if (c.tier === "T0") return "risk T0 → tests only";
 	const entries = CATEGORIES.flatMap((category) => {
 		const paths = c.categories[category];
@@ -152,7 +170,8 @@ export function formatRiskLine(c: Classification): string {
 				return `${category}(${paths.slice(0, SHOWN_PATHS).map(shortPath).join(", ")}${extra})`;
 			})
 			.join(" ");
-	const action = `→ before PR: ${c.tier === "T2" ? "brigadev-verify + " : "review "}${c.lenses.join(",")}`;
+	const revise = rounds > 0 ? `≤${rounds} revise rounds` : "no revise rounds";
+	const action = `→ before PR: ${c.tier === "T2" ? "brigadev-verify + " : "review "}${c.lenses.join(",")}, ${revise}`;
 	const line = (compact: boolean) => ["risk", c.tier, entries.length ? detail(compact) : "", action].filter(Boolean).join(" ");
 	return line(false).length <= MAX_LINE ? line(false) : line(true);
 }
@@ -239,7 +258,7 @@ export async function riskNotice(exec: ExecFn, cwd: string, settings: unknown): 
 		const signature = `${result.tier}|${Object.keys(result.categories).sort().join(",")}`;
 		if (lastNotice.get(key) === signature) return undefined;
 		lastNotice.set(key, signature);
-		return formatRiskLine(result);
+		return formatRiskLine(result, reviewRounds(settings).rounds);
 	} catch {
 		return undefined;
 	}

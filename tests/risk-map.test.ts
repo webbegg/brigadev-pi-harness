@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { branchRisk, classifyPaths, DEFAULT_RISK_MAP, formatRiskLine, mergeRiskMap, riskNotice, resetRiskNotices } from "../lib/risk-map.ts";
+import { branchRisk, classifyPaths, DEFAULT_RISK_MAP, formatRiskLine, mergeRiskMap, reviewRounds, riskNotice, resetRiskNotices } from "../lib/risk-map.ts";
 import type { ExecFn } from "../lib/worktree-snapshot.ts";
 
 const classify = (...paths: string[]) => classifyPaths(paths, DEFAULT_RISK_MAP);
@@ -95,17 +95,41 @@ describe("mergeRiskMap (S3)", () => {
 
 describe("formatRiskLine", () => {
 	it("T2 names the categories, the verify and the lenses", () => {
-		assert.equal(formatRiskLine(classify("lib/guard-rules.ts")), "risk T2 security(lib/guard-rules.ts) → before PR: brigadev-verify + R1,R3");
+		assert.equal(formatRiskLine(classify("lib/guard-rules.ts")), "risk T2 security(lib/guard-rules.ts) → before PR: brigadev-verify + R1,R3, ≤2 revise rounds");
 	});
 	it("shows at most two paths per category with +N and stays short", () => {
 		const line = formatRiskLine(classify("a/auth/one.ts", "a/auth/two.ts", "a/auth/three.ts", "a/auth/four.ts", "db/migrations/1.sql"));
-		assert.match(line, /^risk T2 security\(a\/auth\/one\.ts, a\/auth\/two\.ts \+2\) data\(db\/migrations\/1\.sql\) → before PR: brigadev-verify \+ R1,R3,R4$/);
+		assert.match(line, /^risk T2 security\(a\/auth\/one\.ts, a\/auth\/two\.ts \+2\) data\(db\/migrations\/1\.sql\) → before PR: brigadev-verify \+ R1,R3,R4, ≤2 revise rounds$/);
 		assert.ok(formatRiskLine(classify("x".repeat(200) + "/guard.ts", "y".repeat(200) + "/storage.ts")).length <= 140);
 	});
 	it("T1 and T0", () => {
-		assert.equal(formatRiskLine(classify("src/render.ts")), "risk T1 → before PR: review R3");
-		assert.equal(formatRiskLine(classify("package.json")), "risk T1 delivery(package.json) → before PR: review R1,R3");
+		assert.equal(formatRiskLine(classify("src/render.ts")), "risk T1 → before PR: review R3, ≤2 revise rounds");
+		assert.equal(formatRiskLine(classify("package.json")), "risk T1 delivery(package.json) → before PR: review R1,R3, ≤2 revise rounds");
 		assert.equal(formatRiskLine(classify("README.md")), "risk T0 → tests only");
+	});
+	it("names the configured revise rounds; 0 says none; T0 has none to name", () => {
+		assert.equal(formatRiskLine(classify("src/render.ts"), 5), "risk T1 → before PR: review R3, ≤5 revise rounds");
+		assert.equal(formatRiskLine(classify("lib/guard-rules.ts"), 0), "risk T2 security(lib/guard-rules.ts) → before PR: brigadev-verify + R1,R3, no revise rounds");
+		assert.equal(formatRiskLine(classify("README.md"), 0), "risk T0 → tests only");
+	});
+});
+
+describe("reviewRounds (review.maxRounds)", () => {
+	it("defaults to 2 when absent", () => {
+		assert.deepEqual(reviewRounds(undefined), { rounds: 2, invalid: [] });
+		assert.deepEqual(reviewRounds({}), { rounds: 2, invalid: [] });
+		assert.deepEqual(reviewRounds({ review: {} }), { rounds: 2, invalid: [] });
+	});
+	it("takes an integer from 0 to 5", () => {
+		for (const rounds of [0, 1, 3, 5]) assert.deepEqual(reviewRounds({ review: { maxRounds: rounds } }), { rounds, invalid: [] });
+	});
+	it("falls back to the default and reports anything else", () => {
+		for (const value of [-1, 6, 100, 1.5, "2", null, true]) {
+			const { rounds, invalid } = reviewRounds({ review: { maxRounds: value } });
+			assert.equal(rounds, 2, String(value));
+			assert.deepEqual(invalid, ["review.maxRounds: not an integer from 0 to 5"], String(value));
+		}
+		assert.deepEqual(reviewRounds({ review: 3 }), { rounds: 2, invalid: ["review: not an object"] });
 	});
 });
 
@@ -212,7 +236,7 @@ describe("branchRisk (S4)", () => {
 		git("checkout", "-q", "-b", "feat/notice");
 		write("src/render.ts", "n1\n");
 		const first = await riskNotice(exec, repo, {});
-		assert.equal(first, "risk T1 → before PR: review R3");
+		assert.equal(first, "risk T1 → before PR: review R3, ≤2 revise rounds");
 		assert.equal(await riskNotice(exec, repo, {}), undefined);
 		write("src/render.ts", "n2\n");
 		assert.equal(await riskNotice(exec, repo, {}), undefined, "same tier and categories");
@@ -229,6 +253,8 @@ describe("branchRisk (S4)", () => {
 			throw new Error("boom");
 		};
 		assert.equal(await riskNotice(failing, repo, {}), undefined);
+		resetRiskNotices();
+		assert.match((await riskNotice(exec, repo, { review: { maxRounds: 0 } })) ?? "", /, no revise rounds$/, "the configured rounds");
 	});
 });
 
