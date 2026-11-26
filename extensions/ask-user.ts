@@ -8,6 +8,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Editor, type EditorTheme, Key, matchesKey, Text, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { askWithDialogs } from "../lib/choice-dialog.ts";
 import { askChoice } from "../lib/human-prompt.ts";
 import { isChildSession } from "../lib/runtime.ts";
 
@@ -47,7 +48,9 @@ export default function (pi: ExtensionAPI) {
 			const labels = params.options.map((o) => o.label);
 			const details = (answer: string | null, wasCustom?: boolean): ChoiceDetails => ({ question: params.question, options: labels, answer, wasCustom });
 
-			if (ctx.mode !== "tui") {
+			// An RPC client with a UI (T3 Code, any `pi --mode rpc` front end) gets Pi's standard dialogs instead of the TUI component.
+			const dialogs = ctx.mode === "rpc" && ctx.hasUI;
+			if (ctx.mode !== "tui" && !dialogs) {
 				return {
 					content: [{ type: "text", text: "No interactive UI: ask the question in your reply as a numbered list and stop until the user answers." }],
 					details: details(null),
@@ -62,7 +65,12 @@ export default function (pi: ExtensionAPI) {
 
 			// The TUI component and a web answer race (first wins); a web answer closes the component through its captured `done`.
 			const spec = { source: "ask", question: params.question, options: params.options, recommended: recommended >= 0 ? recommended + 1 : undefined, allowOther: params.allowOther };
-			const result = await askChoice(pi.events, spec, (onClose) => ctx.ui.custom<{ answer: string; wasCustom: boolean } | null>((tui, theme, _kb, done) => {
+			const askInDialogs = (onClose: (close: () => void) => void) => {
+				const controller = new AbortController();
+				onClose(() => controller.abort());
+				return askWithDialogs(ctx.ui, params.question, params.options, recommended, params.allowOther, controller.signal);
+			};
+			const result = await askChoice(pi.events, spec, dialogs ? askInDialogs : (onClose) => ctx.ui.custom<{ answer: string; wasCustom: boolean } | null>((tui, theme, _kb, done) => {
 				onClose(() => done(null));
 				let index = recommended >= 0 ? recommended : 0;
 				let editing = false;
