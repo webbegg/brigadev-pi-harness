@@ -12,7 +12,7 @@ export function validateDoc(text: string): string[] {
 		// A reproduction (`! <cmd>`) proves only that the bug is there: some ticket after it must make <cmd> pass, or the run ends with the bug committed as a test.
 		if (unfinished && ticket.expectFail) {
 			const inner = expectFailInner(ticket.done ?? "")!;
-			const fixed = list.tickets.some((other) => other.deps.includes(ticket.id) && other.doneIsCommand && other.done?.trim() === inner);
+			const fixed = list.tickets.some((other) => other.deps.includes(ticket.id) && other.status !== "dropped" && other.doneIsCommand && other.done?.trim() === inner);
 			if (!fixed) errors.push(`${ticket.id} reproduces with \`${inner}\` but no ticket depends on it with that command passing`);
 		}
 	}

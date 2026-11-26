@@ -784,17 +784,16 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 					logLine(docPath, dateOf(runtime), `PR #${pr.number} not merged: ${why}; waiting for CI again`);
 					return go(runtime, context, at("wait-ci", state));
 				}
-				// S17: the base moved after the final check, and the pushed commit does not contain it: what would be merged was never tested. Merge the base in first;
-				// the suite, the push, CI, and a new approval follow. A base that moved to a commit the branch already has changes nothing.
+				// S17: the pushed commit does not contain the base as it is now: what would be merged was never tested against it. Merge the base in first;
+				// the suite, the push, CI, and a new approval follow. The test is containment, not "moved since the final check": a base that moved before
+				// the check (recorded then, absent from the branch) or a loop from before this version (no recorded base) needs the sync just the same.
 				const base = await live(readBase(deps, cwd));
 				if ("error" in base) return stop(runtime, context, state, `cannot read the base branch before the merge: ${base.error}`, at("ready", state));
-				if (base.sha !== state.base) {
-					const has = await live(contains(deps, cwd, state.sha, base.sha));
-					if (has === undefined) return stop(runtime, context, state, `git cannot tell whether ${short(state.sha)} contains origin/${base.branch}`, at("ready", state));
-					if (!has) {
-						logLine(docPath, dateOf(runtime), `base moved ${state.base ? short(state.base) : "unknown"}..${short(base.sha)}; syncing before merge`);
-						return go(runtime, context, { phase: "sync", target: base.sha, ...carryOf(state) });
-					}
+				const has = await live(contains(deps, cwd, state.sha, base.sha));
+				if (has === undefined) return stop(runtime, context, state, `git cannot tell whether ${short(state.sha)} contains origin/${base.branch}`, at("ready", state));
+				if (!has) {
+					logLine(docPath, dateOf(runtime), `base moved ${state.base && state.base !== base.sha ? short(state.base) : "before the check"}..${short(base.sha)}; syncing before merge`);
+					return go(runtime, context, { phase: "sync", target: base.sha, ...carryOf(state) });
 				}
 				// --match-head-commit: GitHub refuses the merge if the head moved after the re-read above.
 				const result = await live(deps.exec("gh", ["pr", "merge", String(pr.number), "--merge", "--match-head-commit", state.sha], { cwd, timeout: GH_TIMEOUT }));
@@ -814,14 +813,17 @@ export function createPrTask(ticketTask: TicketTask, options: PrOptions = {}) {
 				const state = task.state.checkpoint;
 				const { cwd } = task.input;
 				const carry = carryOf(state);
-				const abort = () => live(deps.exec("git", [...NO_HOOKS, "merge", "--abort"], { cwd, timeout: GIT_TIMEOUT }));
-				if (await live(gitOut(deps, cwd, "rev-parse", "-q", "--verify", "MERGE_HEAD"))) await abort();
-				const head = await live(gitOut(deps, cwd, "rev-parse", "HEAD"));
+				const abort = async () => (await live(deps.exec("git", [...NO_HOOKS, "merge", "--abort"], { cwd, timeout: GIT_TIMEOUT }))).code === 0;
+				// Every git call here runs without the repository's hooks and fsmonitor: `git diff` refreshes the index, which would run a configured fsmonitor.
+				const git = (...args: string[]) => live(gitOut(deps, cwd, ...NO_HOOKS, ...args));
+				const stuck = "git merge --abort failed: the worktree is mid-merge; run `git merge --abort` in it, then resume";
+				if ((await git("rev-parse", "-q", "--verify", "MERGE_HEAD")) && !(await abort())) return stop(runtime, context, carry, stuck, at("check", carry));
+				const head = await git("rev-parse", "HEAD");
 				if (head && (await live(contains(deps, cwd, head, state.target)))) return go(runtime, context, at("check", carry));
 				const merged = await live(deps.exec("git", [...NO_HOOKS, "merge", "--no-edit", state.target], { cwd, timeout: GIT_TIMEOUT }));
 				if (merged.code === 0) return go(runtime, context, at("check", carry));
-				const conflicts = (await live(gitOut(deps, cwd, "diff", "--name-only", "--diff-filter=U"))) ?? "";
-				if (await live(gitOut(deps, cwd, "rev-parse", "-q", "--verify", "MERGE_HEAD"))) await abort();
+				const conflicts = (await git("diff", "--name-only", "--diff-filter=U")) ?? "";
+				if ((await git("rev-parse", "-q", "--verify", "MERGE_HEAD")) && !(await abort())) return stop(runtime, context, carry, stuck, at("check", carry));
 				const files = conflicts.split("\n").filter(Boolean);
 				const reason = files.length > 0 ? `base moved and the merge conflicts: ${files.join(", ")}` : `base moved and git merge failed: ${trimmed(merged.stderr || merged.stdout)}`;
 				await stop(runtime, context, carry, reason, at("check", carry));

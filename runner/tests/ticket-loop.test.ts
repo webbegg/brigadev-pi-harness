@@ -254,6 +254,14 @@ describe("runner-only start rules (S7, A2)", () => {
 		assert.equal(worker.prompts.length, 0);
 	});
 
+	it("a dropped fix ticket does not pair with a reproduction", async () => {
+		const { validateDoc } = await import("../src/doc.ts");
+		const errors = validateDoc(
+			docText(["- T1 [S1] inline: reproduce deps: none done: `! test -f fixed.txt` — pending", "- T2 [S1] inline: fix deps: T1 done: `test -f fixed.txt` — dropped not needed"]),
+		);
+		assert.ok(errors.some((error) => error.startsWith("T1 reproduces with")), errors.join("\n"));
+	});
+
 	it("leaves finished tickets alone: a done ticket with an observable check does not block the start", async () => {
 		writeFileSync(ws.docPath, docText(["- T1 [S1] inline: old deps: none done: the page renders — done abc1234", T2]));
 		const worker = makeWorker({ T2: commitFile("t2.txt") });

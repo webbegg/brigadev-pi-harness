@@ -449,6 +449,17 @@ describe("the merge gate (A5)", () => {
 		assert.equal(gitMerges().length, 1, "the base did not move again: no second sync");
 	});
 
+	it("S17: the base moved before the final check: the pushed commit lacks it, so the merge gate syncs although the base did not move again", async () => {
+		const moved = pushMain("main.js");
+		const { id } = await begin({});
+		await atMerge(id);
+		assert.equal((await mergeLoop(runner!, ws.docPath)).result, "delivered");
+		const again = await atMerge(id);
+		assert.equal(again.mergeKey, "merge-2", "not merged on the first approval");
+		assert.equal(gh.merges().length, 0);
+		assert.deepEqual(gitMerges(), [["merge", "--no-edit", moved]]);
+	});
+
 	it("S17: the base moved and merging it conflicts: needs you with the files, the merge aborted, the worktree clean", async () => {
 		const { id } = await begin({});
 		await atMerge(id);
