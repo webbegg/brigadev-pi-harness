@@ -148,6 +148,19 @@ describe("guard: PR risk gate", () => {
 		}
 	});
 
+	it("a fix/ branch needs a failing test run then a passing one before the PR (factory lanes S7)", async () => {
+		const { cwd, docs } = repo(["src/a.ts"], "fix/crash");
+		const fixRun = (outcome: "fail" | "pass", ts: string, extra: object = {}) =>
+			appendEvidence(evidenceFile(docs, "fix/crash"), record({ type: "run", kind: "test", outcome, ts, branch: "fix/crash", tree: headTree(cwd), root: cwd, cwd, agent: "parent", command: "npm test", tail: "", ...extra }));
+		fixRun("pass", "2026-01-01T00:02:00Z");
+		const before = await session(cwd, { ui: false });
+		assert.match(String(await before.bash(PR)), /fix branch shows no reproduction[\s\S]*\(RED\)/);
+		fixRun("fail", "2026-01-01T00:01:00Z", { tree: "other", exitCode: 1 });
+		const after = await session(cwd, { answer: true });
+		assert.equal(await after.bash(PR), undefined);
+		onlyApproval(after);
+	});
+
 	it("T0 in yolo: only the PR approval, with no gate reason", async () => {
 		const { cwd, docs } = repo(["tests/a.test.ts"]);
 		tested(cwd, docs);
