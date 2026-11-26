@@ -74,9 +74,10 @@ Per field, a launch resolves: session profile, default profile, agent frontmatte
 | `alt+w`, `/brigadev:start [workflow]` | Workflow menu |
 | `/brigadev:profile …` | Model routing profiles |
 | `/brigadev:cost` | Session cost by model and agent, cache hit rate, subscription usage windows |
-| `/brigadev:stats [all\|<N>d]` | Cost by phase, context percentiles, cache rebuilds, gate blocks from Pi's session logs |
+| `/brigadev:stats [all\|<N>d]` | Cost by phase, context percentiles, cache rebuilds, gate blocks, outcomes (the close line's `Outcome:`, per workflow) and failed subagent runs per agent, from Pi's session logs |
 | `alt+g`, `/brigadev:changes` | Uncommitted files and diffs (read-only) |
 | `alt+a`, `/brigadev:runs` | Agents viewer: every subagent run with its thread (read-only) |
+| `/brigadev:retro <runId>` | Close a subagent run with its outcome (success, flawed, blocked, manual); flawed drafts an eval case after a confirm |
 | `/brigadev:ps` | Background processes started with `bg_start` |
 | `/brigadev:web [start\|open\|stop\|status]` | Local web UI for this session: a board of the loop (subagents, checks, commits, your decisions, prompts waiting on you), detail panels, and a composer (send, steer, abort). `open` prints a new one-time link |
 | `/brigadev:pr` | The current branch's pull request (needs `gh`) |
@@ -138,9 +139,10 @@ The same channels feed [pi-agent-dashboard](https://github.com/BlackBeltTechnolo
 
 ```bash
 npm test   # node --test tests/*.test.ts; no build step (Node >= 22.19 runs TypeScript directly)
+npm run eval -- [agent] [--model provider/id]   # agent evals in evals/<agent>/<case>/: real model calls, not part of npm test
 ```
 
-Pure logic lives in `lib/` and is covered by `tests/`; extensions in `extensions/` are thin adapters over the Pi API.
+Pure logic lives in `lib/` and is covered by `tests/`; extensions in `extensions/` are thin adapters over the Pi API. Agent evals (a task, a fixture, and assertions on the structured result) are described in [docs/subagents.md](docs/subagents.md#evals).
 
 ## Known limits
 

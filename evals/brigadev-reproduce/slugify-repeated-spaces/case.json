@@ -1,0 +1,21 @@
+{
+	"task": "Bug report. Where: src/slugify.js. Steps: call slugify(\"Hello   World\") (three spaces). Expected: \"hello-world\". Actual: \"hello---world\". The project's tests run with `node --test` and live in tests/.",
+	"fixture": "fixture",
+	"allowedEditSurfaces": [
+		"tests/**"
+	],
+	"expect": [
+		{
+			"path": "$.reproduced",
+			"equals": true
+		},
+		{
+			"path": "$.testPath",
+			"matches": "^tests/"
+		},
+		{
+			"file": "$.testPath",
+			"contains": "slugify"
+		}
+	]
+}

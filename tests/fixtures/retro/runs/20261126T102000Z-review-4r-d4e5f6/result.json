@@ -1,0 +1,19 @@
+{
+  "runId": "20261126T102000Z-review-4r-d4e5f6",
+  "agent": "review-4r",
+  "task": "Review the diff",
+  "exitCode": 1,
+  "stopReason": "error",
+  "errorMessage": "model quota exceeded",
+  "usage": {
+    "input": 10,
+    "output": 20,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "cost": 0.01,
+    "contextTokens": 0,
+    "turns": 3
+  },
+  "output": "model quota exceeded",
+  "finalText": ""
+}

@@ -1,0 +1,14 @@
+{
+	"task": "Review the change in change.patch, already applied to src/permissions.js in this directory. Apply all four lenses.",
+	"fixture": "fixture",
+	"expect": [
+		{
+			"path": "$.findings[*].severity",
+			"matches": "^(BLOCKER|CRITICAL)$"
+		},
+		{
+			"path": "$.findings[*].location",
+			"matches": "permissions\\.js"
+		}
+	]
+}

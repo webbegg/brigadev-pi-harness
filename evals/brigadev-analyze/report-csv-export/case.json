@@ -1,0 +1,18 @@
+{
+	"task": "Feature request: src/report.js should export toCSV(rows), returning a header line with the column names (id,name,total) and one comma-separated line per row, like toJSON already does for JSON.",
+	"fixture": "fixture",
+	"expect": [
+		{
+			"path": "$.probe.fails",
+			"equals": true
+		},
+		{
+			"path": "$.specs",
+			"minItems": 1
+		},
+		{
+			"path": "$.backcompat",
+			"exists": true
+		}
+	]
+}
