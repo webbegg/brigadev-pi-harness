@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -52,6 +52,10 @@ describe("selectPath", () => {
 		assert.deepEqual(selectPath(value, "$.findings[*].severity"), ["WARNING", "BLOCKER"]);
 		assert.deepEqual(selectPath(value, "$.findings[5].severity"), []);
 		assert.deepEqual(selectPath(value, "$.missing.deeper"), []);
+	});
+
+	it("sees only the result's own keys, never inherited ones", () => {
+		for (const path of ["$.constructor", "$.toString", "$.__proto__", "$.probe.hasOwnProperty"]) assert.deepEqual(selectPath(value, path), [], path);
 	});
 });
 
@@ -124,6 +128,27 @@ describe("loadCases", () => {
 		assert.match(errors[0], /^review-4r\/broken: case\.json is not valid JSON/);
 		assert.equal(errors[1], "review-4r/empty: missing case.json");
 		assert.equal(errors[2], "review-4r/no-fixture: fixture: no such directory fixture");
+	});
+
+	it("refuses a fixture that is the case folder itself, a symlink, or outside the case", () => {
+		const dir = mkdtempSync(join(tmpdir(), "brigadev-evals-fixture-"));
+		try {
+			const outside = join(dir, "outside");
+			mkdirSync(outside);
+			const kase = (name: string, fixture: string) => {
+				mkdirSync(join(dir, "evals", "review-4r", name), { recursive: true });
+				writeFileSync(join(dir, "evals", "review-4r", name, "case.json"), JSON.stringify({ ...valid, fixture }));
+			};
+			kase("dot", ".");
+			kase("up", "../dot");
+			kase("link", "fixture");
+			symlinkSync(outside, join(dir, "evals", "review-4r", "link", "fixture"));
+			const { cases, errors } = loadCases(join(dir, "evals"));
+			assert.deepEqual(cases, []);
+			assert.deepEqual(errors, ["review-4r/dot: fixture: must be a folder inside the case folder", "review-4r/link: fixture: must not be a symlink", "review-4r/up: fixture: must be a relative directory inside the case"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("keeps one agent's cases, and reports a missing folder", () => {

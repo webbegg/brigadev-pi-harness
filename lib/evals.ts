@@ -3,7 +3,7 @@
 // and assertions on the agent's structured result and on the files it left behind.
 // Pure loading, validation, and matching: no model calls, so every rule here has a unit test.
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
@@ -123,14 +123,36 @@ export function loadCases(evalsDir: string, agent?: string): { cases: EvalCase[]
 				continue;
 			}
 			const fixture = parsed.spec.fixture === undefined ? undefined : join(dir, parsed.spec.fixture);
-			if (fixture !== undefined && !(existsSync(fixture) && statSync(fixture).isDirectory())) {
-				errors.push(`${label}: fixture: no such directory ${parsed.spec.fixture}`);
+			const problem = fixture === undefined ? undefined : fixtureProblem(dir, fixture, parsed.spec.fixture!);
+			if (problem) {
+				errors.push(`${label}: fixture: ${problem}`);
 				continue;
 			}
 			cases.push({ ...parsed.spec, agent: agentName, name, dir, fixture });
 		}
 	}
 	return { cases, errors };
+}
+
+/**
+ * Why a case's fixture cannot be copied as the agent's cwd, or undefined. It must be a real folder strictly inside the case
+ * folder: `.` would hand the agent the case's own `expect`, and a symlink or `..` would copy (and let the agent write into)
+ * a folder outside the case.
+ */
+function fixtureProblem(caseDir: string, fixture: string, declared: string): string | undefined {
+	const rel = relative(caseDir, fixture);
+	if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return "must be a folder inside the case folder";
+	if (!existsSync(fixture) && !lstatOrUndefined(fixture)) return `no such directory ${declared}`;
+	if (lstatOrUndefined(fixture)?.isSymbolicLink()) return "must not be a symlink";
+	return statSync(fixture).isDirectory() ? undefined : `no such directory ${declared}`;
+}
+
+function lstatOrUndefined(path: string): ReturnType<typeof lstatSync> | undefined {
+	try {
+		return lstatSync(path);
+	} catch {
+		return undefined;
+	}
 }
 
 /** The values a path selects (`[*]` fans out over an array); empty when nothing is there. */
@@ -140,7 +162,8 @@ export function selectPath(value: unknown, path: string): unknown[] {
 		const next: unknown[] = [];
 		for (const v of current) {
 			if (key !== undefined) {
-				if (isObject(v) && key in v) next.push(v[key]);
+				// Own keys only: `$.constructor` or `$.__proto__` must not find something every object inherits.
+				if (isObject(v) && Object.hasOwn(v, key)) next.push(v[key]);
 			} else if (Array.isArray(v)) {
 				if (index === "*") next.push(...v);
 				else if (Number(index) < v.length) next.push(v[Number(index)]);

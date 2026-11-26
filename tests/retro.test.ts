@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
@@ -147,6 +147,25 @@ describe("/brigadev:retro", () => {
 		const accepted = await run(REPRODUCE, { outcome: "flawed", confirm: true });
 		assert.ok(parseCase(JSON.parse(readFileSync(target(), "utf8"))).ok);
 		assert.match(accepted.text, /Wrote/);
+	});
+
+	it("never writes through an evals folder that leads outside the project", async () => {
+		const outside = join(root, "outside-evals");
+		mkdirSync(outside, { recursive: true });
+		symlinkSync(outside, join(cwd, "evals"));
+		const { text } = await run(REPRODUCE, { outcome: "flawed", confirm: true });
+		assert.match(text, /outside the project/);
+		assert.equal(existsSync(join(outside, "brigadev-reproduce")), false);
+	});
+
+	it("never writes a draft that is not a valid eval case", async () => {
+		const id = "20261126T103000Z-brigadev-analyze-000001";
+		const runDir = join(root, "home", "demo", "runs", id);
+		mkdirSync(runDir, { recursive: true });
+		writeFileSync(join(runDir, "result.json"), JSON.stringify({ agent: "brigadev-analyze", structured: { specs: [] } }));
+		const { text } = await run(id, { outcome: "flawed", confirm: true });
+		assert.match(text, /not a valid eval case/);
+		assert.equal(existsSync(join(cwd, "evals", "brigadev-analyze", id)), false);
 	});
 
 	it("blocked drafts the missing line into the editor; manual and success write nothing", async () => {

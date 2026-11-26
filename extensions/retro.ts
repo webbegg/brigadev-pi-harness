@@ -9,12 +9,35 @@
  * A user command only: no tools, no hooks, no prompt text. Without a UI it prints the draft and writes nothing.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { parseCase } from "../lib/evals.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { repoDocsDir } from "../lib/repo-docs.ts";
 import { blockedLine, draftEvalCase, OUTCOMES, readRun, runIdProblem, type Outcome } from "../lib/retro.ts";
 import { isChildSession } from "../lib/runtime.ts";
+
+/** True when `target`, through its nearest existing folder with every symlink resolved, stays inside `root`. */
+function staysInside(target: string, root: string): boolean {
+	let existing = dirname(target);
+	while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
+	try {
+		const rel = relative(realpathSync(root), realpathSync(existing));
+		return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+	} catch {
+		return false;
+	}
+}
+
+/** Why a draft must not be written, or undefined: it has to load as an eval case. */
+function draftProblem(text: string): string | undefined {
+	try {
+		const parsed = parseCase(JSON.parse(text));
+		return parsed.ok ? undefined : parsed.errors.join("; ");
+	} catch (err) {
+		return err instanceof Error ? err.message : String(err);
+	}
+}
 
 const USAGE = "Usage: /brigadev:retro <runId>  (a folder name under the repo docs runs/; /brigadev:runs shows the ids)";
 
@@ -41,16 +64,22 @@ export default function (pi: ExtensionAPI) {
 			if (!read.ok) return ctx.ui.notify(read.error, "warning");
 			const { run } = read;
 			const draft = draftEvalCase(run);
-			const target = join(await projectRoot(ctx.cwd), draft.path);
+			const root = await projectRoot(ctx.cwd);
+			const target = join(root, draft.path);
 
 			if (!ctx.hasUI) return ctx.ui.notify(`brigadev retro: no UI, nothing written. Eval case draft for ${draft.path}:\n${draft.text}`, "info");
 
 			const outcome = (await ctx.ui.select(`Outcome of ${run.agent} run ${runId}`, [...OUTCOMES])) as Outcome | undefined;
 			if (outcome === "flawed") {
+				const invalid = draftProblem(draft.text);
+				if (invalid) return ctx.ui.notify(`The draft is not a valid eval case (${invalid}); nothing written.\n${draft.text}`, "warning");
+				if (!staysInside(target, root)) return ctx.ui.notify(`${target} leads outside the project (a symlinked evals folder?); nothing written.`, "warning");
 				if (existsSync(target)) return ctx.ui.notify(`${target} already exists; nothing written.`, "warning");
 				if (!(await ctx.ui.confirm("brigadev: write this eval case?", `${target}\n\n${draft.text}`))) return ctx.ui.notify("Eval case not written.", "info");
 				mkdirSync(dirname(target), { recursive: true });
-				writeFileSync(target, draft.text, "utf8");
+				// Checked again after the folders exist (a link made meanwhile), and `wx` never overwrites.
+				if (!staysInside(target, root)) return ctx.ui.notify(`${target} leads outside the project; nothing written.`, "warning");
+				writeFileSync(target, draft.text, { encoding: "utf8", flag: "wx" });
 				return ctx.ui.notify(`Wrote ${target}. Add a fixture and turn the expect skeleton into the right result, then run npm run eval -- ${run.agent}.`, "info");
 			}
 			if (outcome === "blocked") {

@@ -23,9 +23,12 @@ const USAGE = "Usage: npm run eval -- [agent] [--model provider/id]";
 /** The fixture copied into `<root>/work`, committed so the agent starts from a clean tree. */
 function prepareWorkdir(root: string, fixture: string | undefined): string {
 	const work = join(root, "work");
-	if (fixture) cpSync(fixture, work, { recursive: true });
+	// verbatimSymlinks: a relative link stays relative, so it cannot point the agent back into the repository's fixture.
+	if (fixture) cpSync(fixture, work, { recursive: true, verbatimSymlinks: true });
 	else mkdirSync(work);
-	const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=brigadev-eval", "-c", "user.email=eval@localhost", ...args], { cwd: work, stdio: "ignore" });
+	// The user's global git config must not sign, hook, or otherwise act on the throwaway commit.
+	const git = (...args: string[]) =>
+		execFileSync("git", ["-c", "user.name=brigadev-eval", "-c", "user.email=eval@localhost", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args], { cwd: work, stdio: "ignore" });
 	git("init", "-q");
 	git("add", "-A");
 	git("commit", "-q", "--allow-empty", "-m", "eval fixture");
