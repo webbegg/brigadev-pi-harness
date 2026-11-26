@@ -132,10 +132,14 @@ Guard confirmations and `ask_user_choice` can be answered in the terminal or the
 
 The same channels feed [pi-agent-dashboard](https://github.com/BlackBeltTechnology/pi-agent-dashboard) when it is installed. They are declared for its event forwarding, along with a loop breadcrumb and footer segments. Its own prompt bus shows guard dialogs.
 
+## T3 Code
+
+The harness runs in T3 Code as it is: T3 drives Pi over RPC, so guard confirmations show as T3 approvals and `ask_user_choice` as a T3 question. The optional add-on in [t3/](t3/README.md) adds status chips for the loop and a prompt section that settles where brigadev's and T3's rules overlap. The harness never depends on it.
+
 ## Development
 
 ```bash
-npm test   # node --test tests/*.test.ts; no build step (Node >= 22.19 runs TypeScript directly)
+npm test   # node --test tests/*.test.ts t3/tests/*.test.ts; no build step (Node >= 22.19 runs TypeScript directly)
 ```
 
 Pure logic lives in `lib/` and is covered by `tests/`; extensions in `extensions/` are thin adapters over the Pi API.

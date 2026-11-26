@@ -1,0 +1,28 @@
+{
+	"name": "brigadev-t3",
+	"version": "0.1.0",
+	"private": true,
+	"description": "brigadev in T3 Code: status chips for the brigadev loop and a prompt section that settles where brigadev's and T3's rules overlap. Loads next to the brigadev harness; does nothing outside T3 Code.",
+	"license": "MIT",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"brigadev",
+		"t3code"
+	],
+	"pi": {
+		"extensions": [
+			"./src/extension.ts"
+		]
+	},
+	"scripts": {
+		"test": "node --test tests/*.test.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
