@@ -10,6 +10,7 @@ import { CodingTools } from "@earendil-works/pi-durable/tools";
 import {
 	appendLogLine,
 	changedSpecs,
+	expectFailInner,
 	ownedLineConflicts,
 	parseTicketList,
 	readyTickets,
@@ -550,7 +551,10 @@ function createLoopTask(ticketTask: TicketTask, prTask: ReturnType<typeof create
 				let change: Change;
 				if (outcome.status === "completed") {
 					const sha = ("commit" in outcome.result ? outcome.result.commit : "").slice(0, 7);
-					change = { id: state.ticketId, status: "done", note: `${sha} (${state.done} passed)`, log: `${state.ticketId} done ${sha} (${state.done} passed)`, own: true };
+					// A reproduce ticket (`! <cmd>`) passed because <cmd> failed: say so, a "passed" would read as the bug being fixed.
+					const inner = expectFailInner(state.done);
+					const proof = inner !== undefined ? `reproduced (${inner} failed as expected)` : `(${state.done} passed)`;
+					change = { id: state.ticketId, status: "done", note: `${sha} ${proof}`, log: `${state.ticketId} done ${sha} ${proof}`, own: true };
 				} else {
 					const reason = outcome.status === "failed" ? outcome.error.message : `ticket run ${outcome.status}${"reason" in outcome && outcome.reason ? `: ${outcome.reason}` : ""}`;
 					const tail = outcome.status === "failed" ? (outcome.error.detail as { outputTail?: string } | undefined)?.outputTail : undefined;

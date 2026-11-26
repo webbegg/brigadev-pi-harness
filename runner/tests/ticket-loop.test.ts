@@ -95,6 +95,28 @@ describe("ticket loop (S2)", () => {
 		assert.deepEqual(statuses(ws), { T1: "blocked", T2: "pending", T3: "done" });
 	});
 
+	it("runs a reproduce ticket (`! <cmd>`) and then its fix, logging the reproduction as such (S14)", async () => {
+		writeFileSync(
+			ws.docPath,
+			docText(["- T1 [S1] inline: reproduce the bug deps: none done: `! test -f fixed.txt` — pending", "- T2 [S1] inline: fix the bug deps: T1 done: `test -f fixed.txt` — pending"]),
+		);
+		const worker = makeWorker({ T1: commitFile("repro.txt"), T2: commitFile("fixed.txt") });
+		const { outcome } = await run(worker);
+		assert.equal((outcome as { result: { status: string } }).result.status, "done");
+
+		const doc = readDoc(ws);
+		const [t1, t2] = parseTicketList(doc).tickets;
+		assert.match(t1.note, /^[0-9a-f]{7} reproduced \(test -f fixed\.txt failed as expected\)$/);
+		assert.match(t2.note, /^[0-9a-f]{7} \(test -f fixed\.txt passed\)$/);
+		assert.match(doc, /: T1 done [0-9a-f]{7} reproduced \(test -f fixed\.txt failed as expected\)\n/);
+
+		// The reproduce brief asks for a failing, committed test and forbids the fix; the fix ticket's brief does not.
+		const [repro, fix] = worker.prompts;
+		assert.match(repro.system, /test that fails because of the bug/);
+		assert.match(repro.system, /Do not fix the bug/);
+		assert.doesNotMatch(fix.system, /Do not fix the bug/);
+	});
+
 	it("ends done when every ticket is done", async () => {
 		writeFileSync(ws.docPath, docText([T1, T2]));
 		const worker = makeWorker({ T1: commitFile("t1.txt"), T2: commitFile("t2.txt") });
@@ -212,6 +234,24 @@ describe("runner-only start rules (S7, A2)", () => {
 		assert.ok(message.includes("T4 has no done: check"), message);
 		assert.equal(worker.prompts.length, 0);
 		assert.equal(readDoc(ws).includes("in_progress"), false);
+	});
+
+	it("refuses an expected-fail ticket that no ticket follows with its command passing (S14)", async () => {
+		writeFileSync(
+			ws.docPath,
+			docText([
+				"- T1 [S1] inline: reproduce deps: none done: `! test -f fixed.txt` — pending",
+				// Depends on T1 but checks another command; T3 checks the command but does not depend on T1.
+				"- T2 [S1] inline: fix deps: T1 done: `test -f other.txt` — pending",
+				"- T3 [S1] inline: unrelated deps: none done: `test -f fixed.txt` — pending",
+			]),
+		);
+		const worker = makeWorker({});
+		const { outcome } = await run(worker);
+		assert.equal(outcome.status, "failed");
+		const message = (outcome as { error: { message: string } }).error.message;
+		assert.ok(message.includes("T1 reproduces with `test -f fixed.txt` but no ticket depends on it with that command passing"), message);
+		assert.equal(worker.prompts.length, 0);
 	});
 
 	it("leaves finished tickets alone: a done ticket with an observable check does not block the start", async () => {

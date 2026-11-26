@@ -61,6 +61,16 @@ pi-durable allows one writer per storage. Checked on pi-durable 1.6.0: a second 
 
 - `T3 done: is not a command`: the runner can only run commands, so an unfinished ticket's `done:` must be a backticked command.
 - the doc has a `## Log` section (every finished ticket appends one line).
+- `T1 reproduces with \`<cmd>\` but no ticket depends on it with that command passing`: a reproduce ticket is always followed by its fix (below).
+
+**Reproduce, then fix (S14).** A bug's RED can be a ticket of its own: its `done:` is `` `! <cmd>` `` (bash negation, so it exits 0 while `<cmd>` fails), and a fix ticket lists it in `deps:` with `` done: `<cmd>` ``, the same command (compared after the `! `, trimmed):
+
+```markdown
+- T1 [S1] inline: reproduce the crash deps: none done: `! node --test tests/crash.test.ts` — pending
+- T2 [S1] inline: fix the crash deps: T1 done: `node --test tests/crash.test.ts` — pending
+```
+
+The reproduce worker's brief says its job is a committed test that fails because of the bug, and that it must not fix the bug. Its line and Log entry read `done <sha> reproduced (<cmd> failed as expected)` instead of `(<done> passed)`. Like any ticket, it must commit (HEAD must move).
 
 ## How it works
 

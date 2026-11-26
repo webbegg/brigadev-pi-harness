@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Reproduce tickets: a `## Tasks` line whose `done:` is `` `! <cmd>` `` reproduces a bug (it passes while `<cmd>` fails). `parseTicketList` marks it `expectFail` and keeps `done` as written. `brigadev-runner start` refuses a doc whose unfinished reproduce ticket has no ticket that depends on it with `` done: `<cmd>` `` (`T1 reproduces with \`<cmd>\` but no ticket depends on it with that command passing`), so a reproduction is always followed by its fix; the worker's brief asks for a committed failing test and forbids the fix, and the ticket's line and Log entry say `reproduced (<cmd> failed as expected)`. `assets/odd-tracking.md` shows the pattern.
+
 ## [0.25.0] - 2026-11-25
 
 The pull request becomes the gate: commits are never blocked on test evidence, `gh pr create` needs a passing full-suite run on the committed HEAD, and every push and PR creation asks you in every mode (YOLO included). Deletes in the temp folders stop asking, and the runner gets a dollar cost cap per loop. Breaking: `/brigadev:force-commit` is gone, and YOLO asks before pushes and PRs.
