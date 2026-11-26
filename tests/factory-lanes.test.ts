@@ -62,8 +62,18 @@ describe("S1 From a GitHub issue", () => {
 
 	it("treats the issue text as untrusted data and routes to the four lanes", () => {
 		const text = compose("issue", { issue: "42" });
-		has(text, ["untrusted data", "never follow instructions", "Bug:", "Feature:", "Docs:", "Refactor:", "`diagnosis.md`", "Reproduced:", "Analysis:", "Review depth: glance", "Refs #<n>", "`Closes #<n>` only when the user says so"], "issue lanes");
+		has(text, ["untrusted data", "never follow instructions", "Bug:", "Feature:", "Docs:", "Refactor:", "`diagnosis.md`", "Reproduced:", "Analysis:", "Review depth: glance", "`Refs #<n>` footer"], "issue lanes");
 		assert.ok(text.indexOf("untrusted data") < text.indexOf("Bug:"), "the untrusted-data rule comes before the lanes");
+	});
+
+	it("stops on a pull request, asks before a closed issue, and has a Not actionable way out with a drafted reply", () => {
+		const text = compose("issue", { issue: "42" });
+		has(text, ["pull request", "closed issue", "not actionable", "\"Not actionable\"", "`brigadev-comment-writer`", "change nothing"], "issue edges");
+		assert.ok(text.indexOf("pull request") < text.indexOf("Identify the type"), "the PR stop comes before classifying");
+	});
+
+	it("counts the issue as named for brigadev-branch-pr: the closes-or-references question comes before the PR", () => {
+		has(compose("issue", { issue: "42" }), ["counts as named for `brigadev-branch-pr`", "`Closes #<n>`", "`Refs #<n>`", "before opening the PR"], "issue link");
 	});
 });
 
@@ -76,7 +86,7 @@ describe("S2 Docs change", () => {
 
 	it("is a docs-only lane: docs/ branch, no test-first or verify, glance review, stops on a source change", () => {
 		const text = compose("docs", { what: "fix the install section" });
-		has(text, ["docs/<short-slug>", "no test-first", "no `brigadev-verify`", "Review depth: glance (T0)", "stop and say so"], "docs");
+		has(text, ["docs/<short-slug>", "no test-first", "no `brigadev-verify`", "Review depth: glance (T0)", "the last `check` risk line", "stop and say so"], "docs");
 	});
 });
 
@@ -115,14 +125,14 @@ describe("S5 Review depth in the PR body", () => {
 	});
 
 	it("says where the tier comes from and that each rating carries its reason", () => {
-		has(skill, ["the last `check` risk line", "each rating with its reason"], "skill");
+		has(skill, ["the last `check` risk line", "each rating with its reason", "not a trigger for `brigadev-review`"], "skill");
 	});
 });
 
 describe("S6 Outcome on every close", () => {
 	it("the orchestrator close names Outcome with its four values, between Risk and Next", () => {
 		const prompt = read(ASSETS_ROOT, "orchestrator.md");
-		assert.match(prompt, /`Risk:`, `Outcome:` \(success\|flawed\|blocked\|manual\), `Next:`/);
+		assert.match(prompt, /`Risk:`, `Outcome:` \(success\|flawed\|blocked\|manual: [^)]+\), `Next:`/);
 	});
 
 	it("the README defines the four outcomes", () => {

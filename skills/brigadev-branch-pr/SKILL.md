@@ -77,7 +77,7 @@ Review depth: <glance (T0) | focused (T1) | deep (T2)>
 - Backward compatibility: <none|low|medium|high> (reason)
 ```
 
-Review depth tells the reviewer how much effort the PR needs: take the tier from the last `check` risk line (no line: say `unknown` and why). Give each rating with its reason, from the diff and the blast radius; when unsure, pick the higher level.
+Review depth tells the human reviewer how much effort the PR needs; it is not a trigger for `brigadev-review` (step 5 decides that): take the tier from the last `check` risk line (no line: say `unknown` and why). Give each rating with its reason, from the diff and the blast radius; when unsure, pick the higher level.
 
 Add `Closes #N` or `Refs #N` only when the user named an issue. Record only commands you actually ran. Leave unverified checklist items unchecked.
 
