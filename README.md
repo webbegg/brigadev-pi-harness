@@ -46,7 +46,9 @@ The `subagent` tool runs an agent in its own `pi --mode json` process, synchrono
 - `brigadev-explore`: read-only exploration.
 - `brigadev-worker`: bounded writer; needs narrow `allowedEditSurfaces`, parallel writers must be disjoint.
 - `brigadev-verify`: independent verifier for high-risk changes; needs `Risk: <category>`; works with or without a feature document.
-- `review-4r`: one pass over a frozen diff with the four lenses (Risk, Readability, Reliability, Resilience).
+- `review-4r`: one pass over a frozen diff with the four lenses (Risk, Readability, Reliability, Resilience), plus side-effect, performance, and backward-compatibility ratings.
+- `brigadev-reproduce`: bug lane; writes one failing test that shows the reported symptom (test paths only), or reports what was tried. Never fixes.
+- `brigadev-analyze`: feature lane, read-only; a probe that fails on the current code, numbered specs, docs scope, backward compatibility.
 
 Children return a compact result (verdicts, blockers, paths) and the full one is saved under `~/.brigadev/<repo>/runs/<runId>/`. A stall watchdog stops a silent child.
 

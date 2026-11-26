@@ -1,0 +1,23 @@
+{
+	"type": "object",
+	"required": ["reproduced", "command", "output", "testPath", "tried"],
+	"additionalProperties": false,
+	"properties": {
+		"reproduced": { "type": "boolean", "description": "true only when the command fails because of the bug, showing the reported symptom." },
+		"command": { "type": "string", "description": "The exact command that fails because of the bug; empty when not reproduced." },
+		"output": { "type": "string", "description": "An excerpt of the failing output that shows the symptom (a few lines, secrets as <REDACTED>); empty when not reproduced." },
+		"testPath": { "type": "string", "description": "The failing test file you wrote, repository-relative; empty when the command is a script or nothing reproduced." },
+		"tried": {
+			"type": "array",
+			"description": "Every attempt that did not reproduce, in order; [] when the first attempt did.",
+			"items": {
+				"type": "object",
+				"required": ["attempt", "result"],
+				"additionalProperties": false,
+				"properties": { "attempt": { "type": "string", "minLength": 1 }, "result": { "type": "string", "minLength": 1 } }
+			}
+		},
+		"unblock": { "type": "string", "description": "When not reproduced: what would unblock it (access, a redacted artifact, permission for temporary instrumentation)." },
+		"notes": { "type": "string", "description": "Anything the fixer needs: the seam the test sits at, minimisation left to do." }
+	}
+}

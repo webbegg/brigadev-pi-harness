@@ -20,6 +20,17 @@
 				}
 			}
 		},
-		"reviewed": { "type": "string", "minLength": 1, "description": "One line of concrete evidence of what you reviewed (patch, files, checks)." }
+		"reviewed": { "type": "string", "minLength": 1, "description": "One line of concrete evidence of what you reviewed (patch, files, checks)." },
+		"risk": {
+			"type": "object",
+			"description": "How much the change risks, for the PR body's Review section.",
+			"required": ["sideEffect", "performance", "backcompat"],
+			"additionalProperties": false,
+			"properties": {
+				"sideEffect": { "type": "object", "required": ["level", "reason"], "additionalProperties": false, "properties": { "level": { "type": "string", "enum": ["none", "low", "medium", "high"] }, "reason": { "type": "string", "minLength": 1 } }, "description": "What else the change can affect at runtime: callers, shared state, other features." },
+				"performance": { "type": "object", "required": ["level", "reason"], "additionalProperties": false, "properties": { "level": { "type": "string", "enum": ["none", "low", "medium", "high"] }, "reason": { "type": "string", "minLength": 1 } }, "description": "Cost in time, memory, I/O, or tokens per call or per turn." },
+				"backcompat": { "type": "object", "required": ["level", "reason"], "additionalProperties": false, "properties": { "level": { "type": "string", "enum": ["none", "low", "medium", "high"] }, "reason": { "type": "string", "minLength": 1 } }, "description": "What existing users, callers, flags, config, or formats notice." }
+			}
+		}
 	}
 }

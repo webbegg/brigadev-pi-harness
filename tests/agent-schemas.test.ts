@@ -37,6 +37,69 @@ describe("review schema", () => {
 	}
 });
 
+describe("review risk ratings (factory lanes S8)", () => {
+	const rating = (level: string) => ({ level, reason: "r" });
+	const risk = { sideEffect: rating("low"), performance: rating("none"), backcompat: rating("medium") };
+
+	it("review-4r accepts the three ratings, and stays valid without them", () => {
+		const schema = schemaOf("review-4r");
+		assert.deepEqual(validateAgainstSchema(schema, { findings: [], reviewed: "x", risk }), []);
+		assert.deepEqual(validateAgainstSchema(schema, { findings: [], reviewed: "x" }), []);
+	});
+
+	it("rejects an unknown level and a rating without its reason", () => {
+		const schema = schemaOf("review-4r");
+		assert.equal(validateAgainstSchema(schema, { findings: [], reviewed: "x", risk: { ...risk, performance: rating("huge") } }).length, 1);
+		assert.equal(validateAgainstSchema(schema, { findings: [], reviewed: "x", risk: { ...risk, sideEffect: { level: "low" } } }).length, 1);
+	});
+
+	it("review-4r asks for the ratings", () => {
+		const text = readFileSync(join(PACKAGE_AGENTS_DIR, "review-4r.md"), "utf8");
+		for (const needle of ["sideEffect", "performance", "backcompat"]) assert.ok(text.includes(needle), needle);
+	});
+});
+
+describe("brigadev-reproduce (factory lanes S8)", () => {
+	const text = readFileSync(join(PACKAGE_AGENTS_DIR, "brigadev-reproduce.md"), "utf8");
+	const found = { reproduced: true, command: "node --test tests/a.test.ts", output: "expected 1, got 2", testPath: "tests/a.test.ts", tried: [] };
+
+	it("is a writer limited to tests by its surfaces, and never fixes", () => {
+		assert.match(text, /^writer: true$/m);
+		assert.match(text, /never (?:edit|change) (?:source|the code under test)/i);
+		assert.match(text, /fails because of the bug/);
+	});
+
+	it("returns a reproduction, or what was tried", () => {
+		const schema = schemaOf("brigadev-reproduce");
+		assert.deepEqual(validateAgainstSchema(schema, found), []);
+		assert.deepEqual(validateAgainstSchema(schema, { reproduced: false, command: "", output: "", testPath: "", tried: [{ attempt: "npm test", result: "passes" }], unblock: "a redacted log" }), []);
+		assert.deepEqual(validateAgainstSchema(schema, { reproduced: true }), ["$.command: required", "$.output: required", "$.testPath: required", "$.tried: required"]);
+	});
+});
+
+describe("brigadev-analyze (factory lanes S8)", () => {
+	const text = readFileSync(join(PACKAGE_AGENTS_DIR, "brigadev-analyze.md"), "utf8");
+	const analysis = {
+		probe: { command: "node probe.ts", output: "TypeError: blockedDomains", fails: true },
+		specs: [{ id: "S1", text: "accept blockedDomains", check: "node --test tests/a.test.ts" }],
+		docsScope: "docs/web-search.md",
+		backcompat: "optional field; existing callers unchanged",
+	};
+
+	it("is read-only and writes its probe only in a scratch copy", () => {
+		assert.doesNotMatch(text, /^writer: true$/m);
+		assert.match(text, /^tools: read, grep, find, ls, bash, codemode$/m);
+		assert.match(text, /mktemp -d/);
+	});
+
+	it("returns the probe, the specs, the docs scope, and backward compatibility", () => {
+		const schema = schemaOf("brigadev-analyze");
+		assert.deepEqual(validateAgainstSchema(schema, analysis), []);
+		assert.deepEqual(validateAgainstSchema(schema, { ...analysis, specs: [] }), ["$.specs: expected at least 1 item"]);
+		assert.deepEqual(validateAgainstSchema(schema, { ...analysis, probe: { command: "c", output: "o" } }), ["$.probe.fails: required"]);
+	});
+});
+
 describe("brigadev-verify agent", () => {
 	const text = readFileSync(join(PACKAGE_AGENTS_DIR, "brigadev-verify.md"), "utf8");
 

@@ -7,7 +7,9 @@
 - `brigadev-explore`: read-only exploration, used when one batch of `read`/`grep`/`find`/`ls` does not settle it.
 - `brigadev-worker`: bounded writer. It needs narrow repo-relative `allowedEditSurfaces`; parallel writers must be disjoint; it never commits.
 - `brigadev-verify`: independent read-only verifier for high-risk changes (`admission: risk`, so the launch must say `Risk: <category>`). It works from the feature document's specs or, without one, from the task's own numbered acceptance criteria.
-- `review-4r`: one pass over a frozen diff with the four lenses (Risk, Readability, Reliability, Resilience), CRITICAL/WARNING findings by default. Used through the `brigadev-review` skill.
+- `review-4r`: one pass over a frozen diff with the four lenses (Risk, Readability, Reliability, Resilience), CRITICAL/WARNING findings by default, and a `risk` rating (side effects, performance, backward compatibility: none to high, each with its reason) for the PR body. Used through the `brigadev-review` skill.
+- `brigadev-reproduce`: the bug lane's first stage, a writer whose `allowedEditSurfaces` should be test paths only. It writes one test that fails because of the bug and returns `{reproduced, command, output, testPath, tried, unblock?}`; it never fixes or commits.
+- `brigadev-analyze`: the feature lane's first stage, read-only. It runs a probe that fails on the current code in a scratch copy and returns `{probe, specs, docsScope, backcompat, fit?, notes?}`.
 
 Children never wait on a person: the guard denies what would need confirmation, and every dialog a child extension opens is answered as cancelled. A child returns a compact result to the parent (verdicts, blockers, paths); the full result is saved in `~/.brigadev/<repo>/runs/<runId>/` (`task.md`, `transcript.json`, `result.json`, user-only permissions). Run folders older than 14 days are pruned at session start, then the oldest beyond 200. Agents that declare an `output` schema return through a `structured_output` tool; the parent validates it and a run without a valid result fails after one reminder.
 

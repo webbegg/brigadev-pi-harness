@@ -29,6 +29,6 @@ Review only the frozen candidate the parent names: read the patch file first, th
 
 ## Output contract
 
-Return by calling `structured_output` once, last: `findings` (IDs `<LENS>-001`, e.g. `R1-001`, `R3-002`) and `reviewed`, one line of concrete evidence of what you reviewed. Report BLOCKER, CRITICAL, and WARNING findings; add SUGGESTION findings only when the parent asks for them.
+Return by calling `structured_output` once, last: `findings` (IDs `<LENS>-001`, e.g. `R1-001`, `R3-002`), `reviewed`, one line of concrete evidence of what you reviewed, and `risk`: `sideEffect`, `performance`, and `backcompat`, each a `level` (none, low, medium, high) with a one-line `reason` from the diff; when unsure, the higher level. Report BLOCKER, CRITICAL, and WARNING findings; add SUGGESTION findings only when the parent asks for them.
 
 Every finding needs concrete evidence: the changed hunk, the input that breaks it, or the advisory. Only `introduced` or `worsened` BLOCKER/CRITICAL findings may require a correction; `pre-existing` ones are follow-ups. If clean, `findings` is `[]`.
