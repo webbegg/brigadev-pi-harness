@@ -19,8 +19,9 @@ import { readBranchFacts } from "../lib/commit-branch.ts";
 import { branchSlug, evidenceFile, readEvidence } from "../lib/evidence.ts";
 import { checkRefusal, resolveCommand } from "../lib/check.ts";
 import { askConfirm } from "../lib/human-prompt.ts";
+import { classifyMcpTool, mcpInputPreview } from "../lib/mcp-tools.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, sensitiveWords, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
-import { commandPreview, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
+import { commandPreview, decideCommand, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { decidePrGate, opensPrCreate, PR_FACTS_ERROR_REASON, prCreateDirectory, prGateBlockMessage, prGateDialogText, riskMapFor, UNRESOLVED_DIRECTORY_REASON, type PrGateDecision } from "../lib/pr-gate.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
@@ -195,9 +196,22 @@ export default function (pi: ExtensionAPI) {
 	 * failing) asks instead of passing, and so does a `gh pr create` whose directory cannot be resolved.
 	 */
 	const prGate = async (command: string, commandCwd: string): Promise<{ decision: PrGateDecision; categories: RiskCategory[] } | undefined> => {
+		let dir: string | undefined;
 		try {
-			const dir = prCreateDirectory(command, commandCwd);
-			if (!dir) return opensPrCreate(command) ? { decision: { action: "ask", reasons: [UNRESOLVED_DIRECTORY_REASON] }, categories: [] } : undefined;
+			dir = prCreateDirectory(command, commandCwd);
+		} catch (error) {
+			return prFactsError(error);
+		}
+		if (!dir) return opensPrCreate(command) ? { decision: { action: "ask", reasons: [UNRESOLVED_DIRECTORY_REASON] }, categories: [] } : undefined;
+		return prGateAt(dir);
+	};
+	const prFactsError = (error: unknown): { decision: PrGateDecision; categories: RiskCategory[] } => ({
+		decision: { action: "ask", reasons: [`${PR_FACTS_ERROR_REASON} (${String((error as Error)?.message ?? error).split("\n")[0].slice(0, 200)})`] },
+		categories: [],
+	});
+	/** The PR gate for a PR opened from `dir` (a `gh pr create`'s directory, or the session's for an MCP tool that opens one). */
+	const prGateAt = async (dir: string): Promise<{ decision: PrGateDecision; categories: RiskCategory[] } | undefined> => {
+		try {
 			const settings = readSettings();
 			const risk = await branchRisk(exec, dir, riskMapFor(settings));
 			if (!risk?.branch) return undefined;
@@ -217,7 +231,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			return { decision, categories: (Object.keys(risk.categories) as RiskCategory[]).filter((category) => category === "security" || category === "data" || category === "contract") };
 		} catch (error) {
-			return { decision: { action: "ask", reasons: [`${PR_FACTS_ERROR_REASON} (${String((error as Error)?.message ?? error).split("\n")[0].slice(0, 200)})`] }, categories: [] };
+			return prFactsError(error);
 		}
 	};
 
@@ -304,6 +318,26 @@ export default function (pi: ExtensionAPI) {
 			if (surfaces) {
 				const snapshot = await takeSnapshot(exec, projectRoot(ctx));
 				if (snapshot) beforeBash.set(event.toolCallId, snapshot);
+			}
+			return undefined;
+		}
+
+		// MCP tools that deliver or publish (T3 Code's or GitHub's pull_request_create, a merge, a push, a PR comment) follow the
+		// same policy as the gh/git command they stand for; opening a PR also runs the PR gate, on the session's directory.
+		const mcp = classifyMcpTool(event.toolName);
+		if (mcp) {
+			const decision = decideCommand([mcp], mode, isChild);
+			if (decision.action === "block") return { block: true, reason: decision.reason };
+			const pr = mcp.opensPr && !isChild ? await prGateAt(projectRoot(ctx)) : undefined;
+			const prBlock = pr?.decision.action === "ask" ? { block: true as const, reason: prGateBlockMessage(pr.decision, pr.categories, event.toolName) } : undefined;
+			const prText = pr ? prGateDialogText(pr.decision) : "";
+			const preview = `${event.toolName}\n${mcpInputPreview(event.input)}`;
+			if (decision.action === "confirm") {
+				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${preview}${prText ? `\n\n${prText}` : ""}\n\nRun it?`);
+				if (!ok) return prBlock ?? { block: true, reason: `User declined: ${decision.reason}` };
+			} else if (pr && prBlock) {
+				const ok = await confirm(ctx, "brigadev: PR risk gate", `${preview}\n\n${prText}\n\nOpen the PR anyway?`);
+				if (!ok) return prBlock;
 			}
 			return undefined;
 		}

@@ -32,6 +32,13 @@ export interface ChildLaunch {
 	stdio: ["ignore", "pipe", "pipe"];
 }
 
+/**
+ * Environment variables a child never inherits: anything named for an MCP server (`T3_MCP_URL`, `T3_MCP_BEARER_TOKEN`,
+ * `GITHUB_MCP_TOKEN`). They are the parent's credentials for servers whose tools the guard gates by name in the parent; a
+ * child holding them could call the server from bash (`curl`) past every gate. Children get no MCP tools of their own.
+ */
+export const isMcpCredentialVar = (name: string): boolean => /(?:^|_)MCP(?:_|$)/i.test(name);
+
 export function childLaunch(input: ChildLaunchInput): ChildLaunch {
 	const { agent, route } = input;
 	const structured = Boolean(input.structured && agent.outputSchema);
@@ -52,6 +59,7 @@ export function childLaunch(input: ChildLaunchInput): ChildLaunch {
 		[CHILD_ENV.PROJECT_ROOT]: input.cwd,
 		[CHILD_ENV.READ_ONLY]: agent.writer ? "0" : "1",
 	};
+	for (const name of Object.keys(env)) if (isMcpCredentialVar(name)) delete env[name];
 	if (agent.writer && input.allowedEditSurfaces) env[CHILD_ENV.ALLOWED_SURFACES] = JSON.stringify(input.allowedEditSurfaces);
 	else delete env[CHILD_ENV.ALLOWED_SURFACES];
 	if (structured && agent.outputSchema) env[CHILD_ENV.OUTPUT_SCHEMA] = agent.outputSchema;

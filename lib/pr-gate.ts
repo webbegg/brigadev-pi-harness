@@ -145,7 +145,7 @@ export function prGateDialogText(decision: PrGateDecision): string {
 }
 
 /** The block message when the user declines (or no one can be asked): the reasons, and what clears them. */
-export function prGateBlockMessage(decision: PrGateDecision, categories: readonly RiskCategory[]): string {
+export function prGateBlockMessage(decision: PrGateDecision, categories: readonly RiskCategory[], action = "gh pr create"): string {
 	const joined = decision.reasons.join("; ");
 	const steps: string[] = [];
 	if (/no brigadev-verify run/.test(joined)) steps.push(`run one brigadev-verify for this branch with \`Risk: ${categories.length > 0 ? categories.join(",") : "<category>"}\` in the launch reason`);
@@ -154,5 +154,5 @@ export function prGateBlockMessage(decision: PrGateDecision, categories: readonl
 	if (joined.includes(HEAD_TREE_ERROR_REASON) || joined.includes(PR_FACTS_ERROR_REASON)) steps.push("fix the git problem (a corrupt index, a stuck lock, an unreadable evidence log)");
 	if (joined.includes(UNRESOLVED_DIRECTORY_REASON)) steps.push("run `gh pr create` as its own plain command from the repository directory (or after a leading `cd <dir> &&`), not inside a subshell, `bash -c`, `eval`, or a variable path");
 	if (/repro test/.test(joined)) steps.push("add the repro test for each verify blocker and run it through check (RED, then GREEN)");
-	return `Blocked by brigadev guard: gh pr create was declined (${joined}). To clear it: ${steps.join("; ")}; then retry. Do not open the PR another way.`;
+	return `Blocked by brigadev guard: ${action} was declined (${joined}). To clear it: ${steps.join("; ")}; then retry. Do not open the PR another way.`;
 }

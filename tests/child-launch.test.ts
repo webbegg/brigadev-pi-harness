@@ -114,6 +114,25 @@ describe("childLaunch: environment", () => {
 		assert.equal(env[CHILD_ENV.OUTPUT_SCHEMA], "/schemas/s.json");
 	});
 
+	it("never hands a child the parent's MCP server credentials (a child could call the server past the guard)", () => {
+		const parentEnv = {
+			PATH: "/usr/bin",
+			ANTHROPIC_API_KEY: "model-key",
+			T3_MCP_URL: "http://127.0.0.1:3773/mcp",
+			T3_MCP_BEARER_TOKEN: "secret",
+			GITHUB_MCP_TOKEN: "secret",
+			MY_MCP_SERVER_API_KEY: "secret",
+			mcp_auth_header: "secret",
+			T3CODE_THREAD_ID: "thread",
+		};
+		const { env } = childLaunch(input({ parentEnv }));
+		for (const name of ["T3_MCP_URL", "T3_MCP_BEARER_TOKEN", "GITHUB_MCP_TOKEN", "MY_MCP_SERVER_API_KEY", "mcp_auth_header"]) assert.ok(!(name in env), name);
+		// The model's own credentials and plain host facts stay: the child needs them to run.
+		assert.equal(env.ANTHROPIC_API_KEY, "model-key");
+		assert.equal(env.T3CODE_THREAD_ID, "thread");
+		assert.equal(parentEnv.T3_MCP_BEARER_TOKEN, "secret", "the parent keeps its own");
+	});
+
 	it("does not mutate the parent environment", () => {
 		const parentEnv = { PATH: "/usr/bin" };
 		childLaunch(input({ parentEnv }));

@@ -123,6 +123,95 @@ describe("ask_user_choice on the bus", () => {
 		assert.equal(s.prompts().length, count);
 	});
 
+	describe("in an RPC client (T3 Code, any front end over `pi --mode rpc`): Pi's standard dialogs", () => {
+		/** An RPC session: `ui.select` and `ui.input` stay open until the test answers them, or their signal aborts. */
+		function rpc(hasUI = true) {
+			const s = session();
+			Object.assign(s.ctx as any, { mode: "rpc", hasUI });
+			const dialogs: Array<{ kind: string; title: string; items?: string[]; signal?: AbortSignal; answer(value: string | undefined): void }> = [];
+			const open = (kind: string, title: string, items: string[] | undefined, opts?: { signal?: AbortSignal }) =>
+				new Promise<string | undefined>((resolve) => {
+					dialogs.push({ kind, title, items, signal: opts?.signal, answer: resolve });
+					opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+				});
+			(s.ctx.ui as any).select = (title: string, items: string[], opts?: { signal?: AbortSignal }) => open("select", title, items, opts);
+			(s.ctx.ui as any).input = (title: string, _placeholder?: string, opts?: { signal?: AbortSignal }) => open("input", title, undefined, opts);
+			(s.ctx.ui as any).custom = () => assert.fail("an RPC client cannot show a custom component");
+			return { ...s, dialogs };
+		}
+		const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+		it("asks with a select of numbered options, the recommended one marked, and the free-text entry last", async () => {
+			const s = rpc();
+			const result = s.run({ recommended: 2 });
+			await tick();
+			assert.equal(s.dialogs.length, 1);
+			assert.equal(s.dialogs[0].kind, "select");
+			assert.equal(s.dialogs[0].title, "Which database?");
+			assert.deepEqual(s.dialogs[0].items, ["1. SQLite — file", "2. Postgres (recommended)", "3. Something else…"]);
+			s.dialogs[0].answer("2. Postgres (recommended)");
+			const r = await result;
+			assert.equal(r.content[0].text, "The user chose: 2. Postgres");
+			assert.equal(r.details.answer, "Postgres");
+			assert.deepEqual([s.prompts().at(-1)!.status, s.prompts().at(-1)!.by], ["answered", "tui"]);
+		});
+
+		it("the free-text entry asks for the answer with an input", async () => {
+			const s = rpc();
+			const result = s.run();
+			await tick();
+			s.dialogs[0].answer("3. Something else…");
+			await tick();
+			assert.equal(s.dialogs[1].kind, "input");
+			assert.equal(s.dialogs[1].title, "Which database?");
+			s.dialogs[1].answer("  DuckDB ");
+			const r = await result;
+			assert.equal(r.content[0].text, "The user answered: DuckDB");
+			assert.deepEqual([r.details.answer, r.details.wasCustom], ["DuckDB", true]);
+		});
+
+		it("allowOther: false has no free-text entry", async () => {
+			const s = rpc();
+			const result = s.run({ allowOther: false });
+			await tick();
+			assert.deepEqual(s.dialogs[0].items, ["1. SQLite — file", "2. Postgres"]);
+			s.dialogs[0].answer("1. SQLite — file");
+			assert.equal((await result).content[0].text, "The user chose: 1. SQLite");
+		});
+
+		it("a dismissed select, or an empty free-text answer, is a dismissal", async () => {
+			const s = rpc();
+			const result = s.run();
+			await tick();
+			s.dialogs[0].answer(undefined);
+			assert.match((await result).content[0].text, /dismissed the question/);
+			const t = rpc();
+			const other = t.run();
+			await tick();
+			t.dialogs[0].answer("3. Something else…");
+			await tick();
+			t.dialogs[1].answer("   ");
+			assert.match((await other).content[0].text, /dismissed the question/);
+		});
+
+		it("a web answer closes the open dialog and wins", async () => {
+			const s = rpc();
+			const result = s.run();
+			await tick();
+			s.answer("Postgres");
+			const r = await result;
+			assert.equal(r.content[0].text, "The user chose: 2. Postgres");
+			assert.equal(s.dialogs[0].signal?.aborted, true);
+			assert.equal(s.prompts().at(-1)!.by, "web");
+		});
+
+		it("an RPC session without a UI keeps the chat fallback", async () => {
+			const s = rpc(false);
+			assert.match((await s.run()).content[0].text, /^No interactive UI/);
+			assert.equal(s.dialogs.length, 0);
+		});
+	});
+
 	it("outside the TUI the chat fallback stays and nothing is published", async () => {
 		const s = session();
 		(s.ctx as any).mode = "print";
