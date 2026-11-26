@@ -1,5 +1,6 @@
 // lib/mcp-tools.ts: MCP tools that deliver or publish (open a PR, merge, push, write to an issue or PR) are classified like the gh/git commands they stand for.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
 import { COMMAND_KIND } from "../lib/command-classifier.ts";
 import { classifyMcpTool, mcpToolParts } from "../lib/mcp-tools.ts";
@@ -54,6 +55,44 @@ describe("classifyMcpTool", () => {
 
 	it("names the tool and its server in the reason", () => {
 		assert.match(classifyMcpTool("mcp__t3-code__pull_request_create")!.reason, /pull_request_create.*t3-code/);
+	});
+
+	it("server names with leading or doubled separators still match: the tool follows the last `__`", () => {
+		assert.equal(classifyMcpTool("mcp___gh__create_pull_request")?.opensPr, true);
+		assert.equal(classifyMcpTool("mcp__gh__x__merge_pull_request")?.kind, COMMAND_KIND.PUBLISH);
+		assert.equal(classifyMcpTool("mcp__gh-__push_files")?.alwaysConfirm, true);
+	});
+
+	it("camelCase and dashed tool names are the same tool", () => {
+		assert.equal(classifyMcpTool("mcp__github__createPullRequest")?.opensPr, true);
+		assert.equal(classifyMcpTool("mcp__github__merge-pull-request")?.kind, COMMAND_KIND.PUBLISH);
+	});
+
+	describe("names Pi cut to 64 characters (a hash suffix replaces the end)", () => {
+		// Pi 1.6.1's createMcpToolName.
+		const piName = (server: string, tool: string) => {
+			const name = `mcp__${server}__${tool}`.replace(/[^A-Za-z0-9_]/g, "_");
+			if (name.length <= 64) return name;
+			const hash = createHash("sha256").update(`${server}\0${tool}`).digest("hex").slice(0, 8);
+			return `${name.slice(0, 64 - hash.length - 1)}_${hash}`;
+		};
+		const server = "github-enterprise-cloud-production-mirror";
+
+		it("a cut name that may be a PR creation is one, and says so", () => {
+			const name = piName(server, "create_pull_request");
+			assert.equal(name.length, 64);
+			const match = classifyMcpTool(name);
+			assert.equal(match?.opensPr, true);
+			assert.match(match!.reason, /cut by Pi; it may be .*create_pull_request/);
+		});
+
+		it("a cut name whose visible tail starts no known tool is not classified", () => {
+			assert.equal(classifyMcpTool(piName(server, "get_pull_request_comments_and_reviews")), undefined);
+		});
+
+		it("a cut that fell inside the server name could be any tool: the strictest", () => {
+			assert.equal(classifyMcpTool(piName("s".repeat(70), "list_issues"))?.opensPr, true);
+		});
 	});
 
 	it("reads, links, watches, and non-MCP tools are not classified", () => {

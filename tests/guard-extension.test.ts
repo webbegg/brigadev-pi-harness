@@ -444,6 +444,21 @@ describe("guard: PR risk gate", () => {
 			assert.match(s.dialogs[0].body, /expectedHeadSha/);
 		});
 
+		it("a subagent is blocked from every classified MCP call, and its reads pass", async () => {
+			const { cwd } = repo(["tests/a.test.ts"]);
+			process.env.BRIGADEV_CHILD = "1";
+			try {
+				const s = await session(cwd, { mode: "yolo", answer: true });
+				for (const name of [CREATE, "mcp__t3-code__pull_request_merge", "mcp__github__push_files", "mcp__t3-code__pull_request_respond"]) {
+					assert.match(String(await s.tool(name)), /subagents may not run this/, name);
+				}
+				assert.equal(await s.tool("mcp__t3-code__pull_request_read"), undefined);
+				assert.deepEqual(s.dialogs, []);
+			} finally {
+				delete process.env.BRIGADEV_CHILD;
+			}
+		});
+
 		it("a PR comment runs in yolo and asks in normal; reads never ask", async () => {
 			const { cwd } = repo(["tests/a.test.ts"]);
 			const yolo = await session(cwd, { mode: "yolo" });
