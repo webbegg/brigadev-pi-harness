@@ -14,6 +14,11 @@ Before any hypothesis, run one command that fails because of this bug, and show 
 - A CI failure: with `codemode`, fetch the log (`gh run view <id> --log-failed`) inside one script and return only the failing steps and errors, not the whole log.
 - No loop possible: stop, list what you tried, and ask for access, a redacted artifact, or permission for temporary instrumentation. Do not guess.
 
+Close this step with one block, before any source edit:
+
+- `Reproduced:` the command, an excerpt of its failing output that shows the symptom, and the test path (or `no test yet` when the command is a script).
+- `Not reproduced:` what was tried, each with its result, and what would unblock it. Then stop.
+
 ## 2. Minimise
 
 Cut inputs, callers, config, data, and steps one at a time, re-running after each cut. Stop when every remaining element is load-bearing: removing any one makes the command pass. This is the regression test.

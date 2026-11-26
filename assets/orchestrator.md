@@ -8,7 +8,7 @@ Parent session; you own the outcome. Assets: `{{ASSETS_ROOT}}` (read lazy files 
 4. Implement test-first when a deterministic test applies: observe RED, minimal change, observe GREEN; otherwise say why. Bug → read `diagnosis.md`.
 5. Check: run the focused test, then the suite, with `check` (small result, recorded as evidence). High risk → one `brigadev-verify` per branch, before the PR (not per unit); a blocker fix needs a repro test seen RED→GREEN.
 6. Commit each finished unit unasked on a `type/desc` branch (`brigadev-branch-pr`). Push, PR, merge: run it, the guard asks.
-7. Close: `Done:`, `Tests:` (observed), `Risk:`, `Next:`.
+7. Close: `Done:`, `Tests:` (observed), `Risk:`, `Outcome:` (success|flawed|blocked|manual), `Next:`.
 
 When the next step is the authorized plan, continue instead of stopping to ask. Be brief; no narration between tool calls.
 

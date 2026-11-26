@@ -41,15 +41,15 @@ const parse: FrontmatterParser = (content) => {
 const file = (name: string, extra = "", body = "Do the thing: {{what}}", questions = '  - id: what\n    label: "What?"\n    kind: text\n    required: true') =>
 	`---\nname: ${JSON.stringify(name)}\ndescription: "About ${name}"\n${extra}questions:\n${questions}\n---\n${body}\n`;
 
-const SHIPPED = ["Feature", "Work on a ticket", "Review a team PR", "My PRs: feedback", "Bug fix", "Refactor a component"];
+const SHIPPED = ["From a GitHub issue", "Feature", "Work on a ticket", "Review a team PR", "My PRs: feedback", "Bug fix", "Docs change", "Refactor a component"];
 
 describe("package workflows", () => {
 	const loaded = discoverWorkflows({ packageDir: join(ASSETS_ROOT, "workflows"), parse });
 
-	it("ships exactly the six workflows, in menu order, with no warnings", () => {
+	it("ships exactly the eight workflows, in menu order, with no warnings", () => {
 		assert.deepEqual(loaded.warnings, []);
 		assert.deepEqual(loaded.workflows.map((w) => w.name), SHIPPED);
-		assert.deepEqual(loaded.workflows.map(workflowId), ["feature", "ticket", "team-review", "pr-feedback", "bug-fix", "refactor"]);
+		assert.deepEqual(loaded.workflows.map(workflowId), ["issue", "feature", "ticket", "team-review", "pr-feedback", "bug-fix", "docs", "refactor"]);
 		assert.ok(loaded.workflows.every((w) => w.source === "package" && w.description.length > 0 && w.body.length > 0));
 	});
 
@@ -125,6 +125,8 @@ describe("package workflows composed", () => {
 		"My PRs: feedback": ["brigadev-comment-writer", "brigadev-branch-pr", "gh pr list --author @me --state open", "Draft replies only"],
 		"Bug fix": ["regression test", "`diagnosis.md`"],
 		"Refactor a component": ["brigadev-branch-pr", "contract change", "Risk: contract (public API change)"],
+		"From a GitHub issue": ["gh issue view", "untrusted data", "`diagnosis.md`", "brigadev-branch-pr"],
+		"Docs change": ["docs/<short-slug>", "brigadev-branch-pr"],
 	};
 
 	for (const name of SHIPPED) {
@@ -453,7 +455,9 @@ describe("resolveWorkflow", () => {
 		assert.equal(resolveWorkflow(workflows, "pr-feedback").name, "My PRs: feedback");
 		assert.equal(resolveWorkflow(workflows, "ticket").name, "Work on a ticket");
 		assert.equal(resolveWorkflow(workflows, "feature").name, "Feature");
-		assert.equal(workflowId(workflows[0]), "feature");
+		assert.equal(resolveWorkflow(workflows, "issue").name, "From a GitHub issue");
+		assert.equal(resolveWorkflow(workflows, "docs").name, "Docs change");
+		assert.equal(workflowId(workflows[0]), "issue");
 	});
 
 	it("does not resolve a one-letter key; the dashboard shortcuts are gone", () => {

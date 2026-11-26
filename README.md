@@ -28,7 +28,9 @@ Check it loaded: `/brigadev:status`. Run `/brigadev:doctor` if something looks o
 | 5. Verify | A path-based risk tier (shown by `check`) decides the checks: T2 (data, security, contract) branches get one independent `brigadev-verify` before the PR; blocker fixes are proven by a repro test RED→GREEN. | `subagent`, `Risk: <category>` line |
 | 6. Commit / PR | Each finished unit is committed on a `type/description` branch; push, PR, and merge go through the guard. `brigadev-review` runs only on request or once before the PR, with the tier's lenses ([review tiers](docs/configuration.md#review-tiers)). | `brigadev-branch-pr`, `brigadev-review` |
 
-Large multi-session work gets one feature document in the repo docs folder (`/track`); small work leaves no artifacts. A long session compacts itself (see Configuration). Start a day-to-day task from `alt+w` or `/brigadev:start`: feature, ticket, bug fix, refactor, my PRs' feedback, or a team PR review.
+Large multi-session work gets one feature document in the repo docs folder (`/track`); small work leaves no artifacts. A long session compacts itself (see Configuration). Start a day-to-day task from `alt+w` or `/brigadev:start`: a GitHub issue (read, typed as bug, feature, docs, or refactor with a confidence, then worked in that lane), feature, ticket, bug fix, docs change, refactor, my PRs' feedback, or a team PR review. Bugs show a `Reproduced:` block before any source edit; features (except quick changes) an `Analysis:` block with a probe that fails on the current code. PR bodies carry a `Review depth` (glance, focused, deep, from the tier) and side-effect, performance, and backward-compatibility ratings.
+
+Every close ends with an `Outcome:`: **success** (the work shipped as asked), **flawed** (the agent produced the wrong thing: fix the prompt, the context, or add an eval case), **blocked** (the environment lacked something: a credential, a service, a dependency), or **manual** (a boundary drawn on purpose that a person handles).
 
 ## Safety
 

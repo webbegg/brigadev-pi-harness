@@ -69,7 +69,15 @@ Use the repository template when present. Otherwise build the body from the evid
 
 ## Risk
 none | <data|security|contract|concurrency|delivery|untested> (reason)
+
+## Review
+Review depth: <glance (T0) | focused (T1) | deep (T2)>
+- Side effects: <none|low|medium|high> (reason)
+- Performance: <none|low|medium|high> (reason)
+- Backward compatibility: <none|low|medium|high> (reason)
 ```
+
+Review depth tells the reviewer how much effort the PR needs: take the tier from the last `check` risk line (no line: say `unknown` and why). Give each rating with its reason, from the diff and the blast radius; when unsure, pick the higher level.
 
 Add `Closes #N` or `Refs #N` only when the user named an issue. Record only commands you actually ran. Leave unverified checklist items unchecked.
 
