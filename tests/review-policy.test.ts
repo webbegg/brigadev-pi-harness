@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-// Review policy: no 4R review inside the dev loop (high-risk units get brigadev-verify only); the review runs once,
-// before the PR, and only after the user picks its scope.
+// Review policy: no 4R review inside the dev loop (high-risk units get brigadev-verify only); before the PR a T1 or T2 branch
+// gets an automatic review with the tier's lenses (no scope question), then at most the revise rounds the `check` line names.
 //
 // The checks look at the policy's structure (which tools are named, what comes before what, what is negated), never at exact
 // prose, so rewording keeps passing. Each check is a function of the asset's text that returns the problems it found, which lets
@@ -31,7 +31,13 @@ function section(text: string, heading: string): string | undefined {
 	return match?.[1];
 }
 
-/** The orchestrator's review line(s): brigadev-review named, no per-commit or high-risk-commit trigger, brigadev-verify for high risk. */
+/** A scope question before the review (asking, or ask_user_choice, about the scope). */
+const SCOPE_QUESTION = /\bask(?:s|ing)?\b[^.;\n]*\bscope\b|ask_user_choice/i;
+
+/**
+ * The orchestrator's review line(s): brigadev-review named, no per-commit or high-risk-commit trigger, brigadev-verify for high
+ * risk, automatic before the PR, and no scope question.
+ */
 function orchestratorReviewProblems(text: string): string[] {
 	const lines = text.split("\n").filter((line) => line.includes("`brigadev-review`"));
 	if (lines.length === 0) return ["the orchestrator does not mention brigadev-review"];
@@ -39,6 +45,8 @@ function orchestratorReviewProblems(text: string): string[] {
 	for (const line of lines) {
 		problems.push(...commitTriggerProblems(line));
 		if (!line.includes("`brigadev-verify`") || !/high[- ]risk/i.test(line)) problems.push("the review line does not name brigadev-verify for high risk");
+		if (!/\bautomatic\w*\b[^.;]*\bbefore the PR\b/i.test(line)) problems.push("the review line does not make the review automatic before the PR");
+		if (SCOPE_QUESTION.test(line)) problems.push("the review line asks the scope");
 	}
 	return problems;
 }
@@ -49,26 +57,32 @@ function reviewSkillProblems(text: string): string[] {
 	return when === undefined ? ['the review skill has no "When to use" section'] : commitTriggerProblems(when);
 }
 
-/** Step 5 of branch-pr: ask_user_choice and the three options (full / fitting / skip) all come before the brigadev-review invocation. */
+/**
+ * Step 5 of branch-pr: no scope question before the brigadev-review invocation; T0 gets no review; T1 is automatic and T2 adds
+ * brigadev-verify; the revise rounds come from the `check` line; the user can skip.
+ */
 function branchPrProblems(text: string): string[] {
 	const step = /^5\. [\s\S]*?(?=^\d+\. |^## |$(?![\s\S]))/m.exec(text)?.[0];
 	if (step === undefined) return ["branch-pr has no step 5"];
 	const review = step.indexOf("`brigadev-review`");
 	if (review < 0) return ["step 5 does not invoke brigadev-review"];
 	const problems: string[] = [];
-	const ask = step.indexOf("ask_user_choice");
-	if (ask < 0) problems.push("step 5 does not use ask_user_choice");
-	else if (ask > review) problems.push("step 5 invokes brigadev-review before ask_user_choice");
-	for (const option of ["full", "fitting", "skip"]) {
-		const at = new RegExp(`\\b${option}\\b`, "i").exec(step)?.index ?? -1;
-		if (at < 0) problems.push(`step 5 offers no ${option} option`);
-		else if (at > review) problems.push(`step 5 names the ${option} option only after invoking brigadev-review (the question must come before)`);
-	}
+	// The review is not done until the revise rounds start: a scope question anywhere before them is still a gate in front of it.
+	const rounds = step.indexOf("revise rounds", review);
+	const head = step.slice(0, rounds > review ? rounds : step.length);
+	// "without asking the scope" states the policy; any other match is a question.
+	const ask = [...head.matchAll(new RegExp(SCOPE_QUESTION.source, "gi"))].find((m) => !/\b(?:without|never|not|no)\s+$/i.test(head.slice(Math.max(0, m.index - 12), m.index)));
+	if (ask) problems.push(`step 5 asks the scope before reviewing: "${ask[0]}"`);
+	if (!/\bT0\b[^.]*\bno review\b/.test(step)) problems.push("step 5 does not say T0 gets no review");
+	if (!/\bT1\b[^.]*\bautomatic/i.test(step)) problems.push("step 5 does not make the T1 review automatic");
+	if (!/\bT2\b[^.]*`brigadev-verify`/.test(step)) problems.push("step 5 does not add brigadev-verify for T2");
+	if (!/revise rounds[^.]*`check` (?:risk )?line|`check` (?:risk )?line[^.]*revise rounds/.test(step)) problems.push("step 5 does not take the revise rounds from the `check` line");
+	if (!/\bskip\w*\b[^.]*\buser\b|\buser\b[^.]*\bskip/i.test(step)) problems.push("step 5 does not let the user skip the review");
 	return problems;
 }
 
 describe("review policy", () => {
-	it("the orchestrator names brigadev-review without a per-commit or high-risk trigger, and brigadev-verify for high risk", () => {
+	it("the orchestrator names brigadev-review without a per-commit or high-risk trigger, automatic before the PR, and brigadev-verify for high risk", () => {
 		assert.deepEqual(orchestratorReviewProblems(read("assets", "orchestrator.md")), []);
 	});
 
@@ -76,7 +90,7 @@ describe("review policy", () => {
 		assert.deepEqual(reviewSkillProblems(read("skills", "brigadev-review", "SKILL.md")), []);
 	});
 
-	it("branch-pr asks the review scope (full, fitting, skip) before reviewing", () => {
+	it("branch-pr reviews T1/T2 automatically (no scope question), T0 not at all, with the revise rounds of the check line and a user skip", () => {
 		assert.deepEqual(branchPrProblems(read("skills", "brigadev-branch-pr", "SKILL.md")), []);
 	});
 });
@@ -112,25 +126,35 @@ describe("balanced review policy", () => {
 		assert.match(verification, /blockers plus at most 5 defect WARNINGs in the same files/);
 		assert.match(verification, /Follow-ups/);
 		assert.match(verification, /advisories never start a correction/i);
+		assert.match(verification, /one batch per revise round[^.]*`check`/);
 		assert.doesNotMatch(verification, /limited to those blockers/);
 		assert.doesNotMatch(verification, /second correction/i);
 	});
 
-	it("branch-pr step 5 reads the tier from the last check risk line: T0 no review (disclosed), T1 asks, T2 asks with verify in one parallel call", () => {
+	it("branch-pr step 5 reads the tier from the last check risk line: T0 no review (disclosed), T1 the tier's lenses, T2 with verify in one parallel call, then bounded revise rounds", () => {
 		const five = step(branchPr, 5);
 		assert.match(five, /last `check` risk line/);
 		assert.match(five, /T0[^.]*Risk line/);
 		assert.match(five, /T1/);
 		assert.match(five, /T2[^.]*`brigadev-verify`[^.]*one parallel call/);
 		assert.match(five, /the tier's lenses/);
+		assert.match(five, /blockers plus at most 5 defect WARNINGs in the same files/);
+		assert.match(five, /RED→GREEN/);
+		assert.match(five, /re-review[^.]*only the lenses whose findings were fixed/);
+		assert.match(five, /\*\*Needs your decision\*\*/);
 	});
 
-	it("review skill: R2 only for prompt/docs or on request; capped correction batch with a RED→GREEN repro; compact ledger", () => {
+	it("review skill: R2 only for prompt/docs or on request; bounded revise rounds with a RED→GREEN repro; compact ledger", () => {
 		assert.match(/^\| R2 Readability \|.*$/m.exec(reviewSkill)?.[0] ?? "", /prompt\/docs diffs or on request/);
 		const correct = /^4\. \*\*Correct\*\*[\s\S]*?(?=^\d+\. )/m.exec(reviewSkill)?.[0] ?? "";
 		assert.match(correct, /blockers plus at most 5 defect WARNINGs in the same files/);
 		assert.match(correct, /RED→GREEN/);
 		assert.match(correct, /security-parser/);
+		assert.match(correct, /revise rounds?[^.]*`check`/);
+		assert.match(correct, /only the lenses whose findings were fixed/);
+		assert.match(correct, /never start a round/);
+		assert.match(reviewSkill, /^Rounds: <n> of <N>/m);
+		assert.match(section(reviewSkill, "When to use") ?? "", /automatic[^.]*before (?:the|a) PR[^.]*T1/i);
 		assert.doesNotMatch(correct, /one re-review limited to those blocker IDs/);
 		assert.match(reviewSkill, /top 5 advisories/);
 		assert.match(reviewSkill, /SUGGESTION count/);
@@ -168,8 +192,18 @@ describe("review policy checks catch a regression (mutated copies of the asset t
 		});
 
 		it("review on every commit, with verify still named", () => {
-			const mutated = mutate(text, /only when the user asks, or once before the PR/, "on every commit, or once before the PR");
-			assert.notDeepEqual(orchestratorReviewProblems(mutated), []);
+			const mutated = mutate(text, /on request; automatic before the PR/, "on every commit; automatic before the PR");
+			assert.match(orchestratorReviewProblems(mutated).join("\n"), /commit/i);
+		});
+
+		it("the review is no longer automatic before the PR", () => {
+			const mutated = mutate(text, /on request; automatic before the PR for T1\/T2/, "only when the user asks");
+			assert.match(orchestratorReviewProblems(mutated).join("\n"), /automatic/);
+		});
+
+		it("the scope question comes back", () => {
+			const mutated = mutate(text, /\(user may skip\)/, "(after asking its scope)");
+			assert.match(orchestratorReviewProblems(mutated).join("\n"), /asks the scope/);
 		});
 
 		it("brigadev-verify no longer named for high risk", () => {
@@ -209,25 +243,45 @@ describe("review policy checks catch a regression (mutated copies of the asset t
 	describe("branch-pr step 5", () => {
 		const text = read("skills", "brigadev-branch-pr", "SKILL.md");
 
-		it("ask_user_choice removed", () => {
-			assert.match(branchPrProblems(text.replaceAll("ask_user_choice", "ask")).join("\n"), /ask_user_choice/);
+		it("a scope question with ask_user_choice comes back before the review", () => {
+			const mutated = mutate(text, "T1: run `brigadev-review`", "T1: ask the scope with one `ask_user_choice` (full, fitting, skip), then run `brigadev-review`");
+			assert.match(branchPrProblems(mutated).join("\n"), /asks the scope/);
 		});
 
-		it("an option removed (skip, fitting, full), each on its own", () => {
-			for (const [from, option] of [["Skip the review", "skip"], ["Fitting lenses", "fitting"], ["Full 4R", "full"]] as const) {
-				const mutated = mutate(text, from, "Another thing");
-				assert.match(branchPrProblems(mutated).join("\n"), new RegExp(option, "i"), option);
-			}
+		it("a scope question between the review sentence and the revise rounds is still caught", () => {
+			const mutated = mutate(text, "Skip it only when the user said so", "Before it runs, ask the scope with one `ask_user_choice`. Skip it only when the user said so");
+			assert.match(branchPrProblems(mutated).join("\n"), /asks the scope/);
 		});
 
-		it("the review is invoked before the question", () => {
-			const mutated = mutate(text, "5. **Review before the PR**, once the work units are done:", "5. Run `brigadev-review` on the branch.");
-			assert.match(branchPrProblems(mutated).join("\n"), /before/i);
+		it("a question asked after the review is not a scope question", () => {
+			const mutated = text.replace("Show the ledger.", "Show the ledger and ask_user_choice on the leftovers.");
+			assert.notEqual(mutated, text);
+			assert.deepEqual(branchPrProblems(mutated), []);
 		});
 
-		it("an option is only named after the invocation", () => {
-			const mutated = mutate(mutate(text, "**Full 4R** (all four lenses), ", ""), "with the chosen scope", "with the chosen scope (full)");
-			assert.match(branchPrProblems(mutated).join("\n"), /full option only after/);
+		it("T0 gets a review", () => {
+			const mutated = mutate(text, /T0: no review/, "T0: a short review");
+			assert.match(branchPrProblems(mutated).join("\n"), /T0/);
+		});
+
+		it("the T1 review is no longer automatic", () => {
+			const mutated = mutate(text, /, automatically, without asking the scope/, " when the user wants one");
+			assert.match(branchPrProblems(mutated).join("\n"), /automatic/);
+		});
+
+		it("the T2 verify is dropped", () => {
+			const mutated = mutate(text, /T2: the same, plus `brigadev-verify`/, "T2: the same");
+			assert.match(branchPrProblems(mutated).join("\n"), /T2/);
+		});
+
+		it("the revise rounds no longer come from the check line", () => {
+			const mutated = mutate(text, /at most the number the `check` line names/, "as many as it takes");
+			assert.match(branchPrProblems(mutated).join("\n"), /revise rounds/);
+		});
+
+		it("the user skip removed", () => {
+			const mutated = mutate(text, /Skip it only when the user said so, and say so in the Risk line\. /, "");
+			assert.match(branchPrProblems(mutated).join("\n"), /skip/);
 		});
 
 		it("LOOP R3-007: the options carry no stale timing claim (one reviewer pass now)", () => {
@@ -245,7 +299,7 @@ describe("review policy checks catch a regression (mutated copies of the asset t
 		});
 
 		it("rewording that keeps the structure still passes", () => {
-			const mutated = text.replace("(recommended: only the lenses the change's risk needs)", "(the default pick)").replace("Show the ledger.", "Share the ledger.");
+			const mutated = mutate(mutate(text, "Stop when clean or out of rounds.", "Stop once nothing is left or no rounds remain."), "Show the ledger.", "Share the ledger.");
 			assert.deepEqual(branchPrProblems(mutated), []);
 		});
 	});

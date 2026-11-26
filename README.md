@@ -26,7 +26,7 @@ Check it loaded: `/brigadev:status`. Run `/brigadev:doctor` if something looks o
 | 3. Test first | RED, minimal change, GREEN; bugs follow a diagnosis routine. | `assets/diagnosis.md`, `brigadev-worker` for parallel writers |
 | 4. Check | The focused test, then the suite, through one tool that returns a compact result and records evidence. | `check` tool, evidence log |
 | 5. Verify | A path-based risk tier (shown by `check`) decides the checks: T2 (data, security, contract) branches get one independent `brigadev-verify` before the PR; blocker fixes are proven by a repro test RED→GREEN. | `subagent`, `Risk: <category>` line |
-| 6. Commit / PR | Each finished unit is committed on a `type/description` branch; push, PR, and merge go through the guard. `brigadev-review` runs only on request or once before the PR, with the tier's lenses ([review tiers](docs/configuration.md#review-tiers)). | `brigadev-branch-pr`, `brigadev-review` |
+| 6. Commit / PR | Each finished unit is committed on a `type/description` branch; push, PR, and merge go through the guard. Before the PR a T1 or T2 branch gets `brigadev-review` automatically with the tier's lenses, then at most `review.maxRounds` revise rounds; it also runs on request ([review tiers](docs/configuration.md#review-tiers)). | `brigadev-branch-pr`, `brigadev-review` |
 
 Large multi-session work gets one feature document in the repo docs folder (`/track`); small work leaves no artifacts. A long session compacts itself (see Configuration). Start a day-to-day task from `alt+w` or `/brigadev:start`: a GitHub issue (read, typed as bug, feature, docs, or refactor with a confidence, then worked in that lane), feature, ticket, bug fix, docs change, refactor, my PRs' feedback, or a team PR review. Bugs show a `Reproduced:` block before any source edit; features (except quick changes) an `Analysis:` block with a probe that fails on the current code. PR bodies carry a `Review depth` (glance, focused, deep, from the tier) and side-effect, performance, and backward-compatibility ratings.
 
@@ -97,6 +97,7 @@ Also: `/brigadev:agents`, `/brigadev:harness on|off`, `/brigadev:ui footer on|of
 | `bridgePricing` | `false` stops pricing zero-cost `claude-bridge` turns at the API list price |
 | `ui.footer`, `ui.compactTools` | `false` turns off the status bar or the one-line tool rows |
 | `check.test` | Test command for the `check` tool; detected from the project when absent |
+| `review.maxRounds` | Revise rounds after the review before the PR: an integer 0–5, default 2 |
 | `context.enabled`, `context.compactAt`, `context.idleCompactMinutes`, `context.idleCompactMin` | Automatic compaction: at 160,000 tokens at a turn boundary, or on a request after 60 idle minutes with at least 100,000 tokens; `enabled: false` turns it off |
 
 Profiles live in `~/.pi/agent/brigadev-profiles.json`. Paths, environment variables, and agent overrides: [docs/configuration.md](docs/configuration.md).

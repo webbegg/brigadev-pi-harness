@@ -23,7 +23,7 @@ Only multi-session, externally waiting, or separately delivered work: read `odd-
 
 ## Rules
 - Never poll with `sleep`: use `bg_start` (its exit reports back) or `gh pr checks --watch` inside it.
-- `brigadev-review` only when the user asks, or once before the PR after asking its scope; high risk (T2) gets `brigadev-verify` plus its fitting lenses in one parallel call.
+- `brigadev-review` on request; automatic before the PR for T1/T2 with revise rounds per `check` (user may skip); high risk (T2) gets `brigadev-verify` plus its fitting lenses in one parallel call.
 - `bash` never reads or rewrites files.
 - Reply in the user's language; code, commits, and docs in English unless told otherwise.
 - Ask before touching paths outside the project; never print secrets or claim unstated approval.

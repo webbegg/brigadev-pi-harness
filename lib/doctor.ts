@@ -2,7 +2,7 @@
 
 import { realpathSync } from "node:fs";
 import { sep } from "node:path";
-import { DEFAULT_RISK_MAP, mergeRiskMap } from "./risk-map.ts";
+import { DEFAULT_REVIEW_ROUNDS, DEFAULT_RISK_MAP, mergeRiskMap, reviewRounds } from "./risk-map.ts";
 import { PACKAGE_ROOT } from "./runtime.ts";
 
 /** The part of `pi.getAllTools()` entries the check reads. */
@@ -41,6 +41,11 @@ const n = (x: number): string => x.toLocaleString("en-US");
 /** One warning per `risk` entry in brigadev.json that the risk map ignores (unknown category, non-string glob, wrong shape). */
 export function riskWarnings(risk: unknown): string[] {
 	return mergeRiskMap(DEFAULT_RISK_MAP, risk, "").invalid.map((problem) => `${problem} (ignored)`);
+}
+
+/** A warning when `review` in brigadev.json is not usable: the revise rounds fall back to the default. */
+export function reviewWarnings(review: unknown): string[] {
+	return reviewRounds({ review }).invalid.map((problem) => `${problem} (ignored, using ${DEFAULT_REVIEW_ROUNDS})`);
 }
 
 export interface ToolReport {

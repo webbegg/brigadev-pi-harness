@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { analyzeTools, riskWarnings, TOOL_CHARS_LIMIT, type ToolInfo } from "../lib/doctor.ts";
+import { analyzeTools, reviewWarnings, riskWarnings, TOOL_CHARS_LIMIT, type ToolInfo } from "../lib/doctor.ts";
 import { PACKAGE_ROOT } from "../lib/runtime.ts";
 import { createFakeCtx, createFakePi } from "./helpers/fake-pi.ts";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
@@ -71,6 +71,14 @@ describe("riskWarnings (S3)", () => {
 		assert.match(warnings[0], /risk\.paths\.bogus: unknown category.*ignored/);
 		assert.match(warnings[1], /risk\.paths\.security\[0\].*ignored/);
 		assert.equal(riskWarnings("x").length, 1);
+	});
+});
+
+describe("reviewWarnings (review.maxRounds)", () => {
+	it("is empty for no review config or a valid one, and names an invalid maxRounds with the default it uses", () => {
+		assert.deepEqual(reviewWarnings(undefined), []);
+		assert.deepEqual(reviewWarnings({ maxRounds: 0 }), []);
+		assert.deepEqual(reviewWarnings({ maxRounds: 9 }), ["review.maxRounds: not an integer from 0 to 5 (ignored, using 2)"]);
 	});
 });
 
