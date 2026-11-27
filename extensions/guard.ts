@@ -15,12 +15,12 @@ import { isToolCallEventType, type ExtensionAPI, type ExtensionContext, type Too
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { BUS, publish, type GuardDecision, type ModeState } from "../lib/bus.ts";
 import { classifyCommand, COMMAND_KIND, type CommandMatch } from "../lib/command-classifier.ts";
-import { readBranchFacts } from "../lib/commit-branch.ts";
+import { onFeatureBranch, readBranchFacts } from "../lib/commit-branch.ts";
 import { branchSlug, evidenceFile, readEvidence } from "../lib/evidence.ts";
 import { checkRefusal, resolveCommand } from "../lib/check.ts";
 import { askPermission } from "../lib/human-prompt.ts";
 import { showPermissionCard, type CardHost } from "../lib/permission-card.ts";
-import { actionsOf, commandDialog, outsideWriteDialog, SESSION_GRANT_LEVELS, sensitiveFileDialog, toolDialog, whyNote, type PermissionDialog } from "../lib/permission-dialog.ts";
+import { actionsOf, commandDialog, grantable, outsideWriteDialog, sensitiveFileDialog, toolDialog, whyNote, type PermissionDialog } from "../lib/permission-dialog.ts";
 import { classifyMcpTool, mcpInputPreview } from "../lib/mcp-tools.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, sensitiveWords, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
 import { decideCommand, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
@@ -58,13 +58,22 @@ export default function (pi: ExtensionAPI) {
 	let mode: PermissionMode = PERMISSION_MODE.NORMAL;
 	// Per-session grants for directories outside the project root.
 	const outsideGrants = new Set<string>();
-	// Actions (a permission card's heading, "open a pull request") the user said yes to for the rest of the session; Low and Medium only, memory only.
+	// Actions ("open a pull request") the user said yes to for the rest of the session; only those `grantable` allows, memory only.
 	const sessionGrants = new Set<string>();
-	/** The grant that lets these matches run without asking, or undefined: every action must be granted, and none High. */
-	const grantFor = (matches: readonly CommandMatch[]): string | undefined => {
+	/** The grant that lets these matches run without asking, or undefined: each must be grantable, and every action granted. */
+	const grantFor = (matches: readonly CommandMatch[], pushOk: boolean): string | undefined => {
+		if (isChild || !grantable(matches) || (!pushOk && matches.some((match) => match.push))) return undefined;
 		const actions = actionsOf(matches);
-		if (isChild || actions.length === 0 || !actions.every(({ action, level }) => SESSION_GRANT_LEVELS.has(level) && sessionGrants.has(action))) return undefined;
+		if (!actions.every(({ action }) => sessionGrants.has(action))) return undefined;
 		return `brigadev: allowed for this session (${actions.map(({ action }) => action).join(" + ")})`;
+	};
+	/** A plain push a grant may cover: HEAD on a feature branch at `cwd`, and each push sends that branch (no ref, `HEAD`, or its name). */
+	const pushOnFeatureBranch = async (matches: readonly CommandMatch[], cwd: string): Promise<boolean> => {
+		const pushes = matches.filter((match) => match.push);
+		if (pushes.length === 0) return true;
+		const facts = await readBranchFacts(exec, cwd).catch(() => undefined);
+		if (!facts || !onFeatureBranch(facts)) return false;
+		return pushes.every(({ push }) => push?.ref === undefined || push.ref === "HEAD" || push.ref === facts.currentBranch);
 	};
 
 	const projectRoot = (ctx: ExtensionContext) => canonicalPath(process.env[CHILD_ENV.PROJECT_ROOT] ?? ctx.cwd);
@@ -344,10 +353,11 @@ export default function (pi: ExtensionAPI) {
 			const pr = isChild ? undefined : await prGate(command, commandCwd);
 			const prBlock = pr?.decision.action === "ask" ? { block: true as const, reason: prGateBlockMessage(pr.decision, pr.categories) } : undefined;
 			// A session grant skips the policy question; the PR gate still asks on its own when it finds a problem.
-			const granted = decision.action === "confirm" ? grantFor(decision.matches) : undefined;
+			const pushOk = decision.action === "confirm" && !isChild ? await pushOnFeatureBranch(decision.matches, commandCwd) : false;
+			const granted = decision.action === "confirm" ? grantFor(decision.matches, pushOk) : undefined;
 			if (decision.action === "confirm" && !granted) {
 				const prText = pr ? prGateDialogText(pr.decision) : "";
-				const dialog = commandDialog(command, decision.matches, prText || undefined);
+				const dialog = commandDialog(command, decision.matches, prText || undefined, undefined, { sessionGrant: pushOk });
 				const ok = await confirm(ctx, dialog, `brigadev: ${decision.reason}`);
 				if (!ok) return prBlock ?? { block: true, reason: `User declined: ${decision.reason}` };
 			} else if (pr && prBlock) {
@@ -375,7 +385,8 @@ export default function (pi: ExtensionAPI) {
 			const prBlock = pr?.decision.action === "ask" ? { block: true as const, reason: prGateBlockMessage(pr.decision, pr.categories, event.toolName) } : undefined;
 			const prText = pr ? prGateDialogText(pr.decision) : "";
 			const preview = `${event.toolName}\n${mcpInputPreview(event.input)}`;
-			const granted = decision.action === "confirm" ? grantFor(decision.matches) : undefined;
+			// An MCP push is never plain (`CommandMatch.push`), so no grant covers it.
+			const granted = decision.action === "confirm" ? grantFor(decision.matches, false) : undefined;
 			if (decision.action === "confirm" && !granted) {
 				const dialog = toolDialog(preview, decision.matches, prText || undefined);
 				const ok = await confirm(ctx, dialog, `brigadev: ${decision.reason}`);

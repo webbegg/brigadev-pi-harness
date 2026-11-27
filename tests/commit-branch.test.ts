@@ -219,8 +219,8 @@ describe("classifyCommand commit details", () => {
 		assert.deepEqual(moved, { kind: "delivery", reason: "git commit", commit: true, elsewhere: true });
 	});
 
-	it("leaves other matches without the new fields", () => {
-		assert.deepEqual(classifyCommand("git push"), [{ kind: "delivery", reason: "git push", alwaysConfirm: true }]);
+	it("leaves other matches without the commit fields; a move drops a push's plain mark", () => {
+		assert.deepEqual(classifyCommand("git push"), [{ kind: "delivery", reason: "git push", alwaysConfirm: true, push: {} }]);
 		assert.deepEqual(classifyCommand("cd x && git push"), [{ kind: "delivery", reason: "git push", alwaysConfirm: true }]);
 	});
 });

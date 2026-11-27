@@ -627,6 +627,45 @@ describe("guard: yes, and don't ask again this session", () => {
 		assert.equal(s.dialogs[1].options, undefined);
 	});
 
+	it("a push grant covers plain pushes from a feature branch only", async () => {
+		const { cwd } = repo(["README.md"]);
+		const s = await session(cwd, { answer: "session" });
+		assert.equal(await s.bash("# why: share the branch\ngit push -u origin feat/x"), undefined);
+		assert.deepEqual(s.dialogs[0].options, ["Yes", SESSION_LABEL, "No"]);
+		assert.equal(await s.bash("git push"), undefined);
+		assert.equal(await s.bash("git push origin HEAD"), undefined);
+		assert.equal(s.dialogs.length, 1);
+		// Not plain, or not this branch: asks, with no session answer.
+		for (const command of ["git push origin HEAD:main", "git push origin feat/other", "git push --tags", "git checkout main && git push", "git push -uf origin main"]) {
+			const before = s.dialogs.length;
+			await s.bash(command);
+			assert.equal(s.dialogs.length, before + 1, command);
+			assert.equal(s.dialogs.at(-1)!.options, undefined, command);
+		}
+		// An MCP tool that pushes is never covered by it.
+		await s.tool("mcp__github__push_files", { branch: "main" });
+		assert.match(s.dialogs.at(-1)!.title, /push commits to the remote/);
+		assert.equal(s.dialogs.at(-1)!.options, undefined);
+		// On the default branch the push grant does not apply, and is not offered.
+		git(cwd, "checkout", "-q", "main");
+		const count = s.dialogs.length;
+		await s.bash("git push");
+		assert.equal(s.dialogs.length, count + 1);
+		assert.equal(s.dialogs.at(-1)!.options, undefined);
+	});
+
+	it("too-wide actions never offer it: an API write, a merge, an install", async () => {
+		const plain = join(dir, "grant-wide");
+		mkdirSync(plain, { recursive: true });
+		const s = await session(plain, { answer: "session" });
+		for (const command of ["gh api -X POST repos/o/r/issues/1/comments -f body=x", "gh pr merge 1", "npm install left-pad"]) {
+			await s.bash(command);
+			await s.bash(command);
+		}
+		assert.equal(s.dialogs.length, 6);
+		assert.ok(s.dialogs.every((d) => d.options === undefined));
+	});
+
 	it("a granted PR with a clean gate runs without asking", async () => {
 		const plain = join(dir, "grant-pr");
 		mkdirSync(plain, { recursive: true });

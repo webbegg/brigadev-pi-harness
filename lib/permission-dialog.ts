@@ -50,8 +50,23 @@ export interface PermissionCard {
 
 /** The third answer's label. */
 export const SESSION_LABEL = "Yes, and don't ask again this session";
-/** Levels a "yes for this session" may cover: a High action (delete, force push, publish, sudo, secrets) always asks. */
-export const SESSION_GRANT_LEVELS: ReadonlySet<RiskLevel> = new Set(["Low", "Medium"]);
+/**
+ * The actions a "yes for this session" may cover: opening a PR, writing to a PR or issue, and a plain push (`CommandMatch.push`; the guard
+ * also needs HEAD on a feature branch). Everything else always asks: High actions, and Medium ones too wide for one yes (any `gh api`
+ * write, a merge, a dependency change, a commit on the default branch, an MCP push).
+ */
+export const SESSION_GRANT_ACTIONS: ReadonlySet<string> = new Set(["open a pull request", "write to GitHub", "push commits to the remote"]);
+
+/** True when a "yes for this session" may cover these matches (the guard adds the push's branch check). */
+export function grantable(matches: readonly CommandMatch[]): boolean {
+	return (
+		matches.length > 0 &&
+		matches.every((match) => {
+			const profile = profileFor(match);
+			return profile.level !== "High" && SESSION_GRANT_ACTIONS.has(profile.action) && (profile !== PUSH || match.push !== undefined);
+		})
+	);
+}
 
 export interface PermissionDialog {
 	title: string;
@@ -388,6 +403,8 @@ export function permissionDialog(input: { items: ReadonlyArray<{ profile: RiskPr
 
 	const actions = listed.map(({ profile }) => profile.action).join(" + ") + (more.length > 0 ? ` +${more.length} more` : "");
 	const why = input.why ?? input.whyMissing ?? WHY_MISSING;
+	// The PR gate's reasons name branches and paths: their control characters are shown, like the command's.
+	const extra = input.extra ? input.extra.split("\n").map(visible).join("\n") : undefined;
 	const card: PermissionCard = {
 		level: top,
 		heading: capitalize(actions),
@@ -397,10 +414,10 @@ export function permissionDialog(input: { items: ReadonlyArray<{ profile: RiskPr
 		// The lead action is the riskiest: its undo and reach are the ones to weigh.
 		risk: `${lead.undoBrief} · affects ${lead.affectsBrief}`,
 		subject: [...input.subject],
-		...(input.extra ? { extra: input.extra } : {}),
+		...(extra ? { extra } : {}),
 		details,
 		question: input.question,
-		...(input.sessionGrant && input.items.length > 0 && input.items.every(({ profile }) => SESSION_GRANT_LEVELS.has(profile.level)) ? { sessionActions: input.items.map(({ profile }) => profile.action) } : {}),
+		...(input.sessionGrant && input.items.length > 0 && input.items.every(({ profile }) => profile.level !== "High" && SESSION_GRANT_ACTIONS.has(profile.action)) ? { sessionActions: input.items.map(({ profile }) => profile.action) } : {}),
 	};
 	const body = [
 		card.summary,
@@ -409,14 +426,14 @@ export function permissionDialog(input: { items: ReadonlyArray<{ profile: RiskPr
 		`Risk  ● ${top} · ${card.risk}`,
 		"",
 		...card.subject.map((line) => `  ${line}`),
-		...(input.extra ? ["", input.extra] : []),
+		...(extra ? ["", extra] : []),
 		"",
 		input.question,
 	].join("\n");
 	return { title: `brigadev · Needs your permission: ${actions}`, body, details, card, ...(card.sessionActions ? { sessionLabel: SESSION_LABEL } : {}) };
 }
 
-/** `sessionGrant: false`: no "yes for this session" (the PR gate's own question, which a grant never skips). */
+/** `sessionGrant: false`: no "yes for this session" (the PR gate's own question, which a grant never skips; a push the grant may not cover). */
 export interface DialogOptions {
 	sessionGrant?: boolean;
 }
@@ -425,12 +442,12 @@ export interface DialogOptions {
 export function commandDialog(command: string, matches: readonly CommandMatch[], extra?: string, question = "Run it?", { sessionGrant = true }: DialogOptions = {}): PermissionDialog {
 	const lines = commandPreview(withoutLeadingWhy(command)).split("\n");
 	const subject = lines.map((line, index) => `${index === 0 ? "$ " : "  "}${visible(line)}`);
-	return permissionDialog({ items: group(matches), subject, why: whyNote(command), whyMissing: WHY_MISSING, question, extra, sessionGrant });
+	return permissionDialog({ items: group(matches), subject, why: whyNote(command), whyMissing: WHY_MISSING, question, extra, sessionGrant: sessionGrant && grantable(matches) });
 }
 
 /** The dialog for a guarded MCP tool call: `preview` is the tool name and its clipped input. */
 export function toolDialog(preview: string, matches: readonly CommandMatch[], extra?: string, question = "Run it?", { sessionGrant = true }: DialogOptions = {}): PermissionDialog {
-	return permissionDialog({ items: group(matches), subject: preview.split("\n").map(visible), whyMissing: WHY_NOT_ATTACHED, question, extra, sessionGrant });
+	return permissionDialog({ items: group(matches), subject: preview.split("\n").map(visible), whyMissing: WHY_NOT_ATTACHED, question, extra, sessionGrant: sessionGrant && grantable(matches) });
 }
 
 /** The dialog before a tool touches a path that commonly holds secrets; `why` is the `# why:` note of a shell tool's command. */
@@ -440,5 +457,6 @@ export function sensitiveFileDialog(toolName: string, rawPath: string, isWrite: 
 
 /** The dialog before a write outside the project root; a yes grants writes under `target` for the session. */
 export function outsideWriteDialog(toolName: string, absolute: string, projectRoot: string, target: string, why?: string): PermissionDialog {
-	return permissionDialog({ items: [{ profile: outsideProfile(projectRoot, target) }], subject: [`${toolName} ${visible(absolute)}`], why, whyMissing: WHY_NOT_ATTACHED, question: `Allow writes under ${target} for this session?` });
+	const shown = visible(target);
+	return permissionDialog({ items: [{ profile: outsideProfile(visible(projectRoot), shown) }], subject: [`${toolName} ${visible(absolute)}`], why, whyMissing: WHY_NOT_ATTACHED, question: `Allow writes under ${shown} for this session?` });
 }

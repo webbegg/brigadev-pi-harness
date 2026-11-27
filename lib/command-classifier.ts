@@ -32,6 +32,17 @@ export interface CommandMatch {
 	 * `--work-tree` style redirection.
 	 */
 	elsewhere?: boolean;
+	/**
+	 * Set on a `git push` that pushes only the current branch, or one named branch to the same name (`ref`; `HEAD` for the current one), with
+	 * harmless flags only, in the session's directory: the only push a "yes for this session" may cover. Dropped by a move before it.
+	 */
+	push?: { ref?: string };
+}
+
+/** A commit or a push may not run where the guard reads the branch facts: a move, a branch switch, or a git location setting before it. */
+function markElsewhere(match: CommandMatch): void {
+	if (match.commit) match.elsewhere = true;
+	delete match.push;
 }
 
 const SEPARATORS = new Set([";", "&&", "||", "|", "&", "\n", "(", ")"]);
@@ -619,6 +630,28 @@ function gitSubcommand(args: string[]): number {
 	return -1;
 }
 
+/** Flags that change neither what a push sends nor where: upstream tracking, output, a dry run. */
+const PLAIN_PUSH_FLAGS = new Set(["--set-upstream", "--quiet", "--verbose", "--dry-run", "--porcelain", "--progress", "--no-progress"]);
+
+/**
+ * `git push [flags] [<remote> [<branch>]]` with harmless flags only, and the branch neither a refspec (`a:b`), `main`, nor `master`:
+ * `{ ref }` (none: the current branch). Undefined for anything else (`--tags`, `--all`, `-o`, several refs).
+ */
+function plainPush(rest: string[]): { ref?: string } | undefined {
+	const words: string[] = [];
+	for (const a of rest) {
+		if (a.startsWith("--")) {
+			if (!PLAIN_PUSH_FLAGS.has(a)) return undefined;
+		} else if (a.startsWith("-")) {
+			if (!/^-[uqvn]+$/.test(a)) return undefined;
+		} else words.push(a);
+	}
+	if (words.length > 2) return undefined;
+	const ref = words[1];
+	if (ref === undefined) return {};
+	return ref.includes(":") || PROTECTED_NAMES.has(ref) ? undefined : { ref };
+}
+
 function classifyGit(args: string[]): CommandMatch | undefined {
 	const index = gitSubcommand(args);
 	if (index === -1) return undefined;
@@ -671,10 +704,11 @@ function classifyGit(args: string[]): CommandMatch | undefined {
 		case "worktree":
 			return rest[0] === "remove" && hasAny(rest, "-f", "--force") ? destructive("worktree force-remove") : undefined;
 		case "push": {
-			const forced = hasAny(rest, "--force", "-f", "--force-with-lease", "--mirror", "--delete", "-d", "--prune");
+			const forced = hasAny(rest, "--force", "--force-with-lease", "--mirror", "--delete", "--prune") || hasShortFlag(rest, "f") || hasShortFlag(rest, "d");
 			const forcedRefspec = rest.some((a) => !a.startsWith("-") && (a.startsWith("+") || a.startsWith(":")));
 			if (forced || forcedRefspec) return destructive("push rewrites or deletes remote refs");
-			return { kind: COMMAND_KIND.DELIVERY, reason: "git push", alwaysConfirm: true };
+			const push = plainPush(rest);
+			return { kind: COMMAND_KIND.DELIVERY, reason: "git push", alwaysConfirm: true, ...(push ? { push } : {}) };
 		}
 		case "subtree":
 			return rest[0] === "push" ? { kind: COMMAND_KIND.DELIVERY, reason: "git subtree push", alwaysConfirm: true } : undefined;
@@ -753,7 +787,7 @@ function classifySegment(rawArgv: string[], before: string, scratch: ScratchCont
 		if (script) {
 			const nested = classifyCommand(script);
 			// A location variable set on the wrapper applies to every git call inside its script.
-			if (setsGitLocation(rawArgv)) for (const match of nested) if (match.commit) match.elsewhere = true;
+			if (setsGitLocation(rawArgv)) for (const match of nested) markElsewhere(match);
 			matches.push(...nested);
 		}
 		else if (before === "|") matches.push({ kind: COMMAND_KIND.PRIVILEGED, reason: `piping into ${name} executes downloaded or generated code` });
@@ -769,7 +803,7 @@ function classifySegment(rawArgv: string[], before: string, scratch: ScratchCont
 			break;
 		case "git":
 			match = classifyGit(args);
-			if (match?.commit && gitTargetsElsewhere(args, rawArgv)) match.elsewhere = true;
+			if (match && (match.commit || match.push) && gitTargetsElsewhere(args, rawArgv)) markElsewhere(match);
 			break;
 		case "gh":
 			match = classifyGh(args);
@@ -876,7 +910,7 @@ export function classifyCommand(command: string): CommandMatch[] {
 	return [...raw, ...classifyText(blanked).filter((match) => !seen.has(matchKey(match)))];
 }
 
-const matchKey = (match: CommandMatch) => `${match.kind}\u0000${match.reason}\u0000${match.commit ? 1 : 0}\u0000${match.elsewhere ? 1 : 0}`;
+const matchKey = (match: CommandMatch) => `${match.kind}\u0000${match.reason}\u0000${match.commit ? 1 : 0}\u0000${match.elsewhere ? 1 : 0}\u0000${match.push ? `push:${match.push.ref ?? ""}` : ""}`;
 
 function classifyText(command: string): CommandMatch[] {
 	const matches: CommandMatch[] = [];
@@ -885,7 +919,7 @@ function classifyText(command: string): CommandMatch[] {
 	const scratch = scratchContext(text);
 	for (const segment of tokenize(text)) {
 		const found = classifySegment(segment.argv, segment.before, scratch);
-		if (moved) for (const match of found) if (match.commit) match.elsewhere = true;
+		if (moved) for (const match of found) markElsewhere(match);
 		matches.push(...found);
 		moved ||= changesCommitTarget(segment.argv);
 	}

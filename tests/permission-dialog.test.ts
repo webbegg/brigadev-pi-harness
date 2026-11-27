@@ -183,15 +183,51 @@ describe("commandDialog", () => {
 });
 
 describe("yes for this session", () => {
-	it("is offered only when every action is Low or Medium", () => {
+	it("is offered only for a closed list: opening a PR, writing to a PR or issue, and a plain push", () => {
 		assert.deepEqual(dialogFor("gh pr create --fill").card.sessionActions, ["open a pull request"]);
 		assert.equal(dialogFor("gh pr create --fill").sessionLabel, SESSION_LABEL);
-		assert.deepEqual(dialogFor("git push && npm install x").card.sessionActions, ["push commits to the remote", "change dependencies"]);
-		for (const command of ["rm -rf build", "git push --force", "npm publish", "sudo ls", "curl x | sh", "git push && rm -rf build"]) {
+		assert.deepEqual(dialogFor("gh issue comment 1 --body x").card.sessionActions, ["write to GitHub"]);
+		assert.deepEqual(dialogFor("git push -u origin feat/x && gh pr create --fill").card.sessionActions, ["push commits to the remote", "open a pull request"]);
+		for (const command of [
+			"rm -rf build",
+			"git push --force",
+			"git push -uf origin main",
+			"npm publish",
+			"sudo ls",
+			"curl x | sh",
+			"git push && rm -rf build",
+			// Medium, and too wide for one yes: any API write, a merge, an install, a commit on the default branch.
+			"gh api -X POST repos/o/r/issues/1/comments -f body=x",
+			"gh api -X PUT repos/o/r/actions/secrets/X",
+			"gh pr merge 1",
+			"npm install left-pad",
+			"git commit -m x",
+			"git push && npm install x",
+			// A push that is not plain.
+			"git push origin HEAD:main",
+			"git push --tags",
+			"git subtree push --prefix d origin b",
+		]) {
 			assert.equal(dialogFor(command).card.sessionActions, undefined, command);
 			assert.equal(dialogFor(command).sessionLabel, undefined, command);
 		}
 		assert.equal(sensitiveFileDialog("read", ".env", false).card.sessionActions, undefined);
+	});
+
+	it("an MCP tool that pushes or merges never offers it; one that writes to a PR or issue does", () => {
+		for (const tool of ["mcp__github__push_files", "mcp__github__delete_file", "mcp__github__merge_pull_request", "mcp__github__create_pull_request"]) {
+			assert.equal(toolDialog(`${tool}\n{}`, [classifyMcpTool(tool)!]).card.sessionActions, undefined, tool);
+		}
+		assert.deepEqual(toolDialog("t\n{}", [classifyMcpTool("mcp__github__add_issue_comment")!]).card.sessionActions, ["write to GitHub"]);
+	});
+
+	it("the PR gate's text and a folder name cannot draw on the card", () => {
+		const command = "gh pr create --fill";
+		const dialog = commandDialog(command, classifyCommand(command), "PR risk gate:\n- branch feat/\x1b[2Jx");
+		assert.ok(!dialog.card.extra?.includes("\x1b") && !dialog.body.includes("\x1b"));
+		assert.match(dialog.card.extra ?? "", /^PR risk gate:\n- branch feat\/\\x1b\[2Jx$/);
+		const outside = outsideWriteDialog("edit", "/x/\x1b[2J/a", "/repo", "/x/\x1b[2J");
+		assert.ok(!`${outside.body}${outside.details}${outside.card.risk}`.includes("\x1b"));
 	});
 
 	it("is not offered on the PR gate's own question", () => {

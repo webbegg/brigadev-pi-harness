@@ -509,3 +509,52 @@ describe("segmentDirectories (S8b: where each segment of a command starts)", () 
 		assert.deepEqual(dirs("npm test | tail"), [cwd, cwd]);
 	});
 });
+
+describe("git push: force and delete in combined short flags, and a plain push (what a session grant may cover)", () => {
+	const push = (command: string) => classifyCommand(command).find((m) => /push/.test(m.reason));
+
+	it("a force or delete in combined short flags rewrites remote refs", () => {
+		for (const command of ["git push -uf origin main", "git push -fu origin feat/x", "git push -ud origin old", "git push -qf", "git push --force-with-lease=main origin main"]) {
+			assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+		}
+	});
+
+	it("marks a push of the current branch or a named branch, with harmless flags only, as plain", () => {
+		assert.deepEqual(push("git push")?.push, {});
+		assert.deepEqual(push("git push origin")?.push, {});
+		assert.deepEqual(push("git push -u origin feat/x")?.push, { ref: "feat/x" });
+		assert.deepEqual(push("git push --set-upstream -q origin HEAD")?.push, { ref: "HEAD" });
+		assert.deepEqual(push("git push -uv origin feat/x")?.push, { ref: "feat/x" });
+	});
+
+	it("anything else is not plain: a refspec, several refs, tags, all, options, another repository, a move before it", () => {
+		for (const command of [
+			"git push origin HEAD:main",
+			"git push origin feat/x:main",
+			"git push origin a b",
+			"git push origin main",
+			"git push origin master",
+			"git push --tags",
+			"git push --all origin",
+			"git push origin v1.0.0 --follow-tags",
+			"git push -o ci.skip origin feat/x",
+			"git push --repo=x",
+			"git -C ../other push",
+			"cd ../other && git push",
+			"git checkout main && git push",
+			"GIT_DIR=../o/.git git push",
+			"bash -c 'cd .. && git push'",
+			"git subtree push --prefix d origin b",
+		]) {
+			const match = push(command);
+			assert.ok(match, command);
+			assert.equal(match.push, undefined, command);
+		}
+	});
+
+	it("a plain and a not-plain reading of the same push are both kept", () => {
+		const matches = classifyCommand("git push && git push origin HEAD:main").filter((m) => m.reason === "git push");
+		assert.equal(matches.length, 2);
+		assert.deepEqual(matches.map((m) => m.push), [{}, undefined]);
+	});
+});
