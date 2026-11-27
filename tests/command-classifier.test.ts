@@ -526,6 +526,7 @@ describe("git push: force and delete in combined short flags, and a plain push (
 		assert.deepEqual(push("git push --set-upstream -q origin HEAD")?.push, { remote: "origin", ref: "HEAD" });
 		assert.deepEqual(push("git push -uv origin feat/x")?.push, { remote: "origin", ref: "feat/x" });
 		assert.deepEqual(push("# why: share it\ngit push -u origin feat/x && gh pr create --fill")?.push, { remote: "origin", ref: "feat/x" });
+		assert.deepEqual(push("gh pr create --fill && git push -u origin HEAD")?.push, { remote: "origin", ref: "HEAD" });
 	});
 
 	it("anything else is not plain: a refspec, several refs, tags, all, options, another repository, a move before it", () => {
@@ -562,6 +563,12 @@ describe("git push: force and delete in combined short flags, and a plain push (
 			"git push origin @:main",
 			"npm test && git push",
 			"git push origin feat/x # why: trailing",
+			// A gh call that switches branch, repoints a remote, or runs an alias or extension.
+			"gh co 12 && git push",
+			"gh pr checkout 12 && git push",
+			"gh repo fork --remote && git push",
+			"gh myalias; git push",
+			"gh config set git_protocol ssh && git push",
 		]) {
 			const match = push(command);
 			assert.ok(match, command);
@@ -578,5 +585,13 @@ describe("git push: force and delete in combined short flags, and a plain push (
 		// The raw reading takes the trailing comment's words as arguments; the comment-blanked one sees a plain push.
 		const matches = classifyCommand("git push # why: it's ready").filter((m) => m.reason === "git push");
 		assert.deepEqual(matches.map((m) => m.push), [undefined, {}]);
+	});
+
+	it("two readings that show different remotes keep both pushes, so the guard checks both", () => {
+		const matches = classifyCommand("# ; git push origin ; #'\ngit push fork\n#'").filter((m) => m.reason === "git push");
+		assert.deepEqual(
+			matches.map((m) => m.push?.remote),
+			["origin", "fork"],
+		);
 	});
 });

@@ -106,9 +106,11 @@ export default function (pi: ExtensionAPI) {
 			remote ??= "origin";
 			if (!/^[A-Za-z0-9._-]+$/.test(remote)) return undefined;
 			if ((await setting("--get-all", `remote.${remote}.push`)) !== "" || (await setting("--get", `remote.${remote}.mirror`)) !== "") return undefined;
-			const url = await exec("git", ["remote", "get-url", "--push", remote], { cwd, timeout: 10_000 }).catch(() => undefined);
-			if (url?.code !== 0 || !url.stdout.trim()) return undefined;
-			urls.push(url.stdout.trim());
+			// git pushes to every push URL of the remote (several `pushurl`s, or several `url`s): each one must be granted.
+			const found = await exec("git", ["remote", "get-url", "--push", "--all", remote], { cwd, timeout: 10_000 }).catch(() => undefined);
+			const remoteUrls = found?.code === 0 ? found.stdout.split("\n").map((line) => line.trim()).filter(Boolean) : [];
+			if (remoteUrls.length === 0) return undefined;
+			urls.push(...remoteUrls);
 		}
 		return urls;
 	};

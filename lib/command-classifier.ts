@@ -658,9 +658,16 @@ function plainPush(rest: string[]): { remote?: string; ref?: string } | undefine
 	return { ...(remote === undefined ? {} : { remote }), ...(ref === undefined ? {} : { ref }) };
 }
 
-/** A segment that may stand next to a plain push: a comment, a `gh` call, or the literal `git push` itself (no wrapper, no pipe into it). */
+/** `gh pr|issue` actions that may stand next to a plain push: they write to a PR or issue, or only read. Never an alias, an extension, `repo`, or `config`. */
+const GH_BESIDE_PUSH = new Set(["create", "comment", "review", "edit", "close", "reopen", "view", "list", "status", "checks", "diff"]);
+
+/** A segment that may stand next to a plain push: a comment, a PR or issue `gh` call, or the literal `git push` itself (no wrapper, no pipe into it). */
 function allowsPlainPush(argv: readonly string[], before: string): boolean {
-	if (argv.length === 0 || argv[0].startsWith("#") || argv[0] === "gh") return true;
+	if (argv.length === 0 || argv[0].startsWith("#")) return true;
+	if (argv[0] === "gh") {
+		const { group, action = "" } = ghGroupAction(argv.slice(1));
+		return (group === "pr" || group === "issue") && GH_BESIDE_PUSH.has(action);
+	}
 	return argv[0] === "git" && argv[1] === "push" && before !== "|" && plainPush(argv.slice(2)) !== undefined;
 }
 
@@ -922,11 +929,12 @@ export function classifyCommand(command: string): CommandMatch[] {
 	if (blanked === command) return raw;
 	// Fail closed: the raw reading (comments as words) and the comment-blanked one are both judged, and their matches combined.
 	// A quote or `<<` inside a comment hides later lines from the raw reading; a wrong blank would hide them from the other one.
+	// A push's remote and ref are part of its key: a reading that shows another push keeps it, so the guard checks where each one lands.
 	const seen = new Set(raw.map(matchKey));
 	return [...raw, ...classifyText(blanked).filter((match) => !seen.has(matchKey(match)))];
 }
 
-const matchKey = (match: CommandMatch) => `${match.kind}\u0000${match.reason}\u0000${match.commit ? 1 : 0}\u0000${match.elsewhere ? 1 : 0}\u0000${match.push ? `push:${match.push.ref ?? ""}` : ""}`;
+const matchKey = (match: CommandMatch) => `${match.kind}\u0000${match.reason}\u0000${match.commit ? 1 : 0}\u0000${match.elsewhere ? 1 : 0}\u0000${match.push ? `push:${match.push.remote ?? ""}:${match.push.ref ?? ""}` : ""}`;
 
 function classifyText(command: string): CommandMatch[] {
 	const matches: CommandMatch[] = [];

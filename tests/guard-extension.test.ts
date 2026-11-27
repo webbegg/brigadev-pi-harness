@@ -663,6 +663,13 @@ describe("guard: yes, and don't ask again this session", () => {
 		await s.bash("git push");
 		assert.equal(s.dialogs.length, before + 1);
 		git(cwd, "remote", "set-url", "origin", "https://example.invalid/r.git");
+		// git pushes to every push URL: a second one that was never granted asks.
+		git(cwd, "config", "--add", "remote.origin.pushurl", "https://example.invalid/r.git");
+		git(cwd, "config", "--add", "remote.origin.pushurl", "https://mirror.invalid/m.git");
+		const mirrored = s.dialogs.length;
+		await s.bash("git push");
+		assert.equal(s.dialogs.length, mirrored + 1);
+		git(cwd, "config", "--unset-all", "remote.origin.pushurl");
 		// An MCP tool that pushes is never covered by it.
 		await s.tool("mcp__github__push_files", { branch: "main" });
 		assert.match(s.dialogs.at(-1)!.title, /push commits to the remote/);
