@@ -627,7 +627,7 @@ describe("bg_start is guarded exactly like bash", () => {
 			const cwd = join(repo, ".ssh");
 			assert.match(String((await outcome("bg_start", { command: "ls", cwd }, { hasUI: false })).reason), /User declined access to sensitive file/);
 			const yes = await outcome("bg_start", { command: "ls", cwd }, { hasUI: true, answer: true });
-			assert.deepEqual(yes, { reason: undefined, asked: ["brigadev · Needs your permission: change a file that may hold secrets"] });
+			assert.deepEqual(yes, { reason: undefined, asked: ["brigadev · Needs your permission: work in a folder that may hold secrets"] });
 		});
 
 		it("the evidence log folder is never a working directory", async () => {

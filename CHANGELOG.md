@@ -4,7 +4,11 @@
 
 ### Changed
 
-- The guard's permission dialogs explain the action in plain words: WHAT IT WILL DO (a sentence and the command), WHY (the agent's reason), and RISK (level, what could go wrong, whether it can be undone, who it affects). The agent gives its reason with a `# why: <reason>` comment on the command; without one the dialog warns that no reason was given. Titles change from `brigadev: <reason>` to `brigadev · Needs your permission: <action>` (also on the web UI and the guard bus).
+- The guard's permission dialogs explain the action in plain words: WHAT IT WILL DO (a sentence and the command), WHY (the agent's reason), and RISK (level, what could go wrong, whether it can be undone, who it affects). The agent gives its reason with a `# why: <reason>` comment on the command; without one the dialog warns that no reason was given. The reason's control characters are shown as escapes, so it cannot draw fake lines. Dialog titles change from `brigadev: <reason>` to `brigadev · Needs your permission: <action>` (also on the web prompt); the guard bus keeps the terse `brigadev: <reason>`.
+
+### Fixed
+
+- The command rules read shell comments as bash does: an unquoted `#` that begins a word comments out the rest of its line. A quote or `<<` inside a comment (`# why: it's stale`) used to hide the next lines from the guard, so a push, a removal, or a publish after it ran without asking.
 
 ## [0.26.0] - 2026-11-26
 

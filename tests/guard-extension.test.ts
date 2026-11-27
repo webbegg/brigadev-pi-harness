@@ -132,7 +132,7 @@ describe("guard: PR risk gate", () => {
 		assert.equal(await s.bash(PR), undefined);
 		assert.equal(s.dialogs.length, 1);
 		assert.match(s.dialogs[0].title, /open a pull request/);
-		assert.match(s.dialogs[0].body, /WHAT IT WILL DO\n  Opens a pull request on GitHub\.\n  \$ gh pr create --fill\n/);
+		assert.match(s.dialogs[0].body, /WHAT IT WILL DO\n  Opens a pull request on GitHub \(gh pr create\)\.\n  \$ gh pr create --fill\n/);
 		assert.match(s.dialogs[0].body, /RISK  ● Low/);
 		assert.match(s.dialogs[0].body, /Run it\?/);
 		assert.match(s.dialogs[0].body, /has no brigadev-verify run/);
@@ -490,8 +490,17 @@ describe("guard: the permission dialog explains the action", () => {
 		assert.match(String(await s.bash("# why: the worktree is merged and unused\nrm -rf build")), /User declined/);
 		assert.equal(s.dialogs[0].title, "brigadev · Needs your permission: delete or overwrite data");
 		assert.match(s.dialogs[0].body, /^WHAT IT WILL DO\n  Deletes or overwrites data \(.*\)\.\n  \$ rm -rf build\n\nWHY\n  the worktree is merged and unused\n\nRISK  ● High\n/);
-		assert.match(s.dialogs[0].body, /Can it be undone\?   No\.\n/);
+		assert.match(s.dialogs[0].body, /Can it be undone\?   Usually not; /);
 		assert.match(s.dialogs[0].body, /\n\nRun it\?$/);
+	});
+
+	it("a quote in the why line does not hide the command from the guard", async () => {
+		const plain = join(dir, "why-quote");
+		mkdirSync(plain, { recursive: true });
+		const s = await session(plain);
+		assert.match(String(await s.bash("# why: it's stale\nrm -rf build")), /User declined/);
+		assert.equal(s.dialogs.length, 1);
+		assert.match(s.dialogs[0].body, /WHY\n  it's stale\n/);
 	});
 
 	it("warns when the command gives no reason", async () => {

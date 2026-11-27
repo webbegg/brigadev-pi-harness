@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { BUS, publish, type GuardDecision, type ModeState } from "../lib/bus.ts";
-import { classifyCommand } from "../lib/command-classifier.ts";
+import { classifyCommand, COMMAND_KIND } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
 import { branchSlug, evidenceFile, readEvidence } from "../lib/evidence.ts";
 import { checkRefusal, resolveCommand } from "../lib/check.ts";
@@ -22,7 +22,7 @@ import { askConfirm } from "../lib/human-prompt.ts";
 import { commandDialog, outsideWriteDialog, sensitiveFileDialog, toolDialog, whyNote } from "../lib/permission-dialog.ts";
 import { classifyMcpTool, mcpInputPreview } from "../lib/mcp-tools.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, sensitiveWords, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
-import { commandPreview, decideCommand, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
+import { decideCommand, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { decidePrGate, opensPrCreate, PR_FACTS_ERROR_REASON, prCreateDirectory, prGateBlockMessage, prGateDialogText, riskMapFor, UNRESOLVED_DIRECTORY_REASON, type PrGateDecision } from "../lib/pr-gate.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
@@ -129,12 +129,13 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/** Asks the user, in the TUI or from the web (first answer wins); without a UI (print mode, subagents) the answer is no. */
-	const confirm = async (ctx: ExtensionContext, title: string, body: string): Promise<boolean> => {
+	/** `busReason`: what the guard bus records for the confirm (the classifier's terse reason); the dialog's plain title otherwise. */
+	const confirm = async (ctx: ExtensionContext, title: string, body: string, busReason?: string): Promise<boolean> => {
 		if (isChild || !ctx.hasUI) return false;
 		const current = judging.getStore();
 		if (current) {
 			current.asked = true;
-			announce(current, "confirm", title);
+			announce(current, "confirm", busReason ?? title);
 		}
 		// The run's abort signal (Esc, the web Abort) closes the dialog and the web prompt, so a late answer cannot resume an aborted call.
 		return askConfirm(pi.events, ctx, { source: "guard", title, body }, ctx.signal);
@@ -174,8 +175,8 @@ export default function (pi: ExtensionAPI) {
 
 		let verdict: PathVerdict;
 		if (decision.action === "ask" && decision.kind === "sensitive") {
-			const dialog = sensitiveFileDialog(toolName, rawPath, isWrite, why);
-			const ok = await confirm(ctx, dialog.title, dialog.body);
+			const dialog = sensitiveFileDialog(toolName, rawPath, isWrite, why, isDirectory && toolName === "bg_start");
+			const ok = await confirm(ctx, dialog.title, dialog.body, "brigadev: sensitive file");
 			if (!ok) return { block: true, reason: `User declined access to sensitive file ${rawPath}` };
 			verdict = decision.then;
 		} else verdict = decision;
@@ -185,7 +186,7 @@ export default function (pi: ExtensionAPI) {
 			if ([...outsideGrants].some((granted) => isInside(granted, absolute))) return undefined;
 			const target = isDirectory ? absolute : verdict.target;
 			const dialog = outsideWriteDialog(toolName, absolute, root, target, why);
-			const ok = await confirm(ctx, dialog.title, dialog.body);
+			const ok = await confirm(ctx, dialog.title, dialog.body, "brigadev: write outside project");
 			if (!ok) return { block: true, reason: `User declined write outside the project root: ${absolute}` };
 			outsideGrants.add(target);
 		}
@@ -312,10 +313,12 @@ export default function (pi: ExtensionAPI) {
 			if (decision.action === "confirm") {
 				const prText = pr ? prGateDialogText(pr.decision) : "";
 				const dialog = commandDialog(command, decision.matches, prText || undefined);
-				const ok = await confirm(ctx, dialog.title, dialog.body);
+				const ok = await confirm(ctx, dialog.title, dialog.body, `brigadev: ${decision.reason}`);
 				if (!ok) return prBlock ?? { block: true, reason: `User declined: ${decision.reason}` };
 			} else if (pr && prBlock) {
-				const ok = await confirm(ctx, "brigadev: PR risk gate", `${commandPreview(command)}\n\n${prGateDialogText(pr.decision)}\n\nOpen the PR anyway?`);
+				const matches = classifyCommand(command);
+				const dialog = commandDialog(command, matches.length > 0 ? matches : [{ kind: COMMAND_KIND.DELIVERY, reason: "gh pr create" }], prGateDialogText(pr.decision), "Open the PR anyway?");
+				const ok = await confirm(ctx, dialog.title, dialog.body, "brigadev: PR risk gate");
 				if (!ok) return prBlock;
 			}
 			// The command will run: remember the tree so tool_result can see what it changed.
@@ -338,10 +341,11 @@ export default function (pi: ExtensionAPI) {
 			const preview = `${event.toolName}\n${mcpInputPreview(event.input)}`;
 			if (decision.action === "confirm") {
 				const dialog = toolDialog(preview, decision.matches, prText || undefined);
-				const ok = await confirm(ctx, dialog.title, dialog.body);
+				const ok = await confirm(ctx, dialog.title, dialog.body, `brigadev: ${decision.reason}`);
 				if (!ok) return prBlock ?? { block: true, reason: `User declined: ${decision.reason}` };
 			} else if (pr && prBlock) {
-				const ok = await confirm(ctx, "brigadev: PR risk gate", `${preview}\n\n${prText}\n\nOpen the PR anyway?`);
+				const dialog = toolDialog(preview, [mcp], prText, "Open the PR anyway?");
+				const ok = await confirm(ctx, dialog.title, dialog.body, "brigadev: PR risk gate");
 				if (!ok) return prBlock;
 			}
 			return undefined;

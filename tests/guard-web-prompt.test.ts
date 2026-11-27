@@ -96,6 +96,7 @@ describe("guard confirm answered from the bus", () => {
 		assert.deepEqual([final.id, final.status, final.answer, final.by], [prompt.id, "answered", true, "web"]);
 		assert.deepEqual(s.decisions().map((d) => [d.action, d.toolCallId, d.tool]), [["confirm", toolCallId, "bash"], ["allow", toolCallId, "bash"]]);
 		assert.equal(s.decisions()[0].subject, "rm -rf build");
+		assert.equal(s.decisions()[0].reason, "brigadev: rm recursive removal", "the bus keeps the classifier's terse reason");
 	});
 
 	it("a web no blocks the call and publishes confirm then block with the reason", async () => {

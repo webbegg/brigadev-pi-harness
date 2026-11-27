@@ -58,8 +58,64 @@ export interface Segment {
 	redirects: Redirect[];
 }
 
-/** Literal heredoc bodies are data, not commands. */
+/** True when `#` at `i` starts a shell comment: it begins a word (the start, a blank, or an operator character before it). */
+function startsComment(text: string, i: number): boolean {
+	return text[i] === "#" && (i === 0 || /[\s;&|()<>]/.test(text[i - 1]));
+}
+
+/**
+ * Blanks shell comments (an unquoted `#` that begins a word, to the end of its line), keeping offsets and newlines. A quote or a
+ * heredoc marker inside a comment (`# why: it's stale`) is text, so it must not change how the lines after it are read.
+ */
+export function blankComments(command: string): string {
+	return scanComments(command).blanked;
+}
+
+/** The shell comments of a command, each from its `#` to the end of its line, in order. */
+export function shellComments(command: string): string[] {
+	return scanComments(command).comments;
+}
+
+function scanComments(command: string): { blanked: string; comments: string[] } {
+	const comments: string[] = [];
+	let out = "";
+	let quote: "'" | '"' | null = null;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (quote) {
+			if (ch === "\\" && quote === '"' && i + 1 < command.length) {
+				out += ch + command[++i];
+				continue;
+			}
+			if (ch === quote) quote = null;
+			out += ch;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < command.length) {
+			out += ch + command[++i];
+			continue;
+		}
+		if (ch === "'" || ch === '"') quote = ch;
+		else if (startsComment(command, i)) {
+			const end = command.indexOf("\n", i);
+			const stop = end === -1 ? command.length : end;
+			comments.push(command.slice(i, stop));
+			out += " ".repeat(stop - i);
+			i = stop - 1;
+			continue;
+		}
+		out += ch;
+	}
+	return { blanked: out, comments };
+}
+
+/** Literal heredoc bodies are data, not commands; comments are blanked first, so a `<<` in a comment starts no heredoc. */
 export function blankHeredocs(command: string): string {
+	return blankHeredocBodies(blankComments(command));
+}
+
+/** Blanks literal heredoc bodies only (comments untouched). */
+export function blankHeredocBodies(command: string): string {
 	return command.replace(/<<-?\s*(['"]?)([A-Za-z_]\w*)\1[^\n]*\n[\s\S]*?\n\2(?=\n|$)/g, (raw) => {
 		const header = raw.slice(0, raw.indexOf("\n") + 1);
 		return header + " ".repeat(raw.length - header.length);
@@ -229,6 +285,12 @@ export function tokenize(command: string, options: { redirections?: boolean } = 
 		if (ch === "'" || ch === '"') {
 			quote = ch;
 			inToken = true;
+			continue;
+		}
+		// A comment runs to the end of the line (the newline still separates); a quote inside it opens nothing.
+		if (ch === "#" && !inToken && startsComment(command, i)) {
+			const end = command.indexOf("\n", i);
+			i = (end === -1 ? command.length : end) - 1;
 			continue;
 		}
 		if (ch === "\\" && i + 1 < command.length) {

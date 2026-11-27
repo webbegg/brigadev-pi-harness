@@ -13,7 +13,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { basename as executableName, blankHeredocs, segmentDirectories, tokenize, unwrap, type Segment } from "./command-classifier.ts";
+import { basename as executableName, blankHeredocBodies, blankHeredocs, segmentDirectories, shellComments, tokenize, unwrap, type Segment } from "./command-classifier.ts";
 import { canonicalPath, isInside } from "./paths.ts";
 
 const MAX_COMMAND_CHARS = 500;
@@ -297,6 +297,8 @@ function cdTarget(argv: string[], dir: string, top: string, home: string): strin
  */
 export function checkOutcome(command: string, exitCode: number | undefined, context: CheckContext = {}): CheckOutcome {
 	if (exitCode === undefined) return "unknown";
+	// The tokenizer now drops comments as bash does; a test command with one stays "unknown", as before.
+	if (shellComments(blankHeredocBodies(command)).length > 0) return "unknown";
 	const text = blankHeredocs(command);
 	if (text.includes("`") || text.includes("$(")) return "unknown";
 	// The tokenizer drops a separator that ends the command: `npm test &` runs in the background.

@@ -435,6 +435,8 @@ body.open .drawer { transform: none; }
 	// ---- where things land ----
 	function stepColumn() { var p = state.phase && state.phase.phase; return STEP_COLUMN[p] || null; }
 	var COMMIT_CMD = /^\s*(git\s+(commit|push|tag|merge|rebase)|gh\s+(pr|release)\s+(create|merge|edit|ready))\b/;
+	/** The command of a guard prompt: the dialog shows it on its `  $ ` line; a body without one is the command itself. */
+	function promptCommand(body) { var line = /^ {2}\$ (.*)$/m.exec(body || ""); return line ? line[1] : body || ""; }
 	var TEST_CMD = /\b(npm\s+(run\s+)?test|node\s+--test|pytest|cargo\s+test|go\s+test|vitest|jest|make\s+test)\b/;
 	function agentColumn(name) {
 		var n = String(name || "").toLowerCase();
@@ -481,7 +483,7 @@ body.open .drawer { transform: none; }
 			case "brigadev_prompt":
 				if (!d.id) break;
 				if (d.status !== "open" && !state.promptCol.has(d.id)) {
-					state.promptCol.set(d.id, d.kind === "choice" ? "decide" : COMMIT_CMD.test(d.body || "") ? "commit" : stepColumn() || "implement");
+					state.promptCol.set(d.id, d.kind === "choice" ? "decide" : COMMIT_CMD.test(promptCommand(d.body)) ? "commit" : stepColumn() || "implement");
 				}
 				state.prompts.set(d.id, d);
 				break;
