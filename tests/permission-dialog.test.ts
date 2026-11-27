@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { classifyCommand } from "../lib/command-classifier.ts";
 import { classifyMcpTool } from "../lib/mcp-tools.ts";
-import { commandDialog, outsideWriteDialog, profileFor, sensitiveFileDialog, toolDialog, whyNote, WHY_MISSING, WHY_NOT_ATTACHED } from "../lib/permission-dialog.ts";
+import { actionsOf, commandDialog, outsideWriteDialog, profileFor, SESSION_LABEL, sensitiveFileDialog, toolDialog, whyNote, WHY_MISSING, WHY_NOT_ATTACHED } from "../lib/permission-dialog.ts";
 import { decideCommand } from "../lib/permission-policy.ts";
 
 const dialogFor = (command: string) => commandDialog(command, classifyCommand(command));
@@ -51,25 +51,47 @@ describe("whyNote", () => {
 });
 
 describe("commandDialog", () => {
-	it("says what, why, and the risk of a push, and shows the command without the why line", () => {
-		const { title, body } = dialogFor("# why: open the PR for the intake\ngit push -u origin feat/x");
+	it("says what, why, and the risk of a push in short, and shows the command without the why line", () => {
+		const { title, body, details, card } = dialogFor("# why: open the PR for the intake\ngit push -u origin feat/x");
 		assert.equal(title, "brigadev · Needs your permission: push commits to the remote");
 		assert.equal(
 			body,
 			[
-				"WHAT IT WILL DO",
-				"  Uploads commits to the remote repository (git push).",
+				"Uploads commits to the remote repository.",
+				"",
+				"Why   open the PR for the intake",
+				"Risk  ● Medium · partly undoable · affects the remote; the team will see it",
+				"",
 				"  $ git push -u origin feat/x",
 				"",
-				"WHY",
-				"  open the PR for the intake",
+				"Run it?",
+			].join("\n"),
+		);
+		assert.deepEqual(
+			{ ...card, details: undefined },
+			{
+				level: "Medium",
+				heading: "Push commits to the remote",
+				summary: "Uploads commits to the remote repository.",
+				why: "open the PR for the intake",
+				whyGiven: true,
+				risk: "partly undoable · affects the remote; the team will see it",
+				subject: ["$ git push -u origin feat/x"],
+				details: undefined,
+				question: "Run it?",
+				sessionActions: ["push commits to the remote"],
+			},
+		);
+		assert.equal(
+			details,
+			[
+				"WHAT IT WILL DO",
+				"  Uploads commits to the remote repository (git push).",
 				"",
 				"RISK  ● Medium",
 				"  The commits become visible to the team and CI runs on them.",
 				"  Can it be undone?   Partly: the remote branch can be deleted, but others may already have it.",
 				"  Who does it affect? The remote repository; others will see it.",
-				"",
-				"Run it?",
 			].join("\n"),
 		);
 	});
@@ -78,11 +100,11 @@ describe("commandDialog", () => {
 		const command = "# why: clean up\ncat > x.sh <<EOF\n# why: kept\nEOF\nrm -rf build";
 		const { body } = commandDialog(command, classifyCommand(command));
 		assert.match(body, /  \$ cat > x\.sh <<EOF\n    # why: kept\n/);
-		assert.match(body, /WHY\n  clean up\n/);
+		assert.match(body, /\nWhy   clean up\n/);
 	});
 
 	it("warns when the command gives no reason", () => {
-		assert.match(dialogFor("rm -rf build").body, new RegExp(`WHY\\n  ${WHY_MISSING.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+		assert.match(dialogFor("rm -rf build").body, new RegExp(`\\nWhy   ${WHY_MISSING.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 	});
 
 	it("maps each guarded kind to its plain-words risk", () => {
@@ -110,41 +132,45 @@ describe("commandDialog", () => {
 			["npm install picocolors", /change dependencies/, "Medium"],
 		];
 		for (const [command, action, level] of cases) {
-			const { title, body } = dialogFor(command);
+			const { title, body, details } = dialogFor(command);
 			assert.match(title, action, command);
-			for (const match of classifyCommand(command)) assert.ok(body.includes(`(${match.reason})`), `${command}: the classifier's reason is named`);
-			assert.match(body, new RegExp(`RISK  ● ${level}\\n`), command);
-			assert.match(body, /Can it be undone\?/, command);
-			assert.match(body, /Who does it affect\?/, command);
+			for (const match of classifyCommand(command)) assert.ok(details.includes(`(${match.reason})`), `${command}: the classifier's reason is named`);
+			assert.match(details, new RegExp(`RISK  ● ${level}\\n`), command);
+			assert.match(body, new RegExp(`\\nRisk  ● ${level} · \\S`), command);
+			assert.match(details, /Can it be undone\?/, command);
+			assert.match(details, /Who does it affect\?/, command);
 		}
 	});
 
 	it("an action the dialog does not know is never shown as Low", () => {
 		const profile = profileFor({ kind: "delivery", reason: "some new delivery" });
 		assert.notEqual(profile.level, "Low");
-		assert.match(commandDialog("x", [{ kind: "delivery", reason: "some new delivery" }]).body, /\(some new delivery\)/);
+		assert.match(commandDialog("x", [{ kind: "delivery", reason: "some new delivery" }]).details, /\(some new delivery\)/);
 	});
 
 	it("the same action twice is one block that names both forms", () => {
-		const { title, body } = dialogFor("git reset --hard && git clean -fd");
+		const { title, details: body } = dialogFor("git reset --hard && git clean -fd");
 		assert.equal(title, "brigadev · Needs your permission: delete or overwrite data");
 		assert.match(body, /Deletes or overwrites data \(git reset discards work; git clean deletes untracked files\)\./);
 		assert.equal(body.match(/Can it be undone\?/g)?.length, 1);
 	});
 
 	it("lists at most three risks, then how many more", () => {
-		const { title, body } = dialogFor("rm -rf a && npm install x && npm publish && git push && sudo ls");
+		const { title, details: body, card } = dialogFor("rm -rf a && npm install x && npm publish && git push && sudo ls");
+		assert.match(card.summary, /; and 2 more actions\.$/);
 		assert.equal(body.match(/Can it be undone\?/g)?.length, 3);
 		assert.match(body, /\n  \+2 more: /);
 		assert.match(title, /\+2 more$/);
 	});
 
 	it("names the destructive form in what it will do", () => {
-		assert.match(dialogFor("git reset --hard HEAD~1").body, /Deletes or overwrites data \(.*reset.*\)\./);
+		assert.match(dialogFor("git reset --hard HEAD~1").details, /Deletes or overwrites data \(.*reset.*\)\./);
 	});
 
 	it("lists each risk, highest first, and takes the highest level when a command chains several", () => {
-		const { title, body } = dialogFor("# why: release\nnpm install && npm publish");
+		const { title, details: body, card } = dialogFor("# why: release\nnpm install && npm publish");
+		assert.equal(card.heading, "Publish or withdraw a release or package + change dependencies");
+		assert.equal(card.summary, "Publishes, changes, or withdraws a release, package, or image; installs, upgrades, or removes third-party packages.");
 		assert.equal(title, "brigadev · Needs your permission: publish or withdraw a release or package + change dependencies");
 		assert.match(body, /RISK  ● High\n  Publish or withdraw a release or package \(● High\): /);
 		assert.match(body, /\n  Change dependencies \(● Medium\): /);
@@ -153,6 +179,29 @@ describe("commandDialog", () => {
 	it("appends extra text (the PR gate) before the question", () => {
 		const { body } = commandDialog("gh pr create --fill", classifyCommand("gh pr create --fill"), "PR gate: no verify run");
 		assert.match(body, /\n\nPR gate: no verify run\n\nRun it\?$/);
+	});
+});
+
+describe("yes for this session", () => {
+	it("is offered only when every action is Low or Medium", () => {
+		assert.deepEqual(dialogFor("gh pr create --fill").card.sessionActions, ["open a pull request"]);
+		assert.equal(dialogFor("gh pr create --fill").sessionLabel, SESSION_LABEL);
+		assert.deepEqual(dialogFor("git push && npm install x").card.sessionActions, ["push commits to the remote", "change dependencies"]);
+		for (const command of ["rm -rf build", "git push --force", "npm publish", "sudo ls", "curl x | sh", "git push && rm -rf build"]) {
+			assert.equal(dialogFor(command).card.sessionActions, undefined, command);
+			assert.equal(dialogFor(command).sessionLabel, undefined, command);
+		}
+		assert.equal(sensitiveFileDialog("read", ".env", false).card.sessionActions, undefined);
+	});
+
+	it("is not offered on the PR gate's own question", () => {
+		const command = "gh pr create --fill";
+		assert.equal(commandDialog(command, classifyCommand(command), "PR risk gate:\n- x", "Open the PR anyway?", { sessionGrant: false }).card.sessionActions, undefined);
+		assert.equal(toolDialog("t\n{}", [classifyMcpTool("mcp__github__create_pull_request")!], undefined, "Open the PR anyway?", { sessionGrant: false }).card.sessionActions, undefined);
+	});
+
+	it("actionsOf names what a grant is keyed by: one entry per action", () => {
+		assert.deepEqual(actionsOf(classifyCommand("gh pr comment 1 --body x && gh issue comment 2 --body y")), [{ action: "write to GitHub", level: "Low" }]);
 	});
 });
 
@@ -183,18 +232,19 @@ describe("other dialogs", () => {
 		const read = sensitiveFileDialog("read", ".env", false);
 		assert.equal(read.title, "brigadev · Needs your permission: read a file that may hold secrets");
 		assert.match(read.body, /  read \.env\n/);
-		assert.match(read.body, /No: once read, it has been seen\./);
+		assert.match(read.details, /No: once read, it has been seen\./);
 		assert.match(read.body, /Allow\?$/);
 		assert.match(sensitiveFileDialog("write", ".env", true).title, /change a file that may hold secrets/);
-		assert.match(sensitiveFileDialog("bash", ".env", false, "check the token name").body, /WHY\n  check the token name\n/);
+		assert.match(sensitiveFileDialog("bash", ".env", false, "check the token name").body, /\nWhy   check the token name\n/);
 		assert.match(sensitiveFileDialog("bg_start", ".ssh", true, undefined, true).title, /work in a folder that may hold secrets/);
 	});
 
 	it("a write outside the project names the root and the session grant", () => {
-		const { title, body } = outsideWriteDialog("edit", "/Users/x/.config/a.json", "/repo", "/Users/x/.config");
+		const { title, body, details, card } = outsideWriteDialog("edit", "/Users/x/.config/a.json", "/repo", "/Users/x/.config");
 		assert.equal(title, "brigadev · Needs your permission: change files outside the project");
 		assert.match(body, /Writes outside the project root \(\/repo\)\./);
-		assert.match(body, /any write under \/Users\/x\/\.config for this session/);
+		assert.equal(card.sessionActions, undefined, "its yes is already a grant, for that folder");
+		assert.match(details, /any write under \/Users\/x\/\.config for this session/);
 		assert.match(body, /Allow writes under \/Users\/x\/\.config for this session\?$/);
 	});
 });

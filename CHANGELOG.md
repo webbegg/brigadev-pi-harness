@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Permission questions offer a third answer for Low and Medium risk actions: "Yes, and don't ask again this session". The guard then stops asking about that action (by its name, such as `open a pull request` or `write to GitHub`) until the session ends; it is kept in memory only, and a new session starts with no grant. High-risk actions (deletes, force-pushes, publishing, `sudo`, downloaded code) never offer it, a command that adds an action not granted still asks, subagents never inherit it, and the PR risk gate still asks when it finds a problem. In the TUI it is the `s` key; in RPC clients (T3 Code) a three-option select; on the web prompt an "Approve for this session" button.
+
+### Changed
+
+- The permission dialog is short by default. In the TUI it is a card bordered in the risk color (red High, yellow Medium, green Low) that shows the action, one sentence of what it does, Why, a one-line Risk (level · can it be undone · who it affects), the command, and the PR gate's reasons; the full WHAT IT WILL DO and RISK sections open with `d`. RPC clients (T3 Code) get the same short text in Pi's confirm, and the web prompt folds the details under "Show details" and borders the card in the risk color.
+
 ## [0.27.0] - 2026-11-27
 
 Permission dialogs say what the action will do, why the agent wants it (its `# why:` comment), and the risk: level, whether it can be undone, and who it affects. The guard also closes a gap where a quote inside a shell comment hid the next lines of a command from it.

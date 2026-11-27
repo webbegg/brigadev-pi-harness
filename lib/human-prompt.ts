@@ -6,9 +6,12 @@ import { randomUUID } from "node:crypto";
 import { BUS, onAction, publish, type Bus, type PromptState } from "./bus.ts";
 import { redact } from "./redact.ts";
 
-/** The part of Pi's `ctx` that `askConfirm` uses. */
+/** The part of Pi's `ctx` that `askConfirm` uses (`select`: `askPermission`, for its third answer). */
 export interface ConfirmHost {
-	ui: { confirm(title: string, message: string, opts?: { signal?: AbortSignal }): Promise<boolean> };
+	ui: {
+		confirm(title: string, message: string, opts?: { signal?: AbortSignal }): Promise<boolean>;
+		select?(title: string, options: string[], opts?: { signal?: AbortSignal }): Promise<string | undefined>;
+	};
 }
 
 export interface ConfirmSpec {
@@ -27,6 +30,18 @@ export interface ChoiceSpec {
 	allowOther?: boolean;
 }
 
+/** A permission question: `details` is text a UI may fold away; `sessionLabel` offers a third answer, yes for the rest of the session. */
+export interface PermissionSpec extends ConfirmSpec {
+	details?: string;
+	level?: "Low" | "Medium" | "High";
+	sessionLabel?: string;
+}
+
+export type PermissionAnswer = "yes" | "session" | "no";
+
+/** Shows the TUI side in place of Pi's dialogs (the guard's card); resolves the answer, or null when dismissed. */
+export type ShowPermission = (signal: AbortSignal) => Promise<PermissionAnswer | null>;
+
 /** An answer to a choice: one option's label, or the user's own text. */
 export interface ChoiceAnswer {
 	answer: string;
@@ -40,6 +55,8 @@ interface Race<T> {
 	fromWeb(value: boolean | string): T | undefined;
 	/** The result as the snapshot's `answer`. */
 	toAnswer(result: T): boolean | string;
+	/** More fields for the final snapshot. */
+	settled?(result: T): Partial<PromptState>;
 	/** Starts the TUI side; `cancel` is what the race calls when the web answers first. The promise's value is the TUI's answer, null for a dismissal. */
 	start(onCancel: (cancel: () => void) => void): Promise<T | null | undefined>;
 }
@@ -50,7 +67,7 @@ type Outcome<T> = { kind: "answered"; result: T; by: "tui" | "web" } | { kind: "
  * Runs the race; resolves with the first answer, or null when the TUI was dismissed or the run was aborted (`signal`).
  * An abort closes both sides at once, so a late answer cannot resume a call the user aborted. A failing TUI rejects, after the prompt is closed.
  */
-function race<T>(bus: Bus, { prompt, fromWeb, toAnswer, start }: Race<T>, signal?: AbortSignal): Promise<T | null> {
+function race<T>(bus: Bus, { prompt, fromWeb, toAnswer, settled: settledFields, start }: Race<T>, signal?: AbortSignal): Promise<T | null> {
 	if (signal?.aborted) return Promise.resolve(null);
 	return new Promise<T | null>((resolve, reject) => {
 		let settled = false;
@@ -65,7 +82,7 @@ function race<T>(bus: Bus, { prompt, fromWeb, toAnswer, start }: Race<T>, signal
 			if ((outcome.kind === "answered" && outcome.by === "web") || (outcome.kind === "dismissed" && outcome.aborted)) closeTui();
 			const final: PromptState =
 				outcome.kind === "answered"
-					? { ...prompt, status: "answered", answer: toAnswer(outcome.result), by: outcome.by, at: Date.now() }
+					? { ...prompt, status: "answered", answer: toAnswer(outcome.result), ...settledFields?.(outcome.result), by: outcome.by, at: Date.now() }
 					: { ...prompt, status: "dismissed", at: Date.now() };
 			publish(bus, BUS.prompt, final);
 			if (outcome.kind === "failed") reject(outcome.error);
@@ -123,6 +140,47 @@ export async function askConfirm(bus: Bus | undefined, ctx: ConfirmHost, { sourc
 		},
 	}, signal);
 	return result ?? false;
+}
+
+/**
+ * A permission question in the TUI and on the bus; the first answer wins. Like `askConfirm`, with folded `details` for the page
+ * and an optional third answer (`sessionLabel`: yes, and do not ask again this session). `show` replaces Pi's dialogs on the TUI
+ * side (the guard's card); without it, a third answer asks with Pi's select (an RPC client: T3 Code), and none asks with confirm.
+ * Dismissed, aborted, or no answer: "no".
+ */
+export async function askPermission(bus: Bus | undefined, ctx: ConfirmHost, spec: PermissionSpec, signal?: AbortSignal, show?: ShowPermission): Promise<PermissionAnswer> {
+	const { source, title, body, details, level, sessionLabel } = spec;
+	const tui = async (tuiSignal: AbortSignal): Promise<PermissionAnswer | null> => {
+		if (show) return show(tuiSignal);
+		if (sessionLabel && typeof ctx.ui.select === "function") {
+			const picked = await ctx.ui.select(`${title}\n${body}`, ["Yes", sessionLabel, "No"], { signal: tuiSignal });
+			return picked === undefined ? null : picked === "Yes" ? "yes" : picked === sessionLabel ? "session" : "no";
+		}
+		return (await ctx.ui.confirm(title, body, { signal: tuiSignal })) ? "yes" : "no";
+	};
+	if (!bus) return (await tui(signal ?? new AbortController().signal)) ?? "no";
+	const controller = new AbortController();
+	const result = await race<PermissionAnswer>(bus, {
+		// The dialog shows the real text; the bus (and so the page) gets it redacted.
+		prompt: {
+			id: randomUUID(),
+			kind: "confirm",
+			source,
+			title: redact(title),
+			body: redact(body),
+			...(details ? { details: redact(details) } : {}),
+			...(level ? { level } : {}),
+			...(sessionLabel ? { sessionLabel } : {}),
+		},
+		fromWeb: (value) => (value === true ? "yes" : value === false ? "no" : value === "session" && sessionLabel ? "session" : undefined),
+		toAnswer: (answer) => answer !== "no",
+		settled: (answer) => (answer === "session" ? { forSession: true } : {}),
+		start: (onCancel) => {
+			onCancel(() => controller.abort());
+			return tui(controller.signal);
+		},
+	}, signal);
+	return result ?? "no";
 }
 
 /**

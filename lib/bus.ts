@@ -150,6 +150,14 @@ export interface PromptState {
 	source: string;
 	title: string;
 	body?: string;
+	/** confirm only: more text the page folds away (the guard's full risk sections). */
+	details?: string;
+	/** confirm only: the guard's risk level, for the card's color. */
+	level?: "Low" | "Medium" | "High";
+	/** confirm only: the label of a third answer, yes for the rest of the session (the page answers it with the value `"session"`). */
+	sessionLabel?: string;
+	/** answered only: the yes was for the rest of the session. */
+	forSession?: true;
 	/** choice only. */
 	options?: Array<{ label: string; description?: string }>;
 	/** choice only, 1-based. */

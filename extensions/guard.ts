@@ -14,12 +14,13 @@ import { join, resolve } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { BUS, publish, type GuardDecision, type ModeState } from "../lib/bus.ts";
-import { classifyCommand, COMMAND_KIND } from "../lib/command-classifier.ts";
+import { classifyCommand, COMMAND_KIND, type CommandMatch } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
 import { branchSlug, evidenceFile, readEvidence } from "../lib/evidence.ts";
 import { checkRefusal, resolveCommand } from "../lib/check.ts";
-import { askConfirm } from "../lib/human-prompt.ts";
-import { commandDialog, outsideWriteDialog, sensitiveFileDialog, toolDialog, whyNote } from "../lib/permission-dialog.ts";
+import { askPermission } from "../lib/human-prompt.ts";
+import { showPermissionCard, type CardHost } from "../lib/permission-card.ts";
+import { actionsOf, commandDialog, outsideWriteDialog, SESSION_GRANT_LEVELS, sensitiveFileDialog, toolDialog, whyNote, type PermissionDialog } from "../lib/permission-dialog.ts";
 import { classifyMcpTool, mcpInputPreview } from "../lib/mcp-tools.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, sensitiveWords, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
 import { decideCommand, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
@@ -57,6 +58,14 @@ export default function (pi: ExtensionAPI) {
 	let mode: PermissionMode = PERMISSION_MODE.NORMAL;
 	// Per-session grants for directories outside the project root.
 	const outsideGrants = new Set<string>();
+	// Actions (a permission card's heading, "open a pull request") the user said yes to for the rest of the session; Low and Medium only, memory only.
+	const sessionGrants = new Set<string>();
+	/** The grant that lets these matches run without asking, or undefined: every action must be granted, and none High. */
+	const grantFor = (matches: readonly CommandMatch[]): string | undefined => {
+		const actions = actionsOf(matches);
+		if (isChild || actions.length === 0 || !actions.every(({ action, level }) => SESSION_GRANT_LEVELS.has(level) && sessionGrants.has(action))) return undefined;
+		return `brigadev: allowed for this session (${actions.map(({ action }) => action).join(" + ")})`;
+	};
 
 	const projectRoot = (ctx: ExtensionContext) => canonicalPath(process.env[CHILD_ENV.PROJECT_ROOT] ?? ctx.cwd);
 
@@ -118,6 +127,8 @@ export default function (pi: ExtensionAPI) {
 	interface Judging {
 		event: { toolCallId: string; toolName: string; input: unknown };
 		asked: boolean;
+		/** Set when a session grant let the call run unasked: published, so the guard log shows what ran on it. */
+		granted?: string;
 	}
 	const judging = new AsyncLocalStorage<Judging>();
 	const announce = (current: Judging, action: GuardDecision["action"], reason?: string) => {
@@ -130,15 +141,33 @@ export default function (pi: ExtensionAPI) {
 
 	/** Asks the user, in the TUI or from the web (first answer wins); without a UI (print mode, subagents) the answer is no. */
 	/** `busReason`: what the guard bus records for the confirm (the classifier's terse reason); the dialog's plain title otherwise. */
-	const confirm = async (ctx: ExtensionContext, title: string, body: string, busReason?: string): Promise<boolean> => {
+	/** Marks the call being judged as allowed by a session grant. */
+	const noteGrant = (reason: string) => {
+		const current = judging.getStore();
+		if (current) current.granted = reason;
+	};
+
+	/**
+	 * The TUI shows the permission card (details behind `d`); an RPC client (T3 Code) gets Pi's dialogs with the short text.
+	 * A "yes for this session" records the card's actions as granted. Returns whether the call may run.
+	 */
+	const confirm = async (ctx: ExtensionContext, dialog: PermissionDialog, busReason?: string): Promise<boolean> => {
 		if (isChild || !ctx.hasUI) return false;
 		const current = judging.getStore();
 		if (current) {
 			current.asked = true;
-			announce(current, "confirm", busReason ?? title);
+			announce(current, "confirm", busReason ?? dialog.title);
 		}
+		const ui = ctx.ui as unknown as Partial<CardHost>;
+		const show = ctx.mode === "tui" && typeof ui.custom === "function" ? (signal: AbortSignal) => showPermissionCard(ui as CardHost, dialog.title, dialog.card, signal) : undefined;
+		const spec = { source: "guard", title: dialog.title, body: dialog.body, details: dialog.details, level: dialog.card.level, ...(dialog.sessionLabel ? { sessionLabel: dialog.sessionLabel } : {}) };
 		// The run's abort signal (Esc, the web Abort) closes the dialog and the web prompt, so a late answer cannot resume an aborted call.
-		return askConfirm(pi.events, ctx, { source: "guard", title, body }, ctx.signal);
+		const answer = await askPermission(pi.events, ctx, spec, ctx.signal, show);
+		if (answer === "session" && dialog.card.sessionActions) {
+			for (const action of dialog.card.sessionActions) sessionGrants.add(action);
+			ctx.ui.notify(`brigadev: won't ask again this session for: ${dialog.card.sessionActions.join(", ")}`, "info");
+		}
+		return answer !== "no";
 	};
 
 	/** Top of the repository that holds `dir` (canonical); `dir` itself when git cannot tell (not a repository, a failure). */
@@ -176,7 +205,7 @@ export default function (pi: ExtensionAPI) {
 		let verdict: PathVerdict;
 		if (decision.action === "ask" && decision.kind === "sensitive") {
 			const dialog = sensitiveFileDialog(toolName, rawPath, isWrite, why, isDirectory && toolName === "bg_start");
-			const ok = await confirm(ctx, dialog.title, dialog.body, "brigadev: sensitive file");
+			const ok = await confirm(ctx, dialog, "brigadev: sensitive file");
 			if (!ok) return { block: true, reason: `User declined access to sensitive file ${rawPath}` };
 			verdict = decision.then;
 		} else verdict = decision;
@@ -186,7 +215,7 @@ export default function (pi: ExtensionAPI) {
 			if ([...outsideGrants].some((granted) => isInside(granted, absolute))) return undefined;
 			const target = isDirectory ? absolute : verdict.target;
 			const dialog = outsideWriteDialog(toolName, absolute, root, target, why);
-			const ok = await confirm(ctx, dialog.title, dialog.body, "brigadev: write outside project");
+			const ok = await confirm(ctx, dialog, "brigadev: write outside project");
 			if (!ok) return { block: true, reason: `User declined write outside the project root: ${absolute}` };
 			outsideGrants.add(target);
 		}
@@ -246,7 +275,11 @@ export default function (pi: ExtensionAPI) {
 		return "command" in choice ? { command: choice.command } : undefined;
 	};
 
-	pi.on("session_start", async (_event, ctx) => restoreMode(ctx));
+	pi.on("session_start", async (_event, ctx) => {
+		// A new, resumed, or forked session starts with no "yes for this session".
+		sessionGrants.clear();
+		return restoreMode(ctx);
+	});
 	pi.on("session_tree", async (_event, ctx) => restoreMode(ctx));
 	// A compaction drops the notice from the model's context: announce the mode again on the next turn.
 	pi.on("session_compact", async () => {
@@ -310,17 +343,20 @@ export default function (pi: ExtensionAPI) {
 			// The PR gate shares the PR confirmation (every mode: a PR creation always asks; one dialog, the reasons and the note appended). It asks on its own only if the policy let a PR command run unasked.
 			const pr = isChild ? undefined : await prGate(command, commandCwd);
 			const prBlock = pr?.decision.action === "ask" ? { block: true as const, reason: prGateBlockMessage(pr.decision, pr.categories) } : undefined;
-			if (decision.action === "confirm") {
+			// A session grant skips the policy question; the PR gate still asks on its own when it finds a problem.
+			const granted = decision.action === "confirm" ? grantFor(decision.matches) : undefined;
+			if (decision.action === "confirm" && !granted) {
 				const prText = pr ? prGateDialogText(pr.decision) : "";
 				const dialog = commandDialog(command, decision.matches, prText || undefined);
-				const ok = await confirm(ctx, dialog.title, dialog.body, `brigadev: ${decision.reason}`);
+				const ok = await confirm(ctx, dialog, `brigadev: ${decision.reason}`);
 				if (!ok) return prBlock ?? { block: true, reason: `User declined: ${decision.reason}` };
 			} else if (pr && prBlock) {
 				const matches = classifyCommand(command);
-				const dialog = commandDialog(command, matches.length > 0 ? matches : [{ kind: COMMAND_KIND.DELIVERY, reason: "gh pr create" }], prGateDialogText(pr.decision), "Open the PR anyway?");
-				const ok = await confirm(ctx, dialog.title, dialog.body, "brigadev: PR risk gate");
+				const dialog = commandDialog(command, matches.length > 0 ? matches : [{ kind: COMMAND_KIND.DELIVERY, reason: "gh pr create" }], prGateDialogText(pr.decision), "Open the PR anyway?", { sessionGrant: false });
+				const ok = await confirm(ctx, dialog, "brigadev: PR risk gate");
 				if (!ok) return prBlock;
 			}
+			if (granted) noteGrant(granted);
 			// The command will run: remember the tree so tool_result can see what it changed.
 			if (surfaces) {
 				const snapshot = await takeSnapshot(exec, projectRoot(ctx));
@@ -339,15 +375,17 @@ export default function (pi: ExtensionAPI) {
 			const prBlock = pr?.decision.action === "ask" ? { block: true as const, reason: prGateBlockMessage(pr.decision, pr.categories, event.toolName) } : undefined;
 			const prText = pr ? prGateDialogText(pr.decision) : "";
 			const preview = `${event.toolName}\n${mcpInputPreview(event.input)}`;
-			if (decision.action === "confirm") {
+			const granted = decision.action === "confirm" ? grantFor(decision.matches) : undefined;
+			if (decision.action === "confirm" && !granted) {
 				const dialog = toolDialog(preview, decision.matches, prText || undefined);
-				const ok = await confirm(ctx, dialog.title, dialog.body, `brigadev: ${decision.reason}`);
+				const ok = await confirm(ctx, dialog, `brigadev: ${decision.reason}`);
 				if (!ok) return prBlock ?? { block: true, reason: `User declined: ${decision.reason}` };
 			} else if (pr && prBlock) {
-				const dialog = toolDialog(preview, [mcp], prText, "Open the PR anyway?");
-				const ok = await confirm(ctx, dialog.title, dialog.body, "brigadev: PR risk gate");
+				const dialog = toolDialog(preview, [mcp], prText, "Open the PR anyway?", { sessionGrant: false });
+				const ok = await confirm(ctx, dialog, "brigadev: PR risk gate");
 				if (!ok) return prBlock;
 			}
+			if (granted) noteGrant(granted);
 			return undefined;
 		}
 
@@ -370,6 +408,7 @@ export default function (pi: ExtensionAPI) {
 		const result = await judging.run(current, () => decideToolCall(event, ctx));
 		if (result?.block) announce(current, "block", result.reason);
 		else if (current.asked) announce(current, "allow");
+		else if (current.granted) announce(current, "allow", current.granted);
 		return result;
 	});
 
