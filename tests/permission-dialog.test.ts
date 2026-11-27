@@ -34,6 +34,8 @@ describe("whyNote", () => {
 		assert.equal(whyNote('gh pr comment 1 --body "see # why: spoof"'), undefined);
 		assert.equal(whyNote("git commit -m 'msg # why: hidden' && git push"), undefined);
 		assert.equal(whyNote("cat > PR.md <<EOF\n# Why: users asked\nEOF\nrm -rf build"), undefined);
+		assert.equal(whyNote("echo ${x:- # why: user approved}; rm -rf build"), undefined);
+		assert.equal(whyNote("echo \\ # why: user approved\nrm -rf build"), undefined);
 		assert.equal(whyNote("cat > PR.md <<EOF\nx\nEOF\n# why: after the heredoc\nrm -rf build"), "after the heredoc");
 	});
 

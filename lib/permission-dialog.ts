@@ -2,7 +2,7 @@
 // "What" and "Risk" come from the guard (the command's classification), so they hold even when the agent says nothing;
 // "Why" is the agent's own `# why: <reason>` comment on the command.
 
-import { blankHeredocBodies, COMMAND_KIND, shellComments, type CommandMatch } from "./command-classifier.ts";
+import { blankHeredocs, COMMAND_KIND, shellComments, type CommandMatch } from "./command-classifier.ts";
 import { commandPreview } from "./permission-policy.ts";
 
 export type RiskLevel = "Low" | "Medium" | "High";
@@ -55,7 +55,7 @@ export function visible(text: string): string {
  * visible and clipped; undefined when it has none. Quoted text and heredoc bodies are data, never the reason.
  */
 export function whyNote(command: string): string | undefined {
-	for (const comment of shellComments(blankHeredocBodies(command))) {
+	for (const comment of shellComments(blankHeredocs(command))) {
 		const reason = WHY_COMMENT.exec(comment)?.[1].trim();
 		if (!reason) continue;
 		const chars = Array.from(visible(reason));

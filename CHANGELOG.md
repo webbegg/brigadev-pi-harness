@@ -8,7 +8,8 @@
 
 ### Fixed
 
-- The command rules read shell comments as bash does: an unquoted `#` that begins a word comments out the rest of its line. A quote or `<<` inside a comment (`# why: it's stale`) used to hide the next lines from the guard, so a push, a removal, or a publish after it ran without asking.
+- A quote or `<<` inside a shell comment (`# why: it's stale`) hid the next lines from the guard, so a push, a removal, or a publish after it ran without asking. The guard now judges each command both as written and with its comments blanked, and combines what it finds, so neither reading can hide a command from the other.
+- `$'…'` (ANSI-C quoting): `\'` no longer ends the quote for the guard, so `echo $'\' #'; rm -rf build` asks like `rm -rf build`.
 
 ## [0.26.0] - 2026-11-26
 

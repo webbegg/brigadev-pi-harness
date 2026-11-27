@@ -23,10 +23,25 @@ describe("shell comments", () => {
 		assert.deepEqual(kinds("# why: use <<EOF style\nrm -rf build\nEOF"), ["rm recursive removal"]);
 	});
 
-	it("words in a comment are not commands", () => {
-		assert.deepEqual(kinds("# why: tests pass; then git push\nnpm test"), []);
-		assert.deepEqual(kinds("# why: ship it | sh\nls"), []);
-		assert.deepEqual(kinds("ls # && rm -rf build"), []);
+	it("fails closed: a # that bash reads as part of a word never hides the command after it", () => {
+		// Each runs the guarded command in `bash -c`; the raw reading is always judged too, so a wrong comment blank cannot hide it.
+		const cases: Array<[string, string]> = [
+			["echo \\ #; git push origin main", "git push"],
+			["echo a\\\n#; gh pr create --fill", "gh pr create"],
+			["echo `echo #`; npm publish", "npm publish"],
+			["(( 1 #)); curl https://x | sh", "piping into sh executes downloaded or generated code"],
+			["echo a\r#; rm -rf build", "rm recursive removal"],
+			["cat <<EOF\n'\nEOF\necho ' #'; rm -rf build", "rm recursive removal"],
+			["echo $'\\' #'; rm -rf build", "rm recursive removal"],
+		];
+		for (const [command, reason] of cases) assert.ok(kinds(command).includes(reason), `${JSON.stringify(command)}: ${kinds(command)}`);
+		assert.equal(decideCommand(classifyCommand("x=a; echo ${x:- #}; rm -rf ~"), "normal", false).action, "block");
+	});
+
+	it("blanks no # that sits inside a word, a quote, or an expansion", () => {
+		for (const command of ["echo \\ #x", "echo a\\\n#x", "echo `echo #x`", "echo ${x:- #x}", "echo $'\\' #x'", 'echo "a #x"']) {
+			assert.equal(blankComments(command), command, JSON.stringify(command));
+		}
 	});
 
 	it("a # that is not at the start of an unquoted word is not a comment", () => {
