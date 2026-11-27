@@ -85,7 +85,7 @@ describe("guard confirm answered from the bus", () => {
 		const prompt = await s.open();
 		assert.equal(prompt.kind, "confirm");
 		assert.equal(prompt.source, "guard");
-		assert.match(prompt.title, /^brigadev: /);
+		assert.match(prompt.title, /^brigadev · Needs your permission: /);
 		assert.match(prompt.body ?? "", /rm -rf build/);
 
 		s.answer(prompt.id, true);
@@ -96,6 +96,7 @@ describe("guard confirm answered from the bus", () => {
 		assert.deepEqual([final.id, final.status, final.answer, final.by], [prompt.id, "answered", true, "web"]);
 		assert.deepEqual(s.decisions().map((d) => [d.action, d.toolCallId, d.tool]), [["confirm", toolCallId, "bash"], ["allow", toolCallId, "bash"]]);
 		assert.equal(s.decisions()[0].subject, "rm -rf build");
+		assert.equal(s.decisions()[0].reason, "brigadev: rm recursive removal", "the bus keeps the classifier's terse reason");
 	});
 
 	it("a web no blocks the call and publishes confirm then block with the reason", async () => {
@@ -116,7 +117,7 @@ describe("guard confirm answered from the bus", () => {
 		const s = await session();
 		const { result } = s.call("read", { path: ".env" });
 		const prompt = await s.open();
-		assert.match(prompt.title, /sensitive file/);
+		assert.match(prompt.title, /may hold secrets/);
 		s.dialogs[0].resolve(true);
 		assert.equal(await result, undefined);
 		assert.equal(s.dialogs[0].signal?.aborted, false);

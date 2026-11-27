@@ -12,6 +12,9 @@ import { PERMISSION_MODE } from "../lib/permission-policy.ts";
 import type { BrigadevSettings } from "../lib/runtime.ts";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
 
+const PUSH_TITLE = "brigadev · Needs your permission: push commits to the remote";
+const OUTSIDE_TITLE = "brigadev · Needs your permission: change files outside the project";
+
 describe("file access decision", () => {
 	let scratch: string;
 	let project: string;
@@ -554,15 +557,15 @@ describe("bg_start is guarded exactly like bash", () => {
 	});
 
 	it("asks for a push in both modes and not for ordinary delivery in yolo, as bash does", async () => {
-		assert.deepEqual((await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true })).asked, ["brigadev: git push"]);
-		assert.deepEqual((await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true, yolo: true })).asked, ["brigadev: git push"], "a push always asks");
+		assert.deepEqual((await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true })).asked, [PUSH_TITLE]);
+		assert.deepEqual((await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true, yolo: true })).asked, [PUSH_TITLE], "a push always asks");
 		assert.deepEqual(await outcome("bg_start", { command: "gh issue create --fill" }, { hasUI: true, answer: true, yolo: true }), { reason: undefined, asked: [] });
 		assert.deepEqual((await outcome("bg_start", { command: "rm -rf build" }, { hasUI: true, answer: true, yolo: true })).asked.length, 1, "destructive still asks in yolo");
 	});
 
 	it("a stored dsp mode (a removed mode) loads as normal: it still asks", async () => {
 		const stored = await outcome("bg_start", { command: "git push" }, { hasUI: true, answer: true, storedMode: "dsp" });
-		assert.deepEqual(stored.asked, ["brigadev: git push"]);
+		assert.deepEqual(stored.asked, [PUSH_TITLE]);
 		assert.deepEqual((await outcome("bg_start", { command: "npm install left-pad" }, { hasUI: false, storedMode: "dsp" })).reason, "User declined: npm install changes installed dependencies");
 	});
 
@@ -603,7 +606,7 @@ describe("bg_start is guarded exactly like bash", () => {
 		it("outside the project asks the user, once, and grants that directory only", async () => {
 			const s = await session({ hasUI: true, answer: true });
 			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(OUTSIDE, "elsewhere") }), undefined);
-			assert.deepEqual(s.asked, ["brigadev: write outside project"]);
+			assert.deepEqual(s.asked, [OUTSIDE_TITLE]);
 			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(OUTSIDE, "elsewhere") }), undefined);
 			assert.equal(await s.call("bg_start", { command: "ls", cwd: join(OUTSIDE, "elsewhere", "deeper") }), undefined);
 			assert.equal(s.asked.length, 1, "the grant covers that directory and below");
@@ -624,7 +627,7 @@ describe("bg_start is guarded exactly like bash", () => {
 			const cwd = join(repo, ".ssh");
 			assert.match(String((await outcome("bg_start", { command: "ls", cwd }, { hasUI: false })).reason), /User declined access to sensitive file/);
 			const yes = await outcome("bg_start", { command: "ls", cwd }, { hasUI: true, answer: true });
-			assert.deepEqual(yes, { reason: undefined, asked: ["brigadev: sensitive file"] });
+			assert.deepEqual(yes, { reason: undefined, asked: ["brigadev · Needs your permission: work in a folder that may hold secrets"] });
 		});
 
 		it("the evidence log folder is never a working directory", async () => {
@@ -635,9 +638,9 @@ describe("bg_start is guarded exactly like bash", () => {
 		it("does not change what bash is asked: the same rules for a file in that directory", async () => {
 			const s = await session({ hasUI: true, answer: true });
 			assert.equal(await s.call("write", { path: join(OUTSIDE, "elsewhere", "x.txt") }), undefined);
-			assert.deepEqual(s.asked, ["brigadev: write outside project"]);
+			assert.deepEqual(s.asked, [OUTSIDE_TITLE]);
 			assert.equal(await s.call("read", { path: join(repo, ".ssh", "id_rsa") }), undefined);
-			assert.deepEqual(s.asked, ["brigadev: write outside project", "brigadev: sensitive file"]);
+			assert.deepEqual(s.asked, [OUTSIDE_TITLE, "brigadev · Needs your permission: read a file that may hold secrets"]);
 		});
 	});
 

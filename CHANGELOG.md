@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The guard's permission dialogs explain the action in plain words: WHAT IT WILL DO (a sentence and the command), WHY (the agent's reason), and RISK (level, what could go wrong, whether it can be undone, who it affects). The agent gives its reason with a `# why: <reason>` comment on the command; without one the dialog warns that no reason was given. The reason's control characters are shown as escapes, so it cannot draw fake lines. Dialog titles change from `brigadev: <reason>` to `brigadev · Needs your permission: <action>` (also on the web prompt); the guard bus keeps the terse `brigadev: <reason>`.
+
+### Fixed
+
+- A quote or `<<` inside a shell comment (`# why: it's stale`) hid the next lines from the guard, so a push, a removal, or a publish after it ran without asking. The guard now judges each command both as written and with its comments blanked, and combines what it finds, so neither reading can hide a command from the other.
+- `$'…'` (ANSI-C quoting): `\'` no longer ends the quote for the guard, so `echo $'\' #'; rm -rf build` asks like `rm -rf build`.
+
 ## [0.26.0] - 2026-11-26
 
 brigadev runs well inside T3 Code: an optional `brigadev-t3` add-on shows status chips and settles where the two sets of rules overlap, and `ask_user_choice` opens real dialogs in RPC clients. MCP tools that open a PR, merge, or push now go through the guard like their gh/git commands, and subagents no longer inherit MCP server credentials.

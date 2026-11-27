@@ -7,6 +7,8 @@ import { after, before, describe, it } from "node:test";
 import { createFakeCtx, createFakePi } from "./helpers/fake-pi.ts";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
 
+const SENSITIVE_READ_TITLE = "brigadev · Needs your permission: read a file that may hold secrets";
+
 const saved = { ...process.env };
 let dir: string, repo: string, agentDir: string;
 let uninstall: () => void;
@@ -186,7 +188,7 @@ describe("guard on the path of grep, find, and ls", () => {
 		it(`${tool}: the parent is asked about a sensitive path, and a refusal blocks it`, async () => {
 			const s = await guarded({ answer: false });
 			const reason = await s.run(tool, { path: "~/.ssh", pattern: "x" });
-			assert.deepEqual(s.asked, ["brigadev: sensitive file"]);
+			assert.deepEqual(s.asked, [SENSITIVE_READ_TITLE]);
 			assert.match(reason ?? "", /declined access to sensitive file ~\/\.ssh/);
 		});
 
@@ -214,7 +216,7 @@ describe("guard on the path of grep, find, and ls", () => {
 	it("a single sensitive file is asked about too", async () => {
 		const s = await guarded({ answer: false });
 		assert.match((await s.run("grep", { path: ".env", pattern: "x" })) ?? "", /declined/);
-		assert.deepEqual(s.asked, ["brigadev: sensitive file"]);
+		assert.deepEqual(s.asked, [SENSITIVE_READ_TITLE]);
 	});
 });
 

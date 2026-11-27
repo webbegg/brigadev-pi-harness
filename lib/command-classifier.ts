@@ -58,6 +58,71 @@ export interface Segment {
 	redirects: Redirect[];
 }
 
+/** Characters that end a word for bash: blanks and operator characters. */
+const WORD_END = new Set([" ", "\t", "\n", ";", "&", "|", "(", ")", "<", ">"]);
+
+/** Index just past the region that opens at `i` and that bash reads as one piece of a word (a quote, `$'…'`, a backtick, `${…}`, an escape); -1 if none opens there. Unclosed: the end. */
+function opaqueEnd(text: string, i: number): number {
+	const ch = text[i];
+	const scan = (from: number, close: string, escapes: boolean, nest?: string): number => {
+		let depth = 1;
+		for (let j = from; j < text.length; j++) {
+			if (escapes && text[j] === "\\") j++;
+			else if (nest && text[j] === nest) depth++;
+			else if (text[j] === close && --depth === 0) return j + 1;
+		}
+		return text.length;
+	};
+	if (ch === "\\") return Math.min(i + 2, text.length);
+	if (ch === "'") return scan(i + 1, "'", false);
+	if (ch === '"') return scan(i + 1, '"', true);
+	if (ch === "`") return scan(i + 1, "`", true);
+	if (ch === "$" && text[i + 1] === "'") return scan(i + 2, "'", true);
+	if (ch === "$" && text[i + 1] === "{") return scan(i + 2, "}", true, "{");
+	return -1;
+}
+
+/**
+ * Blanks shell comments (a `#` that begins a word, to the end of its line), keeping offsets and newlines. A quote or a heredoc
+ * marker inside a comment (`# why: it's stale`) is text, so it must not change how the lines after it are read. Best effort:
+ * `classifyCommand` reads both the raw and the blanked text, so a wrong blank never hides a command.
+ */
+export function blankComments(command: string): string {
+	return scanComments(command).blanked;
+}
+
+/** The shell comments of a command, each from its `#` to the end of its line, in order. */
+export function shellComments(command: string): string[] {
+	return scanComments(command).comments;
+}
+
+function scanComments(command: string): { blanked: string; comments: string[] } {
+	const comments: string[] = [];
+	let out = "";
+	let inWord = false;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		const end = opaqueEnd(command, i);
+		if (end !== -1) {
+			out += command.slice(i, end);
+			inWord = true;
+			i = end - 1;
+			continue;
+		}
+		if (ch === "#" && !inWord) {
+			const end = command.indexOf("\n", i);
+			const stop = end === -1 ? command.length : end;
+			comments.push(command.slice(i, stop));
+			out += " ".repeat(stop - i);
+			i = stop - 1;
+			continue;
+		}
+		inWord = !WORD_END.has(ch);
+		out += ch;
+	}
+	return { blanked: out, comments };
+}
+
 /** Literal heredoc bodies are data, not commands. */
 export function blankHeredocs(command: string): string {
 	return command.replace(/<<-?\s*(['"]?)([A-Za-z_]\w*)\1[^\n]*\n[\s\S]*?\n\2(?=\n|$)/g, (raw) => {
@@ -228,6 +293,15 @@ export function tokenize(command: string, options: { redirections?: boolean } = 
 		}
 		if (ch === "'" || ch === '"') {
 			quote = ch;
+			inToken = true;
+			continue;
+		}
+		// `$'…'` (ANSI-C quoting): a backslash escapes the next character, so `\'` does not close it.
+		if (ch === "$" && command[i + 1] === "'") {
+			for (i += 2; i < command.length && command[i] !== "'"; i++) {
+				if (command[i] === "\\" && i + 1 < command.length) i++;
+				current += command[i];
+			}
 			inToken = true;
 			continue;
 		}
@@ -793,6 +867,18 @@ function classifySegment(rawArgv: string[], before: string, scratch: ScratchCont
  * command (`cd dir && git commit`) marks a later commit as `elsewhere`.
  */
 export function classifyCommand(command: string): CommandMatch[] {
+	const raw = classifyText(command);
+	const blanked = blankComments(command);
+	if (blanked === command) return raw;
+	// Fail closed: the raw reading (comments as words) and the comment-blanked one are both judged, and their matches combined.
+	// A quote or `<<` inside a comment hides later lines from the raw reading; a wrong blank would hide them from the other one.
+	const seen = new Set(raw.map(matchKey));
+	return [...raw, ...classifyText(blanked).filter((match) => !seen.has(matchKey(match)))];
+}
+
+const matchKey = (match: CommandMatch) => `${match.kind}\u0000${match.reason}\u0000${match.commit ? 1 : 0}\u0000${match.elsewhere ? 1 : 0}`;
+
+function classifyText(command: string): CommandMatch[] {
 	const matches: CommandMatch[] = [];
 	let moved = false;
 	const text = blankHeredocs(command);

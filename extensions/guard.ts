@@ -14,14 +14,15 @@ import { join, resolve } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { writesOutsideSurfaces } from "../lib/bash-writes.ts";
 import { BUS, publish, type GuardDecision, type ModeState } from "../lib/bus.ts";
-import { classifyCommand } from "../lib/command-classifier.ts";
+import { classifyCommand, COMMAND_KIND } from "../lib/command-classifier.ts";
 import { readBranchFacts } from "../lib/commit-branch.ts";
 import { branchSlug, evidenceFile, readEvidence } from "../lib/evidence.ts";
 import { checkRefusal, resolveCommand } from "../lib/check.ts";
 import { askConfirm } from "../lib/human-prompt.ts";
+import { commandDialog, outsideWriteDialog, sensitiveFileDialog, toolDialog, whyNote } from "../lib/permission-dialog.ts";
 import { classifyMcpTool, mcpInputPreview } from "../lib/mcp-tools.ts";
 import { bashWritesEvidence, CHECK_TOOL, decideBashCommand, decideFileAccess, EVIDENCE_BLOCK, hideSensitiveResults, isProtectedPath, runYoloDirCommand, secureYoloDirs, sensitiveWords, shellCallOf, tempRoots, trustedTempRoots, type PathVerdict } from "../lib/guard-rules.ts";
-import { commandPreview, decideCommand, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
+import { decideCommand, isPermissionMode, isSensitivePath, MODE_PROMPT, PERMISSION_MODE, type PermissionMode } from "../lib/permission-policy.ts";
 import { canonicalPath, expandHome, isInside } from "../lib/paths.ts";
 import { decidePrGate, opensPrCreate, PR_FACTS_ERROR_REASON, prCreateDirectory, prGateBlockMessage, prGateDialogText, riskMapFor, UNRESOLVED_DIRECTORY_REASON, type PrGateDecision } from "../lib/pr-gate.ts";
 import { brigadevHome, repoDocsDir } from "../lib/repo-docs.ts";
@@ -128,12 +129,13 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/** Asks the user, in the TUI or from the web (first answer wins); without a UI (print mode, subagents) the answer is no. */
-	const confirm = async (ctx: ExtensionContext, title: string, body: string): Promise<boolean> => {
+	/** `busReason`: what the guard bus records for the confirm (the classifier's terse reason); the dialog's plain title otherwise. */
+	const confirm = async (ctx: ExtensionContext, title: string, body: string, busReason?: string): Promise<boolean> => {
 		if (isChild || !ctx.hasUI) return false;
 		const current = judging.getStore();
 		if (current) {
 			current.asked = true;
-			announce(current, "confirm", title);
+			announce(current, "confirm", busReason ?? title);
 		}
 		// The run's abort signal (Esc, the web Abort) closes the dialog and the web prompt, so a late answer cannot resume an aborted call.
 		return askConfirm(pi.events, ctx, { source: "guard", title, body }, ctx.signal);
@@ -149,9 +151,9 @@ export default function (pi: ExtensionAPI) {
 	 * One file-access decision for a path a tool call touches (read, write, edit, the `path` of grep/find/ls, or the working directory a background
 	 * process starts in): sensitive-path question, outside-project grant. Returns a block, or undefined to let it run.
 	 * `isDirectory`: the path is a working directory, so a sensitive folder (`.ssh`) counts as sensitive and an outside
-	 * directory is granted as itself, not as its parent (the folder of a file).
+	 * directory is granted as itself, not as its parent (the folder of a file). `why`: the `# why:` note of a shell tool's command, for the dialog.
 	 */
-	const checkPath = async (toolName: string, rawPath: string, absolute: string, isWrite: boolean, ctx: ExtensionContext, isDirectory = false): Promise<{ block: true; reason: string } | undefined> => {
+	const checkPath = async (toolName: string, rawPath: string, absolute: string, isWrite: boolean, ctx: ExtensionContext, isDirectory = false, why?: string): Promise<{ block: true; reason: string } | undefined> => {
 		const root = projectRoot(ctx);
 		// Protected paths (the agent folder, ~/.pi, the harness install, credential and shell startup files, git config and hooks) are never
 		// trusted folder content, in any mode: a write there falls back to the outside-project question even under the temp dir or a secure folder.
@@ -173,7 +175,8 @@ export default function (pi: ExtensionAPI) {
 
 		let verdict: PathVerdict;
 		if (decision.action === "ask" && decision.kind === "sensitive") {
-			const ok = await confirm(ctx, "brigadev: sensitive file", `${toolName} ${rawPath}\n\nThis path commonly holds secrets or credentials. Allow?`);
+			const dialog = sensitiveFileDialog(toolName, rawPath, isWrite, why, isDirectory && toolName === "bg_start");
+			const ok = await confirm(ctx, dialog.title, dialog.body, "brigadev: sensitive file");
 			if (!ok) return { block: true, reason: `User declined access to sensitive file ${rawPath}` };
 			verdict = decision.then;
 		} else verdict = decision;
@@ -182,7 +185,8 @@ export default function (pi: ExtensionAPI) {
 		if (verdict.action === "ask") {
 			if ([...outsideGrants].some((granted) => isInside(granted, absolute))) return undefined;
 			const target = isDirectory ? absolute : verdict.target;
-			const ok = await confirm(ctx, "brigadev: write outside project", `${toolName} ${absolute}\n\nOutside the project root ${root}. Allow writes under ${target} for this session?`);
+			const dialog = outsideWriteDialog(toolName, absolute, root, target, why);
+			const ok = await confirm(ctx, dialog.title, dialog.body, "brigadev: write outside project");
 			if (!ok) return { block: true, reason: `User declined write outside the project root: ${absolute}` };
 			outsideGrants.add(target);
 		}
@@ -280,12 +284,12 @@ export default function (pi: ExtensionAPI) {
 				const refusal = checkRefusal(command);
 				if (refusal) return { block: true, reason: `Blocked by brigadev guard: ${refusal}` };
 				for (const { word, absolute } of sensitiveWords(command, commandCwd)) {
-					const blocked = await checkPath(event.toolName, word, absolute, false, ctx, true);
+					const blocked = await checkPath(event.toolName, word, absolute, false, ctx, true, whyNote(command));
 					if (blocked) return blocked;
 				}
 			}
 			if (shell.cwd !== undefined) {
-				const blocked = await checkPath(event.toolName, shell.cwd, commandCwd, true, ctx, true);
+				const blocked = await checkPath(event.toolName, shell.cwd, commandCwd, true, ctx, true, whyNote(command));
 				if (blocked) return blocked;
 			}
 			const surfaces = writerSurfaces();
@@ -308,10 +312,13 @@ export default function (pi: ExtensionAPI) {
 			const prBlock = pr?.decision.action === "ask" ? { block: true as const, reason: prGateBlockMessage(pr.decision, pr.categories) } : undefined;
 			if (decision.action === "confirm") {
 				const prText = pr ? prGateDialogText(pr.decision) : "";
-				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${commandPreview(command)}${prText ? `\n\n${prText}` : ""}\n\nRun it?`);
+				const dialog = commandDialog(command, decision.matches, prText || undefined);
+				const ok = await confirm(ctx, dialog.title, dialog.body, `brigadev: ${decision.reason}`);
 				if (!ok) return prBlock ?? { block: true, reason: `User declined: ${decision.reason}` };
 			} else if (pr && prBlock) {
-				const ok = await confirm(ctx, "brigadev: PR risk gate", `${commandPreview(command)}\n\n${prGateDialogText(pr.decision)}\n\nOpen the PR anyway?`);
+				const matches = classifyCommand(command);
+				const dialog = commandDialog(command, matches.length > 0 ? matches : [{ kind: COMMAND_KIND.DELIVERY, reason: "gh pr create" }], prGateDialogText(pr.decision), "Open the PR anyway?");
+				const ok = await confirm(ctx, dialog.title, dialog.body, "brigadev: PR risk gate");
 				if (!ok) return prBlock;
 			}
 			// The command will run: remember the tree so tool_result can see what it changed.
@@ -333,10 +340,12 @@ export default function (pi: ExtensionAPI) {
 			const prText = pr ? prGateDialogText(pr.decision) : "";
 			const preview = `${event.toolName}\n${mcpInputPreview(event.input)}`;
 			if (decision.action === "confirm") {
-				const ok = await confirm(ctx, `brigadev: ${decision.reason}`, `${preview}${prText ? `\n\n${prText}` : ""}\n\nRun it?`);
+				const dialog = toolDialog(preview, decision.matches, prText || undefined);
+				const ok = await confirm(ctx, dialog.title, dialog.body, `brigadev: ${decision.reason}`);
 				if (!ok) return prBlock ?? { block: true, reason: `User declined: ${decision.reason}` };
 			} else if (pr && prBlock) {
-				const ok = await confirm(ctx, "brigadev: PR risk gate", `${preview}\n\n${prText}\n\nOpen the PR anyway?`);
+				const dialog = toolDialog(preview, [mcp], prText, "Open the PR anyway?");
+				const ok = await confirm(ctx, dialog.title, dialog.body, "brigadev: PR risk gate");
 				if (!ok) return prBlock;
 			}
 			return undefined;
