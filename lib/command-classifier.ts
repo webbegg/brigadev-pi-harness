@@ -32,6 +32,19 @@ export interface CommandMatch {
 	 * `--work-tree` style redirection.
 	 */
 	elsewhere?: boolean;
+	/**
+	 * Set on a `git push` that may be the only push a "yes for this session" covers: a literal `git push [-u|-q|-v|-n] [<remote> [<branch>]]`
+	 * (`remote` and `ref` as written; none: git's default), with no git option before `push`, no wrapper, variable, or substitution, and no
+	 * other command in the whole command line but `gh` and comments (a `git config` or a move before it could change where it lands).
+	 * The guard still asks git where it lands. Dropped by a move before it.
+	 */
+	push?: { remote?: string; ref?: string };
+}
+
+/** A commit or a push may not run where the guard reads the branch facts: a move, a branch switch, or a git location setting before it. */
+function markElsewhere(match: CommandMatch): void {
+	if (match.commit) match.elsewhere = true;
+	delete match.push;
 }
 
 const SEPARATORS = new Set([";", "&&", "||", "|", "&", "\n", "(", ")"]);
@@ -619,6 +632,45 @@ function gitSubcommand(args: string[]): number {
 	return -1;
 }
 
+/** Flags that change neither what a push sends nor where: upstream tracking, output, a dry run. */
+const PLAIN_PUSH_FLAGS = new Set(["--set-upstream", "--quiet", "--verbose", "--dry-run", "--porcelain", "--progress", "--no-progress"]);
+
+/** A word with nothing the shell or git could expand or redirect: no `$`, backtick, quote, glob, `:`, `@`, `+`, `=`, or `~`. */
+const LITERAL_WORD = /^[A-Za-z0-9._/-]+$/;
+
+/**
+ * `git push [flags] [<remote> [<branch>]]` with harmless flags and literal words only, and the branch neither `main` nor `master`:
+ * `{ remote, ref }` as written. Undefined for anything else (`--tags`, `--all`, `-o`, a refspec, several refs, `$R`).
+ */
+function plainPush(rest: string[]): { remote?: string; ref?: string } | undefined {
+	const words: string[] = [];
+	for (const a of rest) {
+		if (!LITERAL_WORD.test(a)) return undefined;
+		if (a.startsWith("--")) {
+			if (!PLAIN_PUSH_FLAGS.has(a)) return undefined;
+		} else if (a.startsWith("-")) {
+			if (!/^-[uqvn]+$/.test(a)) return undefined;
+		} else words.push(a);
+	}
+	if (words.length > 2) return undefined;
+	const [remote, ref] = words;
+	if (ref !== undefined && PROTECTED_NAMES.has(ref)) return undefined;
+	return { ...(remote === undefined ? {} : { remote }), ...(ref === undefined ? {} : { ref }) };
+}
+
+/** `gh pr|issue` actions that may stand next to a plain push: they write to a PR or issue, or only read. Never an alias, an extension, `repo`, or `config`. */
+const GH_BESIDE_PUSH = new Set(["create", "comment", "review", "edit", "close", "reopen", "view", "list", "status", "checks", "diff"]);
+
+/** A segment that may stand next to a plain push: a comment, a PR or issue `gh` call, or the literal `git push` itself (no wrapper, no pipe into it). */
+function allowsPlainPush(argv: readonly string[], before: string): boolean {
+	if (argv.length === 0 || argv[0].startsWith("#")) return true;
+	if (argv[0] === "gh") {
+		const { group, action = "" } = ghGroupAction(argv.slice(1));
+		return (group === "pr" || group === "issue") && GH_BESIDE_PUSH.has(action);
+	}
+	return argv[0] === "git" && argv[1] === "push" && before !== "|" && plainPush(argv.slice(2)) !== undefined;
+}
+
 function classifyGit(args: string[]): CommandMatch | undefined {
 	const index = gitSubcommand(args);
 	if (index === -1) return undefined;
@@ -671,10 +723,11 @@ function classifyGit(args: string[]): CommandMatch | undefined {
 		case "worktree":
 			return rest[0] === "remove" && hasAny(rest, "-f", "--force") ? destructive("worktree force-remove") : undefined;
 		case "push": {
-			const forced = hasAny(rest, "--force", "-f", "--force-with-lease", "--mirror", "--delete", "-d", "--prune");
+			const forced = hasAny(rest, "--force", "--force-with-lease", "--mirror", "--delete", "--prune") || hasShortFlag(rest, "f") || hasShortFlag(rest, "d");
 			const forcedRefspec = rest.some((a) => !a.startsWith("-") && (a.startsWith("+") || a.startsWith(":")));
 			if (forced || forcedRefspec) return destructive("push rewrites or deletes remote refs");
-			return { kind: COMMAND_KIND.DELIVERY, reason: "git push", alwaysConfirm: true };
+			const push = plainPush(rest);
+			return { kind: COMMAND_KIND.DELIVERY, reason: "git push", alwaysConfirm: true, ...(push ? { push } : {}) };
 		}
 		case "subtree":
 			return rest[0] === "push" ? { kind: COMMAND_KIND.DELIVERY, reason: "git subtree push", alwaysConfirm: true } : undefined;
@@ -711,6 +764,10 @@ function classifyGh(args: string[]): CommandMatch | undefined {
 	}
 	if ((group === "pr" && action === "merge") || (group === "release" && ["create", "delete", "upload", "edit"].includes(action))) {
 		return { kind: COMMAND_KIND.PUBLISH, reason: `gh ${group} ${action}` };
+	}
+	// Closing a PR with --delete-branch deletes its head branch on the remote, like `git push --delete`.
+	if (group === "pr" && action === "close" && (hasAny(args, "--delete-branch") || hasShortFlag(args, "d"))) {
+		return { kind: COMMAND_KIND.DESTRUCTIVE, reason: "gh pr close --delete-branch deletes the remote branch" };
 	}
 	if ((group === "pr" || group === "issue") && ["create", "comment", "review", "edit", "close", "reopen"].includes(action)) {
 		return { kind: COMMAND_KIND.DELIVERY, reason: `gh ${group} ${action}`, ...(group === "pr" && action === "create" ? { alwaysConfirm: true } : {}) };
@@ -753,7 +810,7 @@ function classifySegment(rawArgv: string[], before: string, scratch: ScratchCont
 		if (script) {
 			const nested = classifyCommand(script);
 			// A location variable set on the wrapper applies to every git call inside its script.
-			if (setsGitLocation(rawArgv)) for (const match of nested) if (match.commit) match.elsewhere = true;
+			if (setsGitLocation(rawArgv)) for (const match of nested) markElsewhere(match);
 			matches.push(...nested);
 		}
 		else if (before === "|") matches.push({ kind: COMMAND_KIND.PRIVILEGED, reason: `piping into ${name} executes downloaded or generated code` });
@@ -769,7 +826,7 @@ function classifySegment(rawArgv: string[], before: string, scratch: ScratchCont
 			break;
 		case "git":
 			match = classifyGit(args);
-			if (match?.commit && gitTargetsElsewhere(args, rawArgv)) match.elsewhere = true;
+			if (match && (match.commit || match.push) && gitTargetsElsewhere(args, rawArgv)) markElsewhere(match);
 			break;
 		case "gh":
 			match = classifyGh(args);
@@ -872,23 +929,28 @@ export function classifyCommand(command: string): CommandMatch[] {
 	if (blanked === command) return raw;
 	// Fail closed: the raw reading (comments as words) and the comment-blanked one are both judged, and their matches combined.
 	// A quote or `<<` inside a comment hides later lines from the raw reading; a wrong blank would hide them from the other one.
+	// A push's remote and ref are part of its key: a reading that shows another push keeps it, so the guard checks where each one lands.
 	const seen = new Set(raw.map(matchKey));
 	return [...raw, ...classifyText(blanked).filter((match) => !seen.has(matchKey(match)))];
 }
 
-const matchKey = (match: CommandMatch) => `${match.kind}\u0000${match.reason}\u0000${match.commit ? 1 : 0}\u0000${match.elsewhere ? 1 : 0}`;
+const matchKey = (match: CommandMatch) => `${match.kind}\u0000${match.reason}\u0000${match.commit ? 1 : 0}\u0000${match.elsewhere ? 1 : 0}\u0000${match.push ? `push:${match.push.remote ?? ""}:${match.push.ref ?? ""}` : ""}`;
 
 function classifyText(command: string): CommandMatch[] {
 	const matches: CommandMatch[] = [];
 	let moved = false;
 	const text = blankHeredocs(command);
 	const scratch = scratchContext(text);
+	let pushOnly = true;
 	for (const segment of tokenize(text)) {
 		const found = classifySegment(segment.argv, segment.before, scratch);
-		if (moved) for (const match of found) if (match.commit) match.elsewhere = true;
+		if (moved) for (const match of found) markElsewhere(match);
 		matches.push(...found);
 		moved ||= changesCommitTarget(segment.argv);
+		pushOnly &&= allowsPlainPush(segment.argv, segment.before);
 	}
+	// Any other command beside it (a `git config`, an assignment, a wrapper, a nested shell) could change where a push lands.
+	if (!pushOnly) for (const match of matches) delete match.push;
 	return matches;
 }
 

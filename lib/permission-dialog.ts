@@ -20,11 +20,65 @@ export interface RiskProfile {
 	undo: string;
 	/** Who or what it affects. */
 	affects: string;
+	/** `undo` in a few words, for the card's one risk line: "cannot be undone". */
+	undoBrief: string;
+	/** `affects` in a few words, after "affects": "everyone who uses the remote". */
+	affectsBrief: string;
+}
+
+/** What the card shows: the short part always, `details` (the full WHAT IT WILL DO and RISK sections) on request. */
+export interface PermissionCard {
+	level: RiskLevel;
+	/** The actions, capitalized: "Rewrite or delete remote branches + delete or overwrite data". */
+	heading: string;
+	/** What will happen, in one sentence. */
+	summary: string;
+	/** The agent's reason, or the warning that it gave none. */
+	why: string;
+	whyGiven: boolean;
+	/** "cannot be undone · affects everyone who uses the remote" (the level is shown next to it). */
+	risk: string;
+	/** What runs, one entry per line: "$ git push --force", "read .env". */
+	subject: string[];
+	/** Always shown: the PR gate's reasons. */
+	extra?: string;
+	details: string;
+	question: string;
+	/** Offered only when every action is Low or Medium: the actions a "yes for this session" stops asking about. */
+	sessionActions?: string[];
+}
+
+/** The third answer's label. */
+export const SESSION_LABEL = "Yes, and don't ask again this session";
+/**
+ * The actions a "yes for this session" may cover: opening a PR, writing to a PR or issue, and a plain push (`CommandMatch.push`; the guard
+ * also needs HEAD on a feature branch). Everything else always asks: High actions, and Medium ones too wide for one yes (any `gh api`
+ * write, a merge, a dependency change, a commit on the default branch, an MCP push).
+ */
+export const SESSION_GRANT_ACTIONS: ReadonlySet<string> = new Set(["open a pull request", "write to GitHub", "push commits to the remote"]);
+
+/** True when a "yes for this session" may cover these matches (the guard adds the push's branch check). */
+export function grantable(matches: readonly CommandMatch[]): boolean {
+	return (
+		matches.length > 0 &&
+		matches.every((match) => {
+			const profile = profileFor(match);
+			// A PR opened through `gh api` is any API write that names a pulls endpoint: only `gh pr create` is covered.
+			if (profile === OPEN_PR && match.reason !== "gh pr create") return false;
+			return profile.level !== "High" && SESSION_GRANT_ACTIONS.has(profile.action) && (profile !== PUSH || match.push !== undefined);
+		})
+	);
 }
 
 export interface PermissionDialog {
 	title: string;
+	/** The short version as text: the summary, why, risk, the command, the question. Pi's confirm (T3 Code, RPC) and the web prompt show it. */
 	body: string;
+	/** The full sections, behind "Show details". */
+	details: string;
+	card: PermissionCard;
+	/** Set when the card offers "yes for this session". */
+	sessionLabel?: string;
 }
 
 const LEVEL_RANK: Record<RiskLevel, number> = { Low: 0, Medium: 1, High: 2 };
@@ -82,6 +136,8 @@ const COMMIT: RiskProfile = {
 	risk: "The change lands without a PR or a review (an amend also replaces the last commit).",
 	undo: "Yes, with git revert, or git reset before it is pushed (an amended commit is still in git reflog).",
 	affects: "Only your machine, until it is pushed.",
+	undoBrief: "can be undone",
+	affectsBrief: "only your machine until it is pushed",
 };
 const PUSH: RiskProfile = {
 	action: "push commits to the remote",
@@ -90,6 +146,8 @@ const PUSH: RiskProfile = {
 	risk: "The commits become visible to the team and CI runs on them.",
 	undo: "Partly: the remote branch can be deleted, but others may already have it.",
 	affects: "The remote repository; others will see it.",
+	undoBrief: "partly undoable",
+	affectsBrief: "the remote; the team will see it",
 };
 const REPO_PUSH: RiskProfile = {
 	action: "create a repository and push to it",
@@ -98,6 +156,8 @@ const REPO_PUSH: RiskProfile = {
 	risk: "The code leaves your machine; with a public repository, anyone can see it.",
 	undo: "Partly: the repository can be deleted, but others may already have a copy.",
 	affects: "Your GitHub account, and everyone who can see the new repository.",
+	undoBrief: "partly undoable",
+	affectsBrief: "everyone who can see the new repository",
 };
 const PUSH_AND_PR: RiskProfile = {
 	action: "push and open a pull request",
@@ -106,6 +166,8 @@ const PUSH_AND_PR: RiskProfile = {
 	risk: "The commits become visible and CI runs; the reviewers are notified.",
 	undo: "Partly: the PR can be closed and the branch deleted, but both stay in the history.",
 	affects: "The remote repository and its team.",
+	undoBrief: "partly undoable",
+	affectsBrief: "the remote and its team",
 };
 const OPEN_PR: RiskProfile = {
 	action: "open a pull request",
@@ -114,6 +176,8 @@ const OPEN_PR: RiskProfile = {
 	risk: "It notifies the reviewers; the title and description are public in the repository.",
 	undo: "Partly: the PR can be closed, but it stays in the history.",
 	affects: "The repository's team.",
+	undoBrief: "partly undoable",
+	affectsBrief: "the repository's team",
 };
 const GITHUB_WRITE: RiskProfile = {
 	action: "write to GitHub",
@@ -122,6 +186,8 @@ const GITHUB_WRITE: RiskProfile = {
 	risk: "The text is public in the repository and notifies whoever follows it.",
 	undo: "Partly: it can be edited or closed, but the notifications already went out.",
 	affects: "Anyone who can see the repository.",
+	undoBrief: "partly undoable",
+	affectsBrief: "anyone who can see the repository",
 };
 const GITHUB_API: RiskProfile = {
 	action: "change data through the GitHub API",
@@ -130,6 +196,8 @@ const GITHUB_API: RiskProfile = {
 	risk: "It changes data on GitHub directly, without the checks of the usual commands.",
 	undo: "Depends on the endpoint.",
 	affects: "The GitHub repository or account.",
+	undoBrief: "undo depends on the endpoint",
+	affectsBrief: "the GitHub repository or account",
 };
 const MERGE: RiskProfile = {
 	action: "merge a pull request",
@@ -138,6 +206,8 @@ const MERGE: RiskProfile = {
 	risk: "The change lands in the base branch, and anything that deploys from it may ship.",
 	undo: "Partly: with a revert commit.",
 	affects: "Everyone working on the base branch.",
+	undoBrief: "undone only with a revert",
+	affectsBrief: "everyone on the base branch",
 };
 const PUBLISH: RiskProfile = {
 	action: "publish or withdraw a release or package",
@@ -146,6 +216,8 @@ const PUBLISH: RiskProfile = {
 	risk: "Whoever installs or downloads it gets the change as soon as it is out.",
 	undo: "Usually not cleanly: a published version cannot be reused, and a withdrawn one may already be in use.",
 	affects: "Public: every user of the package or repository.",
+	undoBrief: "cannot be cleanly undone",
+	affectsBrief: "every user of the package",
 };
 const REMOTE_REWRITE: RiskProfile = {
 	action: "rewrite or delete remote branches",
@@ -154,6 +226,8 @@ const REMOTE_REWRITE: RiskProfile = {
 	risk: "Commits on the remote can be lost, for you and for everyone who works on that branch.",
 	undo: "Hard: only if someone still has the old commits.",
 	affects: "The remote repository and everyone using it.",
+	undoBrief: "hard to undo",
+	affectsBrief: "everyone who uses the remote",
 };
 const DESTRUCTIVE: RiskProfile = {
 	action: "delete or overwrite data",
@@ -162,6 +236,8 @@ const DESTRUCTIVE: RiskProfile = {
 	risk: "Whatever it deletes or rewrites can be lost, including work that was never committed.",
 	undo: "Usually not; a few forms (an archive, a rename, a rebase) can be reverted with effort.",
 	affects: "The files, history, or data it targets.",
+	undoBrief: "usually cannot be undone",
+	affectsBrief: "the files or data it targets",
 };
 const SUDO: RiskProfile = {
 	action: "run with administrator rights",
@@ -170,6 +246,8 @@ const SUDO: RiskProfile = {
 	risk: "With admin rights the command can change any part of the system.",
 	undo: "Depends on the command.",
 	affects: "The whole system.",
+	undoBrief: "undo depends on the command",
+	affectsBrief: "the whole system",
 };
 const REMOTE_CODE: RiskProfile = {
 	action: "run downloaded or generated code",
@@ -178,6 +256,8 @@ const REMOTE_CODE: RiskProfile = {
 	risk: "The code runs unseen, with your user's rights.",
 	undo: "Depends on what the code does.",
 	affects: "Your machine and your account.",
+	undoBrief: "undo depends on the code",
+	affectsBrief: "your machine and account",
 };
 const DEPENDENCY: RiskProfile = {
 	action: "change dependencies",
@@ -186,6 +266,8 @@ const DEPENDENCY: RiskProfile = {
 	risk: "It brings third-party code into the project, and install scripts run right away.",
 	undo: "Yes: uninstall it, or restore the lockfile.",
 	affects: "The project, and your machine while the scripts run.",
+	undoBrief: "can be undone",
+	affectsBrief: "the project and your machine",
 };
 /** A guarded action this file has no words for yet: never shown as harmless. */
 const UNKNOWN: RiskProfile = {
@@ -195,6 +277,8 @@ const UNKNOWN: RiskProfile = {
 	risk: "The guard has no plain description for this action: read the command and the reason in parentheses carefully.",
 	undo: "Unknown.",
 	affects: "Unknown.",
+	undoBrief: "may not be undoable",
+	affectsBrief: "unknown",
 };
 
 /** The plain-words profile of one classified match (a shell command or an MCP tool). */
@@ -233,6 +317,8 @@ export function sensitiveProfile(isWrite: boolean, isDirectory = false): RiskPro
 			risk: "The command can read or change the keys and tokens there, and its output can bring them into the model's context.",
 			undo: "Not for what was read; changed files only if they have a backup.",
 			affects: "Your credentials.",
+			undoBrief: "what is read cannot be unread",
+			affectsBrief: "your credentials",
 		};
 	}
 	return isWrite
@@ -243,6 +329,8 @@ export function sensitiveProfile(isWrite: boolean, isDirectory = false): RiskPro
 				risk: "A wrong edit can break or leak keys and tokens; what the file holds also enters the model's context.",
 				undo: "Only if the file has a backup or is tracked by git.",
 				affects: "Your credentials.",
+				undoBrief: "undone only from a backup",
+				affectsBrief: "your credentials",
 			}
 		: {
 				action: "read a file that may hold secrets",
@@ -251,6 +339,8 @@ export function sensitiveProfile(isWrite: boolean, isDirectory = false): RiskPro
 				risk: "Its contents (keys, tokens) enter the model's context.",
 				undo: "No: once read, it has been seen.",
 				affects: "Your credentials.",
+				undoBrief: "cannot be unread",
+				affectsBrief: "your credentials",
 			};
 }
 
@@ -263,7 +353,14 @@ export function outsideProfile(projectRoot: string, target: string): RiskProfile
 		risk: `Files there are not this project's, and git does not track them here. Saying yes allows any write under ${target} for this session.`,
 		undo: "Only by editing them back; there is no project history there.",
 		affects: `Whatever uses files under ${target}.`,
+		undoBrief: "undone only by hand",
+		affectsBrief: `files under ${target}`,
 	};
+}
+
+/** The actions (and their levels) a set of matches asks about: what a session grant is keyed by. */
+export function actionsOf(matches: readonly CommandMatch[]): Array<{ action: string; level: RiskLevel }> {
+	return group(matches).map(({ profile }) => ({ action: profile.action, level: profile.level }));
 }
 
 /** One profile per action, with the classifier's reasons that led to it; highest level first. */
@@ -281,59 +378,87 @@ function group(matches: readonly CommandMatch[]): Array<{ profile: RiskProfile; 
 const withReasons = (what: string, reasons: readonly string[]) => (reasons.length === 0 ? what : `${what.replace(/\.$/, "")} (${reasons.map(visible).join("; ")}).`);
 const capitalize = (text: string) => text.charAt(0).toUpperCase() + text.slice(1);
 
+/** The `what` sentences as one: "Force-pushes or deletes refs on the remote repository; deletes or overwrites data." */
+function summarize(profiles: readonly RiskProfile[], more: number): string {
+	const parts = profiles.map(({ what }, index) => {
+		const text = what.replace(/\.$/, "");
+		return index === 0 ? text : text.charAt(0).toLowerCase() + text.slice(1);
+	});
+	return `${parts.join("; ")}${more > 0 ? `; and ${more} more action${more === 1 ? "" : "s"}` : ""}.`;
+}
+
 /**
- * The dialog for one guarded action. `subject` is what runs, already bounded and indented (a command preview, `read .env`);
- * `why` is the agent's reason, or a warning line when it gave none; `extra` is appended before the question (the PR gate's reasons).
+ * The dialog for one guarded action. `subject` is what runs, one entry per line, already bounded (`$ git push`, `read .env`);
+ * `why` is the agent's reason (undefined: it gave none, and `whyMissing` is shown); `extra` is always shown (the PR gate's reasons).
  */
-export function permissionDialog(input: { items: ReadonlyArray<{ profile: RiskProfile; reasons?: readonly string[] }>; subject: string; why: string; question: string; extra?: string }): PermissionDialog {
+export function permissionDialog(input: { items: ReadonlyArray<{ profile: RiskProfile; reasons?: readonly string[] }>; subject: readonly string[]; why?: string; whyMissing?: string; question: string; extra?: string; sessionGrant?: boolean }): PermissionDialog {
 	const listed = input.items.slice(0, MAX_LISTED);
 	const more = input.items.slice(MAX_LISTED);
 	const top = input.items.reduce((max, item) => (LEVEL_RANK[item.profile.level] > LEVEL_RANK[max] ? item.profile.level : max), "Low" as RiskLevel);
+	const lead = listed[0]?.profile ?? UNKNOWN;
 	const risk =
 		listed.length === 1
-			? [`  ${listed[0].profile.risk}`, `  Can it be undone?   ${listed[0].profile.undo}`, `  Who does it affect? ${listed[0].profile.affects}`]
+			? [`  ${lead.risk}`, `  Can it be undone?   ${lead.undo}`, `  Who does it affect? ${lead.affects}`]
 			: listed.flatMap(({ profile }) => [`  ${capitalize(profile.action)} (● ${profile.level}): ${profile.risk}`, `    Can it be undone?   ${profile.undo}`, `    Who does it affect? ${profile.affects}`]);
 	if (more.length > 0) risk.push(`  +${more.length} more: ${more.map(({ profile }) => `${profile.action} (● ${profile.level})`).join(", ")}`);
+	const details = ["WHAT IT WILL DO", ...input.items.map(({ profile, reasons }) => `  ${withReasons(profile.what, reasons ?? [])}`), "", `RISK  ● ${top}`, ...risk].join("\n");
+
+	const actions = listed.map(({ profile }) => profile.action).join(" + ") + (more.length > 0 ? ` +${more.length} more` : "");
+	const why = input.why ?? input.whyMissing ?? WHY_MISSING;
+	// The PR gate's reasons name branches and paths: their control characters are shown, like the command's.
+	const extra = input.extra ? input.extra.split("\n").map(visible).join("\n") : undefined;
+	const card: PermissionCard = {
+		level: top,
+		heading: capitalize(actions),
+		summary: summarize(listed.map(({ profile }) => profile), more.length),
+		why,
+		whyGiven: input.why !== undefined,
+		// The lead action is the riskiest: its undo and reach are the ones to weigh.
+		risk: `${lead.undoBrief} · affects ${lead.affectsBrief}`,
+		subject: [...input.subject],
+		...(extra ? { extra } : {}),
+		details,
+		question: input.question,
+		...(input.sessionGrant && input.items.length > 0 && input.items.every(({ profile }) => profile.level !== "High" && SESSION_GRANT_ACTIONS.has(profile.action)) ? { sessionActions: input.items.map(({ profile }) => profile.action) } : {}),
+	};
 	const body = [
-		"WHAT IT WILL DO",
-		...input.items.map(({ profile, reasons }) => `  ${withReasons(profile.what, reasons ?? [])}`),
-		input.subject,
+		card.summary,
 		"",
-		"WHY",
-		`  ${input.why}`,
+		`Why   ${why}`,
+		`Risk  ● ${top} · ${card.risk}`,
 		"",
-		`RISK  ● ${top}`,
-		...risk,
-		...(input.extra ? ["", input.extra] : []),
+		...card.subject.map((line) => `  ${line}`),
+		...(extra ? ["", extra] : []),
 		"",
 		input.question,
 	].join("\n");
-	const actions = listed.map(({ profile }) => profile.action).join(" + ");
-	return { title: `brigadev · Needs your permission: ${actions}${more.length > 0 ? ` +${more.length} more` : ""}`, body };
+	return { title: `brigadev · Needs your permission: ${actions}`, body, details, card, ...(card.sessionActions ? { sessionLabel: SESSION_LABEL } : {}) };
+}
+
+/** `sessionGrant: false`: no "yes for this session" (the PR gate's own question, which a grant never skips; a push the grant may not cover). */
+export interface DialogOptions {
+	sessionGrant?: boolean;
 }
 
 /** The dialog for a guarded shell command: the matches that need the user's yes, the command, and its `# why:` note. */
-export function commandDialog(command: string, matches: readonly CommandMatch[], extra?: string, question = "Run it?"): PermissionDialog {
+export function commandDialog(command: string, matches: readonly CommandMatch[], extra?: string, question = "Run it?", { sessionGrant = true }: DialogOptions = {}): PermissionDialog {
 	const lines = commandPreview(withoutLeadingWhy(command)).split("\n");
-	const subject = lines.map((line, index) => `${index === 0 ? "  $ " : "    "}${visible(line)}`).join("\n");
-	return permissionDialog({ items: group(matches), subject, why: whyNote(command) ?? WHY_MISSING, question, extra });
+	const subject = lines.map((line, index) => `${index === 0 ? "$ " : "  "}${visible(line)}`);
+	return permissionDialog({ items: group(matches), subject, why: whyNote(command), whyMissing: WHY_MISSING, question, extra, sessionGrant: sessionGrant && grantable(matches) });
 }
 
 /** The dialog for a guarded MCP tool call: `preview` is the tool name and its clipped input. */
-export function toolDialog(preview: string, matches: readonly CommandMatch[], extra?: string, question = "Run it?"): PermissionDialog {
-	const subject = preview
-		.split("\n")
-		.map((line) => `  ${visible(line)}`)
-		.join("\n");
-	return permissionDialog({ items: group(matches), subject, why: WHY_NOT_ATTACHED, question, extra });
+export function toolDialog(preview: string, matches: readonly CommandMatch[], extra?: string, question = "Run it?", { sessionGrant = true }: DialogOptions = {}): PermissionDialog {
+	return permissionDialog({ items: group(matches), subject: preview.split("\n").map(visible), whyMissing: WHY_NOT_ATTACHED, question, extra, sessionGrant: sessionGrant && grantable(matches) });
 }
 
 /** The dialog before a tool touches a path that commonly holds secrets; `why` is the `# why:` note of a shell tool's command. */
 export function sensitiveFileDialog(toolName: string, rawPath: string, isWrite: boolean, why?: string, isDirectory = false): PermissionDialog {
-	return permissionDialog({ items: [{ profile: sensitiveProfile(isWrite, isDirectory) }], subject: `  ${toolName} ${visible(rawPath)}`, why: why ?? WHY_NOT_ATTACHED, question: "Allow?" });
+	return permissionDialog({ items: [{ profile: sensitiveProfile(isWrite, isDirectory) }], subject: [`${toolName} ${visible(rawPath)}`], why, whyMissing: WHY_NOT_ATTACHED, question: "Allow?" });
 }
 
 /** The dialog before a write outside the project root; a yes grants writes under `target` for the session. */
 export function outsideWriteDialog(toolName: string, absolute: string, projectRoot: string, target: string, why?: string): PermissionDialog {
-	return permissionDialog({ items: [{ profile: outsideProfile(projectRoot, target) }], subject: `  ${toolName} ${visible(absolute)}`, why: why ?? WHY_NOT_ATTACHED, question: `Allow writes under ${target} for this session?` });
+	const shown = visible(target);
+	return permissionDialog({ items: [{ profile: outsideProfile(visible(projectRoot), shown) }], subject: [`${toolName} ${visible(absolute)}`], why, whyMissing: WHY_NOT_ATTACHED, question: `Allow writes under ${shown} for this session?` });
 }

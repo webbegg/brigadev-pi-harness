@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { appendEvidence, evidenceFile, type EvidenceRecord } from "../lib/evidence.ts";
+import { SESSION_LABEL } from "../lib/permission-dialog.ts";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
 
 const saved = { ...process.env };
@@ -58,7 +59,12 @@ const headTree = (cwd: string) => execFileSync("git", ["rev-parse", "HEAD^{tree}
 const tested = (cwd: string, docs: string, extra: object = {}) =>
 	appendEvidence(evidenceFile(docs, "feat/x"), record({ type: "run", kind: "test", outcome: "pass", tree: headTree(cwd), root: cwd, cwd, agent: "parent", command: "npm test", tail: "", ...extra }));
 
-async function session(cwd: string, options: { mode?: "yolo"; ui?: boolean; answer?: boolean } = {}) {
+/**
+ * A guard session. `answer`: the user's answer to every permission question ("session": yes, and don't ask again this session).
+ * Pi's confirm, or Pi's select when the question offers the session answer (an RPC client), record each question in `dialogs`;
+ * `tui: true` answers through the permission card instead (Pi's `custom`), recording the card in `cards`.
+ */
+async function session(cwd: string, options: { mode?: "yolo"; ui?: boolean; answer?: boolean | "session"; tui?: boolean } = {}) {
 	const handlers: Record<string, Function[]> = {};
 	const commands: string[] = [];
 	const pi: any = {
@@ -70,17 +76,48 @@ async function session(cwd: string, options: { mode?: "yolo"; ui?: boolean; answ
 			new Promise((resolve) => execFile(command, args, { cwd: options?.cwd }, (error, stdout, stderr) => resolve({ stdout, stderr, code: error ? ((error as any).code ?? 1) : 0 }))),
 	};
 	guard(pi);
-	const dialogs: Array<{ title: string; body: string }> = [];
+	const dialogs: Array<{ title: string; body: string; options?: string[] }> = [];
+	const cards: string[][] = [];
+	const notes: string[] = [];
+	const answer = options.answer ?? false;
 	const ctx: any = {
 		cwd,
 		hasUI: options.ui !== false,
+		...(options.tui ? { mode: "tui" } : {}),
 		sessionManager: { getBranch: () => (options.mode ? [{ type: "custom", customType: "brigadev-mode", data: { mode: options.mode } }] : []) },
-		ui: { confirm: async (title: string, body: string) => (dialogs.push({ title, body }), options.answer ?? false), notify: () => {}, setStatus: () => {}, select: async () => undefined },
+		ui: {
+			confirm: async (title: string, body: string) => (dialogs.push({ title, body }), answer !== false),
+			notify: (message: string) => notes.push(message),
+			setStatus: () => {},
+			select: async (title: string, choices: string[]) => {
+				if (!choices.includes("Yes")) return undefined;
+				const cut = title.indexOf("\n");
+				dialogs.push({ title: title.slice(0, cut), body: title.slice(cut + 1), options: choices });
+				return answer === "session" ? choices[1] : answer ? "Yes" : "No";
+			},
+			...(options.tui
+				? {
+						custom: async (factory: Function) => {
+							let result: unknown;
+							const theme = { fg: (_tone: string, text: string) => text, bold: (text: string) => text };
+							const component = factory({ requestRender: () => {} }, theme, {}, (value: unknown) => (result = value));
+							cards.push(component.render(80));
+							component.handleInput(answer === "session" ? "s" : answer ? "y" : "n");
+							return result;
+						},
+					}
+				: {}),
+		},
 	};
 	for (const h of handlers.session_start ?? []) await h({}, ctx);
 	return {
 		dialogs,
+		cards,
+		notes,
 		commands,
+		newSession: async () => {
+			for (const h of handlers.session_start ?? []) await h({}, ctx);
+		},
 		async bash(command: string, toolName = "bash") {
 			for (const h of handlers.tool_call ?? []) {
 				const input = toolName === "bg_start" ? { command, cwd } : { command };
@@ -132,10 +169,10 @@ describe("guard: PR risk gate", () => {
 		assert.equal(await s.bash(PR), undefined);
 		assert.equal(s.dialogs.length, 1);
 		assert.match(s.dialogs[0].title, /open a pull request/);
-		assert.match(s.dialogs[0].body, /WHAT IT WILL DO\n  Opens a pull request on GitHub \(gh pr create\)\.\n  \$ gh pr create --fill\n/);
-		assert.match(s.dialogs[0].body, /RISK  ● Low/);
-		assert.match(s.dialogs[0].body, /Run it\?/);
-		assert.match(s.dialogs[0].body, /has no brigadev-verify run/);
+		assert.match(s.dialogs[0].body, /^Opens a pull request on GitHub\.\n/);
+		assert.match(s.dialogs[0].body, /\nRisk  ● Low · /);
+		assert.match(s.dialogs[0].body, /\n  \$ gh pr create --fill\n\nPR risk gate:\n/);
+		assert.match(s.dialogs[0].body, /has no brigadev-verify run\n\nRun it\?$/);
 	});
 
 	it("normal: declining the one dialog blocks and tells the model what to do", async () => {
@@ -489,9 +526,28 @@ describe("guard: the permission dialog explains the action", () => {
 		const s = await session(plain);
 		assert.match(String(await s.bash("# why: the worktree is merged and unused\nrm -rf build")), /User declined/);
 		assert.equal(s.dialogs[0].title, "brigadev · Needs your permission: delete or overwrite data");
-		assert.match(s.dialogs[0].body, /^WHAT IT WILL DO\n  Deletes or overwrites data \(.*\)\.\n  \$ rm -rf build\n\nWHY\n  the worktree is merged and unused\n\nRISK  ● High\n/);
-		assert.match(s.dialogs[0].body, /Can it be undone\?   Usually not; /);
-		assert.match(s.dialogs[0].body, /\n\nRun it\?$/);
+		// Pi's confirm (an RPC client: T3 Code) gets the short version.
+		assert.equal(
+			s.dialogs[0].body,
+			["Deletes or overwrites data.", "", "Why   the worktree is merged and unused", "Risk  ● High · usually cannot be undone · affects the files or data it targets", "", "  $ rm -rf build", "", "Run it?"].join("\n"),
+		);
+	});
+
+	it("the TUI shows the permission card, folded, and its answer decides", async () => {
+		const plain = join(dir, "why-card");
+		mkdirSync(plain, { recursive: true });
+		const s = await session(plain, { tui: true, answer: true });
+		assert.equal(await s.bash("# why: the worktree is merged and unused\nrm -rf build"), undefined);
+		assert.deepEqual(s.dialogs, []);
+		const card = s.cards[0].join("\n");
+		assert.match(card, /^╭─ brigadev · Needs your permission ─+╮/);
+		assert.match(card, /│  Why    the worktree is merged and unused +│/);
+		assert.match(card, /│  Risk   ● High · usually cannot be undone/);
+		assert.match(card, /│  \$ rm -rf build +│/);
+		assert.match(card, /▸ Show details/);
+		assert.doesNotMatch(card, /WHAT IT WILL DO/);
+		const declined = await session(plain, { tui: true });
+		assert.match(String(await declined.bash("rm -rf build")), /User declined/);
 	});
 
 	it("a quote in the why line does not hide the command from the guard", async () => {
@@ -500,7 +556,7 @@ describe("guard: the permission dialog explains the action", () => {
 		const s = await session(plain);
 		assert.match(String(await s.bash("# why: it's stale\nrm -rf build")), /User declined/);
 		assert.equal(s.dialogs.length, 1);
-		assert.match(s.dialogs[0].body, /WHY\n  it's stale\n/);
+		assert.match(s.dialogs[0].body, /\nWhy   it's stale\n/);
 	});
 
 	it("warns when the command gives no reason", async () => {
@@ -508,6 +564,142 @@ describe("guard: the permission dialog explains the action", () => {
 		mkdirSync(plain, { recursive: true });
 		const s = await session(plain);
 		await s.bash("rm -rf build");
-		assert.match(s.dialogs[0].body, /WHY\n  ⚠ The agent did not say why\./);
+		assert.match(s.dialogs[0].body, /\nWhy   ⚠ The agent did not say why\./);
+	});
+});
+
+describe("guard: yes, and don't ask again this session", () => {
+	const COMMENT = "# why: answer the reviewer\ngh pr comment 1 --body thanks";
+
+	it("a session yes stops asking about that action until the session ends", async () => {
+		const plain = join(dir, "grant");
+		mkdirSync(plain, { recursive: true });
+		const s = await session(plain, { answer: "session" });
+		assert.equal(await s.bash(COMMENT), undefined);
+		assert.deepEqual(s.dialogs[0].options, ["Yes", SESSION_LABEL, "No"]);
+		assert.match(s.notes.join("\n"), /won't ask again this session for: write to GitHub/);
+		// The same action, another form of it: no question.
+		assert.equal(await s.bash("gh pr comment 2 --body again"), undefined);
+		assert.equal(await s.bash("gh issue comment 3 --body hi"), undefined);
+		assert.equal(s.dialogs.length, 1);
+		// Another action still asks.
+		await s.bash("npm install left-pad");
+		assert.equal(s.dialogs.length, 2);
+		assert.match(s.dialogs[1].title, /change dependencies/);
+		// A new session starts with no grant.
+		await s.newSession();
+		await s.bash("gh pr comment 4 --body x");
+		assert.equal(s.dialogs.length, 3);
+	});
+
+	it("is never offered for a High action, and a grant never covers a command that adds one", async () => {
+		const plain = join(dir, "grant-high");
+		mkdirSync(plain, { recursive: true });
+		const s = await session(plain, { answer: "session" });
+		await s.bash("rm -rf build");
+		assert.equal(s.dialogs[0].options, undefined, "Pi's plain confirm: no third answer");
+		await s.bash("rm -rf build");
+		assert.equal(s.dialogs.length, 2, "a High action asks every time");
+		await s.bash(COMMENT);
+		await s.bash("gh pr comment 1 --body x && rm -rf build");
+		assert.equal(s.dialogs.length, 4);
+		assert.equal(s.dialogs[3].options, undefined);
+	});
+
+	it("the TUI card takes `s` for the session yes", async () => {
+		const plain = join(dir, "grant-card");
+		mkdirSync(plain, { recursive: true });
+		const s = await session(plain, { tui: true, answer: "session" });
+		assert.equal(await s.bash(COMMENT), undefined);
+		assert.match(s.cards[0].join("\n"), /Yes, and don't ask again this session  \(s\)/);
+		assert.equal(await s.bash("gh pr comment 2 --body again"), undefined);
+		assert.equal(s.cards.length, 1);
+	});
+
+	it("a granted PR still asks when the PR gate finds a problem, with no session answer on that question", async () => {
+		const { cwd } = repo(["lib/guard-rules.ts"]);
+		const s = await session(cwd, { answer: "session" });
+		assert.equal(await s.bash(PR), undefined);
+		assert.deepEqual(s.dialogs[0].options, ["Yes", SESSION_LABEL, "No"]);
+		assert.equal(await s.bash(PR), undefined);
+		assert.equal(s.dialogs.length, 2);
+		assert.match(s.dialogs[1].body, /T2 branch \(security: lib\/guard-rules\.ts\) has no brigadev-verify run/);
+		assert.equal(s.dialogs[1].options, undefined);
+	});
+
+	it("a push grant covers plain pushes from a feature branch only", async () => {
+		const { cwd } = repo(["README.md"]);
+		git(cwd, "remote", "add", "origin", "https://example.invalid/r.git");
+		git(cwd, "remote", "add", "other", "https://example.invalid/other.git");
+		const s = await session(cwd, { answer: "session" });
+		assert.equal(await s.bash("# why: share the branch\ngit push -u origin feat/x"), undefined);
+		assert.deepEqual(s.dialogs[0].options, ["Yes", SESSION_LABEL, "No"]);
+		assert.equal(await s.bash("git push"), undefined);
+		assert.equal(await s.bash("git push origin HEAD"), undefined);
+		assert.equal(s.dialogs.length, 1);
+		// Not plain, or not this branch: asks, with no session answer.
+		const asksWithoutOffer = async (command: string) => {
+			const before = s.dialogs.length;
+			await s.bash(command);
+			assert.equal(s.dialogs.length, before + 1, command);
+			assert.equal(s.dialogs.at(-1)!.options, undefined, command);
+		};
+		for (const command of ["git push origin HEAD:main", "git push origin feat/other", "git push --tags", "git checkout main && git push", "git push -uf origin main", "git -c remote.origin.push=HEAD:main push", 'R="origin HEAD:main"; git push $R']) {
+			await asksWithoutOffer(command);
+		}
+		// Another remote is another URL: asks, and may be granted on its own.
+		await s.bash("git push other");
+		assert.deepEqual(s.dialogs.at(-1)!.options, ["Yes", SESSION_LABEL, "No"]);
+		// git is asked where the push lands: a stored refspec, a mirror, or a push.default that can send another branch stop the grant.
+		for (const [key, value] of [["remote.origin.push", "HEAD:main"], ["remote.origin.mirror", "true"], ["push.default", "upstream"], ["push.default", "matching"]]) {
+			git(cwd, "config", key, value);
+			await asksWithoutOffer("git push");
+			git(cwd, "config", "--unset", key);
+		}
+		assert.equal(await s.bash("git push"), undefined);
+		// A new URL for the granted remote is not granted.
+		git(cwd, "remote", "set-url", "origin", "https://evil.invalid/x.git");
+		const before = s.dialogs.length;
+		await s.bash("git push");
+		assert.equal(s.dialogs.length, before + 1);
+		git(cwd, "remote", "set-url", "origin", "https://example.invalid/r.git");
+		// git pushes to every push URL: a second one that was never granted asks.
+		git(cwd, "config", "--add", "remote.origin.pushurl", "https://example.invalid/r.git");
+		git(cwd, "config", "--add", "remote.origin.pushurl", "https://mirror.invalid/m.git");
+		const mirrored = s.dialogs.length;
+		await s.bash("git push");
+		assert.equal(s.dialogs.length, mirrored + 1);
+		git(cwd, "config", "--unset-all", "remote.origin.pushurl");
+		// An MCP tool that pushes is never covered by it.
+		await s.tool("mcp__github__push_files", { branch: "main" });
+		assert.match(s.dialogs.at(-1)!.title, /push commits to the remote/);
+		assert.equal(s.dialogs.at(-1)!.options, undefined);
+		// On the default branch the push grant does not apply, and is not offered.
+		git(cwd, "checkout", "-q", "main");
+		const count = s.dialogs.length;
+		await s.bash("git push");
+		assert.equal(s.dialogs.length, count + 1);
+		assert.equal(s.dialogs.at(-1)!.options, undefined);
+	});
+
+	it("too-wide actions never offer it: an API write, a merge, an install", async () => {
+		const plain = join(dir, "grant-wide");
+		mkdirSync(plain, { recursive: true });
+		const s = await session(plain, { answer: "session" });
+		for (const command of ["gh api -X POST repos/o/r/issues/1/comments -f body=x", "gh pr merge 1", "npm install left-pad"]) {
+			await s.bash(command);
+			await s.bash(command);
+		}
+		assert.equal(s.dialogs.length, 6);
+		assert.ok(s.dialogs.every((d) => d.options === undefined));
+	});
+
+	it("a granted PR with a clean gate runs without asking", async () => {
+		const plain = join(dir, "grant-pr");
+		mkdirSync(plain, { recursive: true });
+		const s = await session(plain, { answer: "session" });
+		assert.equal(await s.bash(PR), undefined);
+		assert.equal(await s.bash(PR), undefined);
+		assert.equal(s.dialogs.length, 1);
 	});
 });

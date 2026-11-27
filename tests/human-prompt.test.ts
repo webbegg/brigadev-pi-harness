@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { BUS, createBus, type PromptState } from "../lib/bus.ts";
-import { askChoice, askConfirm, type ChoiceAnswer } from "../lib/human-prompt.ts";
+import { askChoice, askConfirm, askPermission, type ChoiceAnswer, type PermissionAnswer } from "../lib/human-prompt.ts";
 
 /** A bus that records every prompt snapshot. */
 function setup() {
@@ -329,5 +329,46 @@ describe("an aborted run closes a pending prompt", () => {
 		run.abort();
 		assert.equal(await askChoice(bus, choice, async () => (shown++, null), run.signal), null);
 		assert.deepEqual([shown, snapshots.length], [0, 0]);
+	});
+});
+
+describe("askPermission", () => {
+	const permission = { ...spec, details: "RISK  ● High", level: "Medium" as const, sessionLabel: "Yes, and don't ask again this session" };
+
+	it("publishes the details, level, and session label; a web `session` answer is a yes for the session", async () => {
+		const { bus, snapshots, answer } = setup();
+		let signal: AbortSignal | undefined;
+		const result = askPermission(bus, { ui: { confirm: async () => true } }, permission, undefined, (s) => ((signal = s), new Promise<PermissionAnswer | null>(() => {})));
+		assert.deepEqual([snapshots[0].details, snapshots[0].level, snapshots[0].sessionLabel], ["RISK  ● High", "Medium", permission.sessionLabel]);
+		answer(snapshots[0].id, "session");
+		assert.equal(await result, "session");
+		assert.equal(signal?.aborted, true, "the card is closed");
+		assert.deepEqual([snapshots[1].answer, snapshots[1].forSession, snapshots[1].by], [true, true, "web"]);
+	});
+
+	it("without a session label, a web `session` answer is ignored", async () => {
+		const { bus, snapshots, answer } = setup();
+		const tui = tuiConfirm();
+		const result = askPermission(bus, tui.ctx, spec);
+		answer(snapshots[0].id, "session");
+		assert.equal(snapshots.length, 1);
+		tui.resolve(true);
+		assert.equal(await result, "yes");
+		assert.equal(snapshots[1].forSession, undefined);
+	});
+
+	it("an RPC client gets Pi's select for the third answer, the short text in its title", async () => {
+		const calls: Array<{ title: string; options: string[] }> = [];
+		const ctx = { ui: { confirm: async () => true, select: async (title: string, options: string[]) => (calls.push({ title, options }), options[1]) } };
+		assert.equal(await askPermission(undefined, ctx, permission), "session");
+		assert.deepEqual(calls, [{ title: `${spec.title}\n${spec.body}`, options: ["Yes", permission.sessionLabel, "No"] }]);
+		const dismissed = { ui: { confirm: async () => true, select: async () => undefined } };
+		assert.equal(await askPermission(undefined, dismissed, permission), "no");
+	});
+
+	it("the card's dismissal (null) is a no", async () => {
+		const { bus, snapshots } = setup();
+		assert.equal(await askPermission(bus, { ui: { confirm: async () => true } }, permission, undefined, async () => null), "no");
+		assert.equal(snapshots[1].status, "dismissed");
 	});
 });

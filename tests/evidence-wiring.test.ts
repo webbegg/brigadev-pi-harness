@@ -10,7 +10,12 @@ import { repoDocsDir } from "../lib/repo-docs.ts";
 
 // The extensions import the Pi package at runtime; tests run without it.
 const STUB = `data:text/javascript,export const isToolCallEventType=(n,e)=>e.toolName===n;export const getAgentDir=()=>"/nonexistent";export const parseFrontmatter=()=>({});export const getMarkdownTheme=()=>({});`;
-registerHooks({ resolve: (spec, ctx, next) => (spec === "@earendil-works/pi-coding-agent" ? { url: STUB, shortCircuit: true } : next(spec, ctx)) });
+// The guard's permission card imports Pi's TUI package: key matching and text width.
+const TUI_STUB = `data:text/javascript,export const visibleWidth=(t)=>t.length;export const matchesKey=(d,k)=>d===k;export const Key=new Proxy({},{get:(_,n)=>String(n)});`;
+registerHooks({
+	resolve: (spec, ctx, next) =>
+		spec === "@earendil-works/pi-coding-agent" ? { url: STUB, shortCircuit: true } : spec === "@earendil-works/pi-tui" ? { url: TUI_STUB, shortCircuit: true } : next(spec, ctx),
+});
 
 const base = { ts: "2026-11-14T10:00:00.000Z", branch: "feat/x", tree: "a".repeat(40), cwd: "/repo", agent: "parent" };
 const text = (t: string) => [{ type: "text", text: t }];

@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- Permission questions offer a third answer for a closed list of actions: "Yes, and don't ask again this session". It covers opening a PR (`gh pr create`), writing to a PR or issue (`gh pr comment`, `gh issue create`, the MCP comment tools), and a plain `git push` of the current feature branch: a literal `git push [-u|-q|-v|-n] [<remote> [<branch>]]` with nothing else on the command line but `gh` calls and comments, where git confirms it lands on the same branch name (`push.default` unset, `simple`, or `current`; no `push` refspec or mirror on the remote), and only to a push URL the grant was given for. The guard then stops asking about that action until the session ends; it is kept in memory only, and a new session starts with no grant. Everything else always asks: High-risk actions (deletes, force pushes, publishing, `sudo`, downloaded code), and Medium ones too wide for one yes (any `gh api` write, merges, dependency changes, commits on the default branch, MCP pushes, a push from the default branch or to another branch). A command that adds an action not granted still asks, and the PR risk gate still asks when it finds a problem. In the TUI it is the `s` key; in RPC clients (T3 Code) a three-option select; on the web prompt an "Approve for this session" button.
+
+### Changed
+
+- The permission dialog is short by default. In the TUI it is a card bordered in the risk color (red High, yellow Medium, green Low) that shows the action, one sentence of what it does, Why, a one-line Risk (level · can it be undone · who it affects), the command, and the PR gate's reasons; the full WHAT IT WILL DO and RISK sections open with `d`. RPC clients (T3 Code) get the same short text in Pi's confirm, and the web prompt folds the details under "Show details" and borders the card in the risk color.
+
+### Fixed
+
+- `gh pr close --delete-branch` (`-d`) deletes the PR's remote branch; it now asks as a delete (High) instead of a PR write.
+- A force push or a remote delete written with combined short flags (`git push -uf origin main`, `git push -ud origin old`) was read as a plain push (Medium); it now asks as a rewrite of remote refs (High).
+- The PR gate's reasons and the folder in the outside-project question show their control characters as escapes, like the command, so they cannot draw over the dialog.
+
 ## [0.27.0] - 2026-11-27
 
 Permission dialogs say what the action will do, why the agent wants it (its `# why:` comment), and the risk: level, whether it can be undone, and who it affects. The guard also closes a gap where a quote inside a shell comment hid the next lines of a command from it.

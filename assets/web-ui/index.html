@@ -77,7 +77,9 @@ main { flex: 1; min-height: 0; overflow-y: auto; }
 .card.click:hover { background: var(--card-hover); transform: translateY(-1px); }
 .card:focus-visible { outline: 2px solid var(--active); outline-offset: 2px; }
 .card.live { border-color: color-mix(in srgb, var(--active) 40%, var(--line)); }
-.card.human { border-color: var(--human); box-shadow: 0 0 0 1px color-mix(in srgb, var(--human) 40%, transparent), 0 8px 24px -12px color-mix(in srgb, var(--human) 60%, transparent); }
+.card.human { --risk: var(--human); border-color: var(--risk); box-shadow: 0 0 0 1px color-mix(in srgb, var(--risk) 40%, transparent), 0 8px 24px -12px color-mix(in srgb, var(--risk) 60%, transparent); }
+.card.human.risk-medium { --risk: var(--changes); } .card.human.risk-low { --risk: var(--pass); }
+.more { margin: 4px 0 0; } .more > summary { cursor: pointer; color: var(--muted); font-size: 11.5px; } .more > .body { max-height: 18em; }
 .card.settled { opacity: .78; }
 .card.bad { border-color: color-mix(in srgb, var(--human) 45%, var(--line)); }
 .card-top { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; min-width: 0; }
@@ -685,6 +687,7 @@ body.open .drawer { transform: none; }
 			h("div", { class: "meta" }, i.dur ? h("span", { text: i.dur }) : null, h("span", { text: i.when })));
 		return clickable(el, function () { openView({ kind: "check", id: i.id }); });
 	}
+	var detailsOpen = new Set();
 	function openPromptCard(i) {
 		var p = i.p, busy = i.busy;
 		var answer = function (value) { act("p:" + p.id, { action: "answer", id: p.id, value: value }); };
@@ -692,6 +695,7 @@ body.open .drawer { transform: none; }
 		if (p.kind === "confirm") {
 			parts.push(h("div", { class: "actions" },
 				h("button", { class: "btn good", text: "Approve", disabled: busy, onclick: function () { answer(true); } }),
+				p.sessionLabel ? h("button", { class: "btn", text: "Approve for this session", title: p.sessionLabel, disabled: busy, onclick: function () { answer("session"); } }) : null,
 				h("button", { class: "btn bad", text: "Deny", disabled: busy, onclick: function () { answer(false); } })));
 		} else {
 			(p.options || []).forEach(function (o, idx) {
@@ -706,10 +710,19 @@ body.open .drawer { transform: none; }
 				parts.push(h("div", { class: "free" }, input, h("button", { class: "btn", text: "Send", disabled: busy, onclick: send })));
 			}
 		}
-		return h("article", { class: "card human" },
+		var level = /^(Low|Medium|High)$/.test(p.level || "") ? " risk-" + p.level.toLowerCase() : "";
+		var more = null;
+		if (p.details) {
+			// A redraw rebuilds the card: keep the details open if the user opened them.
+			more = h("details", { class: "more" }, h("summary", { text: "Show details" }), h("div", { class: "body", text: p.details }));
+			more.open = detailsOpen.has(p.id);
+			more.addEventListener("toggle", function () { if (more.open) detailsOpen.add(p.id); else detailsOpen.delete(p.id); });
+		}
+		return h("article", { class: "card human" + level },
 			h("div", { class: "card-top" }, h("span", { class: "kind", text: p.source || "prompt" }), h("span", { class: "flag call", text: "your call" })),
 			h("p", { class: "title", text: p.title }),
 			p.body ? h("div", { class: "body", text: p.body }) : null,
+			more,
 			parts);
 	}
 	function settledPromptCard(i) {
@@ -719,7 +732,7 @@ body.open .drawer { transform: none; }
 		return h("article", { class: "card settled" },
 			h("div", { class: "card-top" }, h("span", { class: "kind", text: (p.kind === "choice" ? "you chose" : p.source || "prompt") }), h("span", { class: "flag " + flag, text: typeof p.answer === "boolean" ? ans : time(p.at) })),
 			h("p", { class: "title", text: p.title }),
-			h("div", { class: "chips" }, typeof p.answer === "boolean" ? null : h("span", { class: "chip info", text: ans }), p.by ? h("span", { class: "chip", text: "in the " + (p.by === "web" ? "browser" : "terminal") }) : null));
+			h("div", { class: "chips" }, typeof p.answer === "boolean" ? null : h("span", { class: "chip info", text: ans }), p.forSession ? h("span", { class: "chip info", text: "for this session" }) : null, p.by ? h("span", { class: "chip", text: "in the " + (p.by === "web" ? "browser" : "terminal") }) : null));
 	}
 
 	// ---- drawer ----
