@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- gh writes outside PRs and issues ran without a question. They now ask, in every mode, with their own words:
+  - deletes (High): `gh issue delete`, `gh label delete`, `gh run delete`, `gh cache delete`, `gh gist delete`, `gh repo deploy-key delete`, `gh release delete-asset`;
+  - secrets and variables (High): `gh secret set|delete|remove`, `gh variable set|delete|remove`;
+  - visibility and access (High): `gh repo edit --visibility`, `gh repo deploy-key add`;
+  - repository settings (Medium): `gh repo edit`, `gh repo rename`, `gh issue transfer`, `gh label create|edit|clone`;
+  - CI workflows (Medium): `gh workflow run|enable|disable`, `gh run rerun|cancel`;
+  - gists (Medium): `gh gist create|edit`.
+- `gh api -XDELETE` and a lowercase method (`-X delete`, `--method=delete`) were not read as a delete; a joined `-XPOST` was not read as a write.
+
 ## [0.28.0] - 2026-11-27
 
 ### Added

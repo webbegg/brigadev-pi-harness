@@ -576,6 +576,46 @@ describe("git push: force and delete in combined short flags, and a plain push (
 		}
 	});
 
+	it("gh writes outside PRs and issues: deletes, secrets, repository settings, workflows, gists", () => {
+		const seen = (command: string) => classifyCommand(command).map((m) => ({ kind: m.kind, ask: Boolean(m.alwaysConfirm) }));
+		for (const command of [
+			"gh issue delete 3 --yes",
+			"gh label delete bug --yes",
+			"gh run delete 12",
+			"gh cache delete --all",
+			"gh gist delete abc",
+			"gh repo deploy-key delete 7",
+			"gh release delete-asset v1 a.zip",
+			"gh api -XDELETE repos/o/r",
+			"gh api --method=delete repos/o/r",
+			"gh api -X delete repos/o/r",
+		]) assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+		// Asked in every mode: they change what CI, deploys, or the public can reach.
+		for (const command of [
+			"gh secret set TOKEN --body x",
+			"gh secret delete TOKEN",
+			"gh secret remove TOKEN",
+			"gh variable set ENV --body prod",
+			"gh variable delete ENV",
+			"gh repo edit --visibility public --accept-visibility-change-consequences",
+			"gh repo edit --description x",
+			"gh repo rename new-name",
+			"gh repo deploy-key add key.pub",
+			"gh issue transfer 3 o/other",
+			"gh workflow run deploy.yml",
+			"gh workflow disable ci",
+			"gh run rerun 12",
+			"gh run cancel 12",
+			"gh gist create notes.md",
+			"gh label create bug",
+		]) assert.deepEqual(seen(command), [{ kind: COMMAND_KIND.DELIVERY, ask: true }], command);
+		assert.deepEqual(seen("gh api -XPOST repos/o/r/issues"), [{ kind: COMMAND_KIND.DELIVERY, ask: false }]);
+		assert.deepEqual(kinds("gh api -XGET repos/o/r"), []);
+		for (const command of ["gh secret list", "gh variable get ENV", "gh repo view", "gh workflow list", "gh run view 12", "gh gist view abc", "gh label list"]) {
+			assert.deepEqual(kinds(command), [], command);
+		}
+	});
+
 	it("closing a PR with --delete-branch deletes a remote branch", () => {
 		for (const command of ["gh pr close 1 --delete-branch", "gh pr close 1 -d", "gh pr close 1 -dc bye"]) assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
 		assert.deepEqual(kinds("gh pr close 1 -c bye"), [COMMAND_KIND.DELIVERY]);

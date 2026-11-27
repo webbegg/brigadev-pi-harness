@@ -738,6 +738,34 @@ function classifyGit(args: string[]): CommandMatch | undefined {
 	}
 }
 
+/** gh actions that delete something on GitHub, by group. */
+const GH_DELETES: Readonly<Record<string, readonly string[]>> = {
+	issue: ["delete"],
+	label: ["delete"],
+	run: ["delete"],
+	cache: ["delete"],
+	gist: ["delete"],
+};
+
+/**
+ * A gh write outside PRs and issues that every mode asks about (secrets, repository settings, CI workflows, gists): its reason, which
+ * names the profile the dialog shows; undefined for anything else. Deletes of secrets and variables are asked here too, as changes.
+ */
+function ghAdminWrite(group: string | undefined, action: string, args: readonly string[]): string | undefined {
+	if ((group === "secret" || group === "variable") && ["set", "delete", "remove"].includes(action)) return `gh ${group} ${action} changes a secret or variable`;
+	if (group === "repo" && action === "edit") {
+		return args.some((a) => a === "--visibility" || a.startsWith("--visibility=")) ? "gh repo edit changes the visibility" : "gh repo edit changes repository settings";
+	}
+	if (group === "repo" && action === "rename") return "gh repo rename changes repository settings";
+	if (group === "repo" && action === "deploy-key" && args.includes("add")) return "gh repo deploy-key add grants a key access";
+	if (group === "issue" && action === "transfer") return "gh issue transfer changes repository settings";
+	if (group === "label" && ["create", "edit", "clone"].includes(action)) return `gh label ${action} changes repository settings`;
+	if (group === "workflow" && ["run", "enable", "disable"].includes(action)) return `gh workflow ${action} runs or changes a CI workflow`;
+	if (group === "run" && ["rerun", "cancel"].includes(action)) return `gh run ${action} runs or changes a CI workflow`;
+	if (group === "gist" && ["create", "edit"].includes(action)) return `gh gist ${action} uploads a gist`;
+	return undefined;
+}
+
 /**
  * The group and action of a gh command (`gh <group> [--repo <o/r>] <action>`). `--repo`/`-R` is a persistent flag gh
  * also accepts between the group and the action; `gh pr new` and `gh issue new` are gh's own aliases of `create`.
@@ -769,13 +797,22 @@ function classifyGh(args: string[]): CommandMatch | undefined {
 	if (group === "pr" && action === "close" && (hasAny(args, "--delete-branch") || hasShortFlag(args, "d"))) {
 		return { kind: COMMAND_KIND.DESTRUCTIVE, reason: "gh pr close --delete-branch deletes the remote branch" };
 	}
+	const deletes = GH_DELETES[group ?? ""];
+	if (deletes?.includes(action) || (group === "repo" && action === "deploy-key" && args.includes("delete"))) {
+		return { kind: COMMAND_KIND.DESTRUCTIVE, reason: `gh ${group} ${action === "deploy-key" ? "deploy-key delete" : action}` };
+	}
+	if (group === "release" && action === "delete-asset") return { kind: COMMAND_KIND.DESTRUCTIVE, reason: "gh release delete-asset" };
+	const write = ghAdminWrite(group, action, args);
+	if (write) return { kind: COMMAND_KIND.DELIVERY, reason: write, alwaysConfirm: true };
 	if ((group === "pr" || group === "issue") && ["create", "comment", "review", "edit", "close", "reopen"].includes(action)) {
 		return { kind: COMMAND_KIND.DELIVERY, reason: `gh ${group} ${action}`, ...(group === "pr" && action === "create" ? { alwaysConfirm: true } : {}) };
 	}
 	if (group === "api") {
 		const all = args.slice(1);
 		const methodIndex = all.findIndex((a) => a === "-X" || a === "--method");
-		const method = methodIndex >= 0 ? all[methodIndex + 1]?.toUpperCase() : all.find((a) => a.startsWith("--method="))?.split("=")[1]?.toUpperCase();
+		// `-X DELETE`, `--method DELETE`, `-XDELETE`, `--method=DELETE`, any case.
+		const joined = all.find((a) => /^-X./.test(a) || a.startsWith("--method="));
+		const method = (methodIndex >= 0 ? all[methodIndex + 1] : joined?.replace(/^-X|^--method=/, ""))?.toUpperCase();
 		if (method === "DELETE") return { kind: COMMAND_KIND.DESTRUCTIVE, reason: "gh api DELETE" };
 		const writes = (method !== undefined && method !== "GET") || all.some((a) => a === "-f" || a === "-F" || a === "--field" || a === "--raw-field" || a === "--input");
 		// A POST to a repo's pulls endpoint, or the GraphQL createPullRequest mutation, opens a PR like `gh pr create`.
