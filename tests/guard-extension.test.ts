@@ -629,6 +629,8 @@ describe("guard: yes, and don't ask again this session", () => {
 
 	it("a push grant covers plain pushes from a feature branch only", async () => {
 		const { cwd } = repo(["README.md"]);
+		git(cwd, "remote", "add", "origin", "https://example.invalid/r.git");
+		git(cwd, "remote", "add", "other", "https://example.invalid/other.git");
 		const s = await session(cwd, { answer: "session" });
 		assert.equal(await s.bash("# why: share the branch\ngit push -u origin feat/x"), undefined);
 		assert.deepEqual(s.dialogs[0].options, ["Yes", SESSION_LABEL, "No"]);
@@ -636,12 +638,31 @@ describe("guard: yes, and don't ask again this session", () => {
 		assert.equal(await s.bash("git push origin HEAD"), undefined);
 		assert.equal(s.dialogs.length, 1);
 		// Not plain, or not this branch: asks, with no session answer.
-		for (const command of ["git push origin HEAD:main", "git push origin feat/other", "git push --tags", "git checkout main && git push", "git push -uf origin main"]) {
+		const asksWithoutOffer = async (command: string) => {
 			const before = s.dialogs.length;
 			await s.bash(command);
 			assert.equal(s.dialogs.length, before + 1, command);
 			assert.equal(s.dialogs.at(-1)!.options, undefined, command);
+		};
+		for (const command of ["git push origin HEAD:main", "git push origin feat/other", "git push --tags", "git checkout main && git push", "git push -uf origin main", "git -c remote.origin.push=HEAD:main push", 'R="origin HEAD:main"; git push $R']) {
+			await asksWithoutOffer(command);
 		}
+		// Another remote is another URL: asks, and may be granted on its own.
+		await s.bash("git push other");
+		assert.deepEqual(s.dialogs.at(-1)!.options, ["Yes", SESSION_LABEL, "No"]);
+		// git is asked where the push lands: a stored refspec, a mirror, or a push.default that can send another branch stop the grant.
+		for (const [key, value] of [["remote.origin.push", "HEAD:main"], ["remote.origin.mirror", "true"], ["push.default", "upstream"], ["push.default", "matching"]]) {
+			git(cwd, "config", key, value);
+			await asksWithoutOffer("git push");
+			git(cwd, "config", "--unset", key);
+		}
+		assert.equal(await s.bash("git push"), undefined);
+		// A new URL for the granted remote is not granted.
+		git(cwd, "remote", "set-url", "origin", "https://evil.invalid/x.git");
+		const before = s.dialogs.length;
+		await s.bash("git push");
+		assert.equal(s.dialogs.length, before + 1);
+		git(cwd, "remote", "set-url", "origin", "https://example.invalid/r.git");
 		// An MCP tool that pushes is never covered by it.
 		await s.tool("mcp__github__push_files", { branch: "main" });
 		assert.match(s.dialogs.at(-1)!.title, /push commits to the remote/);

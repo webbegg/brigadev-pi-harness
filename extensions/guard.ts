@@ -60,20 +60,57 @@ export default function (pi: ExtensionAPI) {
 	const outsideGrants = new Set<string>();
 	// Actions ("open a pull request") the user said yes to for the rest of the session; only those `grantable` allows, memory only.
 	const sessionGrants = new Set<string>();
-	/** The grant that lets these matches run without asking, or undefined: each must be grantable, and every action granted. */
-	const grantFor = (matches: readonly CommandMatch[], pushOk: boolean): string | undefined => {
-		if (isChild || !grantable(matches) || (!pushOk && matches.some((match) => match.push))) return undefined;
+	// The push URLs a "yes for this session" to a push covered: a later push is covered only to one of them.
+	const pushGrants = new Set<string>();
+	/**
+	 * The grant that lets these matches run without asking, or undefined: each must be grantable, every action granted, and a push must go
+	 * to a granted URL (`pushUrls`: where git says the command's pushes land; undefined when they may not be granted).
+	 */
+	const grantFor = (matches: readonly CommandMatch[], pushUrls: readonly string[] | undefined): string | undefined => {
+		if (isChild || !grantable(matches)) return undefined;
+		if (matches.some((match) => match.push) && (!pushUrls || !pushUrls.every((url) => pushGrants.has(url)))) return undefined;
 		const actions = actionsOf(matches);
 		if (!actions.every(({ action }) => sessionGrants.has(action))) return undefined;
 		return `brigadev: allowed for this session (${actions.map(({ action }) => action).join(" + ")})`;
 	};
-	/** A plain push a grant may cover: HEAD on a feature branch at `cwd`, and each push sends that branch (no ref, `HEAD`, or its name). */
-	const pushOnFeatureBranch = async (matches: readonly CommandMatch[], cwd: string): Promise<boolean> => {
+
+	/**
+	 * Where the command's plain pushes land, asked of git at `cwd`: the push URL of each one's remote. Undefined (no grant) unless HEAD is on a
+	 * feature branch, each push sends that branch to the same name (no ref, `HEAD`, or its name), `push.default` is unset, `simple`, or
+	 * `current`, and the remote has no `push` refspec or `mirror` setting. Any git failure is undefined. [] when the command pushes nothing.
+	 */
+	const pushDestinations = async (matches: readonly CommandMatch[], cwd: string): Promise<string[] | undefined> => {
 		const pushes = matches.filter((match) => match.push);
-		if (pushes.length === 0) return true;
+		if (pushes.length === 0) return [];
 		const facts = await readBranchFacts(exec, cwd).catch(() => undefined);
-		if (!facts || !onFeatureBranch(facts)) return false;
-		return pushes.every(({ push }) => push?.ref === undefined || push.ref === "HEAD" || push.ref === facts.currentBranch);
+		if (!facts || !onFeatureBranch(facts) || !facts.currentBranch) return undefined;
+		const branch = facts.currentBranch;
+		/** A setting's value; "" when unset (exit 1); undefined when git fails. */
+		const setting = async (...args: string[]): Promise<string | undefined> => {
+			const result = await exec("git", ["config", ...args], { cwd, timeout: 10_000 }).catch(() => undefined);
+			return result?.code === 0 ? result.stdout.trim() : result?.code === 1 ? "" : undefined;
+		};
+		const pushDefault = await setting("--get", "push.default");
+		if (pushDefault === undefined || !["", "simple", "current"].includes(pushDefault)) return undefined;
+		const urls: string[] = [];
+		for (const { push } of pushes) {
+			if (!push || (push.ref !== undefined && push.ref !== "HEAD" && push.ref !== branch)) return undefined;
+			let remote = push.remote;
+			// git's default remote for a push: the branch's pushRemote, remote.pushDefault, the branch's remote, then origin.
+			for (const key of [`branch.${branch}.pushRemote`, "remote.pushDefault", `branch.${branch}.remote`]) {
+				if (remote) break;
+				const value = await setting("--get", key);
+				if (value === undefined) return undefined;
+				remote = value || undefined;
+			}
+			remote ??= "origin";
+			if (!/^[A-Za-z0-9._-]+$/.test(remote)) return undefined;
+			if ((await setting("--get-all", `remote.${remote}.push`)) !== "" || (await setting("--get", `remote.${remote}.mirror`)) !== "") return undefined;
+			const url = await exec("git", ["remote", "get-url", "--push", remote], { cwd, timeout: 10_000 }).catch(() => undefined);
+			if (url?.code !== 0 || !url.stdout.trim()) return undefined;
+			urls.push(url.stdout.trim());
+		}
+		return urls;
 	};
 
 	const projectRoot = (ctx: ExtensionContext) => canonicalPath(process.env[CHILD_ENV.PROJECT_ROOT] ?? ctx.cwd);
@@ -160,7 +197,7 @@ export default function (pi: ExtensionAPI) {
 	 * The TUI shows the permission card (details behind `d`); an RPC client (T3 Code) gets Pi's dialogs with the short text.
 	 * A "yes for this session" records the card's actions as granted. Returns whether the call may run.
 	 */
-	const confirm = async (ctx: ExtensionContext, dialog: PermissionDialog, busReason?: string): Promise<boolean> => {
+	const confirm = async (ctx: ExtensionContext, dialog: PermissionDialog, busReason?: string, pushUrls: readonly string[] = []): Promise<boolean> => {
 		if (isChild || !ctx.hasUI) return false;
 		const current = judging.getStore();
 		if (current) {
@@ -174,6 +211,7 @@ export default function (pi: ExtensionAPI) {
 		const answer = await askPermission(pi.events, ctx, spec, ctx.signal, show);
 		if (answer === "session" && dialog.card.sessionActions) {
 			for (const action of dialog.card.sessionActions) sessionGrants.add(action);
+			for (const url of pushUrls) pushGrants.add(url);
 			ctx.ui.notify(`brigadev: won't ask again this session for: ${dialog.card.sessionActions.join(", ")}`, "info");
 		}
 		return answer !== "no";
@@ -287,6 +325,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		// A new, resumed, or forked session starts with no "yes for this session".
 		sessionGrants.clear();
+		pushGrants.clear();
 		return restoreMode(ctx);
 	});
 	pi.on("session_tree", async (_event, ctx) => restoreMode(ctx));
@@ -353,12 +392,12 @@ export default function (pi: ExtensionAPI) {
 			const pr = isChild ? undefined : await prGate(command, commandCwd);
 			const prBlock = pr?.decision.action === "ask" ? { block: true as const, reason: prGateBlockMessage(pr.decision, pr.categories) } : undefined;
 			// A session grant skips the policy question; the PR gate still asks on its own when it finds a problem.
-			const pushOk = decision.action === "confirm" && !isChild ? await pushOnFeatureBranch(decision.matches, commandCwd) : false;
-			const granted = decision.action === "confirm" ? grantFor(decision.matches, pushOk) : undefined;
+			const pushUrls = decision.action === "confirm" && !isChild && grantable(decision.matches) ? await pushDestinations(decision.matches, commandCwd) : undefined;
+			const granted = decision.action === "confirm" ? grantFor(decision.matches, pushUrls) : undefined;
 			if (decision.action === "confirm" && !granted) {
 				const prText = pr ? prGateDialogText(pr.decision) : "";
-				const dialog = commandDialog(command, decision.matches, prText || undefined, undefined, { sessionGrant: pushOk });
-				const ok = await confirm(ctx, dialog, `brigadev: ${decision.reason}`);
+				const dialog = commandDialog(command, decision.matches, prText || undefined, undefined, { sessionGrant: pushUrls !== undefined });
+				const ok = await confirm(ctx, dialog, `brigadev: ${decision.reason}`, pushUrls);
 				if (!ok) return prBlock ?? { block: true, reason: `User declined: ${decision.reason}` };
 			} else if (pr && prBlock) {
 				const matches = classifyCommand(command);
@@ -386,7 +425,7 @@ export default function (pi: ExtensionAPI) {
 			const prText = pr ? prGateDialogText(pr.decision) : "";
 			const preview = `${event.toolName}\n${mcpInputPreview(event.input)}`;
 			// An MCP push is never plain (`CommandMatch.push`), so no grant covers it.
-			const granted = decision.action === "confirm" ? grantFor(decision.matches, false) : undefined;
+			const granted = decision.action === "confirm" ? grantFor(decision.matches, undefined) : undefined;
 			if (decision.action === "confirm" && !granted) {
 				const dialog = toolDialog(preview, decision.matches, prText || undefined);
 				const ok = await confirm(ctx, dialog, `brigadev: ${decision.reason}`);

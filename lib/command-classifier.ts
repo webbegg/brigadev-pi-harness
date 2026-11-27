@@ -33,10 +33,12 @@ export interface CommandMatch {
 	 */
 	elsewhere?: boolean;
 	/**
-	 * Set on a `git push` that pushes only the current branch, or one named branch to the same name (`ref`; `HEAD` for the current one), with
-	 * harmless flags only, in the session's directory: the only push a "yes for this session" may cover. Dropped by a move before it.
+	 * Set on a `git push` that may be the only push a "yes for this session" covers: a literal `git push [-u|-q|-v|-n] [<remote> [<branch>]]`
+	 * (`remote` and `ref` as written; none: git's default), with no git option before `push`, no wrapper, variable, or substitution, and no
+	 * other command in the whole command line but `gh` and comments (a `git config` or a move before it could change where it lands).
+	 * The guard still asks git where it lands. Dropped by a move before it.
 	 */
-	push?: { ref?: string };
+	push?: { remote?: string; ref?: string };
 }
 
 /** A commit or a push may not run where the guard reads the branch facts: a move, a branch switch, or a git location setting before it. */
@@ -633,13 +635,17 @@ function gitSubcommand(args: string[]): number {
 /** Flags that change neither what a push sends nor where: upstream tracking, output, a dry run. */
 const PLAIN_PUSH_FLAGS = new Set(["--set-upstream", "--quiet", "--verbose", "--dry-run", "--porcelain", "--progress", "--no-progress"]);
 
+/** A word with nothing the shell or git could expand or redirect: no `$`, backtick, quote, glob, `:`, `@`, `+`, `=`, or `~`. */
+const LITERAL_WORD = /^[A-Za-z0-9._/-]+$/;
+
 /**
- * `git push [flags] [<remote> [<branch>]]` with harmless flags only, and the branch neither a refspec (`a:b`), `main`, nor `master`:
- * `{ ref }` (none: the current branch). Undefined for anything else (`--tags`, `--all`, `-o`, several refs).
+ * `git push [flags] [<remote> [<branch>]]` with harmless flags and literal words only, and the branch neither `main` nor `master`:
+ * `{ remote, ref }` as written. Undefined for anything else (`--tags`, `--all`, `-o`, a refspec, several refs, `$R`).
  */
-function plainPush(rest: string[]): { ref?: string } | undefined {
+function plainPush(rest: string[]): { remote?: string; ref?: string } | undefined {
 	const words: string[] = [];
 	for (const a of rest) {
+		if (!LITERAL_WORD.test(a)) return undefined;
 		if (a.startsWith("--")) {
 			if (!PLAIN_PUSH_FLAGS.has(a)) return undefined;
 		} else if (a.startsWith("-")) {
@@ -647,9 +653,15 @@ function plainPush(rest: string[]): { ref?: string } | undefined {
 		} else words.push(a);
 	}
 	if (words.length > 2) return undefined;
-	const ref = words[1];
-	if (ref === undefined) return {};
-	return ref.includes(":") || PROTECTED_NAMES.has(ref) ? undefined : { ref };
+	const [remote, ref] = words;
+	if (ref !== undefined && PROTECTED_NAMES.has(ref)) return undefined;
+	return { ...(remote === undefined ? {} : { remote }), ...(ref === undefined ? {} : { ref }) };
+}
+
+/** A segment that may stand next to a plain push: a comment, a `gh` call, or the literal `git push` itself (no wrapper, no pipe into it). */
+function allowsPlainPush(argv: readonly string[], before: string): boolean {
+	if (argv.length === 0 || argv[0].startsWith("#") || argv[0] === "gh") return true;
+	return argv[0] === "git" && argv[1] === "push" && before !== "|" && plainPush(argv.slice(2)) !== undefined;
 }
 
 function classifyGit(args: string[]): CommandMatch | undefined {
@@ -745,6 +757,10 @@ function classifyGh(args: string[]): CommandMatch | undefined {
 	}
 	if ((group === "pr" && action === "merge") || (group === "release" && ["create", "delete", "upload", "edit"].includes(action))) {
 		return { kind: COMMAND_KIND.PUBLISH, reason: `gh ${group} ${action}` };
+	}
+	// Closing a PR with --delete-branch deletes its head branch on the remote, like `git push --delete`.
+	if (group === "pr" && action === "close" && (hasAny(args, "--delete-branch") || hasShortFlag(args, "d"))) {
+		return { kind: COMMAND_KIND.DESTRUCTIVE, reason: "gh pr close --delete-branch deletes the remote branch" };
 	}
 	if ((group === "pr" || group === "issue") && ["create", "comment", "review", "edit", "close", "reopen"].includes(action)) {
 		return { kind: COMMAND_KIND.DELIVERY, reason: `gh ${group} ${action}`, ...(group === "pr" && action === "create" ? { alwaysConfirm: true } : {}) };
@@ -917,12 +933,16 @@ function classifyText(command: string): CommandMatch[] {
 	let moved = false;
 	const text = blankHeredocs(command);
 	const scratch = scratchContext(text);
+	let pushOnly = true;
 	for (const segment of tokenize(text)) {
 		const found = classifySegment(segment.argv, segment.before, scratch);
 		if (moved) for (const match of found) markElsewhere(match);
 		matches.push(...found);
 		moved ||= changesCommitTarget(segment.argv);
+		pushOnly &&= allowsPlainPush(segment.argv, segment.before);
 	}
+	// Any other command beside it (a `git config`, an assignment, a wrapper, a nested shell) could change where a push lands.
+	if (!pushOnly) for (const match of matches) delete match.push;
 	return matches;
 }
 

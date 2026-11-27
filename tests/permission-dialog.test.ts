@@ -207,6 +207,11 @@ describe("yes for this session", () => {
 			"git push origin HEAD:main",
 			"git push --tags",
 			"git subtree push --prefix d origin b",
+			// A PR opened through gh api is any API write naming a pulls endpoint; closing a PR with --delete-branch deletes a remote branch.
+			"gh api repos/o/r/merges -f base=main -f head=feat -t repos/o/r/pulls",
+			"gh api graphql -f query='mutation { createPullRequest: mergePullRequest(input:{}) { clientMutationId } }'",
+			"gh pr close 1 --delete-branch",
+			"gh pr close 1 -d",
 		]) {
 			assert.equal(dialogFor(command).card.sessionActions, undefined, command);
 			assert.equal(dialogFor(command).sessionLabel, undefined, command);
