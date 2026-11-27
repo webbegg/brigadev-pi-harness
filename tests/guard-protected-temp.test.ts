@@ -61,7 +61,7 @@ describe("protected paths under the temp dir", () => {
 		it(`asks before a parent write to the agent folder's brigadev.json (${mode ?? "normal"} mode)`, async () => {
 			const s = await session(mode);
 			assert.match(String(await s.write(join(agentDir, "brigadev.json"))), /declined/);
-			assert.deepEqual(s.asked, ["brigadev: write outside project"]);
+			assert.deepEqual(s.asked, ["brigadev · Needs your permission: change files outside the project"]);
 		});
 	}
 

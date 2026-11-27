@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The guard's permission dialogs explain the action in plain words: WHAT IT WILL DO (a sentence and the command), WHY (the agent's reason), and RISK (level, what could go wrong, whether it can be undone, who it affects). The agent gives its reason with a `# why: <reason>` comment on the command; without one the dialog warns that no reason was given. Titles change from `brigadev: <reason>` to `brigadev · Needs your permission: <action>` (also on the web UI and the guard bus).
+
 ## [0.26.0] - 2026-11-26
 
 brigadev runs well inside T3 Code: an optional `brigadev-t3` add-on shows status chips and settles where the two sets of rules overlap, and `ask_user_choice` opens real dialogs in RPC clients. MCP tools that open a PR, merge, or push now go through the guard like their gh/git commands, and subagents no longer inherit MCP server credentials.

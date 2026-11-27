@@ -9,11 +9,12 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
 
 /** One line per mode, sent to the model as a context message when a session starts and when the mode changes (never in the system prompt). */
 export const MODE_PROMPT: Record<PermissionMode, string> = {
-	normal: "Permission mode NORMAL: the guard asks the user before commits on the default branch, pushes, PR/issue writes, and destructive, publish, privileged, or dependency commands. Run the command; don't ask in chat first.",
-	yolo: "Permission mode YOLO: commits and issue writes run without asking; pushes and PR creation always ask; destructive, publish, privileged, and dependency (install) commands still ask.",
+	normal: "Permission mode NORMAL: the guard asks before default-branch commits, pushes, PR/issue writes, and destructive, publish, privileged, or dependency commands. Run them with a `# why: <reason>` line; don't ask in chat.",
+	yolo: "Permission mode YOLO: commits and issue writes run unasked; pushes and PR creation always ask; destructive, publish, privileged, and dependency commands still ask. Give those a `# why: <reason>` line.",
 };
 
-export type Decision = { action: "allow" } | { action: "confirm"; reason: string } | { action: "block"; reason: string };
+/** A confirm carries the matches that need the user's yes, so the dialog explains only those. */
+export type Decision = { action: "allow" } | { action: "confirm"; reason: string; matches: CommandMatch[] } | { action: "block"; reason: string };
 
 /**
  * Decides what to do with a classified shell command.
@@ -39,7 +40,7 @@ export function decideCommand(matches: CommandMatch[], mode: PermissionMode, isC
 	}
 	const needsConfirmation = matches.filter((m) => mode === PERMISSION_MODE.NORMAL || m.kind !== COMMAND_KIND.DELIVERY || m.alwaysConfirm);
 	if (needsConfirmation.length === 0) return { action: "allow" };
-	return { action: "confirm", reason: [...new Set(needsConfirmation.map((m) => m.reason))].join("; ") };
+	return { action: "confirm", reason: [...new Set(needsConfirmation.map((m) => m.reason))].join("; "), matches: needsConfirmation };
 }
 
 /** Families of secret-bearing paths. */

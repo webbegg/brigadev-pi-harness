@@ -98,7 +98,7 @@ describe("the guard decides a check call like bash", () => {
 	it("asks the sensitive-path question for a secret read, like a read of that path", async () => {
 		const s = await session();
 		assert.match(String(await s.check({ command: "cat ~/.ssh/id_rsa" })), /User declined access to sensitive file/);
-		assert.ok(s.asked.some((title) => /sensitive file/.test(title)));
+		assert.ok(s.asked.some((title) => /may hold secrets/.test(title)));
 		const withFocus = await session();
 		assert.match(String(await withFocus.check({ command: "node --test", focus: ".env" })), /User declined access to sensitive file/);
 	});

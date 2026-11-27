@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { installPiStubs } from "./helpers/pi-stubs-loader.ts";
 
+const OUTSIDE_TITLE = "brigadev · Needs your permission: change files outside the project";
+
 const saved = { ...process.env };
 let dir: string, repo: string, home: string, agentDir: string, secure: string;
 let uninstall: () => void;
@@ -107,11 +109,11 @@ describe("writes outside the project", () => {
 		for (const target of [hook, gitConfig]) {
 			const declined = await session({ answer: false });
 			assert.match(String(await declined.run("write", target)), /declined/);
-			assert.deepEqual(declined.asked, ["brigadev: write outside project"]);
+			assert.deepEqual(declined.asked, [OUTSIDE_TITLE]);
 		}
 		const granted = await session({ answer: true });
 		assert.equal(await granted.run("edit", hook), undefined);
-		assert.deepEqual(granted.asked, ["brigadev: write outside project"]);
+		assert.deepEqual(granted.asked, [OUTSIDE_TITLE]);
 	});
 
 	it("keeps a plain file in a secure-yolo folder silent next to a protected one", async () => {
@@ -132,7 +134,7 @@ describe("writes outside the project", () => {
 		try {
 			const s = await session({ answer: false });
 			assert.match(String(await s.run("write", "/brigadev-nonexistent-outside/dsp.txt")), /declined/);
-			assert.deepEqual(s.asked, ["brigadev: write outside project"]);
+			assert.deepEqual(s.asked, [OUTSIDE_TITLE]);
 		} finally {
 			writeFileSync(settings, JSON.stringify({ secureYoloDirs: [secure] }));
 		}

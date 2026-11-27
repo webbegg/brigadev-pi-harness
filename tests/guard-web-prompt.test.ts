@@ -85,7 +85,7 @@ describe("guard confirm answered from the bus", () => {
 		const prompt = await s.open();
 		assert.equal(prompt.kind, "confirm");
 		assert.equal(prompt.source, "guard");
-		assert.match(prompt.title, /^brigadev: /);
+		assert.match(prompt.title, /^brigadev · Needs your permission: /);
 		assert.match(prompt.body ?? "", /rm -rf build/);
 
 		s.answer(prompt.id, true);
@@ -116,7 +116,7 @@ describe("guard confirm answered from the bus", () => {
 		const s = await session();
 		const { result } = s.call("read", { path: ".env" });
 		const prompt = await s.open();
-		assert.match(prompt.title, /sensitive file/);
+		assert.match(prompt.title, /may hold secrets/);
 		s.dialogs[0].resolve(true);
 		assert.equal(await result, undefined);
 		assert.equal(s.dialogs[0].signal?.aborted, false);
