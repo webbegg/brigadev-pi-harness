@@ -745,19 +745,31 @@ const GH_DELETES: Readonly<Record<string, readonly string[]>> = {
 	run: ["delete"],
 	cache: ["delete"],
 	gist: ["delete"],
+	"ssh-key": ["delete"],
+	"gpg-key": ["delete"],
+	codespace: ["delete"],
+	project: ["delete", "item-delete", "field-delete"],
 };
 
 /**
- * A gh write outside PRs and issues that every mode asks about (secrets, repository settings, CI workflows, gists): its reason, which
+ * A gh write outside PRs and issues (secrets, credentials, keys, aliases, repository settings, CI workflows, gists): its reason, which
  * names the profile the dialog shows; undefined for anything else. Deletes of secrets and variables are asked here too, as changes.
  */
-function ghAdminWrite(group: string | undefined, action: string, args: readonly string[]): string | undefined {
+function ghAdminWrite(group: string | undefined, action: string, sub: string | undefined, args: readonly string[]): string | undefined {
 	if ((group === "secret" || group === "variable") && ["set", "delete", "remove"].includes(action)) return `gh ${group} ${action} changes a secret or variable`;
 	if (group === "repo" && action === "edit") {
 		return args.some((a) => a === "--visibility" || a.startsWith("--visibility=")) ? "gh repo edit changes the visibility" : "gh repo edit changes repository settings";
 	}
 	if (group === "repo" && action === "rename") return "gh repo rename changes repository settings";
-	if (group === "repo" && action === "deploy-key" && args.includes("add")) return "gh repo deploy-key add grants a key access";
+	if (group === "repo" && action === "deploy-key" && sub === "add") return "gh repo deploy-key add grants a key access";
+	if ((group === "ssh-key" || group === "gpg-key") && action === "add") return `gh ${group} add grants a key access`;
+	if (group === "repo" && action === "autolink" && sub === "create") return "gh repo autolink create changes repository settings";
+	if (group === "repo" && action === "create") return "gh repo create creates a repository";
+	// A token printed lands in the transcript; the rest change which credentials gh and git use.
+	if (group === "auth" && ["token", "refresh", "logout", "login", "setup-git", "switch"].includes(action)) return `gh auth ${action} reveals or changes GitHub credentials`;
+	// An alias can run any guarded gh command under a name the guard does not know.
+	if (group === "alias" && ["set", "import"].includes(action)) return `gh alias ${action} adds a gh alias`;
+	if (group === "pr" && action === "update-branch") return "gh pr update-branch pushes to a remote branch";
 	if (group === "issue" && action === "transfer") return "gh issue transfer changes repository settings";
 	if (group === "label" && ["create", "edit", "clone"].includes(action)) return `gh label ${action} changes repository settings`;
 	if (group === "workflow" && ["run", "enable", "disable"].includes(action)) return `gh workflow ${action} runs or changes a CI workflow`;
@@ -766,24 +778,51 @@ function ghAdminWrite(group: string | undefined, action: string, args: readonly 
 	return undefined;
 }
 
-/**
- * The group and action of a gh command (`gh <group> [--repo <o/r>] <action>`). `--repo`/`-R` is a persistent flag gh
- * also accepts between the group and the action; `gh pr new` and `gh issue new` are gh's own aliases of `create`.
- */
-export function ghGroupAction(args: readonly string[]): { group: string | undefined; action: string | undefined } {
-	const [group, ...rest] = args;
-	let i = 0;
-	while (i < rest.length) {
-		if (rest[i] === "-R" || rest[i] === "--repo") i += 2;
-		else if (/^(?:-R.+|--repo=.*)$/.test(rest[i])) i += 1;
+/** Past the `-R <o/r>`, `-Ro/r`, `--repo <o/r>`, `--repo=<o/r>` flags at `from`: the index of the next word. */
+function skipRepoFlags(args: readonly string[], from: number): number {
+	let i = from;
+	while (i < args.length) {
+		if (args[i] === "-R" || args[i] === "--repo") i += 2;
+		else if (/^(?:-R.+|--repo=.*)$/.test(args[i])) i += 1;
 		else break;
 	}
-	const written = rest[i];
-	return { group, action: (group === "pr" || group === "issue") && written === "new" ? "create" : written };
+	return i;
+}
+
+/** gh's own names for a group (`gh ext`, `gh cs`) and, per group, for an action (`gh pr new`, `gh gist new`). */
+const GH_GROUP_ALIASES: Readonly<Record<string, string>> = { ext: "extension", extensions: "extension", cs: "codespace" };
+const GH_ACTION_ALIASES: Readonly<Record<string, Readonly<Record<string, string>>>> = { pr: { new: "create" }, issue: { new: "create" }, gist: { new: "create" } };
+
+/**
+ * The group and action of a gh command (`gh [--repo <o/r>] <group> [--repo <o/r>] <action> [<sub>]`), and `rest`: the words after the
+ * group with the repo flags it starts with taken out. `--repo`/`-R` is a persistent flag gh accepts before the group or between the group
+ * and the action. gh's own aliases (`gh ext`, `gh pr new`) read as the names they stand for.
+ */
+export function ghGroupAction(args: readonly string[]): { group: string | undefined; action: string | undefined; sub?: string; rest: string[] } {
+	const start = skipRepoFlags(args, 0);
+	const written = args[start];
+	const group = written === undefined ? undefined : (GH_GROUP_ALIASES[written] ?? written);
+	const at = skipRepoFlags(args, start + 1);
+	const action = args[at] === undefined ? undefined : (GH_ACTION_ALIASES[group ?? ""]?.[args[at]] ?? args[at]);
+	const sub = args.slice(at + 1).find((a) => !a.startsWith("-"));
+	return { group, action, ...(sub === undefined ? {} : { sub }), rest: args.slice(start + 1) };
+}
+
+/** `gh api`'s method as gh reads it: the last `-X`/`--method`, written `-X v`, `-Xv`, `-X=v`, `-iX v`, `--method v`, or `--method=v`. */
+function ghApiMethod(args: readonly string[]): string | undefined {
+	let method: string | undefined;
+	for (let i = 0; i < args.length; i++) {
+		const a = args[i];
+		const short = /^-i*X(.*)$/.exec(a);
+		if (short) method = short[1] ? short[1].replace(/^=/, "") : args[++i];
+		else if (a === "--method") method = args[++i];
+		else if (a.startsWith("--method=")) method = a.slice("--method=".length);
+	}
+	return method?.toUpperCase();
 }
 
 function classifyGh(args: string[]): CommandMatch | undefined {
-	const { group, action = "" } = ghGroupAction(args);
+	const { group, action = "", sub } = ghGroupAction(args);
 	if (group === "repo" && (action === "delete" || action === "archive")) {
 		return { kind: COMMAND_KIND.DESTRUCTIVE, reason: `gh repo ${action}` };
 	}
@@ -798,23 +837,27 @@ function classifyGh(args: string[]): CommandMatch | undefined {
 		return { kind: COMMAND_KIND.DESTRUCTIVE, reason: "gh pr close --delete-branch deletes the remote branch" };
 	}
 	const deletes = GH_DELETES[group ?? ""];
-	if (deletes?.includes(action) || (group === "repo" && action === "deploy-key" && args.includes("delete"))) {
-		return { kind: COMMAND_KIND.DESTRUCTIVE, reason: `gh ${group} ${action === "deploy-key" ? "deploy-key delete" : action}` };
+	if (deletes?.includes(action) || (group === "repo" && (action === "deploy-key" || action === "autolink") && sub === "delete")) {
+		return { kind: COMMAND_KIND.DESTRUCTIVE, reason: `gh ${group} ${action}${sub === "delete" && !deletes?.includes(action) ? " delete" : ""}` };
 	}
+	// A forced sync hard-resets the local branch, or overwrites the fork's branch on the remote.
+	if (group === "repo" && action === "sync" && hasAny(args, "--force")) return { kind: COMMAND_KIND.DESTRUCTIVE, reason: "gh repo sync --force overwrites a branch" };
+	// An extension is third-party code that gh runs.
+	if (group === "extension" && (action === "install" || action === "upgrade")) return { kind: COMMAND_KIND.DEPENDENCY, reason: `gh extension ${action} changes installed dependencies` };
 	if (group === "release" && action === "delete-asset") return { kind: COMMAND_KIND.DESTRUCTIVE, reason: "gh release delete-asset" };
-	const write = ghAdminWrite(group, action, args);
-	if (write) return { kind: COMMAND_KIND.DELIVERY, reason: write, alwaysConfirm: true };
+	const write = ghAdminWrite(group, action, sub, args);
+	// Repository settings stay unasked in yolo, like issue writes; the rest leave the machine, run CI, or touch credentials: every mode asks.
+	if (write) return { kind: COMMAND_KIND.DELIVERY, reason: write, ...(/changes repository settings$|creates a repository$/.test(write) ? {} : { alwaysConfirm: true }) };
 	if ((group === "pr" || group === "issue") && ["create", "comment", "review", "edit", "close", "reopen"].includes(action)) {
 		return { kind: COMMAND_KIND.DELIVERY, reason: `gh ${group} ${action}`, ...(group === "pr" && action === "create" ? { alwaysConfirm: true } : {}) };
 	}
 	if (group === "api") {
-		const all = args.slice(1);
-		const methodIndex = all.findIndex((a) => a === "-X" || a === "--method");
-		// `-X DELETE`, `--method DELETE`, `-XDELETE`, `--method=DELETE`, any case.
-		const joined = all.find((a) => /^-X./.test(a) || a.startsWith("--method="));
-		const method = (methodIndex >= 0 ? all[methodIndex + 1] : joined?.replace(/^-X|^--method=/, ""))?.toUpperCase();
+		const all = ghGroupAction(args).rest;
+		const method = ghApiMethod(all);
 		if (method === "DELETE") return { kind: COMMAND_KIND.DESTRUCTIVE, reason: "gh api DELETE" };
-		const writes = (method !== undefined && method !== "GET") || all.some((a) => a === "-f" || a === "-F" || a === "--field" || a === "--raw-field" || a === "--input");
+		// A field (`-f k=v`, `-fk=v`, `-if k=v`, `--field=k=v`) or an input file makes gh send a POST.
+		const fields = all.some((a) => /^-i*[fF]/.test(a) || ["--field", "--raw-field", "--input"].some((flag) => a === flag || a.startsWith(`${flag}=`)));
+		const writes = (method !== undefined && method !== "GET") || fields;
 		// A POST to a repo's pulls endpoint, or the GraphQL createPullRequest mutation, opens a PR like `gh pr create`.
 		const opensPr = all.some((a) => /^\/?repos\/[^/\s]+\/[^/\s]+\/pulls\/?$/.test(a)) || all.some((a) => /\bcreatePullRequest\b/.test(a));
 		if (writes && opensPr && method !== "PATCH" && method !== "PUT") return { kind: COMMAND_KIND.DELIVERY, reason: "gh api opens a PR", alwaysConfirm: true };

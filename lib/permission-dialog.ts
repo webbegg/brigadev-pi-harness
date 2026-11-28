@@ -291,9 +291,9 @@ const VISIBILITY: RiskProfile = {
 };
 const REPO_ACCESS: RiskProfile = {
 	action: "give a key access to a repository",
-	what: "Adds a deploy key to a GitHub repository.",
+	what: "Adds a deploy key to a GitHub repository, or an SSH or GPG key to your GitHub account.",
 	level: "High",
-	risk: "Whoever holds the private key can read the repository, and push to it if the key may write.",
+	risk: "Whoever holds the private key can read the repository (an account key: every repository you can reach), and push if the key may write.",
 	undo: "Yes: delete the key, but what it already read or pushed stays.",
 	affects: "The repository and its team.",
 	undoBrief: "undoable; what it did stays",
@@ -329,6 +329,26 @@ const GIST: RiskProfile = {
 	undoBrief: "partly undoable",
 	affectsBrief: "anyone with the link",
 };
+const CREDENTIALS: RiskProfile = {
+	action: "reveal or change GitHub credentials",
+	what: "Prints the GitHub token, or logs in, out, switches account, widens the token's scopes, or makes git use gh's token.",
+	level: "High",
+	risk: "A printed token lands in the transcript and the model's context; a changed login changes what every later command may do.",
+	undo: "A revealed token only by revoking it; a login change by logging back in.",
+	affects: "Your GitHub account and everything it can reach.",
+	undoBrief: "a revealed token must be revoked",
+	affectsBrief: "your GitHub account",
+};
+const ALIAS: RiskProfile = {
+	action: "add a gh alias",
+	what: "Adds a gh alias: a new name that runs another gh command, or a shell command.",
+	level: "High",
+	risk: "Under the new name, any command can run later without the guard knowing what it does.",
+	undo: "Yes: `gh alias delete`, but what it already ran stays done.",
+	affects: "Your gh setup, and every later command run through the alias.",
+	undoBrief: "can be deleted; what it ran stays",
+	affectsBrief: "every later gh command",
+};
 /** A guarded action this file has no words for yet: never shown as harmless. */
 const UNKNOWN: RiskProfile = {
 	action: "run an action the guard flags",
@@ -362,7 +382,9 @@ export function profileFor(match: CommandMatch): RiskProfile {
 			if (/changes a secret or variable$/.test(reason)) return SECRETS;
 			if (/^gh repo edit changes the visibility$/.test(reason)) return VISIBILITY;
 			if (/grants a key access$/.test(reason)) return REPO_ACCESS;
-			if (/^gh [a-z]+ [a-z-]+ changes repository settings$/.test(reason)) return REPO_SETTINGS;
+			if (/reveals or changes GitHub credentials$/.test(reason)) return CREDENTIALS;
+			if (/adds a gh alias$/.test(reason)) return ALIAS;
+			if (/^gh [a-z]+ [a-z -]+ changes repository settings$|^gh repo create creates a repository$/.test(reason)) return REPO_SETTINGS;
 			if (/runs or changes a CI workflow$/.test(reason)) return WORKFLOW;
 			if (/uploads a gist$/.test(reason)) return GIST;
 			if (/^gh (pr|issue) [a-z]+$|writes to a PR or issue/.test(reason)) return GITHUB_WRITE;

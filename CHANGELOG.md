@@ -4,14 +4,19 @@
 
 ### Fixed
 
-- gh writes outside PRs and issues ran without a question. They now ask, in every mode, with their own words:
-  - deletes (High): `gh issue delete`, `gh label delete`, `gh run delete`, `gh cache delete`, `gh gist delete`, `gh repo deploy-key delete`, `gh release delete-asset`;
+- gh writes outside PRs and issues ran without a question. They now ask with their own words, in every mode except repository settings, which stay unasked in yolo like issue writes:
+  - deletes (High): `gh issue delete`, `gh label delete`, `gh run delete`, `gh cache delete`, `gh gist delete`, `gh repo deploy-key delete`, `gh repo autolink delete`, `gh release delete-asset`, `gh ssh-key delete`, `gh gpg-key delete`, `gh codespace delete`, `gh project delete|item-delete|field-delete`, `gh repo sync --force`;
   - secrets and variables (High): `gh secret set|delete|remove`, `gh variable set|delete|remove`;
-  - visibility and access (High): `gh repo edit --visibility`, `gh repo deploy-key add`;
-  - repository settings (Medium): `gh repo edit`, `gh repo rename`, `gh issue transfer`, `gh label create|edit|clone`;
+  - visibility and access (High): `gh repo edit --visibility`, `gh repo deploy-key add`, `gh ssh-key add`, `gh gpg-key add`;
+  - credentials (High): `gh auth token|login|logout|refresh|switch|setup-git`;
+  - aliases (High): `gh alias set|import`, since an alias runs any command under a name the guard does not know;
+  - repository settings (Medium): `gh repo create`, `gh repo edit`, `gh repo rename`, `gh repo autolink create`, `gh issue transfer`, `gh label create|edit|clone`;
   - CI workflows (Medium): `gh workflow run|enable|disable`, `gh run rerun|cancel`;
-  - gists (Medium): `gh gist create|edit`.
-- `gh api -XDELETE` and a lowercase method (`-X delete`, `--method=delete`) were not read as a delete; a joined `-XPOST` was not read as a write.
+  - gists (Medium): `gh gist create|edit`;
+  - pushes (Medium): `gh pr update-branch`;
+  - dependencies (Medium): `gh extension install|upgrade`.
+- `-R`/`--repo` written before the group (`gh -R o/r secret set X`, `gh -R o/r pr create`) hid the command from the guard. gh's own aliases (`gh ext`, `gh cs`, `gh gist new`) now read as the commands they stand for.
+- `gh api`'s method is read the way gh reads it: the last `-X`/`--method`, written `-XDELETE`, `-X=DELETE`, `-iX DELETE`, or lowercase. A joined field (`-fbody=x`, `--field=k=v`) counts as a write.
 
 ## [0.28.0] - 2026-11-27
 

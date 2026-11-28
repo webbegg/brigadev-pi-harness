@@ -197,6 +197,13 @@ describe("gh writes outside PRs and issues have their own words", () => {
 		assert.equal(profile("gh run cancel 1").action, "run or change CI workflows");
 		assert.deepEqual([profile("gh gist create notes.md").action, profile("gh gist create notes.md").level], ["upload a gist", "Medium"]);
 		assert.equal(profile("gh issue delete 3").action, "delete or overwrite data");
+		assert.deepEqual([profile("gh auth token").action, profile("gh auth token").level], ["reveal or change GitHub credentials", "High"]);
+		assert.deepEqual([profile("gh ssh-key add k.pub").action, profile("gh ssh-key add k.pub").level], ["give a key access to a repository", "High"]);
+		assert.deepEqual([profile("gh alias set x 'secret set X'").action, profile("gh alias set x 'secret set X'").level], ["add a gh alias", "High"]);
+		assert.equal(profile("gh pr update-branch 1").action, "push commits to the remote");
+		assert.equal(profile("gh repo create o/new --public").action, "change GitHub repository settings");
+		assert.equal(profile("gh repo autolink create JIRA- https://x/<num>").action, "change GitHub repository settings");
+		assert.equal(profile("gh extension install o/gh-x").action, "change dependencies");
 	});
 });
 
@@ -237,6 +244,8 @@ describe("yes for this session", () => {
 			"gh repo edit --description x",
 			"gh workflow run deploy.yml",
 			"gh gist create notes.md",
+			"gh pr update-branch 1",
+			"gh -R o/r issue delete 1",
 		]) {
 			assert.equal(dialogFor(command).card.sessionActions, undefined, command);
 			assert.equal(dialogFor(command).sessionLabel, undefined, command);
