@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-11-28
+
 ### Fixed
 
 - gh writes outside PRs and issues ran without a question. They now ask with their own words, in every mode except repository settings, which stay unasked in yolo like issue writes:
