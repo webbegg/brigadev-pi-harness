@@ -15,8 +15,8 @@
   - gists (Medium): `gh gist create|edit`;
   - pushes (Medium): `gh pr update-branch`;
   - dependencies (Medium): `gh extension install|upgrade`.
-- `-R`/`--repo` written before the group (`gh -R o/r secret set X`, `gh -R o/r pr create`) hid the command from the guard. gh's own aliases (`gh ext`, `gh cs`, `gh gist new`) now read as the commands they stand for.
-- `gh api`'s method is read the way gh reads it: the last `-X`/`--method`, written `-XDELETE`, `-X=DELETE`, `-iX DELETE`, or lowercase. A joined field (`-fbody=x`, `--field=k=v`) counts as a write.
+- `-R`/`--repo` written before the group (`gh -R o/r secret set X`, `gh -R o/r pr create`) hid the command from the guard. gh's own aliases (`gh ext`, `gh cs`, `gh gist new`, `gh repo new`, `gh release new`) now read as the commands they stand for.
+- `gh api`'s method is read the way gh reads it: the last `-X`/`--method`, written `-XDELETE`, `-X=DELETE`, `-iX DELETE`, or lowercase, and never another flag's value (`-p -XGET`, `--jq --method=GET`). A joined field (`-fbody=x`, `--field=k=v`) counts as a write.
 
 ## [0.28.0] - 2026-11-27
 

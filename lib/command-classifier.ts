@@ -791,7 +791,13 @@ function skipRepoFlags(args: readonly string[], from: number): number {
 
 /** gh's own names for a group (`gh ext`, `gh cs`) and, per group, for an action (`gh pr new`, `gh gist new`). */
 const GH_GROUP_ALIASES: Readonly<Record<string, string>> = { ext: "extension", extensions: "extension", cs: "codespace" };
-const GH_ACTION_ALIASES: Readonly<Record<string, Readonly<Record<string, string>>>> = { pr: { new: "create" }, issue: { new: "create" }, gist: { new: "create" } };
+const GH_ACTION_ALIASES: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+	pr: { new: "create" },
+	issue: { new: "create" },
+	gist: { new: "create" },
+	repo: { new: "create" },
+	release: { new: "create" },
+};
 
 /**
  * The group and action of a gh command (`gh [--repo <o/r>] <group> [--repo <o/r>] <action> [<sub>]`), and `rest`: the words after the
@@ -808,15 +814,25 @@ export function ghGroupAction(args: readonly string[]): { group: string | undefi
 	return { group, action, ...(sub === undefined ? {} : { sub }), rest: args.slice(start + 1) };
 }
 
-/** `gh api`'s method as gh reads it: the last `-X`/`--method`, written `-X v`, `-Xv`, `-X=v`, `-iX v`, `--method v`, or `--method=v`. */
+/** gh api's flags that take a value (written next to the flag or as the next word); `-i` is its only short yes/no flag. */
+const GH_API_VALUE_SHORT = "HpqtfFX";
+const GH_API_VALUE_LONG = new Set(["--header", "--preview", "--jq", "--template", "--raw-field", "--field", "--input", "--hostname", "--cache"]);
+
+/**
+ * `gh api`'s method as gh reads it: the last `-X`/`--method`, written `-X v`, `-Xv`, `-X=v`, `-iX v`, `--method v`, or `--method=v`.
+ * Another flag's value (`-p -XGET`, `--jq --method=GET`) is skipped, as gh does.
+ */
 function ghApiMethod(args: readonly string[]): string | undefined {
 	let method: string | undefined;
 	for (let i = 0; i < args.length; i++) {
 		const a = args[i];
-		const short = /^-i*X(.*)$/.exec(a);
-		if (short) method = short[1] ? short[1].replace(/^=/, "") : args[++i];
-		else if (a === "--method") method = args[++i];
+		const short = new RegExp(`^-i*([${GH_API_VALUE_SHORT}])(.*)$`).exec(a);
+		if (short) {
+			const value = short[2] ? short[2].replace(/^=/, "") : args[++i];
+			if (short[1] === "X") method = value;
+		} else if (a === "--method") method = args[++i];
 		else if (a.startsWith("--method=")) method = a.slice("--method=".length);
+		else if (GH_API_VALUE_LONG.has(a)) i++;
 	}
 	return method?.toUpperCase();
 }

@@ -623,6 +623,8 @@ describe("git push: force and delete in combined short flags, and a plain push (
 		assert.deepEqual(kinds("gh -R o/r issue delete 1"), [COMMAND_KIND.DESTRUCTIVE]);
 		assert.deepEqual(classifyCommand("gh -R o/r pr create --fill").map((m) => m.reason), ["gh pr create"]);
 		assert.deepEqual(classifyCommand("gh gist new notes.md").map((m) => m.reason), ["gh gist create uploads a gist"]);
+		assert.deepEqual(classifyCommand("gh repo new x --source . --push").map((m) => m.reason), ["gh repo create --push"]);
+		assert.deepEqual(kinds("gh release new v1"), [COMMAND_KIND.PUBLISH]);
 		assert.deepEqual(classifyCommand("gh ext install o/gh-x").map((m) => m.kind), [COMMAND_KIND.DEPENDENCY]);
 		assert.deepEqual(classifyCommand("gh repo deploy-key add k.pub --title delete").map((m) => m.reason), ["gh repo deploy-key add grants a key access"]);
 		assert.deepEqual(kinds("gh repo deploy-key delete 7"), [COMMAND_KIND.DESTRUCTIVE]);
@@ -633,6 +635,11 @@ describe("git push: force and delete in combined short flags, and a plain push (
 			assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
 		}
 		assert.deepEqual(kinds("gh api -X DELETE -X GET repos/o/r"), []);
+		// A word that is another flag's value is not a method, however it is written.
+		for (const command of ["gh api -X DELETE -p -XGET repos/o/r/git/refs/heads/main", "gh api -X DELETE --template -XGET repos/o/r", "gh api -X DELETE -q --method=GET repos/o/r", "gh api -X DELETE repos/o/r/hooks/1 -ip -X=GET", "gh api -X DELETE -H -XGET repos/o/r", "gh api -X DELETE --jq --method=GET repos/o/r"]) {
+			assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+		}
+		assert.deepEqual(kinds("gh api -X DELETE -p=x -X GET repos/o/r"), []);
 		assert.deepEqual(kinds("gh api -HX-Custom:1 repos/o/r"), []);
 		for (const command of ["gh api repos/o/r/issues -fbody=x", "gh api repos/o/r/issues --field=body=x", "gh api repos/o/r/issues --raw-field=body=x", "gh api repos/o/r/issues --input=body.json"]) {
 			assert.deepEqual(kinds(command), [COMMAND_KIND.DELIVERY], command);
