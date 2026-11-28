@@ -682,6 +682,52 @@ describe("guard: yes, and don't ask again this session", () => {
 		assert.equal(s.dialogs.at(-1)!.options, undefined);
 	});
 
+	it("a push grant asks again when the code a push runs changes: its hooks, the hooks folder, the SSH command, a credential helper", async () => {
+		const { cwd } = repo(["README.md"]);
+		git(cwd, "remote", "add", "origin", "https://example.invalid/r.git");
+		const s = await session(cwd, { answer: "session" });
+		const asks = async (what: string) => {
+			const before = s.dialogs.length;
+			await s.bash("git push");
+			assert.equal(s.dialogs.length, before + 1, what);
+			assert.deepEqual(s.dialogs.at(-1)!.options, ["Yes", SESSION_LABEL, "No"], `${what}: may be granted again`);
+		};
+		const granted = async (what: string) => {
+			const before = s.dialogs.length;
+			await s.bash("git push");
+			assert.equal(s.dialogs.length, before, what);
+		};
+		await asks("first push");
+		await granted("granted push");
+		const gitPath = (name: string) => join(cwd, execFileSync("git", ["rev-parse", "--git-path", name], { cwd, encoding: "utf8" }).trim());
+		const hookPath = gitPath("hooks/pre-push");
+		mkdirSync(dirname(hookPath), { recursive: true });
+		writeFileSync(hookPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		await asks("a new pre-push hook");
+		await granted("the hook it was granted with");
+		writeFileSync(hookPath, "#!/bin/sh\ngit push origin HEAD:main --force\n", { mode: 0o755 });
+		await asks("a changed pre-push hook");
+		rmSync(hookPath);
+		await granted("back to no hook, granted at first");
+		const transaction = gitPath("hooks/reference-transaction");
+		writeFileSync(transaction, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		await asks("a reference-transaction hook, which runs when the push updates the remote-tracking ref");
+		rmSync(transaction);
+		const husky = join(cwd, ".husky");
+		mkdirSync(husky, { recursive: true });
+		writeFileSync(join(husky, "pre-push"), "#!/bin/sh\nnpm test\n", { mode: 0o755 });
+		git(cwd, "config", "core.hooksPath", ".husky");
+		await asks("a hooks folder with a pre-push hook");
+		await granted("husky's hook, once granted");
+		git(cwd, "config", "--unset", "core.hooksPath");
+		for (const [key, value] of [["core.sshCommand", "sh -c 'curl x'"], ["credential.helper", "!sh -c 'curl x'"], ["credential.https://example.invalid.helper", "!x"], ["remote.origin.receivepack", "x"], ["core.fsmonitor", "./x"]]) {
+			git(cwd, "config", key, value);
+			await asks(key);
+			git(cwd, "config", "--unset", key);
+		}
+		await granted("back to the first setup");
+	});
+
 	it("too-wide actions never offer it: an API write, a merge, an install", async () => {
 		const plain = join(dir, "grant-wide");
 		mkdirSync(plain, { recursive: true });
