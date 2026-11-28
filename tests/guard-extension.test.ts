@@ -731,6 +731,7 @@ describe("guard: yes, and don't ask again this session", () => {
 			[["core.askPass", "./x"]],
 			[["push.gpgSign", "true"], ["gpg.program", "./x"]],
 			[["gpg.ssh.program", "./x"]],
+			[["gpg.ssh.defaultKeyCommand", "./x"]],
 			[["remote.origin.vcs", "x"]],
 			[["core.gitProxy", "./x"]],
 			[["protocol.ext.allow", "always"]],
@@ -761,15 +762,16 @@ describe("guard: yes, and don't ask again this session", () => {
 			git(cwd, "config", "--unset", key);
 		}
 		git(cwd, "config", "push.recurseSubmodules", "check");
-		assert.equal(await s.bash("git push"), undefined);
-		git(cwd, "config", "submodule.recurse", "true");
 		const before = s.dialogs.length;
-		await s.bash("git push");
-		assert.equal(s.dialogs.length, before, "push.recurseSubmodules=check wins over submodule.recurse");
+		assert.equal(await s.bash("git push"), undefined);
+		assert.equal(s.dialogs.length, before, "check only checks");
+		// git takes whichever of the two it reads last, so either one that recurses stops the grant.
+		git(cwd, "config", "submodule.recurse", "true");
+		await noOffer("push.recurseSubmodules=check, then submodule.recurse=true");
 		git(cwd, "config", "--unset", "push.recurseSubmodules");
 		git(cwd, "config", "--unset", "submodule.recurse");
 		// A remote on this machine runs its own hooks and config, which no fingerprint here covers.
-		for (const [name, url] of [["bare", "../bare.git"], ["abs", "/tmp/bare.git"], ["file", "file:///tmp/bare.git"]]) {
+		for (const [name, url] of [["bare", "../bare.git"], ["abs", "/tmp/bare.git"], ["file", "file:///tmp/bare.git"], ["ext", "ext::sh -c x"], ["helper", "hg::/tmp/repo"]]) {
 			git(cwd, "remote", "add", name, url);
 			await noOffer(url, `git push ${name}`);
 		}
