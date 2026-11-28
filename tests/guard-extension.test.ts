@@ -720,12 +720,64 @@ describe("guard: yes, and don't ask again this session", () => {
 		await asks("a hooks folder with a pre-push hook");
 		await granted("husky's hook, once granted");
 		git(cwd, "config", "--unset", "core.hooksPath");
-		for (const [key, value] of [["core.sshCommand", "sh -c 'curl x'"], ["credential.helper", "!sh -c 'curl x'"], ["credential.https://example.invalid.helper", "!x"], ["remote.origin.receivepack", "x"], ["core.fsmonitor", "./x"]]) {
-			git(cwd, "config", key, value);
-			await asks(key);
-			git(cwd, "config", "--unset", key);
+		const settings: Array<Array<[string, string]>> = [
+			[["core.sshCommand", "sh -c 'curl x'"]],
+			[["credential.helper", "!sh -c 'curl x'"]],
+			[["credential.https://example.invalid.helper", "!x"]],
+			[["remote.origin.receivepack", "x"]],
+			[["core.fsmonitor", "./x"]],
+			// A hook written in the config (git 2.54+), not as a file.
+			[["hook.evil.event", "pre-push"], ["hook.evil.command", "curl x | sh"]],
+			[["core.askPass", "./x"]],
+			[["push.gpgSign", "true"], ["gpg.program", "./x"]],
+			[["gpg.ssh.program", "./x"]],
+			[["remote.origin.vcs", "x"]],
+			[["core.gitProxy", "./x"]],
+			[["protocol.ext.allow", "always"]],
+		];
+		for (const pairs of settings) {
+			for (const [key, value] of pairs) git(cwd, "config", key, value);
+			await asks(pairs.map(([key]) => key).join(" + "));
+			for (const [key] of pairs) git(cwd, "config", "--unset", key);
 		}
 		await granted("back to the first setup");
+	});
+
+	it("a push grant is not offered when the push may reach a place nobody granted: submodules, or a remote on this machine", async () => {
+		const { cwd } = repo(["README.md"]);
+		git(cwd, "remote", "add", "origin", "https://example.invalid/r.git");
+		const s = await session(cwd, { answer: "session" });
+		await s.bash("git push");
+		const noOffer = async (what: string, command = "git push") => {
+			const before = s.dialogs.length;
+			await s.bash(command);
+			assert.equal(s.dialogs.length, before + 1, what);
+			assert.equal(s.dialogs.at(-1)!.options, undefined, what);
+		};
+		// The push would also send each submodule to the submodule's own remote.
+		for (const [key, value] of [["push.recurseSubmodules", "on-demand"], ["push.recurseSubmodules", "only"], ["submodule.recurse", "true"]]) {
+			git(cwd, "config", key, value);
+			await noOffer(`${key}=${value}`);
+			git(cwd, "config", "--unset", key);
+		}
+		git(cwd, "config", "push.recurseSubmodules", "check");
+		assert.equal(await s.bash("git push"), undefined);
+		git(cwd, "config", "submodule.recurse", "true");
+		const before = s.dialogs.length;
+		await s.bash("git push");
+		assert.equal(s.dialogs.length, before, "push.recurseSubmodules=check wins over submodule.recurse");
+		git(cwd, "config", "--unset", "push.recurseSubmodules");
+		git(cwd, "config", "--unset", "submodule.recurse");
+		// A remote on this machine runs its own hooks and config, which no fingerprint here covers.
+		for (const [name, url] of [["bare", "../bare.git"], ["abs", "/tmp/bare.git"], ["file", "file:///tmp/bare.git"]]) {
+			git(cwd, "remote", "add", name, url);
+			await noOffer(url, `git push ${name}`);
+		}
+		for (const url of ["git@github.com:o/r.git", "ssh://git@example.invalid/r.git"]) {
+			git(cwd, "remote", "set-url", "origin", url);
+			await s.bash("git push");
+			assert.deepEqual(s.dialogs.at(-1)!.options, ["Yes", SESSION_LABEL, "No"], `${url} may be granted`);
+		}
 	});
 
 	it("too-wide actions never offer it: an API write, a merge, an install", async () => {

@@ -77,8 +77,10 @@ export default function (pi: ExtensionAPI) {
 
 	/**
 	 * A fingerprint of the code a push from `cwd` to `remote` runs besides git: the `pre-push` and `reference-transaction` hooks (wherever
-	 * `core.hooksPath` puts them; content and executable bit) and the settings that name a program (`core.hooksPath`, `core.sshCommand`,
-	 * `core.fsmonitor`, credential helpers, the remote's `receivepack`). Undefined when it cannot be read.
+	 * `core.hooksPath` puts them; content and executable bit), hooks written in the config (`hook.*`), and the settings that name a program
+	 * or change how git reaches the remote (`core.hooksPath`, `sshCommand`, `fsmonitor`, `askPass`, `gitProxy`, credential helpers, signing
+	 * (`push.gpgSign`, `gpg.*program`), `url.*`, `protocol.*`, the remote's `receivepack` and `vcs`). Undefined when it cannot be read.
+	 * Only the hook files are read, not what they call (`npm test`, husky's own script).
 	 */
 	const pushCode = async (cwd: string, remote: string): Promise<string | undefined> => {
 		const hash = createHash("sha256");
@@ -94,7 +96,7 @@ export default function (pi: ExtensionAPI) {
 				hash.update(`${hook}:none\0`);
 			}
 		}
-		const keys = `^(core\\.(hookspath|sshcommand|fsmonitor)|credential\\..*helper|remote\\.${remote.replace(/\./g, "\\.")}\\.receivepack)$`;
+		const keys = `^(core\\.(hookspath|sshcommand|fsmonitor|askpass|gitproxy)|credential\\..*helper|hook\\..*|push\\.gpgsign|gpg\\..*program|url\\..*|protocol\\..*|remote\\.${remote.replace(/\./g, "\\.")}\\.(receivepack|vcs))$`;
 		const settings = await exec("git", ["config", "--get-regexp", keys], { cwd, timeout: 10_000 }).catch(() => undefined);
 		if (settings?.code !== 0 && settings?.code !== 1) return undefined;
 		return hash.update(settings.code === 0 ? settings.stdout : "").digest("hex");
@@ -119,6 +121,12 @@ export default function (pi: ExtensionAPI) {
 		};
 		const pushDefault = await setting("--get", "push.default");
 		if (pushDefault === undefined || !["", "simple", "current"].includes(pushDefault)) return undefined;
+		// A push that recurses into submodules also sends each one to the submodule's own remote, which nobody granted.
+		const recurse = await setting("--get", "push.recurseSubmodules");
+		const recurseAll = await setting("--type=bool", "--get", "submodule.recurse");
+		if (recurse === undefined || recurseAll === undefined) return undefined;
+		const pushRecurse = recurse || (recurseAll === "true" ? "on-demand" : "");
+		if (!["", "no", "false", "check"].includes(pushRecurse.toLowerCase())) return undefined;
 		const urls: string[] = [];
 		for (const { push } of pushes) {
 			if (!push || (push.ref !== undefined && push.ref !== "HEAD" && push.ref !== branch)) return undefined;
@@ -137,6 +145,8 @@ export default function (pi: ExtensionAPI) {
 			const found = await exec("git", ["remote", "get-url", "--push", "--all", remote], { cwd, timeout: 10_000 }).catch(() => undefined);
 			const remoteUrls = found?.code === 0 ? found.stdout.split("\n").map((line) => line.trim()).filter(Boolean) : [];
 			if (remoteUrls.length === 0) return undefined;
+			// A remote on this machine (a path, `file://`) runs its own hooks and config during the push, which `pushCode` does not read.
+			if (remoteUrls.some((url) => /^file:/i.test(url) || !(/^[a-z][a-z0-9+.-]*:\/\//i.test(url) || /^[^/:]+:/.test(url)))) return undefined;
 			const code = await pushCode(cwd, remote);
 			if (code === undefined) return undefined;
 			urls.push(...remoteUrls.map((url) => `${url}\0${code}`));

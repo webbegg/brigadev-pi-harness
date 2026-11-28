@@ -84,7 +84,7 @@ const Params = Type.Object({
 	allowedEditSurfaces: described.allowedEditSurfaces,
 	featureDoc: described.featureDoc,
 	skills: described.skills,
-	cwd: Type.Optional(Type.String({ description: "Run in this directory inside the project, e.g. a worktree (default: the project)" })),
+	cwd: Type.Optional(Type.String({ description: "Read-only agents: run in this checkout inside the project, e.g. .worktrees/<name> (default: the project)" })),
 	tasks: Type.Optional(Type.Array(Type.Object(launchFields(false)), { description: `Parallel independent units (max ${MAX_PARALLEL_TASKS}), same fields` })),
 });
 
@@ -358,10 +358,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function launchWithin(params: Static<typeof Params>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: ExtensionContext, held: Array<() => void>) {
-		// Where the children run, and so the branch and tree a verify is judged on: a directory inside the project (a worktree), else the project.
+		// Where the children run, and so the branch and tree a verify is judged on: a checkout inside the project (a worktree), else the
+		// project. Synchronous, so the verify admission below is still entered before any await.
+		const project = canonicalPath(ctx.cwd);
 		const cwd = params.cwd === undefined ? ctx.cwd : canonicalPath(path.resolve(ctx.cwd, params.cwd));
-		if (params.cwd !== undefined && !(isInside(canonicalPath(ctx.cwd), cwd) && fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory())) {
-			return { content: [{ type: "text" as const, text: `Launch rejected by brigadev delegation rules:\n- cwd must be a directory inside the project (${ctx.cwd}), such as a worktree; got "${params.cwd}".` }], details: { mode: (params.tasks?.length ? "parallel" : "single") as Details["mode"], results: [] } as Details, isError: true };
+		const elsewhere = params.cwd !== undefined && cwd !== project;
+		if (elsewhere && !(isInside(project, cwd) && fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory() && fs.existsSync(path.join(cwd, ".git")))) {
+			return { content: [{ type: "text" as const, text: `Launch rejected by brigadev delegation rules:\n- cwd must be a checkout inside the project (${ctx.cwd}), such as ".worktrees/<name>"; got "${params.cwd}".` }], details: { mode: (params.tasks?.length ? "parallel" : "single") as Details["mode"], results: [] } as Details, isError: true };
 		}
 		const agents = loadAgents(ctx);
 		const requests: LaunchRequest[] = params.tasks?.length
@@ -378,6 +381,8 @@ export default function (pi: ExtensionAPI) {
 		const resolved = requests.map((request) => ({ request, agent: agents.find((a) => a.name === request.agent) }));
 		const admission = resolved.map(({ request, agent }) => admitLaunch(request, agent, agents));
 		const problems = admission.flatMap((found, i) => found.map((p) => (requests.length > 1 ? `task ${i + 1}: ${p}` : p)));
+		// A writer's surfaces, the overlap check against running writers, and the outside-surface backstop are all the project's.
+		if (elsewhere && resolved.some(({ agent }) => agent?.writer)) problems.push("cwd runs read-only agents only; a writer works in the project, with allowedEditSurfaces relative to it");
 		problems.push(...writerConflicts(resolved.filter((r) => r.agent).map((r) => ({ agent: r.agent!, surfaces: r.request.allowedEditSurfaces ?? [] })), activeWriters));
 
 		const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);

@@ -377,11 +377,16 @@ line({ type: "agent_settled", aborted: false });
 				assert.equal(log[0].srcTree, tree.kind === "tree" ? tree.sourceTree : "none");
 				assert.equal(records().length, 1, "the main checkout's log is untouched");
 				assert.match(text(await inWorktree(".worktrees/w")), /already verified this source tree/);
-				for (const outside of ["..", root, ".worktrees/missing", "a.ts"]) {
+				fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+				for (const outside of ["..", root, ".worktrees/missing", "a.ts", "src", ".git", ".worktrees"]) {
 					const rejected = await inWorktree(outside);
 					assert.equal(rejected.isError, true, outside);
-					assert.match(text(rejected), /cwd must be a directory inside the project/, outside);
+					assert.match(text(rejected), /cwd must be a checkout inside the project/, outside);
 				}
+				// A writer's surfaces, overlap check, and outside-surface backstop are the project's: it stays there.
+				const writer = await pi.tool("subagent").execute("t", { agent: "brigadev-worker", task: "edit", reason: "context handoff", allowedEditSurfaces: ["a.ts"], cwd: ".worktrees/w" }, undefined, undefined, ctx);
+				assert.equal(writer.isError, true);
+				assert.match(text(writer), /cwd runs read-only agents only/);
 			} finally {
 				git("worktree", "remove", "--force", worktree);
 				git("branch", "-D", "feat/w");
