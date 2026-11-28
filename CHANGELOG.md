@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.28.2] - 2026-11-28
+
 ### Fixed
 
 - `brigadev-verify` launched from a worktree was judged against the main checkout's branch and tree, so it was rejected as "already verified" (and would have reviewed the wrong code). The `subagent` tool takes `cwd`, a checkout inside the project such as `.worktrees/<name>`: the children run there, and the verify budget and its evidence record use that worktree's branch and tree. A path outside the project, or a folder that is not a checkout root, is rejected; so is a writer, whose surfaces and checks stay the project's.
