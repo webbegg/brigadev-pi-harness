@@ -79,7 +79,7 @@ describe("registration", () => {
 describe("tool schema", () => {
 	it("subagent: the launch fields and parallel tasks, no async flag, every field optional", () => {
 		const schema = load().pi.tool("subagent").parameters;
-		assert.deepEqual(Object.keys(schema.properties).sort(), ["agent", "allowedEditSurfaces", "featureDoc", "reason", "skills", "task", "tasks"]);
+		assert.deepEqual(Object.keys(schema.properties).sort(), ["agent", "allowedEditSurfaces", "cwd", "featureDoc", "reason", "skills", "task", "tasks"]);
 		assert.equal(schema.required, undefined, "single and parallel calls share one schema; every field is optional");
 	});
 });
@@ -357,6 +357,40 @@ line({ type: "agent_settled", aborted: false });
 			const again = await verify("Risk: security (guard)");
 			assert.notEqual(again.isError, true, text(again));
 			assert.deepEqual(records().map((r) => r.outcome), ["failed", "clean"]);
+		});
+	});
+
+	it("cwd: a verify in a worktree inside the project is judged and recorded on the worktree's branch and tree, and runs there", { timeout: 60_000 }, async () => {
+		await withVerify({}, async ({ pi, ctx, verify }) => {
+			fs.appendFileSync(path.join(repo, ".git", "info", "exclude"), ".worktrees/\n");
+			const worktree = path.join(repo, ".worktrees", "w");
+			git("worktree", "add", "-q", "-b", "feat/w", worktree);
+			try {
+				fs.writeFileSync(path.join(worktree, "a.ts"), "2\n");
+				await verify("Risk: security (guard)");
+				const inWorktree = (cwd: string) => pi.tool("subagent").execute("t", { agent: "brigadev-verify", task: "verify S1", reason: "Risk: security (guard)", cwd }, undefined, undefined, ctx);
+				const result = await inWorktree(".worktrees/w");
+				assert.notEqual(result.isError, true, text(result));
+				const log = evidence.readEvidence(evidence.evidenceFile(repoDocsDir(worktree), "feat/w")).filter((r) => r.type === "verify") as import("../lib/evidence.ts").VerifyRecord[];
+				assert.deepEqual(log.map((r) => [r.branch, r.root]), [["feat/w", fs.realpathSync(worktree)]]);
+				const tree = await treeLib.worktreeTreeResult(worktree, { sourceTree: true });
+				assert.equal(log[0].srcTree, tree.kind === "tree" ? tree.sourceTree : "none");
+				assert.equal(records().length, 1, "the main checkout's log is untouched");
+				assert.match(text(await inWorktree(".worktrees/w")), /already verified this source tree/);
+				fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+				for (const outside of ["..", root, ".worktrees/missing", "a.ts", "src", ".git", ".worktrees"]) {
+					const rejected = await inWorktree(outside);
+					assert.equal(rejected.isError, true, outside);
+					assert.match(text(rejected), /cwd must be a checkout inside the project/, outside);
+				}
+				// A writer's surfaces, overlap check, and outside-surface backstop are the project's: it stays there.
+				const writer = await pi.tool("subagent").execute("t", { agent: "brigadev-worker", task: "edit", reason: "context handoff", allowedEditSurfaces: ["a.ts"], cwd: ".worktrees/w" }, undefined, undefined, ctx);
+				assert.equal(writer.isError, true);
+				assert.match(text(writer), /cwd runs read-only agents only/);
+			} finally {
+				git("worktree", "remove", "--force", worktree);
+				git("branch", "-D", "feat/w");
+			}
 		});
 	});
 

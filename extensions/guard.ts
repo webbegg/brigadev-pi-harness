@@ -7,8 +7,8 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolCallEventResult } from "@earendil-works/pi-coding-agent";
@@ -60,7 +60,8 @@ export default function (pi: ExtensionAPI) {
 	const outsideGrants = new Set<string>();
 	// Actions ("open a pull request") the user said yes to for the rest of the session; only those `grantable` allows, memory only.
 	const sessionGrants = new Set<string>();
-	// The push URLs a "yes for this session" to a push covered: a later push is covered only to one of them.
+	// The push URLs a "yes for this session" to a push covered, each with the fingerprint of the hooks and settings it ran with
+	// (`pushCode`): a later push is covered only to one of them, running the same code.
 	const pushGrants = new Set<string>();
 	/**
 	 * The grant that lets these matches run without asking, or undefined: each must be grantable, every action granted, and a push must go
@@ -75,9 +76,37 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * Where the command's plain pushes land, asked of git at `cwd`: the push URL of each one's remote. Undefined (no grant) unless HEAD is on a
-	 * feature branch, each push sends that branch to the same name (no ref, `HEAD`, or its name), `push.default` is unset, `simple`, or
-	 * `current`, and the remote has no `push` refspec or `mirror` setting. Any git failure is undefined. [] when the command pushes nothing.
+	 * A fingerprint of the code a push from `cwd` to `remote` runs besides git: the `pre-push` and `reference-transaction` hooks (wherever
+	 * `core.hooksPath` puts them; content and executable bit), hooks written in the config (`hook.*`), and the settings that name a program
+	 * or change how git reaches the remote (`core.hooksPath`, `sshCommand`, `fsmonitor`, `askPass`, `gitProxy`, credential helpers, signing
+	 * (`push.gpgSign`, `gpg.*`), `url.*`, `protocol.*`, the remote's `receivepack` and `vcs`). Undefined when it cannot be read.
+	 * Only the hook files are read, not what they call (`npm test`, husky's own script).
+	 */
+	const pushCode = async (cwd: string, remote: string): Promise<string | undefined> => {
+		const hash = createHash("sha256");
+		for (const hook of ["pre-push", "reference-transaction"]) {
+			const found = await exec("git", ["rev-parse", "--git-path", `hooks/${hook}`], { cwd, timeout: 10_000 }).catch(() => undefined);
+			if (found?.code !== 0 || !found.stdout.trim()) return undefined;
+			const file = resolve(cwd, found.stdout.trim());
+			try {
+				const executable = (statSync(file).mode & 0o111) !== 0;
+				hash.update(`${hook}:${executable}:`).update(readFileSync(file)).update("\0");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+				hash.update(`${hook}:none\0`);
+			}
+		}
+		const keys = `^(core\\.(hookspath|sshcommand|fsmonitor|askpass|gitproxy)|credential\\..*helper|hook\\..*|push\\.gpgsign|gpg\\..*|url\\..*|protocol\\..*|remote\\.${remote.replace(/\./g, "\\.")}\\.(receivepack|vcs))$`;
+		const settings = await exec("git", ["config", "--get-regexp", keys], { cwd, timeout: 10_000 }).catch(() => undefined);
+		if (settings?.code !== 0 && settings?.code !== 1) return undefined;
+		return hash.update(settings.code === 0 ? settings.stdout : "").digest("hex");
+	};
+
+	/**
+	 * Where the command's plain pushes land, asked of git at `cwd`: for each one, the push URLs of its remote, each with the fingerprint of
+	 * the code the push runs (`pushCode`), so a grant asks again when a hook or such a setting appears or changes. Undefined (no grant) unless
+	 * HEAD is on a feature branch, each push sends that branch to the same name (no ref, `HEAD`, or its name), `push.default` is unset,
+	 * `simple`, or `current`, and the remote has no `push` refspec or `mirror` setting. Any git failure is undefined. [] when nothing pushes.
 	 */
 	const pushDestinations = async (matches: readonly CommandMatch[], cwd: string): Promise<string[] | undefined> => {
 		const pushes = matches.filter((match) => match.push);
@@ -92,6 +121,12 @@ export default function (pi: ExtensionAPI) {
 		};
 		const pushDefault = await setting("--get", "push.default");
 		if (pushDefault === undefined || !["", "simple", "current"].includes(pushDefault)) return undefined;
+		// A push that recurses into submodules also sends each one to the submodule's own remote, which nobody granted. git takes whichever
+		// of the two settings it reads last, so each must keep the push out of submodules on its own.
+		const recurse = await setting("--get", "push.recurseSubmodules");
+		const recurseAll = await setting("--type=bool", "--get", "submodule.recurse");
+		if (recurse === undefined || recurseAll === undefined || recurseAll === "true") return undefined;
+		if (!["", "no", "false", "check"].includes(recurse.toLowerCase())) return undefined;
 		const urls: string[] = [];
 		for (const { push } of pushes) {
 			if (!push || (push.ref !== undefined && push.ref !== "HEAD" && push.ref !== branch)) return undefined;
@@ -110,7 +145,12 @@ export default function (pi: ExtensionAPI) {
 			const found = await exec("git", ["remote", "get-url", "--push", "--all", remote], { cwd, timeout: 10_000 }).catch(() => undefined);
 			const remoteUrls = found?.code === 0 ? found.stdout.split("\n").map((line) => line.trim()).filter(Boolean) : [];
 			if (remoteUrls.length === 0) return undefined;
-			urls.push(...remoteUrls);
+			// A remote on this machine (a path, `file://`) runs its own hooks and config during the push, which `pushCode` does not read; a
+			// `<helper>::<address>` URL (`ext::`, `hg::`) runs a transport program.
+			if (remoteUrls.some((url) => /^file:/i.test(url) || /^[A-Za-z0-9+.-]+::/.test(url) || !(/^[a-z][a-z0-9+.-]*:\/\//i.test(url) || /^[^/:]+:/.test(url)))) return undefined;
+			const code = await pushCode(cwd, remote);
+			if (code === undefined) return undefined;
+			urls.push(...remoteUrls.map((url) => `${url}\0${code}`));
 		}
 		return urls;
 	};

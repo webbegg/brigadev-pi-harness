@@ -23,7 +23,7 @@ After a writer returns: read its report (covered `S#`/`A#`, commands with observ
 
 ## Verification
 
-Risk `none`: your checks and the spot check suffice. A named risk category: verify once per branch, before the PR (not per unit), with `reason: "Risk: <category> (why)"` and the task's `S#`.
+Risk `none`: your checks and the spot check suffice. A named risk category: verify once per branch, before the PR (not per unit), with `reason: "Risk: <category> (why)"` and the task's `S#`. Work in a worktree: pass `cwd: ".worktrees/<name>"`, so the verify judges and reviews that branch, not the main checkout (read-only agents only).
 
 Handoff: `featureDoc` and the linked `S#`, or the task's numbered acceptance criteria `A1..An` when there is no feature document; the baseline commit; the exact test, CLI, and typecheck commands it may run. It probes in a `mktemp -d` scratch copy, never the workspace, and returns a compact result (verdicts, blockers, paths); its full result is in the run folder.
 

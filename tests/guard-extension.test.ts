@@ -682,6 +682,106 @@ describe("guard: yes, and don't ask again this session", () => {
 		assert.equal(s.dialogs.at(-1)!.options, undefined);
 	});
 
+	it("a push grant asks again when the code a push runs changes: its hooks, the hooks folder, the SSH command, a credential helper", async () => {
+		const { cwd } = repo(["README.md"]);
+		git(cwd, "remote", "add", "origin", "https://example.invalid/r.git");
+		const s = await session(cwd, { answer: "session" });
+		const asks = async (what: string) => {
+			const before = s.dialogs.length;
+			await s.bash("git push");
+			assert.equal(s.dialogs.length, before + 1, what);
+			assert.deepEqual(s.dialogs.at(-1)!.options, ["Yes", SESSION_LABEL, "No"], `${what}: may be granted again`);
+		};
+		const granted = async (what: string) => {
+			const before = s.dialogs.length;
+			await s.bash("git push");
+			assert.equal(s.dialogs.length, before, what);
+		};
+		await asks("first push");
+		await granted("granted push");
+		const gitPath = (name: string) => join(cwd, execFileSync("git", ["rev-parse", "--git-path", name], { cwd, encoding: "utf8" }).trim());
+		const hookPath = gitPath("hooks/pre-push");
+		mkdirSync(dirname(hookPath), { recursive: true });
+		writeFileSync(hookPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		await asks("a new pre-push hook");
+		await granted("the hook it was granted with");
+		writeFileSync(hookPath, "#!/bin/sh\ngit push origin HEAD:main --force\n", { mode: 0o755 });
+		await asks("a changed pre-push hook");
+		rmSync(hookPath);
+		await granted("back to no hook, granted at first");
+		const transaction = gitPath("hooks/reference-transaction");
+		writeFileSync(transaction, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		await asks("a reference-transaction hook, which runs when the push updates the remote-tracking ref");
+		rmSync(transaction);
+		const husky = join(cwd, ".husky");
+		mkdirSync(husky, { recursive: true });
+		writeFileSync(join(husky, "pre-push"), "#!/bin/sh\nnpm test\n", { mode: 0o755 });
+		git(cwd, "config", "core.hooksPath", ".husky");
+		await asks("a hooks folder with a pre-push hook");
+		await granted("husky's hook, once granted");
+		git(cwd, "config", "--unset", "core.hooksPath");
+		const settings: Array<Array<[string, string]>> = [
+			[["core.sshCommand", "sh -c 'curl x'"]],
+			[["credential.helper", "!sh -c 'curl x'"]],
+			[["credential.https://example.invalid.helper", "!x"]],
+			[["remote.origin.receivepack", "x"]],
+			[["core.fsmonitor", "./x"]],
+			// A hook written in the config (git 2.54+), not as a file.
+			[["hook.evil.event", "pre-push"], ["hook.evil.command", "curl x | sh"]],
+			[["core.askPass", "./x"]],
+			[["push.gpgSign", "true"], ["gpg.program", "./x"]],
+			[["gpg.ssh.program", "./x"]],
+			[["gpg.ssh.defaultKeyCommand", "./x"]],
+			[["remote.origin.vcs", "x"]],
+			[["core.gitProxy", "./x"]],
+			[["protocol.ext.allow", "always"]],
+		];
+		for (const pairs of settings) {
+			for (const [key, value] of pairs) git(cwd, "config", key, value);
+			await asks(pairs.map(([key]) => key).join(" + "));
+			for (const [key] of pairs) git(cwd, "config", "--unset", key);
+		}
+		await granted("back to the first setup");
+	});
+
+	it("a push grant is not offered when the push may reach a place nobody granted: submodules, or a remote on this machine", async () => {
+		const { cwd } = repo(["README.md"]);
+		git(cwd, "remote", "add", "origin", "https://example.invalid/r.git");
+		const s = await session(cwd, { answer: "session" });
+		await s.bash("git push");
+		const noOffer = async (what: string, command = "git push") => {
+			const before = s.dialogs.length;
+			await s.bash(command);
+			assert.equal(s.dialogs.length, before + 1, what);
+			assert.equal(s.dialogs.at(-1)!.options, undefined, what);
+		};
+		// The push would also send each submodule to the submodule's own remote.
+		for (const [key, value] of [["push.recurseSubmodules", "on-demand"], ["push.recurseSubmodules", "only"], ["submodule.recurse", "true"]]) {
+			git(cwd, "config", key, value);
+			await noOffer(`${key}=${value}`);
+			git(cwd, "config", "--unset", key);
+		}
+		git(cwd, "config", "push.recurseSubmodules", "check");
+		const before = s.dialogs.length;
+		assert.equal(await s.bash("git push"), undefined);
+		assert.equal(s.dialogs.length, before, "check only checks");
+		// git takes whichever of the two it reads last, so either one that recurses stops the grant.
+		git(cwd, "config", "submodule.recurse", "true");
+		await noOffer("push.recurseSubmodules=check, then submodule.recurse=true");
+		git(cwd, "config", "--unset", "push.recurseSubmodules");
+		git(cwd, "config", "--unset", "submodule.recurse");
+		// A remote on this machine runs its own hooks and config, which no fingerprint here covers.
+		for (const [name, url] of [["bare", "../bare.git"], ["abs", "/tmp/bare.git"], ["file", "file:///tmp/bare.git"], ["ext", "ext::sh -c x"], ["helper", "hg::/tmp/repo"]]) {
+			git(cwd, "remote", "add", name, url);
+			await noOffer(url, `git push ${name}`);
+		}
+		for (const url of ["git@github.com:o/r.git", "ssh://git@example.invalid/r.git"]) {
+			git(cwd, "remote", "set-url", "origin", url);
+			await s.bash("git push");
+			assert.deepEqual(s.dialogs.at(-1)!.options, ["Yes", SESSION_LABEL, "No"], `${url} may be granted`);
+		}
+	});
+
 	it("too-wide actions never offer it: an API write, a merge, an install", async () => {
 		const plain = join(dir, "grant-wide");
 		mkdirSync(plain, { recursive: true });

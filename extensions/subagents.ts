@@ -35,7 +35,7 @@ import { readCurrentBranch } from "../lib/commit-branch.ts";
 import { RECHECK_KEY, resolveAgentRoute, resolveModelRef, type ResolvedRoute } from "../lib/model-routing.ts";
 import { costCalculator, currentModelRef, loadAgents, modelCatalog } from "../lib/pi-adapters.ts";
 import { effectiveProfile, readProfiles } from "../lib/profiles-store.ts";
-import { canonicalPath } from "../lib/paths.ts";
+import { canonicalPath, isInside } from "../lib/paths.ts";
 import { redact } from "../lib/redact.ts";
 import { isChildSession, readSettings } from "../lib/runtime.ts";
 import { loadOutputSchema } from "../lib/structured-output.ts";
@@ -84,6 +84,7 @@ const Params = Type.Object({
 	allowedEditSurfaces: described.allowedEditSurfaces,
 	featureDoc: described.featureDoc,
 	skills: described.skills,
+	cwd: Type.Optional(Type.String({ description: "Read-only agents: run in this checkout inside the project, e.g. .worktrees/<name> (default: the project)" })),
 	tasks: Type.Optional(Type.Array(Type.Object(launchFields(false)), { description: `Parallel independent units (max ${MAX_PARALLEL_TASKS}), same fields` })),
 });
 
@@ -357,6 +358,14 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function launchWithin(params: Static<typeof Params>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: ExtensionContext, held: Array<() => void>) {
+		// Where the children run, and so the branch and tree a verify is judged on: a checkout inside the project (a worktree), else the
+		// project. Synchronous, so the verify admission below is still entered before any await.
+		const project = canonicalPath(ctx.cwd);
+		const cwd = params.cwd === undefined ? ctx.cwd : canonicalPath(path.resolve(ctx.cwd, params.cwd));
+		const elsewhere = params.cwd !== undefined && cwd !== project;
+		if (elsewhere && !(isInside(project, cwd) && fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory() && fs.existsSync(path.join(cwd, ".git")))) {
+			return { content: [{ type: "text" as const, text: `Launch rejected by brigadev delegation rules:\n- cwd must be a checkout inside the project (${ctx.cwd}), such as ".worktrees/<name>"; got "${params.cwd}".` }], details: { mode: (params.tasks?.length ? "parallel" : "single") as Details["mode"], results: [] } as Details, isError: true };
+		}
 		const agents = loadAgents(ctx);
 		const requests: LaunchRequest[] = params.tasks?.length
 			? params.tasks
@@ -372,6 +381,8 @@ export default function (pi: ExtensionAPI) {
 		const resolved = requests.map((request) => ({ request, agent: agents.find((a) => a.name === request.agent) }));
 		const admission = resolved.map(({ request, agent }) => admitLaunch(request, agent, agents));
 		const problems = admission.flatMap((found, i) => found.map((p) => (requests.length > 1 ? `task ${i + 1}: ${p}` : p)));
+		// A writer's surfaces, the overlap check against running writers, and the outside-surface backstop are all the project's.
+		if (elsewhere && resolved.some(({ agent }) => agent?.writer)) problems.push("cwd runs read-only agents only; a writer works in the project, with allowedEditSurfaces relative to it");
 		problems.push(...writerConflicts(resolved.filter((r) => r.agent).map((r) => ({ agent: r.agent!, surfaces: r.request.allowedEditSurfaces ?? [] })), activeWriters));
 
 		const exec = (command: string, args: string[], options: { cwd: string; timeout: number }) => pi.exec(command, args, options);
@@ -384,9 +395,9 @@ export default function (pi: ExtensionAPI) {
 		let verifyLog: VerifyLog | undefined;
 		const asks: string[] = [];
 		try {
-			verifyLog = verifyTasks.length > 0 ? await readVerifyLog(exec, ctx.cwd) : undefined;
+			verifyLog = verifyTasks.length > 0 ? await readVerifyLog(exec, cwd) : undefined;
 			if (verifyLog) {
-				const key = `${verifyLog.keyed?.root ?? canonicalPath(ctx.cwd)}\0${verifyLog.branch ?? ""}`;
+				const key = `${verifyLog.keyed?.root ?? canonicalPath(cwd)}\0${verifyLog.branch ?? ""}`;
 				for (const { index, request } of verifyTasks) {
 					// Verifies reserved by this call and by sibling calls count like finished ones: the log has no record of them yet.
 					const verdict = verifyBudget([...verifyLog.records, ...pendingVerifies(key)], { reason: request.reason, branch: verifyLog.branch }, verifyLog.srcTree);
@@ -527,7 +538,7 @@ export default function (pi: ExtensionAPI) {
 						slots,
 						runAgent: (call) =>
 							runChild(
-								{ cwd: ctx.cwd, agent: tasks[call.index].agent, request: tasks[call.index].request, taskText: call.taskText, route: call.route, routeLabel: call.routeLabel, schema: schemas[call.index], price, signal: call.signal, onUpdate: call.onUpdate },
+								{ cwd, agent: tasks[call.index].agent, request: tasks[call.index].request, taskText: call.taskText, route: call.route, routeLabel: call.routeLabel, schema: schemas[call.index], price, signal: call.signal, onUpdate: call.onUpdate },
 								{ piInvocation },
 							),
 						skills: () => skills,
@@ -539,7 +550,7 @@ export default function (pi: ExtensionAPI) {
 							},
 						},
 						view,
-						snapshot: () => takeSnapshot(exec, canonicalPath(ctx.cwd)),
+						snapshot: () => takeSnapshot(exec, canonicalPath(cwd)),
 					},
 				),
 			);
