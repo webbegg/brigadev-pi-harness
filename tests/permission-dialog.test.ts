@@ -182,6 +182,31 @@ describe("commandDialog", () => {
 	});
 });
 
+describe("gh writes outside PRs and issues have their own words", () => {
+	const profile = (command: string) => profileFor(classifyCommand(command)[0]!);
+	it("names secrets, settings, visibility, workflows, and gists, never the unknown profile", () => {
+		assert.deepEqual([profile("gh secret set TOKEN --body x").action, profile("gh secret set TOKEN --body x").level], ["change secrets or variables", "High"]);
+		assert.equal(profile("gh variable delete ENV").action, "change secrets or variables");
+		assert.deepEqual([profile("gh repo edit --visibility public").action, profile("gh repo edit --visibility public").level], ["change a repository's visibility", "High"]);
+		assert.deepEqual([profile("gh repo edit --description x").action, profile("gh repo edit --description x").level], ["change GitHub repository settings", "Medium"]);
+		assert.equal(profile("gh repo rename y").action, "change GitHub repository settings");
+		assert.equal(profile("gh issue transfer 3 o/other").action, "change GitHub repository settings");
+		assert.equal(profile("gh label create bug").action, "change GitHub repository settings");
+		assert.equal(profile("gh repo deploy-key add k.pub").level, "High");
+		assert.deepEqual([profile("gh workflow run deploy.yml").action, profile("gh workflow run deploy.yml").level], ["run or change CI workflows", "Medium"]);
+		assert.equal(profile("gh run cancel 1").action, "run or change CI workflows");
+		assert.deepEqual([profile("gh gist create notes.md").action, profile("gh gist create notes.md").level], ["upload a gist", "Medium"]);
+		assert.equal(profile("gh issue delete 3").action, "delete or overwrite data");
+		assert.deepEqual([profile("gh auth token").action, profile("gh auth token").level], ["reveal or change GitHub credentials", "High"]);
+		assert.deepEqual([profile("gh ssh-key add k.pub").action, profile("gh ssh-key add k.pub").level], ["give a key access to a repository", "High"]);
+		assert.deepEqual([profile("gh alias set x 'secret set X'").action, profile("gh alias set x 'secret set X'").level], ["add a gh alias", "High"]);
+		assert.equal(profile("gh pr update-branch 1").action, "push commits to the remote");
+		assert.equal(profile("gh repo create o/new --public").action, "change GitHub repository settings");
+		assert.equal(profile("gh repo autolink create JIRA- https://x/<num>").action, "change GitHub repository settings");
+		assert.equal(profile("gh extension install o/gh-x").action, "change dependencies");
+	});
+});
+
 describe("yes for this session", () => {
 	it("is offered only for a closed list: opening a PR, writing to a PR or issue, and a plain push", () => {
 		assert.deepEqual(dialogFor("gh pr create --fill").card.sessionActions, ["open a pull request"]);
@@ -212,6 +237,15 @@ describe("yes for this session", () => {
 			"gh api graphql -f query='mutation { createPullRequest: mergePullRequest(input:{}) { clientMutationId } }'",
 			"gh pr close 1 --delete-branch",
 			"gh pr close 1 -d",
+			// gh writes outside PRs and issues, and an issue moved to another repository.
+			"gh issue transfer 3 o/other",
+			"gh issue delete 3 --yes",
+			"gh secret set TOKEN --body x",
+			"gh repo edit --description x",
+			"gh workflow run deploy.yml",
+			"gh gist create notes.md",
+			"gh pr update-branch 1",
+			"gh -R o/r issue delete 1",
 		]) {
 			assert.equal(dialogFor(command).card.sessionActions, undefined, command);
 			assert.equal(dialogFor(command).sessionLabel, undefined, command);

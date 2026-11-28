@@ -269,6 +269,86 @@ const DEPENDENCY: RiskProfile = {
 	undoBrief: "can be undone",
 	affectsBrief: "the project and your machine",
 };
+const SECRETS: RiskProfile = {
+	action: "change secrets or variables",
+	what: "Sets or deletes a GitHub Actions secret or variable.",
+	level: "High",
+	risk: "CI and deploys use the new value at once; a secret's old value is gone, since GitHub never shows it again.",
+	undo: "Only by setting the old value again, if you still have it.",
+	affects: "Every workflow and deploy that reads it.",
+	undoBrief: "only if you still have the old value",
+	affectsBrief: "every workflow that reads it",
+};
+const VISIBILITY: RiskProfile = {
+	action: "change a repository's visibility",
+	what: "Makes a GitHub repository public, private, or internal.",
+	level: "High",
+	risk: "Made public, its code and history are visible to anyone; made private, forks and stars are lost.",
+	undo: "Not for what others already saw or copied; forks and stars do not come back.",
+	affects: "Everyone who can, or could, see the repository.",
+	undoBrief: "cannot be cleanly undone",
+	affectsBrief: "everyone who can see the repository",
+};
+const REPO_ACCESS: RiskProfile = {
+	action: "give a key access to a repository",
+	what: "Adds a deploy key to a GitHub repository, or an SSH or GPG key to your GitHub account.",
+	level: "High",
+	risk: "Whoever holds the private key can read the repository (an account key: every repository you can reach), and push if the key may write.",
+	undo: "Yes: delete the key, but what it already read or pushed stays.",
+	affects: "The repository and its team.",
+	undoBrief: "undoable; what it did stays",
+	affectsBrief: "the repository and its team",
+};
+const REPO_SETTINGS: RiskProfile = {
+	action: "change GitHub repository settings",
+	what: "Changes a GitHub repository's settings or labels, renames it, or moves an issue to another repository.",
+	level: "Medium",
+	risk: "The team sees the change at once; a rename or a moved issue breaks links and scripts that name the old place.",
+	undo: "Yes, by changing it back; links to a moved issue may stay broken.",
+	affects: "The repository and its team.",
+	undoBrief: "can be changed back",
+	affectsBrief: "the repository and its team",
+};
+const WORKFLOW: RiskProfile = {
+	action: "run or change CI workflows",
+	what: "Runs, reruns, cancels, enables, or disables a GitHub Actions workflow.",
+	level: "Medium",
+	risk: "A workflow can deploy, publish, or spend CI minutes; disabling one stops its checks.",
+	undo: "Partly: a disabled workflow can be enabled again, but what a run did stays done.",
+	affects: "The repository's CI, and whatever the workflow deploys to.",
+	undoBrief: "what a run did stays done",
+	affectsBrief: "CI and what it deploys to",
+};
+const GIST: RiskProfile = {
+	action: "upload a gist",
+	what: "Uploads files to a GitHub gist.",
+	level: "Medium",
+	risk: "The files leave your machine; a secret gist is still readable by anyone with its link, a public one by anyone.",
+	undo: "Partly: the gist can be deleted, but others may already have a copy.",
+	affects: "Anyone with the gist's link.",
+	undoBrief: "partly undoable",
+	affectsBrief: "anyone with the link",
+};
+const CREDENTIALS: RiskProfile = {
+	action: "reveal or change GitHub credentials",
+	what: "Prints the GitHub token, or logs in, out, switches account, widens the token's scopes, or makes git use gh's token.",
+	level: "High",
+	risk: "A printed token lands in the transcript and the model's context; a changed login changes what every later command may do.",
+	undo: "A revealed token only by revoking it; a login change by logging back in.",
+	affects: "Your GitHub account and everything it can reach.",
+	undoBrief: "a revealed token must be revoked",
+	affectsBrief: "your GitHub account",
+};
+const ALIAS: RiskProfile = {
+	action: "add a gh alias",
+	what: "Adds a gh alias: a new name that runs another gh command, or a shell command.",
+	level: "High",
+	risk: "Under the new name, any command can run later without the guard knowing what it does.",
+	undo: "Yes: `gh alias delete`, but what it already ran stays done.",
+	affects: "Your gh setup, and every later command run through the alias.",
+	undoBrief: "can be deleted; what it ran stays",
+	affectsBrief: "every later gh command",
+};
 /** A guarded action this file has no words for yet: never shown as harmless. */
 const UNKNOWN: RiskProfile = {
 	action: "run an action the guard flags",
@@ -299,6 +379,14 @@ export function profileFor(match: CommandMatch): RiskProfile {
 			if (/^gh repo create --push$/.test(reason)) return REPO_PUSH;
 			if (/pushes and opens a PR/.test(reason)) return PUSH_AND_PR;
 			if (/^gh pr create$|^gh api opens a PR$/.test(reason)) return OPEN_PR;
+			if (/changes a secret or variable$/.test(reason)) return SECRETS;
+			if (/^gh repo edit changes the visibility$/.test(reason)) return VISIBILITY;
+			if (/grants a key access$/.test(reason)) return REPO_ACCESS;
+			if (/reveals or changes GitHub credentials$/.test(reason)) return CREDENTIALS;
+			if (/adds a gh alias$/.test(reason)) return ALIAS;
+			if (/^gh [a-z]+ [a-z -]+ changes repository settings$|^gh repo create creates a repository$/.test(reason)) return REPO_SETTINGS;
+			if (/runs or changes a CI workflow$/.test(reason)) return WORKFLOW;
+			if (/uploads a gist$/.test(reason)) return GIST;
 			if (/^gh (pr|issue) [a-z]+$|writes to a PR or issue/.test(reason)) return GITHUB_WRITE;
 			if (/^gh api /.test(reason)) return GITHUB_API;
 			return UNKNOWN;

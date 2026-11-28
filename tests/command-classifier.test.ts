@@ -576,6 +576,88 @@ describe("git push: force and delete in combined short flags, and a plain push (
 		}
 	});
 
+	it("gh writes outside PRs and issues: deletes, secrets, repository settings, workflows, gists", () => {
+		const seen = (command: string) => classifyCommand(command).map((m) => ({ kind: m.kind, ask: Boolean(m.alwaysConfirm) }));
+		for (const command of [
+			"gh issue delete 3 --yes",
+			"gh label delete bug --yes",
+			"gh run delete 12",
+			"gh cache delete --all",
+			"gh gist delete abc",
+			"gh repo deploy-key delete 7",
+			"gh release delete-asset v1 a.zip",
+			"gh api -XDELETE repos/o/r",
+			"gh api --method=delete repos/o/r",
+			"gh api -X delete repos/o/r",
+		]) assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+		// Asked in every mode: they change what CI, deploys, or the public can reach.
+		for (const command of [
+			"gh secret set TOKEN --body x",
+			"gh secret delete TOKEN",
+			"gh secret remove TOKEN",
+			"gh variable set ENV --body prod",
+			"gh variable delete ENV",
+			"gh repo edit --visibility public --accept-visibility-change-consequences",
+			"gh repo deploy-key add key.pub",
+			"gh workflow run deploy.yml",
+			"gh workflow disable ci",
+			"gh run rerun 12",
+			"gh run cancel 12",
+			"gh gist create notes.md",
+		]) assert.deepEqual(seen(command), [{ kind: COMMAND_KIND.DELIVERY, ask: true }], command);
+		// Repository settings stay unasked in yolo, like issue writes.
+		for (const command of ["gh repo edit --description x", "gh repo rename new-name", "gh issue transfer 3 o/other", "gh label create bug"]) {
+			assert.deepEqual(seen(command), [{ kind: COMMAND_KIND.DELIVERY, ask: false }], command);
+		}
+		assert.deepEqual(seen("gh api -XPOST repos/o/r/issues"), [{ kind: COMMAND_KIND.DELIVERY, ask: false }]);
+		assert.deepEqual(kinds("gh api -XGET repos/o/r"), []);
+		for (const command of ["gh secret list", "gh variable get ENV", "gh repo view", "gh workflow list", "gh run view 12", "gh gist view abc", "gh label list", "gh auth status", "gh extension list", "gh alias list", "gh repo set-default o/r", "gh ssh-key list", "gh codespace list"]) {
+			assert.deepEqual(kinds(command), [], command);
+		}
+	});
+
+	it("reads -R/--repo before the group, gh's own aliases, and an argument named like an action", () => {
+		for (const command of ["gh -R o/r secret set X", "gh --repo=o/r secret set X", "gh --repo o/r secret set X", "gh -Ro/r secret set X", "gh secret -R o/r set X"]) {
+			assert.deepEqual(classifyCommand(command).map((m) => m.reason), ["gh secret set changes a secret or variable"], command);
+		}
+		assert.deepEqual(kinds("gh -R o/r issue delete 1"), [COMMAND_KIND.DESTRUCTIVE]);
+		assert.deepEqual(classifyCommand("gh -R o/r pr create --fill").map((m) => m.reason), ["gh pr create"]);
+		assert.deepEqual(classifyCommand("gh gist new notes.md").map((m) => m.reason), ["gh gist create uploads a gist"]);
+		assert.deepEqual(classifyCommand("gh repo new x --source . --push").map((m) => m.reason), ["gh repo create --push"]);
+		assert.deepEqual(kinds("gh release new v1"), [COMMAND_KIND.PUBLISH]);
+		assert.deepEqual(classifyCommand("gh ext install o/gh-x").map((m) => m.kind), [COMMAND_KIND.DEPENDENCY]);
+		assert.deepEqual(classifyCommand("gh repo deploy-key add k.pub --title delete").map((m) => m.reason), ["gh repo deploy-key add grants a key access"]);
+		assert.deepEqual(kinds("gh repo deploy-key delete 7"), [COMMAND_KIND.DESTRUCTIVE]);
+	});
+
+	it("reads every way of writing gh api's method; the last one wins", () => {
+		for (const command of ["gh api -X=DELETE repos/o/r", "gh api -iX DELETE repos/o/r", "gh api -iXDELETE repos/o/r", "gh api -X GET -X DELETE repos/o/r", "gh api --method GET --method DELETE repos/o/r", "gh api --method GET --method=delete repos/o/r"]) {
+			assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+		}
+		assert.deepEqual(kinds("gh api -X DELETE -X GET repos/o/r"), []);
+		// A word that is another flag's value is not a method, however it is written.
+		for (const command of ["gh api -X DELETE -p -XGET repos/o/r/git/refs/heads/main", "gh api -X DELETE --template -XGET repos/o/r", "gh api -X DELETE -q --method=GET repos/o/r", "gh api -X DELETE repos/o/r/hooks/1 -ip -X=GET", "gh api -X DELETE -H -XGET repos/o/r", "gh api -X DELETE --jq --method=GET repos/o/r"]) {
+			assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+		}
+		assert.deepEqual(kinds("gh api -X DELETE -p=x -X GET repos/o/r"), []);
+		assert.deepEqual(kinds("gh api -HX-Custom:1 repos/o/r"), []);
+		for (const command of ["gh api repos/o/r/issues -fbody=x", "gh api repos/o/r/issues --field=body=x", "gh api repos/o/r/issues --raw-field=body=x", "gh api repos/o/r/issues --input=body.json"]) {
+			assert.deepEqual(kinds(command), [COMMAND_KIND.DELIVERY], command);
+		}
+	});
+
+	it("credentials, keys, extensions, aliases, codespaces, projects, and a forced sync", () => {
+		const seen = (command: string) => classifyCommand(command).map((m) => ({ kind: m.kind, ask: Boolean(m.alwaysConfirm) }));
+		for (const command of ["gh ssh-key delete 1", "gh gpg-key delete 1", "gh codespace delete -c x", "gh cs delete -c x", "gh project delete 1", "gh project item-delete 1", "gh project field-delete 1", "gh repo sync --force", "gh repo autolink delete 1"]) {
+			assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
+		}
+		for (const command of ["gh auth token", "gh auth refresh -s delete_repo", "gh auth logout", "gh auth login --with-token", "gh auth setup-git", "gh auth switch", "gh ssh-key add k.pub", "gh gpg-key add k.asc", "gh alias set x 'secret set X'", "gh alias import a.yml", "gh pr update-branch 1"]) {
+			assert.deepEqual(seen(command), [{ kind: COMMAND_KIND.DELIVERY, ask: true }], command);
+		}
+		for (const command of ["gh repo autolink create JIRA- https://x/<num>", "gh repo create o/new --public"]) assert.deepEqual(seen(command), [{ kind: COMMAND_KIND.DELIVERY, ask: false }], command);
+		for (const command of ["gh extension install o/gh-x", "gh extensions upgrade --all", "gh ext install o/gh-x"]) assert.deepEqual(kinds(command), [COMMAND_KIND.DEPENDENCY], command);
+	});
+
 	it("closing a PR with --delete-branch deletes a remote branch", () => {
 		for (const command of ["gh pr close 1 --delete-branch", "gh pr close 1 -d", "gh pr close 1 -dc bye"]) assert.deepEqual(kinds(command), [COMMAND_KIND.DESTRUCTIVE], command);
 		assert.deepEqual(kinds("gh pr close 1 -c bye"), [COMMAND_KIND.DELIVERY]);
