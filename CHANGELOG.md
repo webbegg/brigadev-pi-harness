@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `brigadev-verify` launched from a worktree was judged against the main checkout's branch and tree, so it was rejected as "already verified" (and would have reviewed the wrong code). The `subagent` tool takes `cwd`, a directory inside the project such as `.worktrees/<name>`: the children run there, and the verify budget and its evidence record use that worktree's branch and tree. A path outside the project is rejected.
+- A push granted for the session ran whatever hooks and settings came later. The grant now remembers the code a push runs besides git (the `pre-push` and `reference-transaction` hooks wherever `core.hooksPath` puts them, and `core.sshCommand`, `core.fsmonitor`, credential helpers, the remote's `receivepack`); when any of it appears or changes, the push asks again, and may be granted again. A repository whose hooks stay the same (husky included) keeps its grant.
+
 ## [0.28.1] - 2026-11-28
 
 ### Fixed
